@@ -13,7 +13,7 @@ import {
   McplConnection,
   textContent,
   method,
-} from '@connectome/mcpl-core';
+} from '@animalabs/mcpl-core';
 
 import type {
   JsonRpcRequest,
@@ -39,7 +39,7 @@ import type {
   ContentBlock,
   ChannelsOutgoingChunkParams,
   ChannelsOutgoingCompleteParams,
-} from '@connectome/mcpl-core';
+} from '@animalabs/mcpl-core';
 
 import type { SlackAdapter, SlackMessageData } from './slack-adapter.js';
 import { toolDefinitions } from './tools.js';

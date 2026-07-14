@@ -2,7 +2,7 @@
  * MCPL channel management — maps Slack conversations to MCPL ChannelDescriptors.
  */
 
-import type { ChannelDescriptor } from '@connectome/mcpl-core';
+import type { ChannelDescriptor } from '@animalabs/mcpl-core';
 import type { SlackConversationInfo } from './slack-adapter.js';
 
 /** MCPL channel ID format: slack:<conversationId>. Slack conversation IDs are
