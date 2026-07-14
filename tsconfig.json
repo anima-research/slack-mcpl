@@ -16,8 +16,5 @@
     "composite": true
   },
   "include": ["src/**/*", "test/**/*"],
-  "exclude": ["node_modules", "dist"],
-  "references": [
-    { "path": "../mcpl-core-ts" }
-  ]
+  "exclude": ["node_modules", "dist"]
 }
