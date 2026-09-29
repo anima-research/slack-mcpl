@@ -675,7 +675,15 @@ export class SlackMcplServer {
     }
   }
 
+  /** Slack only delivers message events from conversations the bot is a
+   *  member of, so with SLACK_SUBSCRIBE_MEMBER_CHANNELS every delivered
+   *  conversation counts as subscribed: inviting the bot is the opt-in. */
+  private subscribeMemberChannels(): boolean {
+    return process.env.SLACK_SUBSCRIBE_MEMBER_CHANNELS === 'true';
+  }
+
   private isChannelSubscribed(channelId: string): boolean {
+    if (this.subscribeMemberChannels()) return true;
     this.ensureSubscriptionsLoaded();
     return this.subscribedChannels.has(channelId);
   }
@@ -925,7 +933,7 @@ export class SlackMcplServer {
       const blocks: string[] = [];
       if (!msg.isDM) {
         const where = meta?.name ? `#${meta.name}` : `conversation ${msg.channelId}`;
-        const wasSubscribed = this.subscribedChannels.has(msg.channelId);
+        const wasSubscribed = this.isChannelSubscribed(msg.channelId);
         if (!wasSubscribed) {
           this.subscribedChannels.add(msg.channelId);
           this.saveSubscriptions();

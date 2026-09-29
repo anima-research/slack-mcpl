@@ -14,6 +14,8 @@
  *                       When set, DMs from anyone else are dropped.
  *   SLACK_SEND_CHANNELS - Optional: comma-separated conversation-ID allow-list
  *                       for writes. When set, writes elsewhere are refused.
+ *   SLACK_SUBSCRIBE_MEMBER_CHANNELS - Optional: 'true' delivers ambient messages from
+ *                       every channel the bot is a member of; no subscription list
  *   SLACK_DISABLE_DMS - Optional: 'true' drops incoming DMs and refuses DM sends
  *                       and DM history reads.
  *   SLACK_ACK_REACTION - Optional: emoji name (e.g. eyes) put on a message that
