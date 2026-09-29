@@ -43,13 +43,15 @@ that grant arrives; plain MCP tool calls are unaffected.
 
 Feature sets: `slack.messaging` (rollback-capable; `send_message`,
 `reply_message`, `send_dm`, `add_reaction`, `edit_message`, `delete_message`,
-plus channel registration, push events and `channels/incoming` delivery),
+plus push events and `channels/incoming` delivery),
 `slack.history` (`fetch_history`, `fetch_thread`, `fetch_attachment`),
 `slack.subscriptions` (`subscribe_channel`, `unsubscribe_channel`,
 `list_subscriptions`). `list_channels`, `refresh_channels` and `find_user`
 belong to no feature set, so disabling a feature set does not switch them
-off. They still need the `tools` grant: every tool is refused until the host
-has granted `tools`.
+off. In MCPL mode they still need the `tools` grant: every tool is refused
+until the host has granted `tools`. Channel registration and
+`channels/publish` follow their own capabilities (`channels.register`,
+`channels.publish`), not the `slack.messaging` feature set.
 
 A host that grants `slack.messaging` a capability set missing what it
 declares (§6.4) stops its tools, its incoming delivery, and its push events

@@ -37,8 +37,6 @@ import type {
   StateRollbackResult,
   ChannelDescriptor,
   ContentBlock,
-  ChannelsOutgoingChunkParams,
-  ChannelsOutgoingCompleteParams,
 } from '@animalabs/mcpl-core';
 
 import type { SlackAdapter, SlackMessageData } from './slack-adapter.js';
@@ -702,6 +700,8 @@ export class SlackMcplServer {
     }
     dbg('registerSlackChannels', { count: descriptors.length });
     if (descriptors.length === 0) return;
+    // The grant may have been revoked, or the peer gone, while Slack answered.
+    if (this.conn !== conn || !this.grant.has('channels.register')) return;
 
     this.channelManager.registerAll(descriptors);
 

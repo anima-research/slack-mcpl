@@ -349,6 +349,10 @@ test('channels/outgoing/complete posts nothing; the reply arrives once, through 
   await new Promise((r) => setTimeout(r, 30));
   assert.equal(h.posts.length, 0);
 
+  // The same reply through channels/publish posts exactly once.
+  await h.host.sendRequest(method.CHANNELS_PUBLISH, { channelId: 'slack:C1', content: complete.content });
+  assert.equal(h.posts.length, 1);
+
   await h.close();
 });
 
@@ -371,6 +375,11 @@ test('registration follows a policy that first grants channels.register, even af
   await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
   await new Promise((r) => setTimeout(r, 30));
   assert.equal(registers(), 1);
+
+  // Denied, then granted again: registers again.
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: ['tools'] });
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await until(() => registers() === 2, 'channels/register after a re-grant');
 
   await h.close();
 });
