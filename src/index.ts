@@ -12,6 +12,10 @@
  *                       for Socket Mode events (no public webhook URL needed)
  *   SLACK_DM_USERS    - Optional: comma-separated user-ID whitelist for DMs.
  *                       When set, DMs from anyone else are dropped.
+ *   SLACK_SEND_CHANNELS - Optional: comma-separated conversation-ID allow-list
+ *                       for writes. When set, writes elsewhere are refused.
+ *   SLACK_DISABLE_DMS - Optional: 'true' drops incoming DMs and refuses DM sends
+ *                       and DM history reads.
  *   SLACK_SUBSCRIPTIONS_FILE - Optional: JSON file persisting ambient-channel
  *                       subscriptions across restarts
  *   SLACK_BACKSCROLL_LIMIT   - Optional: messages fetched on first interaction
@@ -45,7 +49,9 @@ async function main(): Promise<void> {
 
   // Connect Slack first: auth.test resolves the bot's identity, then Socket
   // Mode comes up so no events are missed once the host attaches.
-  const slack = await connectSlack({ botToken, appToken, dmUsers });
+  const sendChannels = process.env.SLACK_SEND_CHANNELS?.split(',').map((s) => s.trim()).filter(Boolean);
+  const disableDms = process.env.SLACK_DISABLE_DMS === 'true';
+  const slack = await connectSlack({ botToken, appToken, dmUsers, sendChannels, disableDms });
   const server = new SlackMcplServer(slack);
   await slack.start();
   console.error(

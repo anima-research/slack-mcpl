@@ -125,6 +125,11 @@ export interface SlackAdapterConfig {
   appToken: string;
   /** When set, DMs from anyone not in this user-ID list are dropped. */
   dmUsers?: string[];
+  /** Conversation-ID allow-list for every write (send, DM, edit, delete,
+   *  reaction). Unset or empty = no restriction. */
+  sendChannels?: string[];
+  /** Drop incoming DMs and refuse DM sends and DM history reads. */
+  disableDms?: boolean;
 }
 
 /**
@@ -146,6 +151,8 @@ export async function connectSlack(config: SlackAdapterConfig): Promise<SlackAda
     (auth.user_id as string | undefined) ?? null,
     (auth.team as string | undefined) ?? '',
     config.dmUsers,
+    config.sendChannels,
+    config.disableDms,
   );
 }
 
@@ -189,6 +196,8 @@ export class SlackAdapter {
     readonly botUserId: string | null,
     readonly teamName: string,
     private dmUsers?: string[],
+    private sendChannels?: string[],
+    private disableDms = false,
   ) {
     // Register the handler at construction so start() ordering can't race
     // an early event past an unregistered listener.
@@ -278,11 +287,22 @@ export class SlackAdapter {
 
   // ── Messaging ──
 
+  /** Slack scopes are workspace-wide, so "speak only here" is enforced here:
+   *  the one place every write passes through. */
+  private assertWritable(channelId: string): void {
+    if (this.sendChannels?.length && !this.sendChannels.includes(channelId)) {
+      throw new Error(
+        `Writing to ${channelId} is not allowed: this bot may only write to ${this.sendChannels.join(', ')} (SLACK_SEND_CHANNELS)`,
+      );
+    }
+  }
+
   async sendMessage(
     channelId: string,
     text: string,
     opts: { threadTs?: string } = {},
   ): Promise<{ messageId: string }> {
+    this.assertWritable(channelId);
     const result = await this.web.chat.postMessage({
       channel: channelId,
       text,
@@ -291,7 +311,17 @@ export class SlackAdapter {
     return { messageId: result.ts ? String(result.ts) : '' };
   }
 
+  /** DM and group-DM conversation IDs start with D; mpim ones with G are
+   *  indistinguishable from private channels by ID, so the scope list is
+   *  what keeps group DMs out. */
+  private assertNotDm(channelId: string): void {
+    if (this.disableDms && channelId.startsWith('D')) {
+      throw new Error('Direct messages are disabled for this bot (SLACK_DISABLE_DMS)');
+    }
+  }
+
   async sendDM(userId: string, text: string): Promise<{ messageId: string; channelId: string }> {
+    if (this.disableDms) throw new Error('Direct messages are disabled for this bot (SLACK_DISABLE_DMS)');
     const open = await this.web.conversations.open({ users: userId });
     const channelId = open.channel?.id;
     if (!channelId) throw new Error(`Could not open a DM with user ${userId}`);
@@ -300,14 +330,17 @@ export class SlackAdapter {
   }
 
   async editMessage(channelId: string, ts: string, text: string): Promise<void> {
+    this.assertWritable(channelId);
     await this.web.chat.update({ channel: channelId, ts, text });
   }
 
   async deleteMessage(channelId: string, ts: string): Promise<void> {
+    this.assertWritable(channelId);
     await this.web.chat.delete({ channel: channelId, ts });
   }
 
   async addReaction(channelId: string, ts: string, emoji: string): Promise<void> {
+    this.assertWritable(channelId);
     // Slack wants the bare emoji name; accept :name: and strip the colons.
     await this.web.reactions.add({ channel: channelId, timestamp: ts, name: emoji.replace(/:/g, '') });
   }
@@ -320,6 +353,7 @@ export class SlackAdapter {
     channelId: string,
     opts: { limit?: number; oldest?: string; latest?: string } = {},
   ): Promise<{ messages: HistoryMessage[]; truncated: boolean }> {
+    this.assertNotDm(channelId);
     const { messages, truncated } = await fetchSlackHistory(this.web, {
       channel: channelId,
       ...(opts.oldest !== undefined ? { oldest: opts.oldest } : {}),
@@ -335,6 +369,7 @@ export class SlackAdapter {
     threadTs: string,
     limit = 100,
   ): Promise<{ messages: HistoryMessage[]; truncated: boolean }> {
+    this.assertNotDm(channelId);
     const collected: SlackHistoryMessage[] = [];
     let cursor: string | undefined;
     let truncated = false;
@@ -429,6 +464,7 @@ export class SlackAdapter {
     if (!event.channel || !event.user || !event.ts) return;
 
     const isDM = event.channel_type === 'im' || event.channel.startsWith('D');
+    if (this.disableDms && (isDM || event.channel_type === 'mpim')) return;
     if (isDM && this.dmUsers && this.dmUsers.length > 0 && !this.dmUsers.includes(event.user)) {
       return; // DM whitelist active and this sender isn't on it
     }
