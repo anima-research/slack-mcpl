@@ -30,6 +30,9 @@ import {
   type SlackHistoryMessage,
 } from './content.js';
 
+/** An acknowledgement reaction never outlives this, replied to or not. */
+const ACK_TTL_MS = 10 * 60 * 1000;
+
 /** Message subtypes that represent real user content. Everything else
  * (message_changed, message_deleted, channel_join, bot_message, …) is noise
  * for the inference loop. */
@@ -130,6 +133,8 @@ export interface SlackAdapterConfig {
   sendChannels?: string[];
   /** Drop incoming DMs and refuse DM sends and DM history reads. */
   disableDms?: boolean;
+  /** Emoji name put on an addressed message while the agent works on it. */
+  ackReaction?: string;
 }
 
 /**
@@ -153,6 +158,7 @@ export async function connectSlack(config: SlackAdapterConfig): Promise<SlackAda
     config.dmUsers,
     config.sendChannels,
     config.disableDms,
+    config.ackReaction,
   );
 }
 
@@ -172,6 +178,7 @@ export interface SlackWebLike {
   };
   reactions: {
     add(args: { channel: string; timestamp: string; name: string }): Promise<unknown>;
+    remove(args: { channel: string; timestamp: string; name: string }): Promise<unknown>;
   };
   users: {
     info(args: { user: string }): Promise<{ user?: { profile?: { display_name?: string }; real_name?: string; name?: string } }>;
@@ -198,6 +205,7 @@ export class SlackAdapter {
     private dmUsers?: string[],
     private sendChannels?: string[],
     private disableDms = false,
+    private ackReaction?: string,
   ) {
     // Register the handler at construction so start() ordering can't race
     // an early event past an unregistered listener.
@@ -297,6 +305,44 @@ export class SlackAdapter {
     }
   }
 
+  // ── Acknowledgement reaction ──
+  // Slack has no typing indicator for bots, so "working on it" is shown as a
+  // reaction on the message that addressed the bot, removed when the bot next
+  // posts in that conversation or after ACK_TTL_MS, whichever comes first.
+
+  private ackPending = new Map<string, Map<string, ReturnType<typeof setTimeout>>>();
+
+  /** Mark an addressed message as being worked on. Best-effort: never throws. */
+  async acknowledge(channelId: string, ts: string): Promise<void> {
+    if (!this.ackReaction) return;
+    try {
+      await this.addReaction(channelId, ts, this.ackReaction);
+    } catch {
+      return; // not writable here, or Slack refused — nothing to clear later
+    }
+    const timer = setTimeout(() => void this.clearAck(channelId, ts), ACK_TTL_MS);
+    timer.unref?.();
+    let pending = this.ackPending.get(channelId);
+    if (!pending) this.ackPending.set(channelId, (pending = new Map()));
+    pending.set(ts, timer);
+  }
+
+  private async clearAck(channelId: string, ts?: string): Promise<void> {
+    const pending = this.ackPending.get(channelId);
+    if (!pending || !this.ackReaction) return;
+    const targets = ts === undefined ? [...pending.keys()] : pending.has(ts) ? [ts] : [];
+    for (const t of targets) {
+      clearTimeout(pending.get(t));
+      pending.delete(t);
+      try {
+        await this.web.reactions.remove({ channel: channelId, timestamp: t, name: this.ackReaction });
+      } catch {
+        // Already removed, or the message is gone.
+      }
+    }
+    if (pending.size === 0) this.ackPending.delete(channelId);
+  }
+
   async sendMessage(
     channelId: string,
     text: string,
@@ -308,6 +354,7 @@ export class SlackAdapter {
       text,
       ...(opts.threadTs ? { thread_ts: opts.threadTs } : {}),
     });
+    void this.clearAck(channelId);
     return { messageId: result.ts ? String(result.ts) : '' };
   }
 

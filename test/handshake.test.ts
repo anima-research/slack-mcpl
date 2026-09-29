@@ -85,6 +85,9 @@ function fakeWeb(posts: unknown[] = []): SlackWebLike {
       async add() {
         return {};
       },
+      async remove() {
+        return {};
+      },
     },
     users: {
       async info({ user }) {

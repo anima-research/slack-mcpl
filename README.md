@@ -133,6 +133,7 @@ SLACK_BOT_TOKEN=xoxb-... SLACK_APP_TOKEN=xapp-... slack-mcpl --stdio
 | `SLACK_DM_USERS` | no | Comma-separated user-ID whitelist for DMs; others' DMs are dropped |
 | `SLACK_SEND_CHANNELS` | no | Comma-separated conversation-ID allow-list for writes (send, DM, edit, delete, reaction); writes elsewhere are refused |
 | `SLACK_DISABLE_DMS` | no | `true` drops incoming DMs and group DMs, and refuses DM sends and DM history reads |
+| `SLACK_ACK_REACTION` | no | Emoji name (e.g. `eyes`) put on a message that addresses the bot and removed when the bot next posts in that conversation, or after 10 minutes. Slack has no typing indicator for bots |
 | `SLACK_SUBSCRIPTIONS_FILE` | no | JSON file persisting ambient subscriptions across restarts |
 | `SLACK_BACKSCROLL_LIMIT` | no | Messages fetched on first interaction with a conversation (default 50) |
 | `SLACK_MCPL_DEBUG_LOG` | no | Absolute path for a diagnostic file log |

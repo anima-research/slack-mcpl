@@ -16,6 +16,8 @@
  *                       for writes. When set, writes elsewhere are refused.
  *   SLACK_DISABLE_DMS - Optional: 'true' drops incoming DMs and refuses DM sends
  *                       and DM history reads.
+ *   SLACK_ACK_REACTION - Optional: emoji name (e.g. eyes) put on a message that
+ *                       addresses the bot, removed when the bot replies there.
  *   SLACK_SUBSCRIPTIONS_FILE - Optional: JSON file persisting ambient-channel
  *                       subscriptions across restarts
  *   SLACK_BACKSCROLL_LIMIT   - Optional: messages fetched on first interaction
@@ -51,7 +53,8 @@ async function main(): Promise<void> {
   // Mode comes up so no events are missed once the host attaches.
   const sendChannels = process.env.SLACK_SEND_CHANNELS?.split(',').map((s) => s.trim()).filter(Boolean);
   const disableDms = process.env.SLACK_DISABLE_DMS === 'true';
-  const slack = await connectSlack({ botToken, appToken, dmUsers, sendChannels, disableDms });
+  const ackReaction = process.env.SLACK_ACK_REACTION?.replace(/:/g, '').trim() || undefined;
+  const slack = await connectSlack({ botToken, appToken, dmUsers, sendChannels, disableDms, ackReaction });
   const server = new SlackMcplServer(slack);
   await slack.start();
   console.error(

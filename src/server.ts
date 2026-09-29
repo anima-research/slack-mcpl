@@ -897,6 +897,7 @@ export class SlackMcplServer {
       dbg('handleSlackMessage:drop', { reason: 'ambient-not-subscribed', channelId: msg.channelId });
       return;
     }
+    if (isAddressed) void this.slack.acknowledge(msg.channelId, msg.id);
 
     // First-interaction handling: when about to forward the very first
     // message from this conversation (this process), pull backscroll for
