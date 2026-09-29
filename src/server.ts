@@ -71,6 +71,22 @@ function dbg(tag: string, info: Record<string, unknown> = {}): void {
   }
 }
 
+/** The bracketed header in front of an incoming message, e.g.
+ *  `[#support (acme) thread=1718000000.000100 id=1718000000.000200] `. */
+export function locationHeader(loc: {
+  conversation?: string;
+  teamName?: string;
+  threadTs?: string;
+  messageId: string;
+}): string {
+  const parts: string[] = [];
+  if (loc.conversation) parts.push(loc.conversation);
+  if (loc.teamName) parts.push(`(${loc.teamName})`);
+  if (loc.threadTs) parts.push(`thread=${loc.threadTs}`);
+  parts.push(`id=${loc.messageId}`);
+  return `[${parts.join(' ')}] `;
+}
+
 export class SlackMcplServer {
   private conn: McplConnection | null = null;
   private mcplEnabled = false;
@@ -928,19 +944,21 @@ export class SlackMcplServer {
     const channelMcplId = mcplChannelId(msg.channelId);
     const channelIsOpen = this.channelManager.isOpen(channelMcplId);
 
-    // Location header only when the conversation differs from the last
-    // communication context (compare BEFORE updating the tracker).
+    // The conversation is named only when it differs from the last
+    // communication context (compare BEFORE updating the tracker). The
+    // thread and the message ID are given every time: two threads in one
+    // channel are otherwise indistinguishable, and replying or reacting to
+    // a message needs its ID.
     const contextChanged = this.lastChannelId !== msg.channelId;
-    let location = '';
-    if (contextChanged) {
-      const meta = await this.slack.getConversationMeta(msg.channelId).catch(() => null);
-      const parts: string[] = [];
-      if (msg.isDM) parts.push('DM');
-      else if (meta?.name) parts.push(`#${meta.name}`);
-      if (msg.threadTs) parts.push('in thread');
-      if (this.slack.teamName) parts.push(`(${this.slack.teamName})`);
-      if (parts.length > 0) location = `[${parts.join(' ')}] `;
-    }
+    const meta = contextChanged
+      ? await this.slack.getConversationMeta(msg.channelId).catch(() => null)
+      : null;
+    const location = locationHeader({
+      conversation: !contextChanged ? undefined : msg.isDM ? 'DM' : meta?.name ? `#${meta.name}` : undefined,
+      teamName: contextChanged ? this.slack.teamName : undefined,
+      threadTs: msg.threadTs,
+      messageId: msg.id,
+    });
     const renderedContent = `${prefixBlock}${location}${msg.authorName}: ${msg.cleanContent}`;
 
     // Advance trackers before forwarding: watermark (bounds future
