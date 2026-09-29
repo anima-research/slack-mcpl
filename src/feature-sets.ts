@@ -17,13 +17,13 @@
  *   channels.lifecycle — server.ts handles channels/open and channels/close
  *   channels.publish   — server.ts handles channels/publish
  *   channels.incoming  — handleSlackMessage sends channels/incoming for open channels
- *   channels.streaming — server.ts buffers channels/outgoing/chunk and finalizes
- *                        on channels/outgoing/complete
  *   pushEvents         — handleSlackMessage sends push/event for addressed
  *                        messages on channels the host has not opened
  *   tools              — the MCP tool surface of this server
  *
- * Deliberately NOT declared: channels.acknowledge (no handler for
+ * Deliberately NOT declared: channels.streaming (the host delivers each reply
+ * once, through channels/publish; a streamed copy would post it twice),
+ * channels.acknowledge (no handler for
  * channels/acknowledge), channels.typing (the adapter has no typing
  * indicator — Slack's Web API exposes none for bots).
  */
@@ -58,7 +58,6 @@ export function buildFeatureSets(): Record<string, FeatureSetDeclaration> {
     'channels.lifecycle',
     'channels.publish',
     'channels.incoming',
-    'channels.streaming',
     'pushEvents',
   ];
 
@@ -94,7 +93,6 @@ export function buildServerCapabilities(): McplManifest {
       lifecycle: true,
       publish: true,
       incoming: true,
-      streaming: true,
     },
     featureSets: buildFeatureSets(),
   };

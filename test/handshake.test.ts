@@ -23,7 +23,6 @@ const FULL_GRANT = [
   'channels.lifecycle',
   'channels.publish',
   'channels.incoming',
-  'channels.streaming',
   'pushEvents',
 ];
 
@@ -51,7 +50,7 @@ function fakeSocket(): FakeSocket {
   };
 }
 
-function fakeWeb(): SlackWebLike {
+function fakeWeb(posts: unknown[] = []): SlackWebLike {
   return {
     conversations: {
       async list() {
@@ -71,7 +70,8 @@ function fakeWeb(): SlackWebLike {
       },
     },
     chat: {
-      async postMessage() {
+      async postMessage(args) {
+        posts.push(args);
         return { ts: '100.1' };
       },
       async update() {
@@ -102,6 +102,8 @@ interface Harness {
   socket: FakeSocket;
   host: McplConnection;
   hostSaw: JsonRpcRequest[];
+  /** chat.postMessage calls that reached Slack. */
+  posts: unknown[];
   served: Promise<void>;
   close(): Promise<void>;
 }
@@ -113,7 +115,8 @@ function harness(): Harness {
   const host = McplConnection.fromStreams(toHost, toServer);
 
   const socket = fakeSocket();
-  const slack = new SlackAdapter(fakeWeb(), socket, 'UBOT', 'acme');
+  const posts: unknown[] = [];
+  const slack = new SlackAdapter(fakeWeb(posts), socket, 'UBOT', 'acme');
   const server = new SlackMcplServer(slack);
 
   const hostSaw: JsonRpcRequest[] = [];
@@ -144,6 +147,7 @@ function harness(): Harness {
     socket,
     host,
     hostSaw,
+    posts,
     served,
     async close() {
       toServer.end();
@@ -222,9 +226,9 @@ test('featureSets/update is answered with a full-grant receipt, and registration
 
   const receipt = (await h.host.sendRequest(method.FEATURE_SETS_UPDATE, {
     effectiveCapabilities: FULL_GRANT,
-  })) as { accepted: boolean; mode: string; unavailableFeatures: unknown[] };
+  })) as { accepted: boolean; mode?: string; unavailableFeatures: unknown[] };
   assert.equal(receipt.accepted, true);
-  assert.equal(receipt.mode, 'full');
+  assert.equal(receipt.mode, undefined, 'mode is omitted when nothing degraded (§6.7)');
   assert.deepEqual(receipt.unavailableFeatures, []);
 
   await until(() => h.hostSaw.some((r) => r.method === method.CHANNELS_REGISTER), 'channels/register');
@@ -327,6 +331,46 @@ test('a featureSets/update Notification never establishes readiness (§6.7)', as
     h.host.sendRequest('tools/call', { name: 'list_channels', arguments: {} }),
     (err: Error & { code?: number }) => err.code === -32002,
   );
+
+  await h.close();
+});
+
+test('channels/outgoing/complete posts nothing; the reply arrives once, through channels/publish', async () => {
+  const h = harness();
+  const init = await initialize(h, true);
+  const mcpl = (init.capabilities as any).experimental.mcpl;
+  assert.equal(mcpl.channels.streaming, undefined, 'channels.streaming is not declared');
+
+  // Even before the policy exchange, and after it, a completed stream is advisory.
+  const complete = { channelId: 'slack:C1', inferenceId: 'i1', content: [{ type: 'text', text: 'hello' }] };
+  h.host.sendNotification(method.CHANNELS_OUTGOING_COMPLETE, complete);
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  h.host.sendNotification(method.CHANNELS_OUTGOING_COMPLETE, complete);
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(h.posts.length, 0);
+
+  await h.close();
+});
+
+test('registration follows a policy that first grants channels.register, even after a refresh under denial', async () => {
+  const h = harness();
+  await initialize(h, true);
+  const registers = () => h.hostSaw.filter((r) => r.method === method.CHANNELS_REGISTER).length;
+
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: ['tools'] });
+  const refreshed = (await h.host.sendRequest('tools/call', { name: 'refresh_channels', arguments: {} })) as {
+    content: { text: string }[];
+  };
+  assert.match(refreshed.content[0].text, /channels\.register/);
+  assert.equal(registers(), 0, 'nothing registered while denied');
+
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await until(() => registers() === 1, 'channels/register after the grant widened');
+
+  // A repeat of the same grant does not register again.
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(registers(), 1);
 
   await h.close();
 });

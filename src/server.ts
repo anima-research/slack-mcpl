@@ -79,8 +79,6 @@ export class SlackMcplServer {
   private grant = new CapabilityGrant(buildFeatureSets());
   private channelManager = new ChannelManager();
   private stateTracker = new StateTracker();
-  /** Buffers for channels/outgoing/chunk streams, keyed by inferenceId */
-  private outgoingBuffers = new Map<string, { channelId: string; chunks: string[] }>();
 
   /** Conversations the agent has opted into for ambient (non-mention,
    *  non-DM) message delivery. Mentions and DMs always come through
@@ -133,14 +131,6 @@ export class SlackMcplServer {
 
     // Handshake
     await this.handleInitialize();
-
-    // Registration waits for the initial policy exchange, not for a timer:
-    // channels/register requires the channels.register capability, which
-    // isn't known until the host's featureSets/update Request is answered.
-    // Runs concurrently with the main request loop below.
-    if (this.mcplEnabled) {
-      void this.grant.whenReady().then(() => this.registerSlackChannels());
-    }
 
     // Main loop
     try {
@@ -254,8 +244,15 @@ export class SlackMcplServer {
           // consequences, never a claim of entitlement. Only this form can
           // establish a ready state (§5.3).
           this.requireMcpl();
+          const couldRegister = this.grant.has('channels.register');
           const receipt = this.grant.apply(params as unknown as FeatureSetsUpdateParams, 'request');
           conn.sendResponse(req.id, receipt);
+          // channels/register needs the channels.register capability. Register
+          // when the grant first allows it, and again if a later policy turns
+          // it from denied to granted. The receipt above is sent first.
+          if (!couldRegister && this.grant.has('channels.register')) {
+            void this.registerSlackChannels();
+          }
           break;
         }
 
@@ -375,42 +372,11 @@ export class SlackMcplServer {
         break;
       }
 
-      case method.CHANNELS_OUTGOING_CHUNK: {
-        const p = notif.params as ChannelsOutgoingChunkParams;
-        const buf = this.outgoingBuffers.get(p.inferenceId);
-        if (buf) {
-          buf.chunks[p.index] = p.delta;
-        } else {
-          const chunks: string[] = [];
-          chunks[p.index] = p.delta;
-          this.outgoingBuffers.set(p.inferenceId, { channelId: p.channelId, chunks });
-        }
+      // channels.streaming is not declared, so a host should not send these. If
+      // one does, ignore them: the reply arrives once, through channels/publish.
+      case method.CHANNELS_OUTGOING_CHUNK:
+      case method.CHANNELS_OUTGOING_COMPLETE:
         break;
-      }
-
-      case method.CHANNELS_OUTGOING_COMPLETE: {
-        const p = notif.params as ChannelsOutgoingCompleteParams;
-        this.outgoingBuffers.delete(p.inferenceId);
-
-        // Extract text and send to Slack (into the active thread, if any)
-        const text = p.content
-          .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
-          .map((b) => b.text)
-          .join('\n');
-
-        if (text) {
-          const parsed = parseMcplChannelId(p.channelId);
-          if (parsed) {
-            const threadTs = this.lastIncomingThreadTs.get(parsed.conversationId);
-            this.slack
-              .sendMessage(parsed.conversationId, text, threadTs ? { threadTs } : {})
-              .catch((err) => {
-                console.error('[slack-mcpl] outgoing/complete send failed:', (err as Error).message);
-              });
-          }
-        }
-        break;
-      }
 
       // Slack's Web API has no typing indicator for bots (the RTM one is
       // deprecated), so typing notifications are accepted and ignored.
@@ -752,16 +718,18 @@ export class SlackMcplServer {
    *  re-registering a known channel refreshes its descriptor but does NOT
    *  re-announce it. Returns the descriptors that were newly added. */
   private registerAndNotifyNew(descriptors: ChannelDescriptor[]): ChannelDescriptor[] {
+    // Without the grant, record nothing: a channel marked known here would
+    // never be announced after the grant widens.
+    if (this.conn && this.mcplEnabled && !this.grant.has('channels.register')) {
+      console.error('[slack-mcpl] channels.register not granted; channels stay unannounced');
+      return [];
+    }
     const added: ChannelDescriptor[] = [];
     for (const d of descriptors) {
       if (!this.channelManager.get(d.id)) added.push(d);
       this.channelManager.register(d);
     }
     if (added.length > 0 && this.conn && this.mcplEnabled) {
-      if (!this.grant.has('channels.register')) {
-        console.error(`[slack-mcpl] channels.register not granted; ${added.length} new channel(s) stay unannounced`);
-        return added;
-      }
       this.conn.sendNotification(method.CHANNELS_CHANGED, { added });
     }
     return added;
@@ -784,7 +752,9 @@ export class SlackMcplServer {
       note:
         added.length > 0
           ? `Registered ${added.length} newly-visible conversation(s).`
-          : 'No new conversations — the host already knows about every visible one.',
+          : this.mcplEnabled && !this.grant.has('channels.register')
+            ? 'The host has not granted channels.register; nothing was announced.'
+            : 'No new conversations — the host already knows about every visible one.',
     };
   }
 

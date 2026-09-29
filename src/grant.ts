@@ -41,14 +41,14 @@ import { McplRpcError } from './errors.js';
 /** SPEC §6.7 — the response to `featureSets/update` is a degradation receipt. */
 export interface DegradationReceipt {
   accepted: true;
-  mode: 'full' | 'degraded';
+  /** Omitted when nothing degraded (§6.7). */
+  mode?: 'degraded';
   unavailableFeatures: UnavailableFeature[];
   notes: string[];
 }
 
 export class CapabilityGrant {
   private state: CapabilityGrantState = emptyGrantState();
-  private readyWaiters: (() => void)[] = [];
 
   constructor(private declarations: Record<string, FeatureSetDeclaration> = {}) {}
 
@@ -64,23 +64,15 @@ export class CapabilityGrant {
 
   /**
    * Forget the grant: a new connection starts from nothing (§5.3) — the
-   * previous peer's policy is not this peer's. Waiters from the old
-   * connection are dropped; their callers guard on the connection anyway.
+   * previous peer's policy is not this peer's.
    */
   reset(): void {
     this.state = emptyGrantState();
-    this.readyWaiters = [];
   }
 
   /** True once a grant-bearing `featureSets/update` Request has been accepted. */
   isReady(): boolean {
     return this.state.ready;
-  }
-
-  /** Resolves the first time a policy is accepted. */
-  whenReady(): Promise<void> {
-    if (this.isReady()) return Promise.resolve();
-    return new Promise<void>((resolve) => this.readyWaiters.push(resolve));
   }
 
   /**
@@ -180,16 +172,9 @@ export class CapabilityGrant {
       }),
     );
 
-    // §6.7: only the Request form can establish a ready state.
-    if (this.state.ready) {
-      const waiters = this.readyWaiters;
-      this.readyWaiters = [];
-      for (const resolve of waiters) resolve();
-    }
-
     return {
       accepted: true,
-      mode: unavailableFeatures.length > 0 ? 'degraded' : 'full',
+      ...(unavailableFeatures.length > 0 ? { mode: 'degraded' as const } : {}),
       unavailableFeatures,
       notes,
     };

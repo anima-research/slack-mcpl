@@ -47,10 +47,20 @@ plus channel registration, push events and `channels/incoming` delivery),
 `slack.history` (`fetch_history`, `fetch_thread`, `fetch_attachment`),
 `slack.subscriptions` (`subscribe_channel`, `unsubscribe_channel`,
 `list_subscriptions`). `list_channels`, `refresh_channels` and `find_user`
-are always available. A host that disables `slack.messaging` — or grants it
-a capability set missing what it declares (§6.4) — stops its tools, its
-incoming delivery, and its push events all at once; the degradation receipt
-to `featureSets/update` reports this in `unavailableFeatures`.
+belong to no feature set, so disabling a feature set does not switch them
+off. They still need the `tools` grant: every tool is refused until the host
+has granted `tools`.
+
+A host that grants `slack.messaging` a capability set missing what it
+declares (§6.4) stops its tools, its incoming delivery, and its push events
+all at once, and the degradation receipt to `featureSets/update` reports the
+missing paths in `unavailableFeatures`. A host that only leaves
+`slack.messaging` out of `enabled`, or lists it in `disabled`, gets the same
+effect, but the receipt does not list it: the receipt reports missing
+capabilities, not feature-set selection.
+
+The host receives each reply once, through `channels/publish`. The server
+does not declare `channels.streaming`.
 
 ## Setup
 
