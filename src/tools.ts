@@ -31,14 +31,14 @@ export const toolDefinitions: ToolDefinition[] = [
   {
     name: 'reply_message',
     description:
-      'Reply to a specific message in a Slack conversation. The reply is posted in that ' +
-      'message\'s thread (Slack\'s equivalent of a reply). Pass the parent message\'s ID; ' +
-      'replying to a message that is itself a thread reply posts into the same thread.',
+      'Reply in a thread of a Slack conversation. Incoming messages show `thread=` when they ' +
+      'are already in a thread and `id=` always. Pass the `thread=` value if the message you ' +
+      'answer shows one; otherwise pass its `id=`, which starts a thread under it.',
     inputSchema: {
       type: 'object',
       properties: {
         channelId: { type: 'string', description: 'Slack conversation ID' },
-        messageId: { type: 'string', description: 'Message ID (ts) to reply to — becomes the thread' },
+        messageId: { type: 'string', description: 'Thread ID (ts): the message\'s `thread=` if it has one, else its `id=`' },
         content: { type: 'string', description: 'Reply text (Slack mrkdwn)' },
       },
       required: ['channelId', 'messageId', 'content'],

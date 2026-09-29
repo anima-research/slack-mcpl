@@ -87,6 +87,21 @@ export function locationHeader(loc: {
   return `[${parts.join(' ')}] `;
 }
 
+/** One backscroll line, e.g. `[2024-06-10T05:33:20.000Z thread=1718000000.000100 id=1718000000.000150] Ann: hi`.
+ *  A thread reply names its parent, so the agent can reply into that thread. */
+export function backscrollLine(m: {
+  id: string;
+  threadTs?: string;
+  timestamp: Date;
+  authorName: string;
+  content: string;
+  attachments: Array<{ name: string }>;
+}): string {
+  const att = m.attachments.length > 0 ? ` [attachments: ${m.attachments.map((a) => a.name).join(', ')}]` : '';
+  const thread = m.threadTs ? ` thread=${m.threadTs}` : '';
+  return `[${m.timestamp.toISOString()}${thread} id=${m.id}] ${m.authorName}: ${m.content}${att}`;
+}
+
 export class SlackMcplServer {
   private conn: McplConnection | null = null;
   private mcplEnabled = false;
@@ -927,13 +942,7 @@ export class SlackMcplServer {
         if (meta?.name && !msg.isDM) attrs.push(`channel="#${meta.name}"`);
         if (msg.isDM) attrs.push('dm="true"');
         attrs.push(`count="${backscroll.length}"`);
-        const lines = backscroll.map((m) => {
-          const att = m.attachments.length > 0
-            ? ` [attachments: ${m.attachments.map((a) => a.name).join(', ')}]`
-            : '';
-          const threadMark = m.threadTs ? ' (thread reply)' : '';
-          return `[${m.timestamp.toISOString()} id=${m.id}]${threadMark} ${m.authorName}: ${m.content}${att}`;
-        });
+        const lines = backscroll.map(backscrollLine);
         blocks.push([`<backscroll ${attrs.join(' ')}>`, ...lines, '</backscroll>'].join('\n'));
       }
       if (blocks.length > 0) {
