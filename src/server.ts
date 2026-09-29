@@ -115,6 +115,9 @@ export class SlackMcplServer {
    *  counts as subscribed (`subscribeMemberChannels`). */
   private mutedChannels = new Set<string>();
 
+  /** Conversations whose read-only note the agent has been given. */
+  private readOnlyNoted = new Set<string>();
+
   /**
    * `subscribeMemberChannels`: Slack only delivers message events from
    * conversations the bot is a member of, so every delivered conversation
@@ -234,7 +237,8 @@ export class SlackMcplServer {
     try {
       switch (req.method) {
         case 'tools/list': {
-          conn.sendResponse(req.id, { tools: toolDefinitions });
+          const tools = this.slack.dmsDisabled ? toolDefinitions.filter((t) => t.name !== 'send_dm') : toolDefinitions;
+          conn.sendResponse(req.id, { tools });
           break;
         }
 
@@ -584,7 +588,9 @@ export class SlackMcplServer {
           ? this.opts.subscribeMemberChannels
             ? `Unmuted conversation ${channelId}: its ambient messages arrive again.`
             : `Subscribed to ambient messages from conversation ${channelId}.`
-          : `Already subscribed to conversation ${channelId}.`;
+          : this.opts.subscribeMemberChannels
+            ? `Conversation ${channelId} is not muted.`
+            : `Already subscribed to conversation ${channelId}.`;
       }
 
       case 'unsubscribe_channel': {
@@ -594,7 +600,9 @@ export class SlackMcplServer {
           ? this.opts.subscribeMemberChannels
             ? `Muted ambient messages in conversation ${channelId} until you subscribe_channel it again. Mentions and DMs from there will still arrive.`
             : `Unsubscribed from ambient messages in conversation ${channelId}. Mentions and DMs from there will still arrive.`
-          : `Conversation ${channelId} was not subscribed.`;
+          : this.opts.subscribeMemberChannels
+            ? `Conversation ${channelId} is already muted.`
+            : `Conversation ${channelId} was not subscribed.`;
       }
 
       case 'list_subscriptions': {
@@ -968,7 +976,9 @@ export class SlackMcplServer {
 
       const meta = await this.slack.getConversationMeta(msg.channelId).catch(() => null);
       const blocks: string[] = [];
-      if (!msg.isDM) {
+      // In member mode every conversation is subscribed unless muted, and a
+      // mention must not undo a mute.
+      if (!msg.isDM && !this.opts.subscribeMemberChannels) {
         const where = meta?.name ? `#${meta.name}` : `conversation ${msg.channelId}`;
         const wasSubscribed = this.isChannelSubscribed(msg.channelId);
         if (!wasSubscribed) {
@@ -980,10 +990,6 @@ export class SlackMcplServer {
               `To stop ambient delivery from here: unsubscribe_channel("${msg.channelId}").</system>`,
           );
         }
-      }
-      if (!this.slack.canWrite(msg.channelId)) {
-        const where = msg.isDM ? 'this DM' : meta?.name ? `#${meta.name}` : `conversation ${msg.channelId}`;
-        blocks.push(`<system>You cannot write to ${where} (write allow-list). You can read it; do not try to reply here.</system>`);
       }
       if (backscroll.length > 0) {
         const attrs: string[] = [];
@@ -1002,6 +1008,14 @@ export class SlackMcplServer {
       if (blocks.length > 0) {
         prefixBlock = blocks.join('\n') + '\n';
       }
+    }
+
+    // Told with the first message the agent gets from here, addressed or not.
+    if (!this.slack.canWrite(msg.channelId) && !this.readOnlyNoted.has(msg.channelId)) {
+      this.readOnlyNoted.add(msg.channelId);
+      prefixBlock +=
+        `<system>You cannot write to conversation ${msg.channelId}: it is not on the write allow-list. ` +
+        `You can read it; do not try to reply there.</system>\n`;
     }
 
     const channelMcplId = mcplChannelId(msg.channelId);

@@ -56,6 +56,11 @@ async function main(): Promise<void> {
   // Connect Slack first: auth.test resolves the bot's identity, then Socket
   // Mode comes up so no events are missed once the host attaches.
   const sendChannels = process.env.SLACK_SEND_CHANNELS?.split(',').map((s) => s.trim()).filter(Boolean);
+  // Set but empty would mean "write anywhere": most likely a broken template.
+  if (process.env.SLACK_SEND_CHANNELS !== undefined && sendChannels!.length === 0) {
+    console.error('SLACK_SEND_CHANNELS is set but names no conversation; unset it to allow writing anywhere');
+    process.exit(1);
+  }
   const disableDms = process.env.SLACK_DISABLE_DMS === 'true';
   const ackReaction = process.env.SLACK_ACK_REACTION?.replace(/:/g, '').trim() || undefined;
   const slack = await connectSlack({ botToken, appToken, dmUsers, sendChannels, disableDms, ackReaction });
@@ -66,6 +71,22 @@ async function main(): Promise<void> {
   console.error(
     `[slack-mcpl] Slack connected as bot ${slack.botUserId} in workspace "${slack.teamName}"`,
   );
+  console.error(
+    `[slack-mcpl] writes: ${sendChannels?.length ? `only ${sendChannels.join(', ')}` : 'anywhere'}; ` +
+      `DMs: ${disableDms ? 'off' : 'on'}`,
+  );
+
+  // Take pending acknowledgement reactions off before exiting. Bounded, since
+  // the Slack client retries rate-limited calls for a long time.
+  let stopping = false;
+  const shutdown = () => {
+    if (stopping) return;
+    stopping = true;
+    setTimeout(() => process.exit(0), 5000).unref();
+    void slack.stop().finally(() => process.exit(0));
+  };
+  process.once('SIGTERM', shutdown);
+  process.once('SIGINT', shutdown);
 
   if (useStdio) {
     // Stdio transport — single client, MCP-compatible
@@ -73,6 +94,7 @@ async function main(): Promise<void> {
     console.error('[slack-mcpl] Starting on stdio');
     const conn = McplConnection.fromStreams(process.stdin, process.stdout);
     await server.serve(conn);
+    shutdown(); // the host closed stdin
   } else if (tcpPort) {
     // TCP transport — single client
     console.error(`[slack-mcpl] Listening on TCP port ${tcpPort}`);

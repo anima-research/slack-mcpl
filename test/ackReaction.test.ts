@@ -88,8 +88,8 @@ test('a reply that lands while the reaction is still being added does not leave 
   assert.deepEqual(calls, ['add-start:1.0', 'post:C1', 'add-done:1.0', 'remove:1.0']);
 });
 
-test('a removal Slack refuses is kept and tried again; a gone message is not', async () => {
-  let failure: Error | null = Object.assign(new Error('ratelimited'), { data: { error: 'ratelimited' } });
+test('a removal that failed without an answer from Slack is tried again, a few times at most', async () => {
+  let failure: Error | null = new Error('socket hang up');
   const { adapter, calls, release } = makeSlowAdapter(() => failure);
   release();
   await adapter.acknowledge('C1', '1.0');
@@ -102,12 +102,31 @@ test('a removal Slack refuses is kept and tried again; a gone message is not', a
   await adapter.clearAck('C1'); // and now it is gone
   assert.equal(calls.filter((c) => c.startsWith('remove')).length, 2);
 
-  const gone = makeSlowAdapter(() => Object.assign(new Error('x'), { data: { error: 'message_not_found' } }));
-  gone.release();
-  await gone.adapter.acknowledge('C1', '2.0');
-  await gone.adapter.clearAck('C1');
-  await gone.adapter.clearAck('C1');
-  assert.equal(gone.calls.filter((c) => c.startsWith('remove')).length, 1, 'dropped after a terminal error');
+  const flaky = makeSlowAdapter(() => new Error('socket hang up'));
+  flaky.release();
+  await flaky.adapter.acknowledge('C1', '3.0');
+  for (let i = 0; i < 8; i++) await flaky.adapter.clearAck('C1');
+  assert.equal(flaky.calls.filter((c) => c.startsWith('remove')).length, 5, 'gives up after 5 tries');
+});
+
+test('a removal Slack itself refused is not tried again', async () => {
+  for (const error of ['message_not_found', 'is_archived', 'not_in_channel']) {
+    const { adapter, calls, release } = makeSlowAdapter(() => Object.assign(new Error(error), { data: { error } }));
+    release();
+    await adapter.acknowledge('C1', '2.0');
+    await adapter.clearAck('C1');
+    await adapter.clearAck('C1');
+    assert.equal(calls.filter((c) => c.startsWith('remove')).length, 1, error);
+  }
+});
+
+test('the same message acknowledged twice gets one reaction, and a reply removes it', async () => {
+  const { adapter, calls, settle } = makeAdapter({ ackReaction: 'eyes' });
+  await adapter.acknowledge('C1', '1.0');
+  await adapter.acknowledge('C1', '1.0'); // Slack redelivered the event
+  await adapter.sendMessage('C1', 'answer');
+  await settle();
+  assert.deepEqual(calls, ['add:C1:1.0:eyes', 'post:C1', 'remove:C1:1.0:eyes']);
 });
 
 test('stop() takes pending reactions off', async () => {

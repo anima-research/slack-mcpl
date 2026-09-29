@@ -50,6 +50,10 @@ test('a mute survives a restart when SLACK_SUBSCRIPTIONS_FILE is set', async () 
 
     const second = new SlackMcplServer({} as any, { subscribeMemberChannels: true });
     assert.equal((second as any).isChannelSubscribed('C1'), false);
+
+    // Nothing muted: the file is a plain array again, as older versions write it.
+    await call(second, 'subscribe_channel', { channelId: 'C1' });
+    assert.deepEqual(JSON.parse(readFileSync(file, 'utf-8')), []);
   } finally {
     delete process.env.SLACK_SUBSCRIPTIONS_FILE;
   }

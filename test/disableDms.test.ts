@@ -94,7 +94,9 @@ test('a group DM is told from a private channel by asking Slack, and unknown mea
   assert.ok(!calls.some((c) => /^(history|replies|post):G1/.test(c)));
 
   await adapter.fetchHistory('G2'); // an old-style private channel is fine
+  await adapter.sendMessage('G2', 'hi');
   assert.ok(calls.includes('history:G2'));
+  assert.equal(calls.filter((c) => c === 'info:G2').length, 1, 'asked about once');
 
   await assert.rejects(adapter.fetchHistory('GUNKNOWN'), /disabled/, 'fail closed when Slack cannot say');
 });
@@ -103,4 +105,11 @@ test('with DMs disabled, conversations.list is not asked for DMs or group DMs', 
   const { adapter, listTypes } = makeStrictAdapter();
   await adapter.listConversations();
   assert.deepEqual(listTypes, ['public_channel,private_channel']);
+});
+
+test('a user ID is refused: posting to it would land in that user\'s DM', async () => {
+  const { adapter, calls } = makeStrictAdapter();
+  await assert.rejects(adapter.sendMessage('U123', 'hi'), /disabled/);
+  await assert.rejects(adapter.fetchHistory('CUNKNOWN'), /disabled/);
+  assert.ok(!calls.some((c) => /^(post|history):/.test(c)));
 });

@@ -36,7 +36,7 @@ test('a conversation outside the write allow-list is registered inbound, listed 
 
   await h.socket.emitMessage(MENTION_EVENT);
   await until(() => pushes(h).length === 1, 'push/event');
-  assert.match(pushText(h, 0), /cannot write to #general/);
+  assert.match(pushText(h, 0), /cannot write to conversation C1/);
 
   await h.close();
 });
@@ -108,6 +108,39 @@ test('the reaction stays while the host has the message', async () => {
   await ready(h);
   await h.socket.emitMessage(MENTION_EVENT);
   await until(() => pushes(h).length === 1, 'push/event');
+  await new Promise((r) => setTimeout(r, 50)); // a wrong removal would land here
   assert.deepEqual(h.reactions, ['add:C1:111.1:eyes']);
+  await h.close();
+});
+
+test('the read-only note comes with the first message, even when that one is ambient', async () => {
+  const h = harness({ sendChannels: ['C9'], subscribeMemberChannels: true });
+  await ready(h);
+  await h.socket.emitMessage({ type: 'message', channel: 'C1', user: 'U2', text: 'chatter', ts: '1.1' });
+  await until(() => pushes(h).length === 1, 'the ambient message');
+  await h.socket.emitMessage({ ...MENTION_EVENT, ts: '1.2' });
+  await until(() => pushes(h).length === 2, 'the mention');
+  assert.match(pushText(h, 0), /cannot write to conversation C1/);
+  assert.doesNotMatch(pushText(h, 1), /cannot write/, 'told once');
+  await h.close();
+});
+
+test('a mention does not undo a mute', async () => {
+  const h = harness({ subscribeMemberChannels: true });
+  await ready(h);
+  await h.host.sendRequest('tools/call', { name: 'unsubscribe_channel', arguments: { channelId: 'C1' } });
+  await h.socket.emitMessage(MENTION_EVENT); // first message from C1: the auto-subscribe path
+  await until(() => pushes(h).length === 1, 'the mention');
+  await h.socket.emitMessage({ type: 'message', channel: 'C1', user: 'U2', text: 'chatter', ts: '2.1' });
+  assert.equal(pushes(h).length, 1, 'still muted');
+  await h.close();
+});
+
+test('send_dm is not offered when DMs are disabled', async () => {
+  const h = harness({ disableDms: true });
+  await initialize(h, true);
+  const { tools } = (await h.host.sendRequest('tools/list')) as { tools: { name: string }[] };
+  assert.equal(tools.some((t) => t.name === 'send_dm'), false);
+  assert.equal(tools.some((t) => t.name === 'send_message'), true);
   await h.close();
 });
