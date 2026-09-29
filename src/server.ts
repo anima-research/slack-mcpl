@@ -43,9 +43,11 @@ import type {
 
 import type { SlackAdapter, SlackMessageData } from './slack-adapter.js';
 import { toolDefinitions } from './tools.js';
-import { featureSets, isEnabled, featureSetForTool } from './feature-sets.js';
+import { buildFeatureSets, buildServerCapabilities, featureSetForTool, MESSAGING_FEATURE_SET } from './feature-sets.js';
 import { ChannelManager, mcplChannelId, parseMcplChannelId, toDescriptor } from './channels.js';
 import { StateTracker } from './state.js';
+import { CapabilityGrant } from './grant.js';
+import { McplRpcError, capabilityDenied } from './errors.js';
 import {
   fetchAttachmentBytes,
   parseSlackAttachmentUrl,
@@ -74,7 +76,7 @@ function dbg(tag: string, info: Record<string, unknown> = {}): void {
 export class SlackMcplServer {
   private conn: McplConnection | null = null;
   private mcplEnabled = false;
-  private enabledFeatureSets = new Set<string>();
+  private grant = new CapabilityGrant(buildFeatureSets());
   private channelManager = new ChannelManager();
   private stateTracker = new StateTracker();
   /** Buffers for channels/outgoing/chunk streams, keyed by inferenceId */
@@ -122,15 +124,22 @@ export class SlackMcplServer {
   async serve(conn: McplConnection): Promise<void> {
     this.conn = conn;
 
+    // Every connection starts from nothing (§5.3) — a previous peer's grant
+    // is not this peer's.
+    this.grant.reset();
+
     // Set up Slack event forwarding
     this.setupSlackForwarding();
 
     // Handshake
     await this.handleInitialize();
 
-    // If MCPL is enabled, register all visible Slack conversations
+    // Registration waits for the initial policy exchange, not for a timer:
+    // channels/register requires the channels.register capability, which
+    // isn't known until the host's featureSets/update Request is answered.
+    // Runs concurrently with the main request loop below.
     if (this.mcplEnabled) {
-      await this.registerSlackChannels();
+      void this.grant.whenReady().then(() => this.registerSlackChannels());
     }
 
     // Main loop
@@ -181,13 +190,7 @@ export class SlackMcplServer {
     // the host publishes text-only turns to the conversational locus via
     // channels/publish, so no contextHooks are declared here (same rationale
     // as discord-mcpl; see LOCUS-ROUTING-DESIGN.md).
-    const serverCaps: McplCapabilities = {
-      version: '0.4',
-      pushEvents: true,
-      channels: true,
-      rollback: true,
-      featureSets,
-    };
+    const serverCaps: McplCapabilities = buildServerCapabilities();
 
     const capabilities: InitializeCapabilities = {
       tools: {},
@@ -210,11 +213,15 @@ export class SlackMcplServer {
       console.log('[slack-mcpl] Client initialized' + (this.mcplEnabled ? ' (MCPL mode)' : ' (MCP mode)'));
     }
 
-    // In MCPL mode, default all feature sets to enabled
-    if (this.mcplEnabled) {
-      for (const fs of featureSets) {
-        this.enabledFeatureSets.add(fs.name);
-      }
+    // No default grant here (§5.3): until the host's featureSets/update
+    // Request is answered, every capability-dependent behavior — channel
+    // registration, push events, privileged inbound methods — stays
+    // unavailable. Plain MCP tool calls are unaffected; see callTool below.
+  }
+
+  private requireMcpl(): void {
+    if (!this.mcplEnabled) {
+      throw new McplRpcError(-32601, 'MCPL is not negotiated on this connection');
     }
   }
 
@@ -240,7 +247,21 @@ export class SlackMcplServer {
           break;
         }
 
+        case method.FEATURE_SETS_UPDATE: {
+          // §6.7: featureSets/update is a Request carrying the effective
+          // grant, and its response is a degradation receipt — what this
+          // server WILL DO under the grant it was given. Testimony about
+          // consequences, never a claim of entitlement. Only this form can
+          // establish a ready state (§5.3).
+          this.requireMcpl();
+          const receipt = this.grant.apply(params as unknown as FeatureSetsUpdateParams, 'request');
+          conn.sendResponse(req.id, receipt);
+          break;
+        }
+
         case method.CHANNELS_LIST: {
+          this.requireMcpl();
+          if (!this.grant.has('channels.register')) throw capabilityDenied('channels.register');
           const result: ChannelsListResult = {
             channels: this.channelManager.getAll(),
           };
@@ -249,6 +270,8 @@ export class SlackMcplServer {
         }
 
         case method.CHANNELS_OPEN: {
+          this.requireMcpl();
+          if (!this.grant.has('channels.lifecycle')) throw capabilityDenied('channels.lifecycle');
           const openP = params as unknown as ChannelsOpenParams;
           const result = this.handleChannelOpen(openP);
           conn.sendResponse(req.id, result);
@@ -256,6 +279,8 @@ export class SlackMcplServer {
         }
 
         case method.CHANNELS_CLOSE: {
+          this.requireMcpl();
+          if (!this.grant.has('channels.lifecycle')) throw capabilityDenied('channels.lifecycle');
           const closeP = params as unknown as ChannelsCloseParams;
           const closed = this.channelManager.close(closeP.channelId);
           const result: ChannelsCloseResult = { closed };
@@ -264,6 +289,8 @@ export class SlackMcplServer {
         }
 
         case method.CHANNELS_PUBLISH: {
+          this.requireMcpl();
+          if (!this.grant.has('channels.publish')) throw capabilityDenied('channels.publish');
           const pubP = params as unknown as ChannelsPublishParams;
           const result = await this.handlePublish(pubP);
           conn.sendResponse(req.id, result);
@@ -271,16 +298,18 @@ export class SlackMcplServer {
         }
 
         case method.STATE_ROLLBACK: {
+          this.requireMcpl();
           const rollbackP = params as unknown as StateRollbackParams;
           const result = await this.handleRollback(rollbackP);
           conn.sendResponse(req.id, result);
           break;
         }
 
-        case method.CONTEXT_AFTER_INFERENCE: {
-          // Not declared in capabilities; answered as a harmless no-op in
-          // case an older host still calls it.
-          conn.sendResponse(req.id, { featureSet: 'slack.messaging' });
+        case 'context/afterInference': {
+          // Removed in MCPL 0.5 (replaced by inference/lifecycle) and not
+          // declared in capabilities; answered as a harmless no-op in case
+          // an older host still calls it.
+          conn.sendResponse(req.id, { featureSet: MESSAGING_FEATURE_SET });
           break;
         }
 
@@ -288,6 +317,10 @@ export class SlackMcplServer {
           conn.sendError(req.id, -32601, `Method not found: ${req.method}`);
       }
     } catch (err) {
+      if (err instanceof McplRpcError) {
+        conn.sendError(req.id, err.code, err.message, err.data);
+        return;
+      }
       // Report with full context — tool name, truncated args, stack — so
       // transient failures (Slack 5xx, rate limits, missing scopes) are
       // traceable from the host side.
@@ -323,14 +356,21 @@ export class SlackMcplServer {
   // ── Notification Dispatch ──
 
   private handleNotification(notif: JsonRpcNotification): void {
+    try {
+      this.dispatchNotification(notif);
+    } catch (err) {
+      // A notification can never be answered; a failing one is logged, never fatal.
+      console.error(`[slack-mcpl] notification ${notif.method} failed:`, (err as Error).message);
+    }
+  }
+
+  private dispatchNotification(notif: JsonRpcNotification): void {
     switch (notif.method) {
       case method.FEATURE_SETS_UPDATE: {
-        const p = notif.params as FeatureSetsUpdateParams;
-        if (p.enabled) {
-          for (const name of p.enabled) this.enabledFeatureSets.add(name);
-        }
-        if (p.disabled) {
-          for (const name of p.disabled) this.enabledFeatureSets.delete(name);
+        // §6.7 Notification form: descriptive metadata only. Grant-bearing
+        // updates (including the §5.3 initial policy) arrive as a Request.
+        if (this.mcplEnabled) {
+          this.grant.apply(notif.params as unknown as FeatureSetsUpdateParams, 'notification');
         }
         break;
       }
@@ -390,9 +430,18 @@ export class SlackMcplServer {
     name: string,
     args: Record<string, unknown>,
   ): Promise<{ content: ContentBlock[]; isError?: boolean; state?: unknown }> {
+    // §14.1/§6.2: in MCPL mode the tool surface itself is gated on the
+    // `tools` capability — thrown, not returned, since a missing capability
+    // is a protocol-level denial (§5.4), unlike a feature set that is merely
+    // temporarily disabled (below). Plain MCP clients (mcplEnabled false)
+    // are not subject to a grant — there is none to consult.
+    if (this.mcplEnabled && !this.grant.has('tools')) {
+      throw capabilityDenied('tools');
+    }
+
     // Check feature set permission
     const fs = featureSetForTool(name);
-    if (fs && this.mcplEnabled && !isEnabled(fs, this.enabledFeatureSets)) {
+    if (fs && this.mcplEnabled && !this.grant.isFeatureSetActive(fs)) {
       return {
         content: [textContent(`Feature set '${fs}' is not enabled`)],
         isError: true,
@@ -408,7 +457,7 @@ export class SlackMcplServer {
       }
 
       // Track checkpoints for rollback-enabled tools
-      if (fs === 'slack.messaging') {
+      if (fs === MESSAGING_FEATURE_SET) {
         const cpId = this.stateTracker.createCheckpoint();
         return {
           content: [textContent(typeof result === 'string' ? result : JSON.stringify(result))],
@@ -672,6 +721,10 @@ export class SlackMcplServer {
   private async registerSlackChannels(): Promise<void> {
     const conn = this.conn;
     if (!conn || !this.mcplEnabled) return;
+    if (!this.grant.has('channels.register')) {
+      console.error('[slack-mcpl] channels.register not granted; skipping channel registration');
+      return;
+    }
 
     let descriptors: ChannelDescriptor[] = [];
     try {
@@ -705,6 +758,10 @@ export class SlackMcplServer {
       this.channelManager.register(d);
     }
     if (added.length > 0 && this.conn && this.mcplEnabled) {
+      if (!this.grant.has('channels.register')) {
+        console.error(`[slack-mcpl] channels.register not granted; ${added.length} new channel(s) stay unannounced`);
+        return added;
+      }
       this.conn.sendNotification(method.CHANNELS_CHANGED, { added });
     }
     return added;
@@ -786,7 +843,7 @@ export class SlackMcplServer {
   // ── Rollback ──
 
   private async handleRollback(params: StateRollbackParams): Promise<StateRollbackResult> {
-    if (params.featureSet !== 'slack.messaging') {
+    if (params.featureSet !== MESSAGING_FEATURE_SET) {
       return {
         checkpoint: params.checkpoint,
         success: false,
@@ -856,7 +913,10 @@ export class SlackMcplServer {
     });
     if (!conn) return;
     if (!this.mcplEnabled) return; // No push events in MCP-only mode
-    if (!isEnabled('slack.messaging', this.enabledFeatureSets)) return;
+    // §6.7: a disabled slack.messaging stops its traffic at once — incoming
+    // and push alike. False before the initial policy exchange too (§5.3):
+    // fail closed until the host's featureSets/update Request is answered.
+    if (!this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
 
     // Direct address (mention or DM) always reaches the agent. Ambient
     // messages only flow from subscribed conversations — otherwise every
@@ -1007,7 +1067,7 @@ export class SlackMcplServer {
       }
     } else {
       const pushParams: PushEventParams = {
-        featureSet: 'slack.messaging',
+        featureSet: MESSAGING_FEATURE_SET,
         eventId: `slack_msg_${msg.channelId}_${msg.id}`,
         timestamp: msg.timestamp.toISOString(),
         origin: {

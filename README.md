@@ -7,6 +7,13 @@ Sibling of [discord-mcpl](../discord-mcpl), built on
 
 Works in plain MCP mode too (tools only, no push events or channels).
 
+The server negotiates MCPL when the host advertises `experimental.mcpl` in
+`initialize`. It stays inert until the host's `featureSets/update` Request
+establishes the capability grant (MCPL 0.5 SPEC §5.3 — absence is denial),
+then registers Slack conversations as channels. Channel registration, push
+events, and every other privileged inbound method stay unavailable until
+that grant arrives; plain MCP tool calls are unaffected.
+
 ## Features
 
 - **Channels**: every conversation the bot can act in is registered as an
@@ -34,8 +41,16 @@ Works in plain MCP mode too (tools only, no push events or channels).
 `fetch_thread`, `find_user`, `fetch_attachment`, `subscribe_channel`,
 `unsubscribe_channel`, `list_subscriptions`.
 
-Feature sets: `slack.messaging` (rollback-capable), `slack.history`,
-`slack.subscriptions`.
+Feature sets: `slack.messaging` (rollback-capable; `send_message`,
+`reply_message`, `send_dm`, `add_reaction`, `edit_message`, `delete_message`,
+plus channel registration, push events and `channels/incoming` delivery),
+`slack.history` (`fetch_history`, `fetch_thread`, `fetch_attachment`),
+`slack.subscriptions` (`subscribe_channel`, `unsubscribe_channel`,
+`list_subscriptions`). `list_channels`, `refresh_channels` and `find_user`
+are always available. A host that disables `slack.messaging` — or grants it
+a capability set missing what it declares (§6.4) — stops its tools, its
+incoming delivery, and its push events all at once; the degradation receipt
+to `featureSets/update` reports this in `unavailableFeatures`.
 
 ## Setup
 
@@ -120,3 +135,9 @@ The Slack domain logic (Socket Mode event handling, mrkdwn formatting,
 cursor-drained history pagination, attachment URL allowlisting) was salvaged
 from zulip-mcp PR #8's multi-platform branch and re-homed here as a
 standalone MCPL server following discord-mcpl's structure.
+
+The MCPL 0.5 policy handshake (`src/grant.ts`, `src/errors.ts`, and the
+`featureSets/update` wiring in `src/server.ts`) is ported from zulip-mcp's
+`src/grant.ts`, which is itself protocol-generic — no Zulip-specific logic —
+built on `@animalabs/mcpl-core`'s `grantFromUpdate`/`capabilityGranted`/
+`deriveFeatureSets`.
