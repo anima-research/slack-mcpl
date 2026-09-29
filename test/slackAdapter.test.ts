@@ -53,6 +53,16 @@ test('incoming message sets mentionsBot=false for other mentions and broadcasts'
   assert.equal(received[0].mentionsBot, false);
 });
 
+test('a thread_broadcast that names its parent only under root keeps the thread', async () => {
+  const { emit, received } = makeAdapter();
+  await emit({
+    type: 'message', subtype: 'thread_broadcast', channel: 'C1', user: 'U1',
+    ts: '6.5', text: 'also to the channel', root: { thread_ts: '6.0' },
+  });
+  assert.equal(received.length, 1);
+  assert.equal(received[0].threadTs, '6.0');
+});
+
 test('own and bot messages are filtered out', async () => {
   const { emit, received } = makeAdapter();
   await emit({ type: 'message', channel: 'C1', user: 'UBOT', ts: '1.0', text: 'self' });

@@ -71,6 +71,49 @@ function dbg(tag: string, info: Record<string, unknown> = {}): void {
   }
 }
 
+/** The bracketed header in front of an incoming message, e.g.
+ *  `[#support (acme) thread=1718000000.000100 id=1718000000.000200] `. */
+export function locationHeader(loc: {
+  conversation?: string;
+  teamName?: string;
+  threadTs?: string;
+  messageId: string;
+}): string {
+  const parts: string[] = [];
+  if (loc.conversation) parts.push(loc.conversation);
+  if (loc.teamName) parts.push(`(${loc.teamName})`);
+  if (loc.threadTs) parts.push(`thread=${loc.threadTs}`);
+  parts.push(`id=${loc.messageId}`);
+  return `[${parts.join(' ')}] `;
+}
+
+/** One backscroll line, e.g. `[2024-06-10T05:33:20.000Z thread=1718000000.000100 id=1718000000.000150] Ann: hi`.
+ *  A thread reply names its parent, so the agent can reply into that thread. */
+export function backscrollLine(m: {
+  id: string;
+  threadTs?: string;
+  timestamp: Date;
+  authorName: string;
+  content: string;
+  attachments: Array<{ name: string }>;
+}): string {
+  const att = m.attachments.length > 0 ? ` [attachments: ${m.attachments.map((a) => a.name).join(', ')}]` : '';
+  const thread = m.threadTs ? ` thread=${m.threadTs}` : '';
+  return `[${m.timestamp.toISOString()}${thread} id=${m.id}] ${m.authorName}: ${m.content}${att}`;
+}
+
+/** The `<backscroll>` block given with the first message from a conversation. */
+export function backscrollBlock(
+  messages: Parameters<typeof backscrollLine>[0][],
+  where: { channelName?: string; isDM: boolean },
+): string {
+  const attrs: string[] = [];
+  if (where.channelName && !where.isDM) attrs.push(`channel="#${where.channelName}"`);
+  if (where.isDM) attrs.push('dm="true"');
+  attrs.push(`count="${messages.length}"`);
+  return [`<backscroll ${attrs.join(' ')}>`, ...messages.map(backscrollLine), '</backscroll>'].join('\n');
+}
+
 export class SlackMcplServer {
   private conn: McplConnection | null = null;
   private mcplEnabled = false;
@@ -907,18 +950,7 @@ export class SlackMcplServer {
         }
       }
       if (backscroll.length > 0) {
-        const attrs: string[] = [];
-        if (meta?.name && !msg.isDM) attrs.push(`channel="#${meta.name}"`);
-        if (msg.isDM) attrs.push('dm="true"');
-        attrs.push(`count="${backscroll.length}"`);
-        const lines = backscroll.map((m) => {
-          const att = m.attachments.length > 0
-            ? ` [attachments: ${m.attachments.map((a) => a.name).join(', ')}]`
-            : '';
-          const threadMark = m.threadTs ? ' (thread reply)' : '';
-          return `[${m.timestamp.toISOString()} id=${m.id}]${threadMark} ${m.authorName}: ${m.content}${att}`;
-        });
-        blocks.push([`<backscroll ${attrs.join(' ')}>`, ...lines, '</backscroll>'].join('\n'));
+        blocks.push(backscrollBlock(backscroll, { channelName: meta?.name, isDM: msg.isDM }));
       }
       if (blocks.length > 0) {
         prefixBlock = blocks.join('\n') + '\n';
@@ -928,19 +960,21 @@ export class SlackMcplServer {
     const channelMcplId = mcplChannelId(msg.channelId);
     const channelIsOpen = this.channelManager.isOpen(channelMcplId);
 
-    // Location header only when the conversation differs from the last
-    // communication context (compare BEFORE updating the tracker).
+    // The conversation is named only when it differs from the last
+    // communication context (compare BEFORE updating the tracker). The
+    // thread and the message ID are given every time: two threads in one
+    // channel are otherwise indistinguishable, and replying or reacting to
+    // a message needs its ID.
     const contextChanged = this.lastChannelId !== msg.channelId;
-    let location = '';
-    if (contextChanged) {
-      const meta = await this.slack.getConversationMeta(msg.channelId).catch(() => null);
-      const parts: string[] = [];
-      if (msg.isDM) parts.push('DM');
-      else if (meta?.name) parts.push(`#${meta.name}`);
-      if (msg.threadTs) parts.push('in thread');
-      if (this.slack.teamName) parts.push(`(${this.slack.teamName})`);
-      if (parts.length > 0) location = `[${parts.join(' ')}] `;
-    }
+    const meta = contextChanged
+      ? await this.slack.getConversationMeta(msg.channelId).catch(() => null)
+      : null;
+    const location = locationHeader({
+      conversation: !contextChanged ? undefined : msg.isDM ? 'DM' : meta?.name ? `#${meta.name}` : undefined,
+      teamName: contextChanged ? this.slack.teamName : undefined,
+      threadTs: msg.threadTs,
+      messageId: msg.id,
+    });
     const renderedContent = `${prefixBlock}${location}${msg.authorName}: ${msg.cleanContent}`;
 
     // Advance trackers before forwarding: watermark (bounds future

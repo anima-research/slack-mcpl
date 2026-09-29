@@ -45,6 +45,8 @@ interface SlackMessageEvent {
   text?: string;
   ts?: string;
   thread_ts?: string;
+  /** On a thread_broadcast the parent may be named only here. */
+  root?: { thread_ts?: string };
   bot_id?: string;
   channel_type?: string;
   team?: string;
@@ -454,7 +456,7 @@ export class SlackAdapter {
     const msg: SlackMessageData = {
       channelId: event.channel,
       id: String(event.ts),
-      threadTs: event.thread_ts || undefined,
+      threadTs: event.thread_ts || event.root?.thread_ts || undefined,
       authorId: String(event.user),
       authorName,
       content: event.text ?? '',
