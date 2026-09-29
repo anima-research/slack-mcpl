@@ -50,3 +50,10 @@ test('ChannelManager tracks registered vs open channels', () => {
   assert.equal(mgr.unregister('slack:C1'), true);
   assert.deepEqual(mgr.getAll(), []);
 });
+
+test('a conversation the bot may not write to is inbound only', () => {
+  const conv = { id: 'C1', kind: 'channel' as const, name: 'general', isMember: true };
+  assert.equal(toDescriptor(conv, 'acme').direction, 'bidirectional');
+  assert.equal(toDescriptor(conv, 'acme', true).direction, 'bidirectional');
+  assert.equal(toDescriptor(conv, 'acme', false).direction, 'inbound');
+});

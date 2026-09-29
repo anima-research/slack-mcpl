@@ -20,7 +20,7 @@ export function parseMcplChannelId(id: string): { conversationId: string } | nul
 }
 
 /** Convert a Slack conversation to an MCPL ChannelDescriptor. */
-export function toDescriptor(conv: SlackConversationInfo, teamName: string): ChannelDescriptor {
+export function toDescriptor(conv: SlackConversationInfo, teamName: string, writable = true): ChannelDescriptor {
   const label =
     conv.kind === 'dm' ? `DM: @${conv.name} (${teamName})` :
     conv.kind === 'group_dm' ? `Group DM: ${conv.name} (${teamName})` :
@@ -29,7 +29,8 @@ export function toDescriptor(conv: SlackConversationInfo, teamName: string): Cha
     id: mcplChannelId(conv.id),
     type: 'slack',
     label,
-    direction: 'bidirectional',
+    // A conversation the bot may not write to is inbound only.
+    direction: writable ? 'bidirectional' : 'inbound',
     address: { channelId: conv.id, ...(conv.userId ? { userId: conv.userId } : {}) },
     metadata: {
       kind: conv.kind,

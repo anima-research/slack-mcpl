@@ -53,3 +53,67 @@ test('off unless configured', async () => {
   await settle();
   assert.deepEqual(calls, ['post:C1']);
 });
+
+/** A web whose reactions.add waits for `release()`, to model a slow Slack. */
+function makeSlowAdapter(removeFails?: () => Error | null) {
+  const calls: string[] = [];
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  const socket = { on() {}, async start() {}, async disconnect() {} } as any;
+  const web = {
+    chat: { postMessage: async ({ channel }: any) => { calls.push(`post:${channel}`); return { ts: '9.0' }; } },
+    reactions: {
+      add: async ({ channel, timestamp }: any) => { calls.push(`add-start:${timestamp}`); await gate; calls.push(`add-done:${timestamp}`); },
+      remove: async ({ channel, timestamp }: any) => {
+        const err = removeFails?.();
+        calls.push(`remove:${timestamp}${err ? ':failed' : ''}`);
+        if (err) throw err;
+      },
+    },
+  } as any;
+  const adapter = new SlackAdapter(web, socket, 'UBOT', 'acme', undefined, undefined, false, 'eyes');
+  return { adapter, calls, release };
+}
+
+test('a reply that lands while the reaction is still being added does not leave it behind', async () => {
+  const { adapter, calls, release } = makeSlowAdapter();
+  const acked = adapter.acknowledge('C1', '1.0'); // add is in flight
+  await new Promise((r) => setTimeout(r, 0));
+  const posted = adapter.sendMessage('C1', 'answer');
+  await new Promise((r) => setTimeout(r, 0));
+  release();
+  await Promise.all([acked, posted]);
+  await new Promise((r) => setTimeout(r, 0));
+  // The removal waits for the add to finish, so it is the last thing that happens.
+  assert.deepEqual(calls, ['add-start:1.0', 'post:C1', 'add-done:1.0', 'remove:1.0']);
+});
+
+test('a removal Slack refuses is kept and tried again; a gone message is not', async () => {
+  let failure: Error | null = Object.assign(new Error('ratelimited'), { data: { error: 'ratelimited' } });
+  const { adapter, calls, release } = makeSlowAdapter(() => failure);
+  release();
+  await adapter.acknowledge('C1', '1.0');
+  await adapter.clearAck('C1');
+  assert.deepEqual(calls.filter((c) => c.startsWith('remove')), ['remove:1.0:failed']);
+
+  failure = null;
+  await adapter.clearAck('C1'); // still pending, so it is tried again
+  assert.deepEqual(calls.filter((c) => c.startsWith('remove')), ['remove:1.0:failed', 'remove:1.0']);
+  await adapter.clearAck('C1'); // and now it is gone
+  assert.equal(calls.filter((c) => c.startsWith('remove')).length, 2);
+
+  const gone = makeSlowAdapter(() => Object.assign(new Error('x'), { data: { error: 'message_not_found' } }));
+  gone.release();
+  await gone.adapter.acknowledge('C1', '2.0');
+  await gone.adapter.clearAck('C1');
+  await gone.adapter.clearAck('C1');
+  assert.equal(gone.calls.filter((c) => c.startsWith('remove')).length, 1, 'dropped after a terminal error');
+});
+
+test('stop() takes pending reactions off', async () => {
+  const { adapter, calls, release } = makeSlowAdapter();
+  release();
+  await adapter.acknowledge('C1', '1.0');
+  await adapter.stop();
+  assert.ok(calls.includes('remove:1.0'));
+});

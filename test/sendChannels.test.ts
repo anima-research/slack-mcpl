@@ -45,3 +45,22 @@ test('no allow-list means no restriction', async () => {
   await adapter.sendDM('U1', 'hi');
   assert.deepEqual(calls, ['post:CANY', 'post:D9']);
 });
+
+test('send_dm is refused before a conversation is opened when the list names no DM', async () => {
+  const calls: string[] = [];
+  const socket = { on() {}, async start() {}, async disconnect() {} } as any;
+  const web = {
+    chat: { postMessage: async () => { calls.push('post'); return { ts: '1.0' }; } },
+    conversations: { open: async () => { calls.push('open'); return { channel: { id: 'D9' } }; } },
+  } as any;
+  const adapter = new SlackAdapter(web, socket, 'UBOT', 'acme', undefined, ['CALLOWED']);
+  await assert.rejects(adapter.sendDM('UNEW', 'hi'), /not allowed/);
+  assert.deepEqual(calls, []);
+});
+
+test('canWrite follows the allow-list', () => {
+  const { adapter } = makeAdapter(['CALLOWED']);
+  assert.equal(adapter.canWrite('CALLOWED'), true);
+  assert.equal(adapter.canWrite('COTHER'), false);
+  assert.equal(makeAdapter().adapter.canWrite('COTHER'), true);
+});

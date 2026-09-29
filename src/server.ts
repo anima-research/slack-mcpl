@@ -111,7 +111,19 @@ export class SlackMcplServer {
     return Number.isFinite(n) && n > 0 && n <= 1000 ? n : 50;
   }
 
-  constructor(private slack: SlackAdapter) {}
+  /** Conversations muted with unsubscribe_channel while every member channel
+   *  counts as subscribed (`subscribeMemberChannels`). */
+  private mutedChannels = new Set<string>();
+
+  /**
+   * `subscribeMemberChannels`: Slack only delivers message events from
+   * conversations the bot is a member of, so every delivered conversation
+   * counts as subscribed: inviting the bot is the opt-in.
+   */
+  constructor(
+    private slack: SlackAdapter,
+    private opts: { subscribeMemberChannels?: boolean } = {},
+  ) {}
 
   /**
    * Serve a single connection. Blocks until the connection closes.
@@ -504,6 +516,7 @@ export class SlackMcplServer {
           name: c.kind === 'dm' ? `DM: @${c.name}` : c.name,
           ...(c.topic ? { topic: c.topic } : {}),
           ...(c.kind === 'channel' || c.kind === 'private_channel' ? { isMember: c.isMember } : {}),
+          writable: this.slack.canWrite(c.id),
         }));
       }
 
@@ -567,26 +580,34 @@ export class SlackMcplServer {
       case 'subscribe_channel': {
         this.ensureSubscriptionsLoaded();
         const channelId = this.requireString(args, 'channelId');
-        const wasNew = !this.subscribedChannels.has(channelId);
-        this.subscribedChannels.add(channelId);
-        if (wasNew) this.saveSubscriptions();
-        return wasNew
-          ? `Subscribed to ambient messages from conversation ${channelId}.`
+        return this.subscribe(channelId)
+          ? this.opts.subscribeMemberChannels
+            ? `Unmuted conversation ${channelId}: its ambient messages arrive again.`
+            : `Subscribed to ambient messages from conversation ${channelId}.`
           : `Already subscribed to conversation ${channelId}.`;
       }
 
       case 'unsubscribe_channel': {
         this.ensureSubscriptionsLoaded();
         const channelId = this.requireString(args, 'channelId');
-        const removed = this.subscribedChannels.delete(channelId);
-        if (removed) this.saveSubscriptions();
-        return removed
-          ? `Unsubscribed from ambient messages in conversation ${channelId}. Mentions and DMs from there will still arrive.`
+        return this.unsubscribe(channelId)
+          ? this.opts.subscribeMemberChannels
+            ? `Muted ambient messages in conversation ${channelId} until you subscribe_channel it again. Mentions and DMs from there will still arrive.`
+            : `Unsubscribed from ambient messages in conversation ${channelId}. Mentions and DMs from there will still arrive.`
           : `Conversation ${channelId} was not subscribed.`;
       }
 
       case 'list_subscriptions': {
         this.ensureSubscriptionsLoaded();
+        if (this.opts.subscribeMemberChannels) {
+          return {
+            mode: 'member-channels',
+            muted: [...this.mutedChannels].sort(),
+            note:
+              'Ambient messages arrive from every conversation the bot is a member of, except the muted ones. ' +
+              'Mentions and DMs always come through.',
+          };
+        }
         return {
           channels: [...this.subscribedChannels].sort(),
           count: this.subscribedChannels.size,
@@ -652,11 +673,14 @@ export class SlackMcplServer {
     if (!path || !existsSync(path)) return;
     try {
       const parsed = JSON.parse(readFileSync(path, 'utf-8'));
-      if (Array.isArray(parsed)) {
-        for (const id of parsed) {
-          if (typeof id === 'string' && id.length > 0) this.subscribedChannels.add(id);
-        }
-      }
+      // A plain array is the subscribed list; an object also carries the muted one.
+      const lists = Array.isArray(parsed) ? { subscribed: parsed, muted: [] } : (parsed ?? {});
+      const into = (ids: unknown, set: Set<string>) => {
+        if (!Array.isArray(ids)) return;
+        for (const id of ids) if (typeof id === 'string' && id.length > 0) set.add(id);
+      };
+      into(lists.subscribed, this.subscribedChannels);
+      into(lists.muted, this.mutedChannels);
       dbg('subscriptions:loaded', { count: this.subscribedChannels.size, path });
     } catch (err) {
       // Corrupt or unreadable file: start with empty set; don't fail boot.
@@ -669,23 +693,36 @@ export class SlackMcplServer {
     if (!path) return; // in-memory mode
     try {
       mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(path, JSON.stringify([...this.subscribedChannels].sort(), null, 2) + '\n');
+      const subscribed = [...this.subscribedChannels].sort();
+      const muted = [...this.mutedChannels].sort();
+      writeFileSync(path, JSON.stringify(muted.length > 0 ? { subscribed, muted } : subscribed, null, 2) + '\n');
     } catch (err) {
       console.error('[slack-mcpl] Failed to save subscriptions:', (err as Error).message);
     }
   }
 
-  /** Slack only delivers message events from conversations the bot is a
-   *  member of, so with SLACK_SUBSCRIBE_MEMBER_CHANNELS every delivered
-   *  conversation counts as subscribed: inviting the bot is the opt-in. */
-  private subscribeMemberChannels(): boolean {
-    return process.env.SLACK_SUBSCRIBE_MEMBER_CHANNELS === 'true';
+  private isChannelSubscribed(channelId: string): boolean {
+    this.ensureSubscriptionsLoaded();
+    if (this.opts.subscribeMemberChannels) return !this.mutedChannels.has(channelId);
+    return this.subscribedChannels.has(channelId);
   }
 
-  private isChannelSubscribed(channelId: string): boolean {
-    if (this.subscribeMemberChannels()) return true;
-    this.ensureSubscriptionsLoaded();
-    return this.subscribedChannels.has(channelId);
+  /** Returns true when this changed anything. With `subscribeMemberChannels`
+   *  a conversation is subscribed unless muted, so subscribing unmutes. */
+  private subscribe(channelId: string): boolean {
+    const was = this.isChannelSubscribed(channelId);
+    if (this.opts.subscribeMemberChannels) this.mutedChannels.delete(channelId);
+    else this.subscribedChannels.add(channelId);
+    if (!was) this.saveSubscriptions();
+    return !was;
+  }
+
+  private unsubscribe(channelId: string): boolean {
+    const was = this.isChannelSubscribed(channelId);
+    if (this.opts.subscribeMemberChannels) this.mutedChannels.add(channelId);
+    else this.subscribedChannels.delete(channelId);
+    if (was) this.saveSubscriptions();
+    return was;
   }
 
   // ── Channel Operations ──
@@ -701,7 +738,7 @@ export class SlackMcplServer {
     let descriptors: ChannelDescriptor[] = [];
     try {
       const convs = await this.slack.listConversations();
-      descriptors = convs.map((c) => toDescriptor(c, this.slack.teamName));
+      descriptors = convs.map((c) => toDescriptor(c, this.slack.teamName, this.slack.canWrite(c.id)));
     } catch (err) {
       console.error('[slack-mcpl] Failed to enumerate conversations:', (err as Error).message);
       return;
@@ -752,7 +789,7 @@ export class SlackMcplServer {
     note: string;
   }> {
     const convs = await this.slack.listConversations();
-    const descriptors = convs.map((c) => toDescriptor(c, this.slack.teamName));
+    const descriptors = convs.map((c) => toDescriptor(c, this.slack.teamName, this.slack.canWrite(c.id)));
     const added = this.registerAndNotifyNew(descriptors);
     return {
       visible: descriptors.length,
@@ -935,8 +972,7 @@ export class SlackMcplServer {
         const where = meta?.name ? `#${meta.name}` : `conversation ${msg.channelId}`;
         const wasSubscribed = this.isChannelSubscribed(msg.channelId);
         if (!wasSubscribed) {
-          this.subscribedChannels.add(msg.channelId);
-          this.saveSubscriptions();
+          this.subscribe(msg.channelId);
           blocks.push(
             `<system>Auto-subscribed to ${where} because you were mentioned. ` +
               `Ambient (non-mention) messages from this conversation will now arrive in your context. ` +
@@ -944,6 +980,10 @@ export class SlackMcplServer {
               `To stop ambient delivery from here: unsubscribe_channel("${msg.channelId}").</system>`,
           );
         }
+      }
+      if (!this.slack.canWrite(msg.channelId)) {
+        const where = msg.isDM ? 'this DM' : meta?.name ? `#${meta.name}` : `conversation ${msg.channelId}`;
+        blocks.push(`<system>You cannot write to ${where} (write allow-list). You can read it; do not try to reply here.</system>`);
       }
       if (backscroll.length > 0) {
         const attrs: string[] = [];
@@ -1023,6 +1063,12 @@ export class SlackMcplServer {
       ...(msg.attachments.length > 0 ? { attachments: msg.attachments } : {}),
     };
 
+    // The reaction says "received". If the host does not take the message,
+    // take the reaction off.
+    const releaseAck = () => {
+      if (isAddressed) void this.slack.clearAck(msg.channelId, msg.id);
+    };
+
     // If this channel is open, use channels/incoming; otherwise push/event
     if (channelIsOpen) {
       const incomingParams: ChannelsIncomingParams = {
@@ -1039,10 +1085,14 @@ export class SlackMcplServer {
       };
 
       try {
-        await conn.sendRequest(method.CHANNELS_INCOMING, incomingParams);
+        const res = (await conn.sendRequest(method.CHANNELS_INCOMING, incomingParams)) as
+          | { results?: Array<{ accepted?: boolean }> }
+          | undefined;
         dbg('handleSlackMessage:sent', { method: 'channels/incoming', channelMcplId });
+        if (res?.results?.[0]?.accepted === false) releaseAck();
       } catch (err) {
         console.error('[slack-mcpl] channels/incoming failed:', (err as Error).message);
+        releaseAck();
       }
     } else {
       const pushParams: PushEventParams = {
@@ -1065,10 +1115,12 @@ export class SlackMcplServer {
       };
 
       try {
-        await conn.sendRequest(method.PUSH_EVENT, pushParams);
+        const res = (await conn.sendRequest(method.PUSH_EVENT, pushParams)) as { accepted?: boolean } | undefined;
         dbg('handleSlackMessage:sent', { method: 'push/event', channelMcplId });
+        if (res?.accepted === false) releaseAck();
       } catch (err) {
         console.error('[slack-mcpl] push/event failed:', (err as Error).message);
+        releaseAck();
       }
     }
   }

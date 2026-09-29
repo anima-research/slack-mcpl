@@ -15,11 +15,13 @@
  *   SLACK_SEND_CHANNELS - Optional: comma-separated conversation-ID allow-list
  *                       for writes. When set, writes elsewhere are refused.
  *   SLACK_SUBSCRIBE_MEMBER_CHANNELS - Optional: 'true' delivers ambient messages from
- *                       every channel the bot is a member of; no subscription list
+ *                       every channel the bot is a member of; unsubscribe_channel
+ *                       then mutes one
  *   SLACK_DISABLE_DMS - Optional: 'true' drops incoming DMs and refuses DM sends
  *                       and DM history reads.
  *   SLACK_ACK_REACTION - Optional: emoji name (e.g. eyes) put on a message that
- *                       addresses the bot, removed when the bot replies there.
+ *                       addresses the bot, removed at the bot's next post in that
+ *                       conversation, or after 10 minutes.
  *   SLACK_SUBSCRIPTIONS_FILE - Optional: JSON file persisting ambient-channel
  *                       subscriptions across restarts
  *   SLACK_BACKSCROLL_LIMIT   - Optional: messages fetched on first interaction
@@ -57,7 +59,9 @@ async function main(): Promise<void> {
   const disableDms = process.env.SLACK_DISABLE_DMS === 'true';
   const ackReaction = process.env.SLACK_ACK_REACTION?.replace(/:/g, '').trim() || undefined;
   const slack = await connectSlack({ botToken, appToken, dmUsers, sendChannels, disableDms, ackReaction });
-  const server = new SlackMcplServer(slack);
+  const server = new SlackMcplServer(slack, {
+    subscribeMemberChannels: process.env.SLACK_SUBSCRIBE_MEMBER_CHANNELS === 'true',
+  });
   await slack.start();
   console.error(
     `[slack-mcpl] Slack connected as bot ${slack.botUserId} in workspace "${slack.teamName}"`,
