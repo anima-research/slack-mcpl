@@ -138,6 +138,7 @@ export class SlackMcplServer {
     // Every connection starts from nothing (§5.3) — a previous peer's grant
     // is not this peer's.
     this.grant.reset();
+    this.readOnlyNoted.clear(); // a new host has not been told
 
     // Set up Slack event forwarding
     this.setupSlackForwarding();
@@ -237,7 +238,7 @@ export class SlackMcplServer {
     try {
       switch (req.method) {
         case 'tools/list': {
-          const tools = this.slack.dmsDisabled ? toolDefinitions.filter((t) => t.name !== 'send_dm') : toolDefinitions;
+          const tools = this.slack.dmsWritable ? toolDefinitions : toolDefinitions.filter((t) => t.name !== 'send_dm');
           conn.sendResponse(req.id, { tools });
           break;
         }
@@ -1011,8 +1012,9 @@ export class SlackMcplServer {
     }
 
     // Told with the first message the agent gets from here, addressed or not.
-    if (!this.slack.canWrite(msg.channelId) && !this.readOnlyNoted.has(msg.channelId)) {
-      this.readOnlyNoted.add(msg.channelId);
+    // Counted as told only once the host has taken that message.
+    const noteReadOnly = !this.slack.canWrite(msg.channelId) && !this.readOnlyNoted.has(msg.channelId);
+    if (noteReadOnly) {
       prefixBlock +=
         `<system>You cannot write to conversation ${msg.channelId}: it is not on the write allow-list. ` +
         `You can read it; do not try to reply there.</system>\n`;
@@ -1082,6 +1084,9 @@ export class SlackMcplServer {
     const releaseAck = () => {
       if (isAddressed) void this.slack.clearAck(msg.channelId, msg.id);
     };
+    const taken = () => {
+      if (noteReadOnly) this.readOnlyNoted.add(msg.channelId);
+    };
 
     // If this channel is open, use channels/incoming; otherwise push/event
     if (channelIsOpen) {
@@ -1104,6 +1109,7 @@ export class SlackMcplServer {
           | undefined;
         dbg('handleSlackMessage:sent', { method: 'channels/incoming', channelMcplId });
         if (res?.results?.[0]?.accepted === false) releaseAck();
+        else taken();
       } catch (err) {
         console.error('[slack-mcpl] channels/incoming failed:', (err as Error).message);
         releaseAck();
@@ -1132,6 +1138,7 @@ export class SlackMcplServer {
         const res = (await conn.sendRequest(method.PUSH_EVENT, pushParams)) as { accepted?: boolean } | undefined;
         dbg('handleSlackMessage:sent', { method: 'push/event', channelMcplId });
         if (res?.accepted === false) releaseAck();
+        else taken();
       } catch (err) {
         console.error('[slack-mcpl] push/event failed:', (err as Error).message);
         releaseAck();

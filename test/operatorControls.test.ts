@@ -144,3 +144,22 @@ test('send_dm is not offered when DMs are disabled', async () => {
   assert.equal(tools.some((t) => t.name === 'send_message'), true);
   await h.close();
 });
+
+test('the read-only note is given again when the host did not take the message that carried it', async () => {
+  const h = harness({ sendChannels: ['C9'], pushAccepted: false });
+  await ready(h);
+  await h.socket.emitMessage(MENTION_EVENT);
+  await h.socket.emitMessage({ ...MENTION_EVENT, ts: '111.2' });
+  await until(() => pushes(h).length === 2, 'two pushes');
+  assert.match(pushText(h, 0), /cannot write/);
+  assert.match(pushText(h, 1), /cannot write/);
+  await h.close();
+});
+
+test('send_dm is not offered when the write list names no DM', async () => {
+  const h = harness({ sendChannels: ['C9'] });
+  await initialize(h, true);
+  const { tools } = (await h.host.sendRequest('tools/list')) as { tools: { name: string }[] };
+  assert.equal(tools.some((t) => t.name === 'send_dm'), false);
+  await h.close();
+});

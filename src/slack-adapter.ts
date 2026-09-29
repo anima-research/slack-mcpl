@@ -211,6 +211,13 @@ export class SlackAdapter {
     return this.disableDms;
   }
 
+  /** Can send_dm succeed at all? A DM ID starts with D. */
+  get dmsWritable(): boolean {
+    return !this.disableDms && (!this.sendChannels?.length || this.sendChannels.some((id) => id.startsWith('D')));
+  }
+
+  private stopping = false;
+
   constructor(
     private web: SlackWebLike,
     private socket: SlackSocketLike,
@@ -249,7 +256,8 @@ export class SlackAdapter {
 
   async stop(): Promise<void> {
     // Best effort: take our reactions off before going away. A crash or kill
-    // cannot, and leaves them on Slack.
+    // cannot, and leaves them on Slack. No new ones while that runs.
+    this.stopping = true;
     await Promise.all([...this.ackPending.keys()].map((c) => this.clearAck(c)));
     if (this.socketStarted) {
       await this.socket.disconnect().catch(() => {});
@@ -302,7 +310,8 @@ export class SlackAdapter {
       this.dmIds.add(conv.id);
       return { id: conv.id, kind: 'group_dm', name: conv.name ?? conv.id, isMember: true };
     }
-    this.channelIds.add(conv.id);
+    // Cached as a channel only when Slack says outright it is neither kind of DM.
+    if (conv.is_im === false && conv.is_mpim === false) this.channelIds.add(conv.id);
     return {
       id: conv.id,
       kind: conv.is_private ? 'private_channel' : 'channel',
@@ -354,7 +363,7 @@ export class SlackAdapter {
 
   /** Mark an addressed message as received. Best-effort: never throws. */
   async acknowledge(channelId: string, ts: string): Promise<void> {
-    if (!this.ackReaction) return;
+    if (!this.ackReaction || this.stopping) return;
     if (this.ackPending.get(channelId)?.has(ts)) return; // Slack delivered the event twice
     const added = this.addReaction(channelId, ts, this.ackReaction).then(() => true, () => false);
     // Recorded before the add resolves, so a reply that lands first still removes it.
@@ -409,13 +418,18 @@ export class SlackAdapter {
    *  channel may be written to or read. Every write path and both history
    *  reads call this. An ID is not enough: a group DM ID looks like a channel
    *  ID, and a user ID (U…) posts into that user's DM. An unknown ID is asked
-   *  about once; if Slack cannot say, it is refused. */
+   *  about until Slack confirms it; if Slack cannot say, it is refused. */
   private async assertNotDm(channelId: string): Promise<void> {
     if (!this.disableDms || this.channelIds.has(channelId)) return;
-    const known = this.dmIds.has(channelId) || channelId.startsWith('D');
-    const info = known ? null : await this.getConversationMeta(channelId).catch(() => null);
-    if (info?.kind === 'channel' || info?.kind === 'private_channel') return;
-    throw new Error('Direct messages are disabled for this bot (SLACK_DISABLE_DMS)');
+    const refuse = (why: string) =>
+      new Error(`Conversation ${channelId} ${why}; direct messages are disabled for this bot (SLACK_DISABLE_DMS)`);
+    if (this.dmIds.has(channelId) || channelId.startsWith('D')) throw refuse('is a DM');
+    try {
+      await this.getConversationMeta(channelId); // fills channelIds for this very ID, or not
+    } catch (err) {
+      throw refuse(`could not be confirmed as a channel (${(err as Error).message})`);
+    }
+    if (!this.channelIds.has(channelId)) throw refuse('is not a channel');
   }
 
   async sendDM(userId: string, text: string): Promise<{ messageId: string; channelId: string }> {
@@ -570,7 +584,8 @@ export class SlackAdapter {
     if (!event.channel || !event.user || !event.ts) return;
 
     const isDM = event.channel_type === 'im' || event.channel.startsWith('D');
-    if (this.disableDms && (isDM || event.channel_type === 'mpim')) return;
+    // Only what Slack marks as a channel gets through, not merely what isn't marked a DM.
+    if (this.disableDms && event.channel_type !== 'channel' && event.channel_type !== 'group') return;
     if (isDM && this.dmUsers && this.dmUsers.length > 0 && !this.dmUsers.includes(event.user)) {
       return; // DM whitelist active and this sender isn't on it
     }

@@ -136,3 +136,11 @@ test('stop() takes pending reactions off', async () => {
   await adapter.stop();
   assert.ok(calls.includes('remove:1.0'));
 });
+
+test('no new reaction once stop() has begun', async () => {
+  const { adapter, calls, release } = makeSlowAdapter();
+  release();
+  await adapter.stop();
+  await adapter.acknowledge('C1', '2.0');
+  assert.deepEqual(calls, []);
+});

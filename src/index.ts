@@ -33,6 +33,17 @@ import { McplConnection } from '@animalabs/mcpl-core';
 import { connectSlack } from './slack-adapter.js';
 import { SlackMcplServer } from './server.js';
 
+/** A yes/no switch. Anything but a clear yes or no stops the server: a typo
+ *  must not silently leave a guard off. */
+function flag(name: string): boolean {
+  const raw = process.env[name];
+  const v = raw?.trim().toLowerCase();
+  if (v === undefined || v === '' || v === 'false' || v === '0' || v === 'no') return false;
+  if (v === 'true' || v === '1' || v === 'yes') return true;
+  console.error(`${name} must be true or false, got "${raw}"`);
+  process.exit(1);
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const useStdio = args.includes('--stdio');
@@ -61,11 +72,11 @@ async function main(): Promise<void> {
     console.error('SLACK_SEND_CHANNELS is set but names no conversation; unset it to allow writing anywhere');
     process.exit(1);
   }
-  const disableDms = process.env.SLACK_DISABLE_DMS === 'true';
+  const disableDms = flag('SLACK_DISABLE_DMS');
   const ackReaction = process.env.SLACK_ACK_REACTION?.replace(/:/g, '').trim() || undefined;
   const slack = await connectSlack({ botToken, appToken, dmUsers, sendChannels, disableDms, ackReaction });
   const server = new SlackMcplServer(slack, {
-    subscribeMemberChannels: process.env.SLACK_SUBSCRIBE_MEMBER_CHANNELS === 'true',
+    subscribeMemberChannels: flag('SLACK_SUBSCRIBE_MEMBER_CHANNELS'),
   });
   await slack.start();
   console.error(

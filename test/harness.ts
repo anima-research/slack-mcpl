@@ -46,10 +46,10 @@ function fakeWeb(posts: unknown[], reactions: string[]): SlackWebLike {
   return {
     conversations: {
       async list() {
-        return { channels: [{ id: 'C1', name: 'general', is_member: true }] };
+        return { channels: [{ id: 'C1', name: 'general', is_member: true, is_im: false, is_mpim: false }] };
       },
       async info({ channel }) {
-        return { channel: { id: channel, name: 'general', is_member: true } };
+        return { channel: { id: channel, name: 'general', is_member: true, is_im: false, is_mpim: false } };
       },
       async open() {
         return { channel: { id: 'D1' } };
