@@ -30,6 +30,15 @@ import {
   type SlackHistoryMessage,
 } from './content.js';
 
+/** An acknowledgement reaction is removed after this, replied to or not. */
+const ACK_TTL_MS = 10 * 60 * 1000;
+/** A removal that failed without an answer from Slack is tried again after
+ *  this, at most ACK_MAX_TRIES times in all. */
+const ACK_RETRY_MS = 60 * 1000;
+const ACK_MAX_TRIES = 5;
+
+type AckEntry = { timer: ReturnType<typeof setTimeout>; added: Promise<boolean>; tries: number };
+
 /** Message subtypes that represent real user content. Everything else
  * (message_changed, message_deleted, channel_join, bot_message, …) is noise
  * for the inference loop. */
@@ -127,6 +136,13 @@ export interface SlackAdapterConfig {
   appToken: string;
   /** When set, DMs from anyone not in this user-ID list are dropped. */
   dmUsers?: string[];
+  /** Conversation-ID allow-list for every write (send, DM, edit, delete,
+   *  reaction). Unset or empty = no restriction. */
+  sendChannels?: string[];
+  /** Drop incoming DMs and refuse DM sends and DM history reads. */
+  disableDms?: boolean;
+  /** Emoji name put on an addressed message while the agent works on it. */
+  ackReaction?: string;
 }
 
 /**
@@ -148,6 +164,9 @@ export async function connectSlack(config: SlackAdapterConfig): Promise<SlackAda
     (auth.user_id as string | undefined) ?? null,
     (auth.team as string | undefined) ?? '',
     config.dmUsers,
+    config.sendChannels,
+    config.disableDms,
+    config.ackReaction,
   );
 }
 
@@ -167,6 +186,7 @@ export interface SlackWebLike {
   };
   reactions: {
     add(args: { channel: string; timestamp: string; name: string }): Promise<unknown>;
+    remove(args: { channel: string; timestamp: string; name: string }): Promise<unknown>;
   };
   users: {
     info(args: { user: string }): Promise<{ user?: { profile?: { display_name?: string }; real_name?: string; name?: string } }>;
@@ -184,6 +204,21 @@ export class SlackAdapter {
   private userNameCache = new Map<string, string>();
   private messageHandlers: Array<(msg: SlackMessageData) => void> = [];
   private socketStarted = false;
+  /** Conversations Slack reported as DMs or group DMs, and as channels. IDs
+   *  alone don't tell them apart. */
+  private dmIds = new Set<string>();
+  private channelIds = new Set<string>();
+
+  get dmsDisabled(): boolean {
+    return this.disableDms;
+  }
+
+  /** Can send_dm succeed at all? A DM ID starts with D. */
+  get dmsWritable(): boolean {
+    return !this.disableDms && (!this.sendChannels?.length || this.sendChannels.some((id) => id.startsWith('D')));
+  }
+
+  private stopping = false;
 
   constructor(
     private web: SlackWebLike,
@@ -191,6 +226,9 @@ export class SlackAdapter {
     readonly botUserId: string | null,
     readonly teamName: string,
     private dmUsers?: string[],
+    private sendChannels?: string[],
+    private disableDms = false,
+    private ackReaction?: string,
   ) {
     // Register the handler at construction so start() ordering can't race
     // an early event past an unregistered listener.
@@ -219,6 +257,10 @@ export class SlackAdapter {
   }
 
   async stop(): Promise<void> {
+    // Best effort: take our reactions off before going away. A crash or kill
+    // cannot, and leaves them on Slack. No new ones while that runs.
+    this.stopping = true;
+    await Promise.all([...this.ackPending.keys()].map((c) => this.clearAck(c)));
     if (this.socketStarted) {
       await this.socket.disconnect().catch(() => {});
       this.socketStarted = false;
@@ -236,7 +278,7 @@ export class SlackAdapter {
     let cursor: string | undefined;
     do {
       const result = await this.web.conversations.list({
-        types: 'public_channel,private_channel,im,mpim',
+        types: this.disableDms ? 'public_channel,private_channel' : 'public_channel,private_channel,im,mpim',
         exclude_archived: true,
         limit: 200,
         cursor,
@@ -263,11 +305,15 @@ export class SlackAdapter {
       // DM: label with the human's name so the host can scope/whitelist it.
       await this.resolveUserNames([conv.user]);
       const userName = (conv.user ? this.userNameCache.get(conv.user) : undefined) ?? conv.user ?? conv.id;
+      this.dmIds.add(conv.id);
       return { id: conv.id, kind: 'dm', name: userName, userId: conv.user, isMember: true };
     }
     if (conv.is_mpim) {
+      this.dmIds.add(conv.id);
       return { id: conv.id, kind: 'group_dm', name: conv.name ?? conv.id, isMember: true };
     }
+    // Cached as a channel only when Slack says outright it is neither kind of DM.
+    if (conv.is_im === false && conv.is_mpim === false) this.channelIds.add(conv.id);
     return {
       id: conv.id,
       kind: conv.is_private ? 'private_channel' : 'channel',
@@ -280,20 +326,121 @@ export class SlackAdapter {
 
   // ── Messaging ──
 
+  /** Slack scopes are workspace-wide, so "speak only here" is enforced here:
+   *  the one place every write passes through. */
+  canWrite(channelId: string): boolean {
+    return !this.sendChannels?.length || this.sendChannels.includes(channelId);
+  }
+
+  private assertWritable(channelId: string): void {
+    if (!this.canWrite(channelId)) {
+      throw new Error(
+        `Writing to ${channelId} is not allowed: this bot may only write to ${this.sendChannels?.join(', ')} (SLACK_SEND_CHANNELS)`,
+      );
+    }
+  }
+
+  // ── Acknowledgement reaction ──
+  // Slack has no typing indicator for bots, so "received" is shown as a
+  // reaction on the message that addressed the bot, removed when the bot next
+  // posts in that conversation or after ACK_TTL_MS, whichever comes first.
+
+  /** `added` settles once reactions.add has, so a removal never overtakes it. */
+  private ackPending = new Map<string, Map<string, AckEntry>>();
+
+  private armAck(channelId: string, ts: string, ms: number): ReturnType<typeof setTimeout> {
+    const timer = setTimeout(() => void this.clearAck(channelId, ts), ms);
+    timer.unref?.();
+    return timer;
+  }
+
+  /** Forget `entry`, unless a newer entry has taken its place. */
+  private dropAck(channelId: string, ts: string, entry: AckEntry): void {
+    const pending = this.ackPending.get(channelId);
+    if (!pending || pending.get(ts) !== entry) return;
+    clearTimeout(entry.timer);
+    pending.delete(ts);
+    if (pending.size === 0) this.ackPending.delete(channelId);
+  }
+
+  /** Mark an addressed message as received. Best-effort: never throws. */
+  async acknowledge(channelId: string, ts: string): Promise<void> {
+    if (!this.ackReaction || this.stopping) return;
+    if (this.ackPending.get(channelId)?.has(ts)) return; // Slack delivered the event twice
+    const added = this.addReaction(channelId, ts, this.ackReaction).then(() => true, () => false);
+    // Recorded before the add resolves, so a reply that lands first still removes it.
+    let pending = this.ackPending.get(channelId);
+    if (!pending) this.ackPending.set(channelId, (pending = new Map()));
+    const entry: AckEntry = { timer: this.armAck(channelId, ts, ACK_TTL_MS), added, tries: 0 };
+    pending.set(ts, entry);
+    if (!(await added)) this.dropAck(channelId, ts, entry); // not writable here, or Slack refused
+  }
+
+  /** Remove the reaction from one message, or from every pending message in the
+   *  conversation. A removal that failed without an answer from Slack (rate
+   *  limit, HTTP or network error) is tried again; one Slack refused is not. */
+  async clearAck(channelId: string, ts?: string): Promise<void> {
+    const pending = this.ackPending.get(channelId);
+    if (!pending || !this.ackReaction) return;
+    const targets = ts === undefined ? [...pending.keys()] : pending.has(ts) ? [ts] : [];
+    await Promise.all(targets.map(async (t) => {
+      const entry = pending.get(t);
+      if (!entry) return;
+      clearTimeout(entry.timer);
+      if (!(await entry.added)) return this.dropAck(channelId, t, entry);
+      try {
+        await this.web.reactions.remove({ channel: channelId, timestamp: t, name: this.ackReaction! });
+        this.dropAck(channelId, t, entry);
+      } catch (err) {
+        // Slack's own answer (data.error) will be the same next time.
+        const answered = !!(err as { data?: { error?: string } }).data?.error;
+        if (answered || ++entry.tries >= ACK_MAX_TRIES) this.dropAck(channelId, t, entry);
+        else entry.timer = this.armAck(channelId, t, ACK_RETRY_MS);
+      }
+    }));
+  }
+
   async sendMessage(
     channelId: string,
     text: string,
     opts: { threadTs?: string } = {},
   ): Promise<{ messageId: string }> {
+    this.assertWritable(channelId);
+    await this.assertNotDm(channelId);
     const result = await this.web.chat.postMessage({
       channel: channelId,
       text,
       ...(opts.threadTs ? { thread_ts: opts.threadTs } : {}),
     });
+    void this.clearAck(channelId);
     return { messageId: result.ts ? String(result.ts) : '' };
   }
 
+  /** With SLACK_DISABLE_DMS, only a conversation Slack confirmed to be a
+   *  channel may be written to or read. Every write path and both history
+   *  reads call this. An ID is not enough: a group DM ID looks like a channel
+   *  ID, and a user ID (U…) posts into that user's DM. An unknown ID is asked
+   *  about until Slack confirms it; if Slack cannot say, it is refused. */
+  private async assertNotDm(channelId: string): Promise<void> {
+    if (!this.disableDms || this.channelIds.has(channelId)) return;
+    const refuse = (why: string) =>
+      new Error(`Conversation ${channelId} ${why}; direct messages are disabled for this bot (SLACK_DISABLE_DMS)`);
+    if (this.dmIds.has(channelId) || channelId.startsWith('D')) throw refuse('is a DM');
+    try {
+      await this.getConversationMeta(channelId); // fills channelIds for this very ID, or not
+    } catch (err) {
+      throw refuse(`could not be confirmed as a channel (${(err as Error).message})`);
+    }
+    if (!this.channelIds.has(channelId)) throw refuse('is not a channel');
+  }
+
   async sendDM(userId: string, text: string): Promise<{ messageId: string; channelId: string }> {
+    if (this.disableDms) throw new Error('Direct messages are disabled for this bot (SLACK_DISABLE_DMS)');
+    // A DM ID starts with D. If the allow-list names none, no DM can be written,
+    // so don't open one just to find that out.
+    if (this.sendChannels?.length && !this.sendChannels.some((id) => id.startsWith('D'))) {
+      throw new Error('Writing to a direct message is not allowed: SLACK_SEND_CHANNELS lists no DM conversation');
+    }
     const open = await this.web.conversations.open({ users: userId });
     const channelId = open.channel?.id;
     if (!channelId) throw new Error(`Could not open a DM with user ${userId}`);
@@ -302,14 +449,20 @@ export class SlackAdapter {
   }
 
   async editMessage(channelId: string, ts: string, text: string): Promise<void> {
+    this.assertWritable(channelId);
+    await this.assertNotDm(channelId);
     await this.web.chat.update({ channel: channelId, ts, text });
   }
 
   async deleteMessage(channelId: string, ts: string): Promise<void> {
+    this.assertWritable(channelId);
+    await this.assertNotDm(channelId);
     await this.web.chat.delete({ channel: channelId, ts });
   }
 
   async addReaction(channelId: string, ts: string, emoji: string): Promise<void> {
+    this.assertWritable(channelId);
+    await this.assertNotDm(channelId);
     // Slack wants the bare emoji name; accept :name: and strip the colons.
     await this.web.reactions.add({ channel: channelId, timestamp: ts, name: emoji.replace(/:/g, '') });
   }
@@ -322,6 +475,7 @@ export class SlackAdapter {
     channelId: string,
     opts: { limit?: number; oldest?: string; latest?: string } = {},
   ): Promise<{ messages: HistoryMessage[]; truncated: boolean }> {
+    await this.assertNotDm(channelId);
     const { messages, truncated } = await fetchSlackHistory(this.web, {
       channel: channelId,
       ...(opts.oldest !== undefined ? { oldest: opts.oldest } : {}),
@@ -337,6 +491,7 @@ export class SlackAdapter {
     threadTs: string,
     limit = 100,
   ): Promise<{ messages: HistoryMessage[]; truncated: boolean }> {
+    await this.assertNotDm(channelId);
     const collected: SlackHistoryMessage[] = [];
     let cursor: string | undefined;
     let truncated = false;
@@ -431,6 +586,8 @@ export class SlackAdapter {
     if (!event.channel || !event.user || !event.ts) return;
 
     const isDM = event.channel_type === 'im' || event.channel.startsWith('D');
+    // Only what Slack marks as a channel gets through, not merely what isn't marked a DM.
+    if (this.disableDms && event.channel_type !== 'channel' && event.channel_type !== 'group') return;
     if (isDM && this.dmUsers && this.dmUsers.length > 0 && !this.dmUsers.includes(event.user)) {
       return; // DM whitelist active and this sender isn't on it
     }

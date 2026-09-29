@@ -37,15 +37,15 @@ import type {
   StateRollbackResult,
   ChannelDescriptor,
   ContentBlock,
-  ChannelsOutgoingChunkParams,
-  ChannelsOutgoingCompleteParams,
 } from '@animalabs/mcpl-core';
 
 import type { SlackAdapter, SlackMessageData } from './slack-adapter.js';
 import { toolDefinitions } from './tools.js';
-import { featureSets, isEnabled, featureSetForTool } from './feature-sets.js';
+import { buildFeatureSets, buildServerCapabilities, featureSetForTool, MESSAGING_FEATURE_SET } from './feature-sets.js';
 import { ChannelManager, mcplChannelId, parseMcplChannelId, toDescriptor } from './channels.js';
 import { StateTracker } from './state.js';
+import { CapabilityGrant } from './grant.js';
+import { McplRpcError, capabilityDenied } from './errors.js';
 import {
   fetchAttachmentBytes,
   parseSlackAttachmentUrl,
@@ -117,11 +117,9 @@ export function backscrollBlock(
 export class SlackMcplServer {
   private conn: McplConnection | null = null;
   private mcplEnabled = false;
-  private enabledFeatureSets = new Set<string>();
+  private grant = new CapabilityGrant(buildFeatureSets());
   private channelManager = new ChannelManager();
   private stateTracker = new StateTracker();
-  /** Buffers for channels/outgoing/chunk streams, keyed by inferenceId */
-  private outgoingBuffers = new Map<string, { channelId: string; chunks: string[] }>();
 
   /** Conversations the agent has opted into for ambient (non-mention,
    *  non-DM) message delivery. Mentions and DMs always come through
@@ -156,7 +154,22 @@ export class SlackMcplServer {
     return Number.isFinite(n) && n > 0 && n <= 1000 ? n : 50;
   }
 
-  constructor(private slack: SlackAdapter) {}
+  /** Conversations muted with unsubscribe_channel while every member channel
+   *  counts as subscribed (`subscribeMemberChannels`). */
+  private mutedChannels = new Set<string>();
+
+  /** Conversations whose read-only note the agent has been given. */
+  private readOnlyNoted = new Set<string>();
+
+  /**
+   * `subscribeMemberChannels`: Slack only delivers message events from
+   * conversations the bot is a member of, so every delivered conversation
+   * counts as subscribed: inviting the bot is the opt-in.
+   */
+  constructor(
+    private slack: SlackAdapter,
+    private opts: { subscribeMemberChannels?: boolean } = {},
+  ) {}
 
   /**
    * Serve a single connection. Blocks until the connection closes.
@@ -165,16 +178,16 @@ export class SlackMcplServer {
   async serve(conn: McplConnection): Promise<void> {
     this.conn = conn;
 
+    // Every connection starts from nothing (§5.3) — a previous peer's grant
+    // is not this peer's.
+    this.grant.reset();
+    this.readOnlyNoted.clear(); // a new host has not been told
+
     // Set up Slack event forwarding
     this.setupSlackForwarding();
 
     // Handshake
     await this.handleInitialize();
-
-    // If MCPL is enabled, register all visible Slack conversations
-    if (this.mcplEnabled) {
-      await this.registerSlackChannels();
-    }
 
     // Main loop
     try {
@@ -224,13 +237,7 @@ export class SlackMcplServer {
     // the host publishes text-only turns to the conversational locus via
     // channels/publish, so no contextHooks are declared here (same rationale
     // as discord-mcpl; see LOCUS-ROUTING-DESIGN.md).
-    const serverCaps: McplCapabilities = {
-      version: '0.4',
-      pushEvents: true,
-      channels: true,
-      rollback: true,
-      featureSets,
-    };
+    const serverCaps: McplCapabilities = buildServerCapabilities();
 
     const capabilities: InitializeCapabilities = {
       tools: {},
@@ -253,11 +260,15 @@ export class SlackMcplServer {
       console.log('[slack-mcpl] Client initialized' + (this.mcplEnabled ? ' (MCPL mode)' : ' (MCP mode)'));
     }
 
-    // In MCPL mode, default all feature sets to enabled
-    if (this.mcplEnabled) {
-      for (const fs of featureSets) {
-        this.enabledFeatureSets.add(fs.name);
-      }
+    // No default grant here (§5.3): until the host's featureSets/update
+    // Request is answered, every capability-dependent behavior — channel
+    // registration, push events, privileged inbound methods — stays
+    // unavailable. Plain MCP tool calls are unaffected; see callTool below.
+  }
+
+  private requireMcpl(): void {
+    if (!this.mcplEnabled) {
+      throw new McplRpcError(-32601, 'MCPL is not negotiated on this connection');
     }
   }
 
@@ -270,7 +281,8 @@ export class SlackMcplServer {
     try {
       switch (req.method) {
         case 'tools/list': {
-          conn.sendResponse(req.id, { tools: toolDefinitions });
+          const tools = this.slack.dmsWritable ? toolDefinitions : toolDefinitions.filter((t) => t.name !== 'send_dm');
+          conn.sendResponse(req.id, { tools });
           break;
         }
 
@@ -283,7 +295,28 @@ export class SlackMcplServer {
           break;
         }
 
+        case method.FEATURE_SETS_UPDATE: {
+          // §6.7: featureSets/update is a Request carrying the effective
+          // grant, and its response is a degradation receipt — what this
+          // server WILL DO under the grant it was given. Testimony about
+          // consequences, never a claim of entitlement. Only this form can
+          // establish a ready state (§5.3).
+          this.requireMcpl();
+          const couldRegister = this.grant.has('channels.register');
+          const receipt = this.grant.apply(params as unknown as FeatureSetsUpdateParams, 'request');
+          conn.sendResponse(req.id, receipt);
+          // channels/register needs the channels.register capability. Register
+          // when the grant first allows it, and again if a later policy turns
+          // it from denied to granted. The receipt above is sent first.
+          if (!couldRegister && this.grant.has('channels.register')) {
+            void this.registerSlackChannels();
+          }
+          break;
+        }
+
         case method.CHANNELS_LIST: {
+          this.requireMcpl();
+          if (!this.grant.has('channels.register')) throw capabilityDenied('channels.register');
           const result: ChannelsListResult = {
             channels: this.channelManager.getAll(),
           };
@@ -292,6 +325,8 @@ export class SlackMcplServer {
         }
 
         case method.CHANNELS_OPEN: {
+          this.requireMcpl();
+          if (!this.grant.has('channels.lifecycle')) throw capabilityDenied('channels.lifecycle');
           const openP = params as unknown as ChannelsOpenParams;
           const result = this.handleChannelOpen(openP);
           conn.sendResponse(req.id, result);
@@ -299,6 +334,8 @@ export class SlackMcplServer {
         }
 
         case method.CHANNELS_CLOSE: {
+          this.requireMcpl();
+          if (!this.grant.has('channels.lifecycle')) throw capabilityDenied('channels.lifecycle');
           const closeP = params as unknown as ChannelsCloseParams;
           const closed = this.channelManager.close(closeP.channelId);
           const result: ChannelsCloseResult = { closed };
@@ -307,6 +344,8 @@ export class SlackMcplServer {
         }
 
         case method.CHANNELS_PUBLISH: {
+          this.requireMcpl();
+          if (!this.grant.has('channels.publish')) throw capabilityDenied('channels.publish');
           const pubP = params as unknown as ChannelsPublishParams;
           const result = await this.handlePublish(pubP);
           conn.sendResponse(req.id, result);
@@ -314,16 +353,18 @@ export class SlackMcplServer {
         }
 
         case method.STATE_ROLLBACK: {
+          this.requireMcpl();
           const rollbackP = params as unknown as StateRollbackParams;
           const result = await this.handleRollback(rollbackP);
           conn.sendResponse(req.id, result);
           break;
         }
 
-        case method.CONTEXT_AFTER_INFERENCE: {
-          // Not declared in capabilities; answered as a harmless no-op in
-          // case an older host still calls it.
-          conn.sendResponse(req.id, { featureSet: 'slack.messaging' });
+        case 'context/afterInference': {
+          // Removed in MCPL 0.5 (replaced by inference/lifecycle) and not
+          // declared in capabilities; answered as a harmless no-op in case
+          // an older host still calls it.
+          conn.sendResponse(req.id, { featureSet: MESSAGING_FEATURE_SET });
           break;
         }
 
@@ -331,6 +372,10 @@ export class SlackMcplServer {
           conn.sendError(req.id, -32601, `Method not found: ${req.method}`);
       }
     } catch (err) {
+      if (err instanceof McplRpcError) {
+        conn.sendError(req.id, err.code, err.message, err.data);
+        return;
+      }
       // Report with full context — tool name, truncated args, stack — so
       // transient failures (Slack 5xx, rate limits, missing scopes) are
       // traceable from the host side.
@@ -366,54 +411,30 @@ export class SlackMcplServer {
   // ── Notification Dispatch ──
 
   private handleNotification(notif: JsonRpcNotification): void {
+    try {
+      this.dispatchNotification(notif);
+    } catch (err) {
+      // A notification can never be answered; a failing one is logged, never fatal.
+      console.error(`[slack-mcpl] notification ${notif.method} failed:`, (err as Error).message);
+    }
+  }
+
+  private dispatchNotification(notif: JsonRpcNotification): void {
     switch (notif.method) {
       case method.FEATURE_SETS_UPDATE: {
-        const p = notif.params as FeatureSetsUpdateParams;
-        if (p.enabled) {
-          for (const name of p.enabled) this.enabledFeatureSets.add(name);
-        }
-        if (p.disabled) {
-          for (const name of p.disabled) this.enabledFeatureSets.delete(name);
+        // §6.7 Notification form: descriptive metadata only. Grant-bearing
+        // updates (including the §5.3 initial policy) arrive as a Request.
+        if (this.mcplEnabled) {
+          this.grant.apply(notif.params as unknown as FeatureSetsUpdateParams, 'notification');
         }
         break;
       }
 
-      case method.CHANNELS_OUTGOING_CHUNK: {
-        const p = notif.params as ChannelsOutgoingChunkParams;
-        const buf = this.outgoingBuffers.get(p.inferenceId);
-        if (buf) {
-          buf.chunks[p.index] = p.delta;
-        } else {
-          const chunks: string[] = [];
-          chunks[p.index] = p.delta;
-          this.outgoingBuffers.set(p.inferenceId, { channelId: p.channelId, chunks });
-        }
+      // channels.streaming is not declared, so a host should not send these. If
+      // one does, ignore them: the reply arrives once, through channels/publish.
+      case method.CHANNELS_OUTGOING_CHUNK:
+      case method.CHANNELS_OUTGOING_COMPLETE:
         break;
-      }
-
-      case method.CHANNELS_OUTGOING_COMPLETE: {
-        const p = notif.params as ChannelsOutgoingCompleteParams;
-        this.outgoingBuffers.delete(p.inferenceId);
-
-        // Extract text and send to Slack (into the active thread, if any)
-        const text = p.content
-          .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
-          .map((b) => b.text)
-          .join('\n');
-
-        if (text) {
-          const parsed = parseMcplChannelId(p.channelId);
-          if (parsed) {
-            const threadTs = this.lastIncomingThreadTs.get(parsed.conversationId);
-            this.slack
-              .sendMessage(parsed.conversationId, text, threadTs ? { threadTs } : {})
-              .catch((err) => {
-                console.error('[slack-mcpl] outgoing/complete send failed:', (err as Error).message);
-              });
-          }
-        }
-        break;
-      }
 
       // Slack's Web API has no typing indicator for bots (the RTM one is
       // deprecated), so typing notifications are accepted and ignored.
@@ -433,9 +454,18 @@ export class SlackMcplServer {
     name: string,
     args: Record<string, unknown>,
   ): Promise<{ content: ContentBlock[]; isError?: boolean; state?: unknown }> {
+    // §14.1/§6.2: in MCPL mode the tool surface itself is gated on the
+    // `tools` capability — thrown, not returned, since a missing capability
+    // is a protocol-level denial (§5.4), unlike a feature set that is merely
+    // temporarily disabled (below). Plain MCP clients (mcplEnabled false)
+    // are not subject to a grant — there is none to consult.
+    if (this.mcplEnabled && !this.grant.has('tools')) {
+      throw capabilityDenied('tools');
+    }
+
     // Check feature set permission
     const fs = featureSetForTool(name);
-    if (fs && this.mcplEnabled && !isEnabled(fs, this.enabledFeatureSets)) {
+    if (fs && this.mcplEnabled && !this.grant.isFeatureSetActive(fs)) {
       return {
         content: [textContent(`Feature set '${fs}' is not enabled`)],
         isError: true,
@@ -451,7 +481,7 @@ export class SlackMcplServer {
       }
 
       // Track checkpoints for rollback-enabled tools
-      if (fs === 'slack.messaging') {
+      if (fs === MESSAGING_FEATURE_SET) {
         const cpId = this.stateTracker.createCheckpoint();
         return {
           content: [textContent(typeof result === 'string' ? result : JSON.stringify(result))],
@@ -534,6 +564,7 @@ export class SlackMcplServer {
           name: c.kind === 'dm' ? `DM: @${c.name}` : c.name,
           ...(c.topic ? { topic: c.topic } : {}),
           ...(c.kind === 'channel' || c.kind === 'private_channel' ? { isMember: c.isMember } : {}),
+          writable: this.slack.canWrite(c.id),
         }));
       }
 
@@ -597,26 +628,38 @@ export class SlackMcplServer {
       case 'subscribe_channel': {
         this.ensureSubscriptionsLoaded();
         const channelId = this.requireString(args, 'channelId');
-        const wasNew = !this.subscribedChannels.has(channelId);
-        this.subscribedChannels.add(channelId);
-        if (wasNew) this.saveSubscriptions();
-        return wasNew
-          ? `Subscribed to ambient messages from conversation ${channelId}.`
-          : `Already subscribed to conversation ${channelId}.`;
+        return this.subscribe(channelId)
+          ? this.opts.subscribeMemberChannels
+            ? `Unmuted conversation ${channelId}: its ambient messages arrive again.`
+            : `Subscribed to ambient messages from conversation ${channelId}.`
+          : this.opts.subscribeMemberChannels
+            ? `Conversation ${channelId} is not muted.`
+            : `Already subscribed to conversation ${channelId}.`;
       }
 
       case 'unsubscribe_channel': {
         this.ensureSubscriptionsLoaded();
         const channelId = this.requireString(args, 'channelId');
-        const removed = this.subscribedChannels.delete(channelId);
-        if (removed) this.saveSubscriptions();
-        return removed
-          ? `Unsubscribed from ambient messages in conversation ${channelId}. Mentions and DMs from there will still arrive.`
-          : `Conversation ${channelId} was not subscribed.`;
+        return this.unsubscribe(channelId)
+          ? this.opts.subscribeMemberChannels
+            ? `Muted ambient messages in conversation ${channelId} until you subscribe_channel it again. Mentions and DMs from there will still arrive.`
+            : `Unsubscribed from ambient messages in conversation ${channelId}. Mentions and DMs from there will still arrive.`
+          : this.opts.subscribeMemberChannels
+            ? `Conversation ${channelId} is already muted.`
+            : `Conversation ${channelId} was not subscribed.`;
       }
 
       case 'list_subscriptions': {
         this.ensureSubscriptionsLoaded();
+        if (this.opts.subscribeMemberChannels) {
+          return {
+            mode: 'member-channels',
+            muted: [...this.mutedChannels].sort(),
+            note:
+              'Ambient messages arrive from every conversation the bot is a member of, except the muted ones. ' +
+              'Mentions and DMs always come through.',
+          };
+        }
         return {
           channels: [...this.subscribedChannels].sort(),
           count: this.subscribedChannels.size,
@@ -682,11 +725,14 @@ export class SlackMcplServer {
     if (!path || !existsSync(path)) return;
     try {
       const parsed = JSON.parse(readFileSync(path, 'utf-8'));
-      if (Array.isArray(parsed)) {
-        for (const id of parsed) {
-          if (typeof id === 'string' && id.length > 0) this.subscribedChannels.add(id);
-        }
-      }
+      // A plain array is the subscribed list; an object also carries the muted one.
+      const lists = Array.isArray(parsed) ? { subscribed: parsed, muted: [] } : (parsed ?? {});
+      const into = (ids: unknown, set: Set<string>) => {
+        if (!Array.isArray(ids)) return;
+        for (const id of ids) if (typeof id === 'string' && id.length > 0) set.add(id);
+      };
+      into(lists.subscribed, this.subscribedChannels);
+      into(lists.muted, this.mutedChannels);
       dbg('subscriptions:loaded', { count: this.subscribedChannels.size, path });
     } catch (err) {
       // Corrupt or unreadable file: start with empty set; don't fail boot.
@@ -699,7 +745,9 @@ export class SlackMcplServer {
     if (!path) return; // in-memory mode
     try {
       mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(path, JSON.stringify([...this.subscribedChannels].sort(), null, 2) + '\n');
+      const subscribed = [...this.subscribedChannels].sort();
+      const muted = [...this.mutedChannels].sort();
+      writeFileSync(path, JSON.stringify(muted.length > 0 ? { subscribed, muted } : subscribed, null, 2) + '\n');
     } catch (err) {
       console.error('[slack-mcpl] Failed to save subscriptions:', (err as Error).message);
     }
@@ -707,7 +755,26 @@ export class SlackMcplServer {
 
   private isChannelSubscribed(channelId: string): boolean {
     this.ensureSubscriptionsLoaded();
+    if (this.opts.subscribeMemberChannels) return !this.mutedChannels.has(channelId);
     return this.subscribedChannels.has(channelId);
+  }
+
+  /** Returns true when this changed anything. With `subscribeMemberChannels`
+   *  a conversation is subscribed unless muted, so subscribing unmutes. */
+  private subscribe(channelId: string): boolean {
+    const was = this.isChannelSubscribed(channelId);
+    if (this.opts.subscribeMemberChannels) this.mutedChannels.delete(channelId);
+    else this.subscribedChannels.add(channelId);
+    if (!was) this.saveSubscriptions();
+    return !was;
+  }
+
+  private unsubscribe(channelId: string): boolean {
+    const was = this.isChannelSubscribed(channelId);
+    if (this.opts.subscribeMemberChannels) this.mutedChannels.add(channelId);
+    else this.subscribedChannels.delete(channelId);
+    if (was) this.saveSubscriptions();
+    return was;
   }
 
   // ── Channel Operations ──
@@ -715,17 +782,23 @@ export class SlackMcplServer {
   private async registerSlackChannels(): Promise<void> {
     const conn = this.conn;
     if (!conn || !this.mcplEnabled) return;
+    if (!this.grant.has('channels.register')) {
+      console.error('[slack-mcpl] channels.register not granted; skipping channel registration');
+      return;
+    }
 
     let descriptors: ChannelDescriptor[] = [];
     try {
       const convs = await this.slack.listConversations();
-      descriptors = convs.map((c) => toDescriptor(c, this.slack.teamName));
+      descriptors = convs.map((c) => toDescriptor(c, this.slack.teamName, this.slack.canWrite(c.id)));
     } catch (err) {
       console.error('[slack-mcpl] Failed to enumerate conversations:', (err as Error).message);
       return;
     }
     dbg('registerSlackChannels', { count: descriptors.length });
     if (descriptors.length === 0) return;
+    // The grant may have been revoked, or the peer gone, while Slack answered.
+    if (this.conn !== conn || !this.grant.has('channels.register')) return;
 
     this.channelManager.registerAll(descriptors);
 
@@ -742,6 +815,12 @@ export class SlackMcplServer {
    *  re-registering a known channel refreshes its descriptor but does NOT
    *  re-announce it. Returns the descriptors that were newly added. */
   private registerAndNotifyNew(descriptors: ChannelDescriptor[]): ChannelDescriptor[] {
+    // Without the grant, record nothing: a channel marked known here would
+    // never be announced after the grant widens.
+    if (this.conn && this.mcplEnabled && !this.grant.has('channels.register')) {
+      console.error('[slack-mcpl] channels.register not granted; channels stay unannounced');
+      return [];
+    }
     const added: ChannelDescriptor[] = [];
     for (const d of descriptors) {
       if (!this.channelManager.get(d.id)) added.push(d);
@@ -762,7 +841,7 @@ export class SlackMcplServer {
     note: string;
   }> {
     const convs = await this.slack.listConversations();
-    const descriptors = convs.map((c) => toDescriptor(c, this.slack.teamName));
+    const descriptors = convs.map((c) => toDescriptor(c, this.slack.teamName, this.slack.canWrite(c.id)));
     const added = this.registerAndNotifyNew(descriptors);
     return {
       visible: descriptors.length,
@@ -770,7 +849,9 @@ export class SlackMcplServer {
       note:
         added.length > 0
           ? `Registered ${added.length} newly-visible conversation(s).`
-          : 'No new conversations — the host already knows about every visible one.',
+          : this.mcplEnabled && !this.grant.has('channels.register')
+            ? 'The host has not granted channels.register; nothing was announced.'
+            : 'No new conversations — the host already knows about every visible one.',
     };
   }
 
@@ -829,7 +910,7 @@ export class SlackMcplServer {
   // ── Rollback ──
 
   private async handleRollback(params: StateRollbackParams): Promise<StateRollbackResult> {
-    if (params.featureSet !== 'slack.messaging') {
+    if (params.featureSet !== MESSAGING_FEATURE_SET) {
       return {
         checkpoint: params.checkpoint,
         success: false,
@@ -899,7 +980,10 @@ export class SlackMcplServer {
     });
     if (!conn) return;
     if (!this.mcplEnabled) return; // No push events in MCP-only mode
-    if (!isEnabled('slack.messaging', this.enabledFeatureSets)) return;
+    // §6.7: a disabled slack.messaging stops its traffic at once — incoming
+    // and push alike. False before the initial policy exchange too (§5.3):
+    // fail closed until the host's featureSets/update Request is answered.
+    if (!this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
 
     // Direct address (mention or DM) always reaches the agent. Ambient
     // messages only flow from subscribed conversations — otherwise every
@@ -910,6 +994,7 @@ export class SlackMcplServer {
       dbg('handleSlackMessage:drop', { reason: 'ambient-not-subscribed', channelId: msg.channelId });
       return;
     }
+    if (isAddressed) void this.slack.acknowledge(msg.channelId, msg.id);
 
     // First-interaction handling: when about to forward the very first
     // message from this conversation (this process), pull backscroll for
@@ -935,12 +1020,13 @@ export class SlackMcplServer {
 
       const meta = await this.slack.getConversationMeta(msg.channelId).catch(() => null);
       const blocks: string[] = [];
-      if (!msg.isDM) {
+      // In member mode every conversation is subscribed unless muted, and a
+      // mention must not undo a mute.
+      if (!msg.isDM && !this.opts.subscribeMemberChannels) {
         const where = meta?.name ? `#${meta.name}` : `conversation ${msg.channelId}`;
-        const wasSubscribed = this.subscribedChannels.has(msg.channelId);
+        const wasSubscribed = this.isChannelSubscribed(msg.channelId);
         if (!wasSubscribed) {
-          this.subscribedChannels.add(msg.channelId);
-          this.saveSubscriptions();
+          this.subscribe(msg.channelId);
           blocks.push(
             `<system>Auto-subscribed to ${where} because you were mentioned. ` +
               `Ambient (non-mention) messages from this conversation will now arrive in your context. ` +
@@ -955,6 +1041,15 @@ export class SlackMcplServer {
       if (blocks.length > 0) {
         prefixBlock = blocks.join('\n') + '\n';
       }
+    }
+
+    // Told with the first message the agent gets from here, addressed or not.
+    // Counted as told only once the host has taken that message.
+    const noteReadOnly = !this.slack.canWrite(msg.channelId) && !this.readOnlyNoted.has(msg.channelId);
+    if (noteReadOnly) {
+      prefixBlock +=
+        `<system>You cannot write to conversation ${msg.channelId}: it is not on the write allow-list. ` +
+        `You can read it; do not try to reply there.</system>\n`;
     }
 
     const channelMcplId = mcplChannelId(msg.channelId);
@@ -1018,6 +1113,15 @@ export class SlackMcplServer {
       ...(msg.attachments.length > 0 ? { attachments: msg.attachments } : {}),
     };
 
+    // The reaction says "received". If the host does not take the message,
+    // take the reaction off.
+    const releaseAck = () => {
+      if (isAddressed) void this.slack.clearAck(msg.channelId, msg.id);
+    };
+    const taken = () => {
+      if (noteReadOnly) this.readOnlyNoted.add(msg.channelId);
+    };
+
     // If this channel is open, use channels/incoming; otherwise push/event
     if (channelIsOpen) {
       const incomingParams: ChannelsIncomingParams = {
@@ -1034,14 +1138,19 @@ export class SlackMcplServer {
       };
 
       try {
-        await conn.sendRequest(method.CHANNELS_INCOMING, incomingParams);
+        const res = (await conn.sendRequest(method.CHANNELS_INCOMING, incomingParams)) as
+          | { results?: Array<{ accepted?: boolean }> }
+          | undefined;
         dbg('handleSlackMessage:sent', { method: 'channels/incoming', channelMcplId });
+        if (res?.results?.[0]?.accepted === false) releaseAck();
+        else taken();
       } catch (err) {
         console.error('[slack-mcpl] channels/incoming failed:', (err as Error).message);
+        releaseAck();
       }
     } else {
       const pushParams: PushEventParams = {
-        featureSet: 'slack.messaging',
+        featureSet: MESSAGING_FEATURE_SET,
         eventId: `slack_msg_${msg.channelId}_${msg.id}`,
         timestamp: msg.timestamp.toISOString(),
         origin: {
@@ -1060,10 +1169,13 @@ export class SlackMcplServer {
       };
 
       try {
-        await conn.sendRequest(method.PUSH_EVENT, pushParams);
+        const res = (await conn.sendRequest(method.PUSH_EVENT, pushParams)) as { accepted?: boolean } | undefined;
         dbg('handleSlackMessage:sent', { method: 'push/event', channelMcplId });
+        if (res?.accepted === false) releaseAck();
+        else taken();
       } catch (err) {
         console.error('[slack-mcpl] push/event failed:', (err as Error).message);
+        releaseAck();
       }
     }
   }

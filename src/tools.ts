@@ -217,7 +217,9 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: 'list_subscriptions',
-    description: 'List the Slack conversations currently subscribed for ambient message delivery',
+    description:
+      'List the Slack conversations subscribed for ambient message delivery. When every member ' +
+      'conversation is subscribed (member mode), lists the muted ones instead.',
     inputSchema: {
       type: 'object',
       properties: {},
