@@ -102,6 +102,18 @@ export function backscrollLine(m: {
   return `[${m.timestamp.toISOString()}${thread} id=${m.id}] ${m.authorName}: ${m.content}${att}`;
 }
 
+/** The `<backscroll>` block given with the first message from a conversation. */
+export function backscrollBlock(
+  messages: Parameters<typeof backscrollLine>[0][],
+  where: { channelName?: string; isDM: boolean },
+): string {
+  const attrs: string[] = [];
+  if (where.channelName && !where.isDM) attrs.push(`channel="#${where.channelName}"`);
+  if (where.isDM) attrs.push('dm="true"');
+  attrs.push(`count="${messages.length}"`);
+  return [`<backscroll ${attrs.join(' ')}>`, ...messages.map(backscrollLine), '</backscroll>'].join('\n');
+}
+
 export class SlackMcplServer {
   private conn: McplConnection | null = null;
   private mcplEnabled = false;
@@ -938,12 +950,7 @@ export class SlackMcplServer {
         }
       }
       if (backscroll.length > 0) {
-        const attrs: string[] = [];
-        if (meta?.name && !msg.isDM) attrs.push(`channel="#${meta.name}"`);
-        if (msg.isDM) attrs.push('dm="true"');
-        attrs.push(`count="${backscroll.length}"`);
-        const lines = backscroll.map(backscrollLine);
-        blocks.push([`<backscroll ${attrs.join(' ')}>`, ...lines, '</backscroll>'].join('\n'));
+        blocks.push(backscrollBlock(backscroll, { channelName: meta?.name, isDM: msg.isDM }));
       }
       if (blocks.length > 0) {
         prefixBlock = blocks.join('\n') + '\n';

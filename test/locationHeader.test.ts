@@ -6,7 +6,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { backscrollLine, locationHeader } from '../src/server.js';
+import { backscrollBlock, backscrollLine, locationHeader } from '../src/server.js';
 import { SlackAdapter } from '../src/slack-adapter.js';
 
 test('same conversation, top level: message ID only', () => {
@@ -52,4 +52,22 @@ test('backscroll: threadTs survives from Slack history through the adapter into 
   const lines = messages.map(backscrollLine);
   assert.match(lines.find((l) => l.includes('old broadcast'))!, / thread=1718000000\.000100 id=1718000000\.000150\]/);
   assert.doesNotMatch(lines.find((l) => l.includes('parent'))!, /thread=/, 'the thread root is not its own reply');
+});
+
+test('backscroll block: what the agent sees on first interaction names the parent thread', () => {
+  const base = { authorName: 'Ann', attachments: [], timestamp: new Date(0) };
+  const block = backscrollBlock(
+    [{ ...base, id: '1.0', content: 'parent' }, { ...base, id: '1.5', threadTs: '1.0', content: 'reply' }],
+    { channelName: 'support', isDM: false },
+  );
+  assert.equal(
+    block,
+    [
+      '<backscroll channel="#support" count="2">',
+      '[1970-01-01T00:00:00.000Z id=1.0] Ann: parent',
+      '[1970-01-01T00:00:00.000Z thread=1.0 id=1.5] Ann: reply',
+      '</backscroll>',
+    ].join('\n'),
+  );
+  assert.match(backscrollBlock([], { isDM: true }), /^<backscroll dm="true" count="0">/);
 });
