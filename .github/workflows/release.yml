@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+
+      - name: Install dependencies (strict lockfile)
+        run: npm ci
+
+      - name: Type-check
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+  # The package is not published to npm: the tag plus this GitHub release
+  # is the release artifact, and hosts install from the repository.
+  github-release:
+    name: GitHub release notes
+    runs-on: ubuntu-latest
+    needs: build-and-test
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Mirror changelog section into release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          # Section header is '## X.Y.Z — YYYY-MM-DD'; match the version
+          # field exactly (string compare, no regex escaping needed).
+          awk -v ver="$ver" '
+            /^## / { if (in_section) exit; if ($2 == ver) { in_section = 1; next } }
+            in_section { print }
+          ' CHANGELOG.md | sed '/./,$!d' > notes.md
+          # Refuses a tag with no matching (or an empty) changelog section.
+          if ! [ -s notes.md ]; then
+            echo "::error::CHANGELOG.md has no '## ${ver}' section for tag ${GITHUB_REF_NAME}. Cut releases with 'npm version' (see CONTRIBUTING.md)."
+            exit 1
+          fi
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --notes-file notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" \
+              --notes-file notes.md --verify-tag
+          fi

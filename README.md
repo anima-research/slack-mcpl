@@ -149,6 +149,12 @@ Switches take `true`/`false` (also `1`/`0`, `yes`/`no`); any other value stops t
 npm test
 ```
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). A change an operator, a host or an
+agent would notice lands with a changelog fragment in
+[`changelog.d/`](changelog.d/README.md).
+
 ## Provenance
 
 The Slack domain logic (Socket Mode event handling, mrkdwn formatting,

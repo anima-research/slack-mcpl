@@ -12,7 +12,8 @@
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test test/*.test.ts",
     "start": "node --import tsx src/index.ts",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "version": "node scripts/release-changelog.mjs && git add CHANGELOG.md changelog.d"
   },
   "dependencies": {
     "@animalabs/mcpl-core": "^0.3.0",
