@@ -12,8 +12,10 @@
  * reply/publish routing posts into the thread of the referenced message
  * (top-level when the conversation isn't threaded).
  *
- * No typing indicator: Slack's Web API exposes none for bots (RTM-only,
- * deprecated), so the server treats channels/typing as a no-op.
+ * Typing: Slack has no typing indicator for bots outside RTM. channels/typing
+ * is shown instead as a thread status ("is thinking…",
+ * assistant.threads.setStatus, which works in channels with chat:write since
+ * 2026-03) on the thread of the message being answered.
  *
  * Event handling salvaged from zulip-mcp PR #8's SlackAdapter.
  */
@@ -36,6 +38,10 @@ const ACK_TTL_MS = 10 * 60 * 1000;
  *  this, at most ACK_MAX_TRIES times in all. */
 const ACK_RETRY_MS = 60 * 1000;
 const ACK_MAX_TRIES = 5;
+/** The host refreshes typing every few seconds; Slack keeps a thread status
+ *  for 2 minutes, so it is set again only after this. */
+const STATUS_REFRESH_MS = 60 * 1000;
+const STATUS_TEXT = 'is thinking…';
 
 type AckEntry = { timer: ReturnType<typeof setTimeout>; added: Promise<boolean>; tries: number };
 
@@ -187,6 +193,10 @@ export interface SlackWebLike {
   reactions: {
     add(args: { channel: string; timestamp: string; name: string }): Promise<unknown>;
     remove(args: { channel: string; timestamp: string; name: string }): Promise<unknown>;
+  };
+  /** Optional so test fakes need not carry it; the real WebClient has it. */
+  assistant?: {
+    threads: { setStatus(args: { channel_id: string; thread_ts: string; status: string }): Promise<unknown> };
   };
   users: {
     info(args: { user: string }): Promise<{ user?: { profile?: { display_name?: string }; real_name?: string; name?: string } }>;
@@ -363,6 +373,40 @@ export class SlackAdapter {
     if (pending.size === 0) this.ackPending.delete(channelId);
   }
 
+  // ── Thread status ──
+
+  /** Per conversation, the thread showing our status and when it was set. */
+  private statusOn = new Map<string, { ts: string; at: number }>();
+
+  /** Show "is thinking…" on thread `threadTs` of `channelId`, or clear the
+   *  conversation's status when `threadTs` is undefined. Moving to another
+   *  thread clears the old one. Only where the bot may write: a status in a
+   *  read-only conversation would tell its readers the bot is reading.
+   *  Best-effort: never throws. */
+  async setThreadStatus(channelId: string, threadTs: string | undefined): Promise<void> {
+    const cur = this.statusOn.get(channelId);
+    if (threadTs && cur?.ts === threadTs && Date.now() - cur.at < STATUS_REFRESH_MS) return;
+    if (cur && cur.ts !== threadTs) {
+      this.statusOn.delete(channelId);
+      await this.callStatus(channelId, cur.ts, '');
+    }
+    if (!threadTs || !this.canWrite(channelId)) return;
+    if (this.disableDms && (this.dmIds.has(channelId) || channelId.startsWith('D'))) return;
+    this.statusOn.set(channelId, { ts: threadTs, at: Date.now() });
+    if (!(await this.callStatus(channelId, threadTs, STATUS_TEXT))) this.statusOn.delete(channelId);
+  }
+
+  private async callStatus(channelId: string, threadTs: string, status: string): Promise<boolean> {
+    if (!this.web.assistant) return false;
+    try {
+      await this.web.assistant.threads.setStatus({ channel_id: channelId, thread_ts: threadTs, status });
+      return true;
+    } catch (err) {
+      console.error(`[slack-mcpl] thread status on ${channelId} failed:`, (err as Error).message);
+      return false;
+    }
+  }
+
   /** Mark an addressed message as received. Best-effort: never throws. */
   async acknowledge(channelId: string, ts: string): Promise<void> {
     if (!this.ackReaction || this.stopping) return;
@@ -413,6 +457,8 @@ export class SlackAdapter {
       ...(opts.threadTs ? { thread_ts: opts.threadTs } : {}),
     });
     void this.clearAck(channelId);
+    // Slack clears a thread's status when the bot posts in that thread.
+    if (opts.threadTs && this.statusOn.get(channelId)?.ts === opts.threadTs) this.statusOn.delete(channelId);
     return { messageId: result.ts ? String(result.ts) : '' };
   }
 
