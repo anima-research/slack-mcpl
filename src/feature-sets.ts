@@ -19,13 +19,13 @@
  *   channels.incoming  — handleSlackMessage sends channels/incoming for open channels
  *   pushEvents         — handleSlackMessage sends push/event for addressed
  *                        messages on channels the host has not opened
+ *   channels.typing    — server.ts handles channels/typing (a thread status)
  *   tools              — the MCP tool surface of this server
  *
  * Deliberately NOT declared: channels.streaming (the host delivers each reply
  * once, through channels/publish; a streamed copy would post it twice),
  * channels.acknowledge (no handler for
- * channels/acknowledge), channels.typing (the adapter has no typing
- * indicator — Slack's Web API exposes none for bots).
+ * channels/acknowledge).
  */
 
 import type { CapabilityPath, FeatureSetDeclaration, McplManifest, TagOntology } from '@animalabs/mcpl-core';
@@ -59,6 +59,7 @@ export function buildFeatureSets(): Record<string, FeatureSetDeclaration> {
     'channels.publish',
     'channels.incoming',
     'pushEvents',
+    'channels.typing',
   ];
 
   return {
@@ -93,6 +94,7 @@ export function buildServerCapabilities(): McplManifest {
       lifecycle: true,
       publish: true,
       incoming: true,
+      typing: true,
     },
     featureSets: buildFeatureSets(),
   };
