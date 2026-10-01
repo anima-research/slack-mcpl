@@ -30,6 +30,10 @@ that grant arrives; plain MCP tool calls are unaffected.
 - **Threads**: incoming thread replies carry `threadId`; `reply_message`
   posts into a message's thread; `fetch_thread` reads one (Slack's
   channel-level history API does not include thread replies).
+- **Typing**: `channels/typing` shows "is thinking…" on the thread of the
+  conversation's newest incoming message (`assistant.threads.setStatus`,
+  covered by `chat:write`), only where the bot may write. Slack clears it
+  when the bot posts in that thread, on `op: 'stop'`, or after 2 minutes.
 - **Attachments**: incoming files are forwarded as refs and fetched on demand
   via `fetch_attachment`, which is auth-locked to `files.slack.com` (the bot
   token is never sent to any other host) and size-capped at 5MB.
@@ -138,7 +142,7 @@ Switches take `true`/`false` (also `1`/`0`, `yes`/`no`); any other value stops t
 | `SLACK_SEND_CHANNELS` | no | Comma-separated conversation-ID allow-list for writes (send, DM, edit, delete, reaction, and the host's `channels/publish`); writes elsewhere are refused before the call reaches Slack. Other conversations are registered `inbound`, `list_channels` shows `writable: false`, and the first message the agent gets from one, addressed or not, carries a read-only note. A mention there still reaches the agent; whether it wakes is the host's policy. `send_dm` is refused before a DM is opened, and not offered, unless the list names a DM. Set but empty is refused at startup; the effective list is logged |
 | `SLACK_SUBSCRIBE_MEMBER_CHANNELS` | no | `true` delivers ambient messages from every channel the bot is a member of, so inviting the bot is the subscription. `unsubscribe_channel` then mutes a conversation (`subscribe_channel` unmutes it) and `list_subscriptions` lists the muted ones |
 | `SLACK_DISABLE_DMS` | no | `true` drops incoming DMs and group DMs, refuses every write to them and both history reads on them, and leaves them out of `conversations.list`, so they are neither listed nor registered; `send_dm` is not offered. Only a conversation Slack confirms as a channel passes: a group DM ID looks like a channel ID, and a user ID posts into that user's DM. An unknown ID is asked about until Slack confirms it; if Slack cannot say, it is refused. Incoming events pass only when Slack marks them `channel` or `group` |
-| `SLACK_ACK_REACTION` | no | Emoji name (e.g. `eyes`) put on a message that addresses the bot. It means "received": it is removed at the bot's next post in that conversation, after 10 minutes, or at once if the host does not accept the message. A removal that fails without an answer from Slack (rate limit, network) is retried every minute, 5 times at most; one Slack refuses is dropped. On SIGTERM, SIGINT or the host closing stdin, pending reactions are removed (5 s at most); a crash cannot, so removal is best-effort. Slack has no typing indicator for bots |
+| `SLACK_ACK_REACTION` | no | Emoji name (e.g. `eyes`) put on a message that addresses the bot. It means "received": it is removed at the bot's next post in that conversation, after 10 minutes, or at once if the host does not accept the message. A removal that fails without an answer from Slack (rate limit, network) is retried every minute, 5 times at most; one Slack refuses is dropped. On SIGTERM, SIGINT or the host closing stdin, pending reactions are removed (5 s at most); a crash cannot, so removal is best-effort. For a typing signal see **Typing** above. |
 | `SLACK_SUBSCRIPTIONS_FILE` | no | JSON file persisting ambient subscriptions across restarts: an array of IDs, or `{subscribed, muted}` while anything is muted (older versions read the object form as empty) |
 | `SLACK_BACKSCROLL_LIMIT` | no | Messages fetched on first interaction with a conversation (default 50) |
 | `SLACK_MCPL_DEBUG_LOG` | no | Absolute path for a diagnostic file log |
