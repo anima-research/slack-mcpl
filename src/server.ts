@@ -1157,6 +1157,9 @@ export class SlackMcplServer {
           source: 'slack',
           messageId: msg.id,
           channelId: msg.channelId,
+          // The MCPL channel ID, so a host can route and type to a channel it
+          // has not opened (zulip-mcp sends the same field).
+          mcplChannelId: channelMcplId,
           threadTs: msg.threadTs,
           authorId: msg.authorId,
           authorName: msg.authorName,
