@@ -1,0 +1,2 @@
+- Cache channel registrations only after the host accepts each descriptor, so `refresh_channels` can recover rejected or timed-out registrations. Discard stale listings and acknowledgements after a registration re-grant.
+- Refuse `state/rollback` until the current connection establishes its initial policy, including when a TCP client reconnects with an earlier checkpoint.
