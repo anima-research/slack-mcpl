@@ -1,0 +1,2 @@
+- TCP reconnects keep one Slack forwarding callback and reset peer-owned channel, routing, and backscroll state. Pending work from an old connection cannot alter the next peer's context; subscriptions and rollback checkpoints remain intact (#4).
+- Concurrent messages in one conversation share first-interaction preparation and arrive in order, without repeating backscroll. Other conversations remain independent (#4).
