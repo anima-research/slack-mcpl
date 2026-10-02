@@ -25,6 +25,7 @@ import type {
   FeatureSetsUpdateParams,
   PushEventParams,
   ChannelsRegisterParams,
+  ChannelsRegisterResult,
   ChannelsOpenParams,
   ChannelsOpenResult,
   ChannelsCloseParams,
@@ -119,6 +120,8 @@ export class SlackMcplServer {
   private mcplEnabled = false;
   private grant = new CapabilityGrant(buildFeatureSets());
   private channelManager = new ChannelManager();
+  /** A new registration supersedes work started under an earlier grant. */
+  private registrationGeneration = 0;
   private stateTracker = new StateTracker();
 
   /** Conversations the agent has opted into for ambient (non-mention,
@@ -354,6 +357,11 @@ export class SlackMcplServer {
 
         case method.STATE_ROLLBACK: {
           this.requireMcpl();
+          // Rollback has no capability path (§6.2), but still requires the
+          // initial policy exchange on this connection (§5.3).
+          if (!this.grant.isReady()) {
+            throw new McplRpcError(-32000, 'Initial policy not established');
+          }
           const rollbackP = params as unknown as StateRollbackParams;
           const result = await this.handleRollback(rollbackP);
           conn.sendResponse(req.id, result);
@@ -787,6 +795,10 @@ export class SlackMcplServer {
       return;
     }
 
+    const generation = ++this.registrationGeneration;
+    const isCurrent = () => this.conn === conn && !conn.isClosed &&
+      this.registrationGeneration === generation && this.grant.has('channels.register');
+
     let descriptors: ChannelDescriptor[] = [];
     try {
       const convs = await this.slack.listConversations();
@@ -797,14 +809,17 @@ export class SlackMcplServer {
     }
     dbg('registerSlackChannels', { count: descriptors.length });
     if (descriptors.length === 0) return;
-    // The grant may have been revoked, or the peer gone, while Slack answered.
-    if (this.conn !== conn || !this.grant.has('channels.register')) return;
-
-    this.channelManager.registerAll(descriptors);
+    // A revoke/re-grant can start a newer listing while Slack answers this one.
+    if (!isCurrent()) return;
 
     const regParams: ChannelsRegisterParams = { channels: descriptors };
     try {
-      await conn.sendRequest(method.CHANNELS_REGISTER, regParams);
+      const result = await conn.sendRequest(method.CHANNELS_REGISTER, regParams) as ChannelsRegisterResult;
+      if (!isCurrent()) return;
+      // §14.5 acceptance is per descriptor. Rejected, omitted, or unanswered
+      // descriptors stay unknown so refresh_channels can announce them again.
+      const accepted = new Set(result.results.filter((r) => r.accepted === true).map((r) => r.id));
+      this.channelManager.registerAll(descriptors.filter((d) => accepted.has(d.id)));
     } catch (err) {
       console.error('[slack-mcpl] Failed to register channels:', (err as Error).message);
     }
