@@ -16,9 +16,7 @@ that grant arrives; plain MCP tool calls are unaffected.
 
 ## Features
 
-- **Channels**: every conversation the bot can act in is registered as an
-  MCPL channel (`slack:<conversationId>`); `channels/publish` replies into
-  the active thread of the conversation automatically.
+- **Channels**: every conversation the bot can act in is registered as an MCPL channel (`slack:<conversationId>`). `channels/publish` follows the newest forwarded message's thread, which can change while the agent is answering. Use [`reply_message` for an explicit thread](#reply-to-a-specific-thread).
 - **Real-time events** via Socket Mode — no public webhook URL needed, so the
   server can be spawned over stdio like any other MCPL server.
 - **Addressing model**: mentions (`<@bot>`) and DMs are always delivered;
@@ -65,6 +63,26 @@ capabilities, not feature-set selection.
 
 The host receives each reply once, through `channels/publish`. The server
 does not declare `channels.streaming`.
+
+## Reply to a specific thread
+
+When answering a particular message, use `reply_message` to select its thread explicitly. Automatic prose delivery through `channels/publish` carries no thread or triggering message ID. The server uses the newest forwarded message in that Slack conversation instead: another message can redirect the reply to a different thread, or to the channel's top level ([#6](https://github.com/anima-research/slack-mcpl/issues/6)).
+
+1. Select the Slack conversation ID, such as `C123`, rather than its MCPL ID, `slack:C123`.
+2. For `messageId`, use the target message's displayed `thread=` value. If it has no `thread=`, use its `id=` to start a thread under that message. History results call these fields `threadTs` and `id`.
+3. Send the reply through `reply_message`.
+
+For example, to answer `[thread=1718000000.000100 id=1718000000.000200] Ann: Can you check this?` in conversation `C123`, call `reply_message` with:
+
+```json
+{
+  "channelId": "C123",
+  "messageId": "1718000000.000100",
+  "content": "Here is what I found."
+}
+```
+
+This selects the thread root even if another message arrives before the tool call. The automatic `channels/publish` route still has the limitation above; explicit tool replies do not change its destination.
 
 ## Setup
 
