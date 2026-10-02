@@ -144,3 +144,92 @@ test('no new reaction once stop() has begun', async () => {
   await adapter.acknowledge('C1', '2.0');
   assert.deepEqual(calls, []);
 });
+
+test('concurrent clears while reactions.add is pending share one removal', async () => {
+  const { adapter, calls, release } = makeSlowAdapter();
+  const added = adapter.acknowledge('C1', '1.0');
+  const clears = Array.from({ length: 8 }, () => adapter.clearAck('C1'));
+  release();
+  await Promise.all([added, ...clears]);
+  assert.equal(calls.filter((c) => c.startsWith('remove')).length, 1);
+});
+
+/** Hold each removal until the test lets Slack answer. */
+function makeSlowRemovalAdapter() {
+  let removes = 0;
+  let disconnected = false;
+  const answers: Array<() => void> = [];
+  const socket = {
+    on() {}, async start() {},
+    async disconnect() { disconnected = true; },
+  };
+  const web = {
+    chat: { async postMessage() { return { ts: '9.0' }; } },
+    reactions: {
+      async add() {},
+      async remove() {
+        assert.equal(disconnected, false, 'cleanup cannot call Slack after disconnect');
+        removes++;
+        await new Promise<void>((resolve) => answers.push(resolve));
+        throw new Error('network failure');
+      },
+    },
+  } as any;
+  const adapter = new SlackAdapter(web, socket, 'UBOT', 'acme', undefined, undefined, false, 'eyes');
+  return {
+    adapter,
+    get removes() { return removes; },
+    get disconnected() { return disconnected; },
+    answer() { for (const resolve of answers.splice(0)) resolve(); },
+  };
+}
+
+test('concurrent posts and explicit clears share each of five removal attempts', async () => {
+  const h = makeSlowRemovalAdapter();
+  await h.adapter.acknowledge('C1', '1.0');
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    // Every successful post starts a fire-and-forget clearAck.
+    await Promise.all(Array.from({ length: 8 }, () => h.adapter.sendMessage('C1', 'reply')));
+    const clearing = h.adapter.clearAck('C1');
+    await Promise.resolve();
+    const observed = h.removes;
+    h.answer();
+    await clearing;
+    assert.equal(observed, attempt, 'one in-flight attempt per reaction');
+  }
+  await h.adapter.clearAck('C1');
+  assert.equal(h.removes, 5, 'attempt budget is exhausted');
+  await h.adapter.stop();
+});
+
+test('stop joins an in-flight removal and leaves no retry after disconnect', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const h = makeSlowRemovalAdapter();
+  await h.adapter.start();
+  await h.adapter.acknowledge('C1', '1.0');
+  const clearing = h.adapter.clearAck('C1');
+  await Promise.resolve();
+  const stopping = h.adapter.stop();
+  await Promise.resolve();
+  const observed = h.removes;
+  h.answer();
+  await Promise.all([clearing, stopping]);
+  assert.equal(observed, 1);
+  assert.equal(h.disconnected, true);
+  t.mock.timers.tick(20 * 60 * 1000);
+  await h.adapter.clearAck('C1');
+  assert.equal(h.removes, 1);
+});
+
+test('a failed shutdown cleanup drops the scheduled retry and expiry timers', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { adapter, calls, release } = makeSlowAdapter(() => new Error('network failure'));
+  release();
+  await adapter.acknowledge('C1', '1.0');
+  await adapter.clearAck('C1'); // schedule a retry
+  await adapter.stop(); // final cleanup attempt
+  assert.equal(calls.filter((c) => c.startsWith('remove')).length, 2);
+  t.mock.timers.tick(20 * 60 * 1000);
+  await adapter.clearAck('C1');
+  assert.equal(calls.filter((c) => c.startsWith('remove')).length, 2);
+});
