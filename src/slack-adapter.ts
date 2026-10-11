@@ -8,9 +8,11 @@
  * app-level token) for real-time events — no public webhook URL needed,
  * matching the stdio-spawned server model.
  *
- * Threads map to thread_ts: incoming messages carry their thread_ts, and
- * reply/publish routing posts into the thread of the referenced message
- * (top-level when the conversation isn't threaded).
+ * Threads map to thread_ts: incoming messages carry their thread (threadOf),
+ * reply_message posts into the thread of the message it names, and
+ * channels/publish posts where its RFC-011 threadId says or, without one,
+ * into the newest incoming message's thread (top level when that wasn't
+ * threaded).
  *
  * No typing indicator: Slack's Web API exposes none for bots (RTM-only,
  * deprecated), so the server treats channels/typing as a no-op.
@@ -43,6 +45,17 @@ type AckEntry = { timer: ReturnType<typeof setTimeout>; added: Promise<boolean>;
  * (message_changed, message_deleted, channel_join, bot_message, …) is noise
  * for the inference loop. */
 const CONTENT_SUBTYPES = new Set([undefined, 'file_share', 'thread_broadcast', 'me_message']);
+
+/** The thread a Slack message sits in: its thread_ts when it is a reply, or
+ *  undefined at the top level. A thread's parent carries a thread_ts equal
+ *  to its own ts once it has replies, and is still at the top level. One
+ *  reading for history, live events and where a post landed, so they agree
+ *  (MCPL RFC-011: a top-level message names no thread). */
+export function threadOf(message: { ts?: unknown; thread_ts?: unknown }): string | undefined {
+  const thread = message.thread_ts;
+  if (thread === undefined || thread === null || thread === '') return undefined;
+  return String(thread) !== String(message.ts) ? String(thread) : undefined;
+}
 
 /** The fields of a Socket Mode message event this adapter dereferences.
  * Payloads come off the wire — everything is optional until checked. */
@@ -180,7 +193,7 @@ export interface SlackWebLike {
     replies(args: Record<string, unknown>): Promise<{ messages?: unknown[]; response_metadata?: { next_cursor?: string } }>;
   };
   chat: {
-    postMessage(args: Record<string, unknown>): Promise<{ ts?: string }>;
+    postMessage(args: Record<string, unknown>): Promise<{ ts?: string; message?: { ts?: string; thread_ts?: string } }>;
     update(args: Record<string, unknown>): Promise<unknown>;
     delete(args: Record<string, unknown>): Promise<unknown>;
   };
@@ -404,7 +417,7 @@ export class SlackAdapter {
     channelId: string,
     text: string,
     opts: { threadTs?: string } = {},
-  ): Promise<{ messageId: string }> {
+  ): Promise<{ messageId: string; landedThreadTs?: string | null }> {
     this.assertWritable(channelId);
     await this.assertNotDm(channelId);
     const result = await this.web.chat.postMessage({
@@ -413,7 +426,14 @@ export class SlackAdapter {
       ...(opts.threadTs ? { thread_ts: opts.threadTs } : {}),
     });
     void this.clearAck(channelId);
-    return { messageId: result.ts ? String(result.ts) : '' };
+    // landedThreadTs: where Slack's own response says the post landed — the
+    // thread's parent ts, null for top level, or absent when the response
+    // carried no message to tell (then nobody can say; callers must not guess).
+    const posted = result.message;
+    return {
+      messageId: result.ts ? String(result.ts) : '',
+      ...(posted ? { landedThreadTs: threadOf({ ts: posted.ts ?? result.ts, thread_ts: posted.thread_ts }) ?? null } : {}),
+    };
   }
 
   /** With SLACK_DISABLE_DMS, only a conversation Slack confirmed to be a
@@ -513,6 +533,50 @@ export class SlackAdapter {
     return { messages: await this.shapeHistory(collected), truncated };
   }
 
+  /** Why a write to `channelId` would be refused before reaching Slack
+   *  (SLACK_SEND_CHANNELS, SLACK_DISABLE_DMS), or undefined when it would go
+   *  through. Asks nothing of Slack beyond what those checks already ask. */
+  async writeRefusal(channelId: string): Promise<string | undefined> {
+    try {
+      this.assertWritable(channelId);
+      await this.assertNotDm(channelId);
+      return undefined;
+    } catch (err) {
+      return (err as Error).message;
+    }
+  }
+
+  /**
+   * Whether `ts` is a message in `channelId` that can take thread replies:
+   * a top-level message, with or without replies yet (`parent`). A reply
+   * inside some thread is `reply`; a ts Slack cannot find in this
+   * conversation is `missing`, with Slack's own code when it gave one. Any
+   * other failure throws: the caller cannot tell, and must not post on a
+   * guess.
+   */
+  async threadParent(
+    channelId: string,
+    ts: string,
+  ): Promise<{ status: 'parent' | 'reply' | 'missing'; slackError?: string }> {
+    await this.assertNotDm(channelId);
+    let first: { ts?: unknown; thread_ts?: unknown } | undefined;
+    try {
+      const result = await this.web.conversations.replies({ channel: channelId, ts, limit: 1 });
+      first = (result.messages ?? [])[0] as typeof first;
+    } catch (err) {
+      const code = (err as { data?: { error?: string } }).data?.error;
+      if (code === 'thread_not_found' || code === 'message_not_found') return { status: 'missing', slackError: code };
+      throw err;
+    }
+    if (!first || String(first.ts) !== ts) {
+      // Slack answered with a different message first: ts sits inside the
+      // thread of that parent, if anywhere.
+      const parentFirst = first?.thread_ts !== undefined && String(first.thread_ts) === String(first.ts);
+      return { status: parentFirst ? 'reply' : 'missing' };
+    }
+    return { status: threadOf(first) !== undefined ? 'reply' : 'parent' };
+  }
+
   private async shapeHistory(messages: SlackHistoryMessage[]): Promise<HistoryMessage[]> {
     // Pre-resolve author + mentioned user names in one pass.
     const ids = new Set<string>();
@@ -527,7 +591,7 @@ export class SlackAdapter {
       authorId: msg.user,
       authorName: msg.user ? (this.userNameCache.get(msg.user) ?? msg.user) : (msg.username ?? 'bot'),
       content: formatSlackText(msg.text ?? '', this.userNameCache),
-      threadTs: msg.thread_ts && msg.thread_ts !== msg.ts ? msg.thread_ts : undefined,
+      threadTs: threadOf(msg),
       timestamp: new Date(parseFloat(msg.ts ?? '0') * 1000),
       attachments: (msg.files ?? []).map((f) => ({
         name: f.name ?? 'attachment',
@@ -613,7 +677,7 @@ export class SlackAdapter {
     const msg: SlackMessageData = {
       channelId: event.channel,
       id: String(event.ts),
-      threadTs: event.thread_ts || event.root?.thread_ts || undefined,
+      threadTs: threadOf({ ts: event.ts, thread_ts: event.thread_ts || event.root?.thread_ts }),
       authorId: String(event.user),
       authorName,
       content: event.text ?? '',

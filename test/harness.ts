@@ -42,8 +42,14 @@ function fakeSocket(): FakeSocket {
   };
 }
 
-function fakeWeb(posts: unknown[], reactions: string[]): SlackWebLike {
-  return {
+/** Replace parts of the fake Slack client (a test's own platform stub). */
+export interface WebOverrides {
+  postMessage?: SlackWebLike['chat']['postMessage'];
+  replies?: SlackWebLike['conversations']['replies'];
+}
+
+function fakeWeb(posts: unknown[], reactions: string[], overrides: WebOverrides = {}): SlackWebLike {
+  const web: SlackWebLike = {
     conversations: {
       async list() {
         return { channels: [{ id: 'C1', name: 'general', is_member: true, is_im: false, is_mpim: false }] };
@@ -92,6 +98,15 @@ function fakeWeb(posts: unknown[], reactions: string[]): SlackWebLike {
       },
     },
   };
+  if (overrides.replies) web.conversations.replies = overrides.replies;
+  if (overrides.postMessage) {
+    const post = overrides.postMessage;
+    web.chat.postMessage = async (args) => {
+      posts.push(args);
+      return post(args);
+    };
+  }
+  return web;
 }
 
 export interface HarnessOptions {
@@ -101,6 +116,8 @@ export interface HarnessOptions {
   subscribeMemberChannels?: boolean;
   /** What the host answers to push/event (default true). */
   pushAccepted?: boolean;
+  /** Platform-stub replacements for parts of the fake Slack client. */
+  web?: WebOverrides;
 }
 
 export interface Harness {
@@ -126,7 +143,7 @@ export function harness(opts: HarnessOptions = {}): Harness {
   const posts: unknown[] = [];
   const reactions: string[] = [];
   const slack = new SlackAdapter(
-    fakeWeb(posts, reactions), socket, 'UBOT', 'acme',
+    fakeWeb(posts, reactions, opts.web), socket, 'UBOT', 'acme',
     undefined, opts.sendChannels, opts.disableDms, opts.ackReaction,
   );
   const server = new SlackMcplServer(slack, { subscribeMemberChannels: opts.subscribeMemberChannels });
