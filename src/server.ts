@@ -118,6 +118,18 @@ export function backscrollBlock(
 /** A Slack message ts, as a thread's parent is named (RFC-011 threadId). */
 const SLACK_TS = /^\d+\.\d+$/;
 
+/** A host-supplied value as a refusal or a log names it: JSON-encoded, and
+ *  cut short when long, so neither carries an unbounded value. */
+function brief(value: unknown, max = 40): string {
+  let text: string;
+  try {
+    text = JSON.stringify(value) ?? String(value);
+  } catch {
+    text = String(value);
+  }
+  return text.length <= max ? text : `${text.slice(0, max)}… (${text.length} characters)`;
+}
+
 export class SlackMcplServer {
   private conn: McplConnection | null = null;
   private mcplEnabled = false;
@@ -138,11 +150,11 @@ export class SlackMcplServer {
    *  only — resets on restart. */
   private forwardedWatermark = new Map<string, string>();
 
-  /** Thread routing for host publishes: the thread_ts of the most recent
-   *  incoming message per conversation. channels/publish carries no thread
-   *  information, so "reply where the conversation is" is reconstructed
-   *  here — a publish goes into the last incoming message's thread, or
-   *  top-level when the conversation isn't threaded. */
+  /** Thread routing for a host publish that names no place (no RFC-011
+   *  threadId): the thread_ts of the most recent incoming message per
+   *  conversation, so such a publish goes into that message's thread, or
+   *  top-level when it wasn't threaded. A publish carrying threadId posts
+   *  where it says and never reads this. */
   private lastIncomingThreadTs = new Map<string, string | undefined>();
 
   /** Most recently active conversation (either direction) — used to decide
@@ -446,6 +458,21 @@ export class SlackMcplServer {
       case 'channels/typing':
       case 'notifications/typing':
         break;
+
+      // MCPL RFC-011 §4: a publish carrying threadId must be a Request, since
+      // only a result can say where it landed. One sent as a Notification is
+      // dropped, never posted, and said so where an operator looks. A legacy
+      // Notification stays ignored, as before.
+      case method.CHANNELS_PUBLISH: {
+        const p = notif.params as { channelId?: unknown; threadId?: unknown } | undefined;
+        if (p?.threadId !== undefined) {
+          console.error(
+            `[slack-mcpl] channels/publish Notification carrying threadId for ${brief(p.channelId)} dropped: ` +
+              'a targeted publish must be a Request (MCPL RFC-011); nothing was posted',
+          );
+        }
+        break;
+      }
 
       default:
         // Ignore unknown notifications
@@ -883,6 +910,9 @@ export class SlackMcplServer {
   private async handlePublish(
     params: ChannelsPublishParams & { threadId?: unknown },
   ): Promise<ChannelsPublishResult & { threadId?: string | null; reason?: string }> {
+    // RFC-011: a publish that names its place takes its own path.
+    if (params.threadId !== undefined) return this.publishTargeted(params, params.threadId);
+
     const parsed = parseMcplChannelId(params.channelId);
     if (!parsed) {
       throw new Error(`Invalid channel ID: ${params.channelId}`);
@@ -899,32 +929,55 @@ export class SlackMcplServer {
       return { delivered: false, messageId: undefined };
     }
 
+    // A legacy caller (no RFC-011 target): reply in the thread of the most
+    // recent incoming message on this conversation; top-level when it
+    // wasn't threaded. Kept exactly for callers that name no place.
     const conversationId = parsed.conversationId;
-    if (params.threadId === undefined) {
-      // A legacy caller (no RFC-011 target): reply in the thread of the most
-      // recent incoming message on this conversation; top-level when it
-      // wasn't threaded. Kept exactly for callers that name no place.
-      const threadTs = this.lastIncomingThreadTs.get(conversationId);
-      const result = await this.slack.sendMessage(conversationId, text, threadTs ? { threadTs } : {});
-      this.stateTracker.recordSent(result.messageId, conversationId, text);
-      this.markOutbound(conversationId);
-      dbg('handlePublish:sent', { channelId: params.channelId, messageId: result.messageId, threadTs });
-      return { delivered: true, messageId: result.messageId };
-    }
+    const threadTs = this.lastIncomingThreadTs.get(conversationId);
+    const result = await this.slack.sendMessage(conversationId, text, threadTs ? { threadTs } : {});
+    this.stateTracker.recordSent(result.messageId, conversationId, text);
+    this.markOutbound(conversationId);
+    dbg('handlePublish:sent', { channelId: params.channelId, messageId: result.messageId, threadTs });
+    return { delivered: true, messageId: result.messageId };
+  }
 
-    // RFC-011: the caller named the place — a thread's parent ts, or null
-    // for top level — and every conversation declares publish.target
-    // 'exact'. It lands exactly there or fails with nothing posted
-    // (delivered: false, no message id); it is never moved to the top level
-    // or to another thread, and the latest-incoming heuristic plays no part.
-    const target = params.threadId;
+  /**
+   * A publish carrying RFC-011 threadId. The caller named the place, a
+   * thread's parent ts or null for the top level, and every conversation
+   * declares publish.target 'exact', so it lands exactly there or is refused
+   * with nothing posted ({delivered: false, reason}, no message id). It is
+   * never moved to the top level or to another thread, and the
+   * latest-incoming heuristic plays no part.
+   *
+   * Every failure before the post is sent is such a refusal, with the
+   * target's form checked first. After it is sent, Slack's own refusal is
+   * one too; anything else stays an error, RFC-011's unconfirmed outcome.
+   */
+  private async publishTargeted(
+    params: ChannelsPublishParams,
+    target: unknown,
+  ): Promise<ChannelsPublishResult & { threadId?: string | null; reason?: string }> {
     const refuse = (reason: string) => {
-      dbg('handlePublish:refused-target', { channelId: params.channelId, threadId: target, reason });
+      dbg('handlePublish:refused-target', { channelId: brief(params.channelId), threadId: brief(target), reason });
       return { delivered: false, reason };
     };
     if (target !== null && !(typeof target === 'string' && SLACK_TS.test(target))) {
-      return refuse(`invalid threadId ${JSON.stringify(target)}: expected a thread's parent ts, or null for the top level`);
+      return refuse(`invalid threadId ${brief(target)}: expected a thread's parent ts, or null for the top level; nothing was posted`);
     }
+    const parsed = typeof params.channelId === 'string' ? parseMcplChannelId(params.channelId) : null;
+    if (!parsed) {
+      return refuse(`invalid channelId ${brief(params.channelId)}: expected slack:<conversation ID>; nothing was posted`);
+    }
+    const blocks: unknown[] = Array.isArray(params.content) ? params.content : [];
+    const text = blocks
+      .filter((b): b is { type: 'text'; text: string } =>
+        typeof b === 'object' && b !== null && (b as { type?: unknown }).type === 'text' &&
+        typeof (b as { text?: unknown }).text === 'string')
+      .map((b) => b.text)
+      .join('\n');
+    if (!text) return refuse('no text content to post; nothing was posted');
+    const conversationId = parsed.conversationId;
+
     // A write this server would refuse before reaching Slack
     // (SLACK_SEND_CHANNELS, SLACK_DISABLE_DMS) is a certain no-post: say so.
     const blocked = await this.slack.writeRefusal(conversationId);
@@ -935,15 +988,18 @@ export class SlackMcplServer {
     // Slack would do with it there. (A deletion in the moment between this
     // check and the post is the one case left to the platform.)
     if (typeof target === 'string') {
-      let status: 'parent' | 'reply' | 'missing';
+      let found: Awaited<ReturnType<SlackAdapter['threadParent']>>;
       try {
-        status = await this.slack.threadParent(conversationId, target);
+        found = await this.slack.threadParent(conversationId, target);
       } catch (err) {
         return refuse(`could not confirm thread ${target} in this conversation (${(err as Error).message}); nothing was posted`);
       }
-      if (status !== 'parent') {
-        return refuse(status === 'reply'
-          ? `${target} is a reply inside a thread, not a thread's parent; nothing was posted`
+      if (found.status === 'reply') {
+        return refuse(`${target} is a reply inside a thread, not a thread's parent; nothing was posted`);
+      }
+      if (found.status === 'missing') {
+        return refuse(found.slackError
+          ? `Slack found no message ${target} in this conversation to reply under (${found.slackError}); nothing was posted`
           : `no message ${target} in this conversation to reply under; nothing was posted`);
       }
     }

@@ -9,7 +9,9 @@ import type { SlackConversationInfo } from './slack-adapter.js';
  * Where a channels/publish lands (MCPL RFC-011 `capabilities.publish`).
  * Every Slack conversation can hold threads, and this server posts exactly
  * where a publish carrying `threadId` asks — that thread, or top level for
- * `null` — or fails with nothing posted (see handlePublish). Local until
+ * `null` — or refuses it with nothing posted (see publishTargeted). An error
+ * after the post was sent (a lost connection, Slack's internal_error or
+ * fatal_error) is RFC-011's third outcome, unconfirmed. Local until
  * @animalabs/mcpl-core ships the RFC-011 types.
  */
 export type SlackChannelDescriptor = ChannelDescriptor & {

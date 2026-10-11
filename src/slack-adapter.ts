@@ -8,9 +8,11 @@
  * app-level token) for real-time events — no public webhook URL needed,
  * matching the stdio-spawned server model.
  *
- * Threads map to thread_ts: incoming messages carry their thread_ts, and
- * reply/publish routing posts into the thread of the referenced message
- * (top-level when the conversation isn't threaded).
+ * Threads map to thread_ts: incoming messages carry their thread (threadOf),
+ * reply_message posts into the thread of the message it names, and
+ * channels/publish posts where its RFC-011 threadId says or, without one,
+ * into the newest incoming message's thread (top level when that wasn't
+ * threaded).
  *
  * No typing indicator: Slack's Web API exposes none for bots (RTM-only,
  * deprecated), so the server treats channels/typing as a no-op.
@@ -43,6 +45,17 @@ type AckEntry = { timer: ReturnType<typeof setTimeout>; added: Promise<boolean>;
  * (message_changed, message_deleted, channel_join, bot_message, …) is noise
  * for the inference loop. */
 const CONTENT_SUBTYPES = new Set([undefined, 'file_share', 'thread_broadcast', 'me_message']);
+
+/** The thread a Slack message sits in: its thread_ts when it is a reply, or
+ *  undefined at the top level. A thread's parent carries a thread_ts equal
+ *  to its own ts once it has replies, and is still at the top level. One
+ *  reading for history, live events and where a post landed, so they agree
+ *  (MCPL RFC-011: a top-level message names no thread). */
+export function threadOf(message: { ts?: unknown; thread_ts?: unknown }): string | undefined {
+  const thread = message.thread_ts;
+  if (thread === undefined || thread === null || thread === '') return undefined;
+  return String(thread) !== String(message.ts) ? String(thread) : undefined;
+}
 
 /** The fields of a Socket Mode message event this adapter dereferences.
  * Payloads come off the wire — everything is optional until checked. */
@@ -419,7 +432,7 @@ export class SlackAdapter {
     const posted = result.message;
     return {
       messageId: result.ts ? String(result.ts) : '',
-      ...(posted ? { landedThreadTs: posted.thread_ts ? String(posted.thread_ts) : null } : {}),
+      ...(posted ? { landedThreadTs: threadOf({ ts: posted.ts ?? result.ts, thread_ts: posted.thread_ts }) ?? null } : {}),
     };
   }
 
@@ -537,10 +550,14 @@ export class SlackAdapter {
    * Whether `ts` is a message in `channelId` that can take thread replies:
    * a top-level message, with or without replies yet (`parent`). A reply
    * inside some thread is `reply`; a ts Slack cannot find in this
-   * conversation is `missing`. Any other failure throws: the caller cannot
-   * tell, and must not post on a guess.
+   * conversation is `missing`, with Slack's own code when it gave one. Any
+   * other failure throws: the caller cannot tell, and must not post on a
+   * guess.
    */
-  async threadParent(channelId: string, ts: string): Promise<'parent' | 'reply' | 'missing'> {
+  async threadParent(
+    channelId: string,
+    ts: string,
+  ): Promise<{ status: 'parent' | 'reply' | 'missing'; slackError?: string }> {
     await this.assertNotDm(channelId);
     let first: { ts?: unknown; thread_ts?: unknown } | undefined;
     try {
@@ -548,15 +565,16 @@ export class SlackAdapter {
       first = (result.messages ?? [])[0] as typeof first;
     } catch (err) {
       const code = (err as { data?: { error?: string } }).data?.error;
-      if (code === 'thread_not_found' || code === 'message_not_found') return 'missing';
+      if (code === 'thread_not_found' || code === 'message_not_found') return { status: 'missing', slackError: code };
       throw err;
     }
     if (!first || String(first.ts) !== ts) {
       // Slack answered with a different message first: ts sits inside the
       // thread of that parent, if anywhere.
-      return first?.thread_ts !== undefined && String(first.thread_ts) === String(first.ts) ? 'reply' : 'missing';
+      const parentFirst = first?.thread_ts !== undefined && String(first.thread_ts) === String(first.ts);
+      return { status: parentFirst ? 'reply' : 'missing' };
     }
-    return first.thread_ts !== undefined && String(first.thread_ts) !== ts ? 'reply' : 'parent';
+    return { status: threadOf(first) !== undefined ? 'reply' : 'parent' };
   }
 
   private async shapeHistory(messages: SlackHistoryMessage[]): Promise<HistoryMessage[]> {
@@ -573,7 +591,7 @@ export class SlackAdapter {
       authorId: msg.user,
       authorName: msg.user ? (this.userNameCache.get(msg.user) ?? msg.user) : (msg.username ?? 'bot'),
       content: formatSlackText(msg.text ?? '', this.userNameCache),
-      threadTs: msg.thread_ts && msg.thread_ts !== msg.ts ? msg.thread_ts : undefined,
+      threadTs: threadOf(msg),
       timestamp: new Date(parseFloat(msg.ts ?? '0') * 1000),
       attachments: (msg.files ?? []).map((f) => ({
         name: f.name ?? 'attachment',
@@ -659,7 +677,7 @@ export class SlackAdapter {
     const msg: SlackMessageData = {
       channelId: event.channel,
       id: String(event.ts),
-      threadTs: event.thread_ts || event.root?.thread_ts || undefined,
+      threadTs: threadOf({ ts: event.ts, thread_ts: event.thread_ts || event.root?.thread_ts }),
       authorId: String(event.user),
       authorName,
       content: event.text ?? '',

@@ -17,8 +17,9 @@ that grant arrives; plain MCP tool calls are unaffected.
 ## Features
 
 - **Channels**: every conversation the bot can act in is registered as an
-  MCPL channel (`slack:<conversationId>`); `channels/publish` replies into
-  the active thread of the conversation automatically.
+  MCPL channel (`slack:<conversationId>`); a `channels/publish` without
+  `threadId` replies into the active thread of the conversation
+  automatically (see Targeted publish).
 - **Real-time events** via Socket Mode — no public webhook URL needed, so the
   server can be spawned over stdio like any other MCPL server.
 - **Addressing model**: mentions (`<@bot>`) and DMs are always delivered;
@@ -35,10 +36,14 @@ that grant arrives; plain MCP tool calls are unaffected.
   token is never sent to any other host) and size-capped at 5MB.
 - **Targeted publish** (MCPL RFC-011): every conversation declares
   `capabilities.publish.target: 'exact'`. A host that sends `threadId` on
-  `channels/publish` gets exactly that place, a thread's parent ts or
-  `null` for the top level, or a refusal with nothing posted; the result
-  echoes where Slack says the post landed. Without `threadId`, publish
-  follows the newest incoming message's thread as before (#6).
+  `channels/publish` gets exactly that place, a thread's parent ts or `null`
+  for the top level, or a refusal with nothing posted; the result echoes
+  where Slack's response says the post landed, when the response says. An
+  error after the post was sent (a lost connection, or Slack's
+  `internal_error` or `fatal_error`) can't say whether it landed, and the
+  host counts it unconfirmed. Without `threadId`, publish still follows the
+  newest incoming message's thread, for callers that name no place; #6
+  reports how that placement misroutes replies.
 - **Rollback**: `slack.messaging` supports MCPL checkpoints — rolling back
   deletes the messages the bot sent after the checkpoint (best-effort).
 
