@@ -25,7 +25,6 @@ import type {
   FeatureSetsUpdateParams,
   PushEventParams,
   ChannelsRegisterParams,
-  ChannelsRegisterResult,
   ChannelsOpenParams,
   ChannelsOpenResult,
   ChannelsCloseParams,
@@ -357,11 +356,6 @@ export class SlackMcplServer {
 
         case method.STATE_ROLLBACK: {
           this.requireMcpl();
-          // Rollback has no capability path (§6.2), but still requires the
-          // initial policy exchange on this connection (§5.3).
-          if (!this.grant.isReady()) {
-            throw new McplRpcError(-32000, 'Initial policy not established');
-          }
           const rollbackP = params as unknown as StateRollbackParams;
           const result = await this.handleRollback(rollbackP);
           conn.sendResponse(req.id, result);
@@ -813,15 +807,58 @@ export class SlackMcplServer {
     if (!isCurrent()) return;
 
     const regParams: ChannelsRegisterParams = { channels: descriptors };
+    let answer: unknown;
     try {
-      const result = await conn.sendRequest(method.CHANNELS_REGISTER, regParams) as ChannelsRegisterResult;
-      if (!isCurrent()) return;
-      // §14.5 acceptance is per descriptor. Rejected, omitted, or unanswered
-      // descriptors stay unknown so refresh_channels can announce them again.
-      const accepted = new Set(result.results.filter((r) => r.accepted === true).map((r) => r.id));
-      this.channelManager.registerAll(descriptors.filter((d) => accepted.has(d.id)));
+      answer = await conn.sendRequest(method.CHANNELS_REGISTER, regParams);
     } catch (err) {
       console.error('[slack-mcpl] Failed to register channels:', (err as Error).message);
+      return;
+    }
+    if (!isCurrent()) return;
+    this.applyRegistrationAnswer(descriptors, answer);
+  }
+
+  /**
+   * Record the host's itemized channels/register answer (§14.5), descriptor by
+   * descriptor, so the registry holds what the host's latest answer accepted.
+   * `accepted: true` makes a descriptor known. `accepted: false` forgets it,
+   * and closes it if it was open. A descriptor the answer leaves out, or
+   * answers without a boolean `accepted`, stays as it was: that says nothing
+   * about what the host holds, and an unknown one stays for refresh_channels
+   * to announce again.
+   */
+  private applyRegistrationAnswer(sent: ChannelDescriptor[], answer: unknown): void {
+    const results = (answer as { results?: unknown } | null | undefined)?.results;
+    if (!Array.isArray(results)) {
+      console.error('[slack-mcpl] The host answered channels/register without itemized results, so no channel was accepted');
+      return;
+    }
+    const answered = new Map<string, { accepted: boolean; reason?: unknown }>();
+    for (const r of results) {
+      const { id, accepted, reason } = (r ?? {}) as { id?: unknown; accepted?: unknown; reason?: unknown };
+      if (typeof id === 'string' && typeof accepted === 'boolean') answered.set(id, { accepted, reason });
+    }
+    const refused: string[] = [];
+    const unanswered: string[] = [];
+    for (const d of sent) {
+      const a = answered.get(d.id);
+      if (!a) {
+        unanswered.push(d.id);
+      } else if (a.accepted) {
+        this.channelManager.register(d);
+      } else {
+        this.channelManager.unregister(d.id);
+        refused.push(typeof a.reason === 'string' && a.reason ? `${d.id} (${a.reason})` : d.id);
+      }
+    }
+    // One line per answer, so an operator can see why a conversation never registered.
+    if (refused.length > 0 || unanswered.length > 0) {
+      console.error(
+        `[slack-mcpl] Of ${sent.length} channels sent to channels/register, the host refused ${refused.length}` +
+          (refused.length > 0 ? `: ${refused.join(', ')}` : '') +
+          `; it left ${unanswered.length} unanswered` +
+          (unanswered.length > 0 ? `: ${unanswered.join(', ')}` : ''),
+      );
     }
   }
 
@@ -855,8 +892,20 @@ export class SlackMcplServer {
     added: Array<{ id: string; label: string }>;
     note: string;
   }> {
+    const conn = this.conn;
     const convs = await this.slack.listConversations();
     const descriptors = convs.map((c) => toDescriptor(c, this.slack.teamName, this.slack.canWrite(c.id)));
+    // As registration does after its listing: a listing begun for a peer that
+    // has since gone neither writes the registry nor announces. The grant is
+    // checked next, in registerAndNotifyNew (serve() handles one request at a
+    // time, so no featureSets/update lands during the listing).
+    if (this.conn !== conn || conn?.isClosed) {
+      return {
+        visible: descriptors.length,
+        added: [],
+        note: "The host's connection closed while Slack was listing conversations; nothing was announced.",
+      };
+    }
     const added = this.registerAndNotifyNew(descriptors);
     return {
       visible: descriptors.length,
@@ -871,15 +920,22 @@ export class SlackMcplServer {
   }
 
   private handleChannelOpen(params: ChannelsOpenParams): ChannelsOpenResult {
+    // A request that names a channel, by its exact id (which mcpl-core prefers)
+    // or by its conversation's address, opens that channel or fails. Opening
+    // another instead would send that other conversation's messages to the
+    // host as channels/incoming, while the named one stays closed.
     const addr = params.address as { channelId?: string } | undefined;
-    if (params.type === 'slack' && addr?.channelId) {
-      const desc = this.channelManager.openByConversationId(addr.channelId);
+    const named = params.channelId
+      ?? (params.type === 'slack' && addr?.channelId ? mcplChannelId(addr.channelId) : undefined);
+    if (named !== undefined) {
+      const desc = this.channelManager.open(named);
       if (desc) {
         return { channel: desc };
       }
+      throw new Error('No matching channel found');
     }
 
-    // Fall back to the first registered channel of the requested type
+    // A request that names no channel opens the first registered channel of its type
     for (const desc of this.channelManager.getAll()) {
       if (desc.type === params.type) {
         this.channelManager.open(desc.id);
@@ -930,6 +986,19 @@ export class SlackMcplServer {
         checkpoint: params.checkpoint,
         success: false,
         reason: `Feature set '${params.featureSet}' does not support rollback`,
+      };
+    }
+
+    // This server's rule, not the spec's: rollback deletes the bot's messages
+    // through chat.delete, a slack.messaging write, so it runs only while
+    // slack.messaging is active on the connection asking. §5.3 keeps it
+    // inactive until that connection's initial policy. A refusal leaves the
+    // checkpoint in place.
+    if (!this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) {
+      return {
+        checkpoint: params.checkpoint,
+        success: false,
+        reason: `Feature set '${MESSAGING_FEATURE_SET}' is not active on this connection`,
       };
     }
 
