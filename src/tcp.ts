@@ -1,37 +1,63 @@
 /**
- * The TCP transport's accept loop, apart from the CLI so it can be tested.
+ * The TCP transport: serving MCPL clients on a listening server, apart from
+ * the CLI so it can be tested.
  */
 
 import type * as net from 'node:net';
 import { McplConnection } from '@animalabs/mcpl-core';
 
 /**
- * Accept MCPL connections on a listening TCP server and serve them one at a
- * time, for as long as the process runs.
+ * Serve MCPL clients on a listening TCP server, one at a time, for as long as
+ * the process runs. It owns the server's 'connection' and 'error' events for
+ * the server's life, which a one-at-a-time server needs: mcpl-core's
+ * `acceptTcp` takes a single connection, and leaves the server unheard
+ * between accepts.
  *
- * An 'error' the server emits while a client is being served (an accept
- * that fails for the next one, say) is logged, and serving goes on. Without
- * this listener, what became of it would depend on mcpl-core: 0.3.0's
- * `acceptTcp` leaves an 'error' listener behind for each connection it
- * accepts, which swallows it unseen, and once mcpl-core-ts#12 stops that
- * leak nothing would hear it, and an 'error' nobody hears ends the process.
- * An 'error' while an accept is pending still rejects `acceptTcp`, which
- * ends the loop, as before.
+ * - A client that connects while none is served is served: `serve` runs with
+ *   its connection, and once that ends, however it ends, the connection is
+ *   closed and the next client can be served. A rejection from `serve` is
+ *   logged.
+ * - A client that connects while another is served is refused: its socket
+ *   is destroyed at once, and the refusal logged. Its 'error' listener goes
+ *   on first, so nothing that socket reports can go unheard.
+ * - An 'error' the server emits (an accept that fails, say) is logged
+ *   whenever it comes, and serving goes on: Node's server keeps listening.
  *
- * Call it once the server is listening: before that, the listener added
- * here would also catch a failure to listen (a port already taken), and the
- * caller would wait for a 'listening' that never comes.
+ * The server must be listening already, or this throws: a failure to listen
+ * (a port already taken) belongs to the caller, and with the 'error'
+ * listener added here it would only be logged, and the caller would wait for
+ * a 'listening' that never comes.
  */
-export async function serveTcp(
+export function serveTcp(
   tcpServer: net.Server,
   serve: (conn: McplConnection) => Promise<void>,
   log: (...args: unknown[]) => void = console.error,
-): Promise<never> {
-  tcpServer.on('error', (err) => log('[slack-mcpl] TCP server error:', err));
-  while (true) {
-    const conn = await McplConnection.acceptTcp(tcpServer);
-    log('[slack-mcpl] Client connected');
-    await serve(conn);
-    log('[slack-mcpl] Client disconnected, waiting for next...');
+): void {
+  if (!tcpServer.listening) {
+    throw new Error("serveTcp needs a listening server: call it once the server has emitted 'listening'");
   }
+  tcpServer.on('error', (err) => log('[slack-mcpl] TCP server error:', err));
+  // Set before anything awaits, so two clients connecting in the same tick
+  // can't both be served.
+  let serving = false;
+  tcpServer.on('connection', (socket) => {
+    if (serving) {
+      socket.on('error', (err) => log('[slack-mcpl] Refused client socket error:', err));
+      socket.destroy();
+      log('[slack-mcpl] Refused a client: one client is served at a time');
+      return;
+    }
+    serving = true;
+    // fromTcp listens for the socket's errors before this handler returns.
+    const conn = McplConnection.fromTcp(socket);
+    log('[slack-mcpl] Client connected');
+    void Promise.resolve()
+      .then(() => serve(conn))
+      .catch((err) => log('[slack-mcpl] Serving a client failed:', err))
+      .finally(() => {
+        conn.close();
+        serving = false;
+        log('[slack-mcpl] Client disconnected, waiting for next...');
+      });
+  });
 }

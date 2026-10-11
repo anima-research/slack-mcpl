@@ -1,8 +1,14 @@
-- With `--tcp`, an error the TCP server emits while a client is being served
-  (an accept that fails for the next client, say) is logged, and serving
-  goes on. Before, mcpl-core 0.3.0's `acceptTcp` left an 'error' listener
-  behind for each accepted connection, which swallowed such an error unseen;
-  with a release carrying anima-research/mcpl-core-ts#12, which stops that
-  leak, nothing would have heard it, and the process would have ended. An
-  error while the server waits for a client still ends the process, as
-  before.
+- With `--tcp`, the server keeps serving through what it can survive. An
+  error the TCP server emits (an accept that fails, say) is logged whenever
+  it comes, whether a client is being served or not. A client that leaves
+  before `initialize`, or whose serving fails, ends only its own
+  connection, and the next client is served. Before, any of these could
+  end the process.
+- With `--tcp`, a client that connects while another is being served is
+  refused at once. Before, it was left connected and never read, holding
+  its connection open until the process exited.
+- Each Slack message reaches the host once. The server added a message
+  forwarder for each client it served and never removed one, so with
+  `--tcp` the third client got every message three times.
+- A line from the host that isn't JSON is logged, and the connection goes
+  on. Before, it ended the process.
