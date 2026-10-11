@@ -1,2 +1,1 @@
-- Concurrent acknowledgement cleanup shares one removal attempt and respects the five-attempt limit. Shutdown cancels pending expiry and retry timers instead of retrying against a disconnected Slack client (#9).
-- Empty or whitespace-only `SLACK_DISABLE_DMS` and `SLACK_SUBSCRIBE_MEMBER_CHANNELS` values stop startup, as other invalid boolean values do (#9).
+- Acknowledgement cleanup makes at most five removal attempts per reaction, however posts, the ten-minute expiry and shutdown overlap: they share one attempt at a time (#9). At shutdown each pending reaction gets one attempt, and one that fails is dropped rather than retried a minute later.

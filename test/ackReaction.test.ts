@@ -145,7 +145,7 @@ test('no new reaction once stop() has begun', async () => {
   assert.deepEqual(calls, []);
 });
 
-test('concurrent clears while reactions.add is pending share one removal', async () => {
+test('concurrent clears while reactions.add is pending share one removal', { timeout: 5000 }, async () => {
   const { adapter, calls, release } = makeSlowAdapter();
   const added = adapter.acknowledge('C1', '1.0');
   const clears = Array.from({ length: 8 }, () => adapter.clearAck('C1'));
@@ -157,6 +157,7 @@ test('concurrent clears while reactions.add is pending share one removal', async
 /** Hold each removal until the test lets Slack answer. */
 function makeSlowRemovalAdapter() {
   let removes = 0;
+  let afterDisconnect = 0;
   let disconnected = false;
   const answers: Array<() => void> = [];
   const socket = {
@@ -168,7 +169,9 @@ function makeSlowRemovalAdapter() {
     reactions: {
       async add() {},
       async remove() {
-        assert.equal(disconnected, false, 'cleanup cannot call Slack after disconnect');
+        // Counted here, asserted by the test: a throw here would be caught
+        // as a failed removal.
+        if (disconnected) afterDisconnect++;
         removes++;
         await new Promise<void>((resolve) => answers.push(resolve));
         throw new Error('network failure');
@@ -179,12 +182,13 @@ function makeSlowRemovalAdapter() {
   return {
     adapter,
     get removes() { return removes; },
+    get afterDisconnect() { return afterDisconnect; },
     get disconnected() { return disconnected; },
     answer() { for (const resolve of answers.splice(0)) resolve(); },
   };
 }
 
-test('concurrent posts and explicit clears share each of five removal attempts', async () => {
+test('concurrent posts and explicit clears share each of five removal attempts', { timeout: 5000 }, async () => {
   const h = makeSlowRemovalAdapter();
   await h.adapter.acknowledge('C1', '1.0');
   for (let attempt = 1; attempt <= 5; attempt++) {
@@ -202,7 +206,7 @@ test('concurrent posts and explicit clears share each of five removal attempts',
   await h.adapter.stop();
 });
 
-test('stop joins an in-flight removal and leaves no retry after disconnect', async (t) => {
+test('stop joins an in-flight removal and leaves no retry after disconnect', { timeout: 5000 }, async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const h = makeSlowRemovalAdapter();
   await h.adapter.start();
@@ -217,7 +221,10 @@ test('stop joins an in-flight removal and leaves no retry after disconnect', asy
   assert.equal(observed, 1);
   assert.equal(h.disconnected, true);
   t.mock.timers.tick(20 * 60 * 1000);
+  await flush();
+  h.answer(); // settle any removal the tick started, so a regression fails here rather than hangs
   await h.adapter.clearAck('C1');
+  assert.equal(h.afterDisconnect, 0, 'no call reached Slack after disconnect');
   assert.equal(h.removes, 1);
 });
 
@@ -232,4 +239,80 @@ test('a failed shutdown cleanup drops the scheduled retry and expiry timers', as
   t.mock.timers.tick(20 * 60 * 1000);
   await adapter.clearAck('C1');
   assert.equal(calls.filter((c) => c.startsWith('remove')).length, 2);
+});
+
+/** Let timer callbacks and the removals they start run to completion. */
+async function flush() {
+  for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
+}
+
+const removals = (calls: string[]) => calls.filter((c) => c.startsWith('remove'));
+
+test('an unanswered acknowledgement comes off at the ten-minute mark, with no post', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { adapter, calls, release } = makeSlowAdapter();
+  release();
+  await adapter.acknowledge('C1', '1.0');
+  t.mock.timers.tick(10 * 60 * 1000 - 1);
+  await flush();
+  assert.deepEqual(removals(calls), []);
+  t.mock.timers.tick(1);
+  await flush();
+  assert.deepEqual(removals(calls), ['remove:1.0']);
+});
+
+test('a failed removal is tried again a minute later, with no one calling', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let failure: Error | null = new Error('socket hang up');
+  const { adapter, calls, release } = makeSlowAdapter(() => failure);
+  release();
+  await adapter.acknowledge('C1', '1.0');
+  await adapter.clearAck('C1'); // the bot posted there, and this attempt fails
+  failure = null;
+  t.mock.timers.tick(60 * 1000 - 1);
+  await flush();
+  assert.deepEqual(removals(calls), ['remove:1.0:failed']);
+  t.mock.timers.tick(1);
+  await flush();
+  assert.deepEqual(removals(calls), ['remove:1.0:failed', 'remove:1.0']);
+});
+
+test('a retry replaces the expiry timer: no extra attempt when the ten minutes run out', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { adapter, calls, release } = makeSlowAdapter(() => new Error('socket hang up'));
+  release();
+  await adapter.acknowledge('C1', '1.0');
+  t.mock.timers.tick(9.5 * 60 * 1000);
+  await adapter.clearAck('C1'); // fails at 9.5 minutes, so the retry is due at 10.5
+  t.mock.timers.tick(30 * 1000);
+  await flush();
+  assert.equal(removals(calls).length, 1, 'nothing at 10 minutes: the expiry timer was cancelled');
+  t.mock.timers.tick(30 * 1000);
+  await flush();
+  assert.equal(removals(calls).length, 2, 'the retry at 10.5 minutes');
+});
+
+test('an add that failed leaves no timer to clear a later acknowledgement early', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const calls: string[] = [];
+  let addFails = true;
+  const socket = { on() {}, async start() {}, async disconnect() {} } as any;
+  const web = {
+    chat: { async postMessage() { return { ts: '9.0' }; } },
+    reactions: {
+      add: async ({ timestamp }: any) => { if (addFails) throw new Error('missing_scope'); calls.push(`add:${timestamp}`); },
+      remove: async ({ timestamp }: any) => { calls.push(`remove:${timestamp}`); },
+    },
+  } as any;
+  const adapter = new SlackAdapter(web, socket, 'UBOT', 'acme', undefined, undefined, false, 'eyes');
+  await adapter.acknowledge('C1', '1.0'); // the add fails, so the entry is dropped
+  t.mock.timers.tick(5 * 60 * 1000);
+  addFails = false;
+  await adapter.acknowledge('C1', '1.0'); // the same message, acknowledged again, now added
+  t.mock.timers.tick(5 * 60 * 1000); // the first acknowledgement's ten minutes
+  await flush();
+  assert.deepEqual(calls, ['add:1.0'], 'not cleared early by the dropped entry\'s timer');
+  t.mock.timers.tick(5 * 60 * 1000); // its own ten minutes
+  await flush();
+  assert.deepEqual(calls, ['add:1.0', 'remove:1.0']);
 });
