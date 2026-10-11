@@ -132,9 +132,16 @@ export class SlackMcplServer {
   private subscribedChannels = new Set<string>();
   private subscriptionsLoaded = false;
 
-  /** Per-conversation ts of the newest message forwarded to this peer.
-   *  A new peer needs its own first-interaction backscroll. */
+  /** Per-conversation ts of the newest message this peer has taken. Its
+   *  presence marks the peer's first interaction with the conversation as
+   *  done, so a new peer gets its own first-interaction backscroll. */
   private forwardedWatermark = new Map<string, string>();
+
+  /** Conversations this process has delivered a message from, to any peer.
+   *  A mention auto-subscribes a conversation only on the process's first
+   *  delivery from it, so an agent's unsubscribe_channel holds until the
+   *  process restarts, whichever peer it reconnects as. */
+  private deliveredThisProcess = new Set<string>();
 
   /** Thread routing for host publishes: the thread_ts of the most recent
    *  incoming message per conversation. channels/publish carries no thread
@@ -211,7 +218,10 @@ export class SlackMcplServer {
         console.error('[slack-mcpl] Connection error:', err);
       }
     } finally {
+      // A failed handshake ends here too: close the connection, so a TCP
+      // client isn't left on a socket nobody serves.
       this.conn = null;
+      conn.close();
     }
   }
 
@@ -991,37 +1001,47 @@ export class SlackMcplServer {
       authorId: msg.authorId,
       mentionsBot: msg.mentionsBot,
       isDM: msg.isDM,
-      hasConn: !!conn,
+      current: isCurrent(),
       mcplEnabled: this.mcplEnabled,
     });
-    // Queued work belongs to the peer that received it.
-    // §6.7: a disabled slack.messaging stops its traffic at once — incoming
-    // and push alike. False before the initial policy exchange too (§5.3):
-    // fail closed until the host's featureSets/update Request is answered.
-    if (!isCurrent()) return;
-
     // Direct address (mention or DM) always reaches the agent. Ambient
     // messages only flow from subscribed conversations — otherwise every
     // visible channel would pour unbounded noise into context. The wake
     // decision is the host's, via the chat:* tags below.
     const isAddressed = msg.mentionsBot || msg.isDM;
+    const releaseAck = () => {
+      if (isAddressed) void this.slack.clearAck(msg.channelId, msg.id);
+    };
+    // Queued work belongs to the peer that received it. When that peer has
+    // left, or its messaging was switched off, before the message reaches it,
+    // the message is dropped; an addressed one says so once on stderr.
+    const abandon = () => {
+      if (!isAddressed) return;
+      const why = this.conn === conn && !conn.isClosed ? 'slack.messaging was switched off' : 'its peer disconnected';
+      console.error(`[slack-mcpl] Dropped addressed message ${msg.id} in ${msg.channelId}: ${why} before delivery`);
+      releaseAck();
+    };
+    // §6.7: a disabled slack.messaging stops its traffic at once — incoming
+    // and push alike. False before the initial policy exchange too (§5.3):
+    // fail closed until the host's featureSets/update Request is answered.
+    if (!isCurrent()) return abandon();
+
     if (!isAddressed && !this.isChannelSubscribed(msg.channelId)) {
       dbg('handleSlackMessage:drop', { reason: 'ambient-not-subscribed', channelId: msg.channelId });
       return;
     }
     if (isAddressed) void this.slack.acknowledge(msg.channelId, msg.id);
-    const releaseAck = () => {
-      if (isAddressed) void this.slack.clearAck(msg.channelId, msg.id);
-    };
 
     // First-interaction handling: when about to forward the very first
     // message from this conversation for this peer, pull backscroll for
-    // context. For channels reached via mention, also auto-subscribe and
-    // emit a system note. DMs always come through, so no subscription
-    // note for them — just the backscroll.
+    // context. A mention in a channel the process has never delivered from
+    // also auto-subscribes it, with a system note. DMs always come through,
+    // so no subscription note for them — just the backscroll. Both are
+    // committed in taken(), once the host has the message that carries them.
     this.ensureSubscriptionsLoaded();
     const isFirstInteraction = !this.forwardedWatermark.has(msg.channelId);
     let prefixBlock = '';
+    let autoSubscribe = false;
     if (isFirstInteraction && isAddressed) {
       let backscroll: Awaited<ReturnType<typeof this.slack.fetchHistory>>['messages'] = [];
       try {
@@ -1036,17 +1056,17 @@ export class SlackMcplServer {
         dbg('backscroll:fetch-failed', { channelId: msg.channelId, error: (err as Error).message });
       }
 
-      if (!isCurrent()) return releaseAck();
+      if (!isCurrent()) return abandon();
       const meta = await this.slack.getConversationMeta(msg.channelId).catch(() => null);
-      if (!isCurrent()) return releaseAck();
+      if (!isCurrent()) return abandon();
       const blocks: string[] = [];
       // In member mode every conversation is subscribed unless muted, and a
       // mention must not undo a mute.
-      if (!msg.isDM && !this.opts.subscribeMemberChannels) {
+      if (!msg.isDM && !this.opts.subscribeMemberChannels && !this.deliveredThisProcess.has(msg.channelId)) {
         const where = meta?.name ? `#${meta.name}` : `conversation ${msg.channelId}`;
         const wasSubscribed = this.isChannelSubscribed(msg.channelId);
         if (!wasSubscribed) {
-          this.subscribe(msg.channelId);
+          autoSubscribe = true;
           blocks.push(
             `<system>Auto-subscribed to ${where} because you were mentioned. ` +
               `Ambient (non-mention) messages from this conversation will now arrive in your context. ` +
@@ -1083,7 +1103,7 @@ export class SlackMcplServer {
     const meta = contextChanged
       ? await this.slack.getConversationMeta(msg.channelId).catch(() => null)
       : null;
-    if (!isCurrent()) return releaseAck();
+    if (!isCurrent()) return abandon();
     const channelIsOpen = this.channelManager.isOpen(channelMcplId);
     const location = locationHeader({
       conversation: !contextChanged ? undefined : msg.isDM ? 'DM' : meta?.name ? `#${meta.name}` : undefined,
@@ -1093,10 +1113,8 @@ export class SlackMcplServer {
     });
     const renderedContent = `${prefixBlock}${location}${msg.authorName}: ${msg.cleanContent}`;
 
-    // Advance trackers before forwarding: watermark (bounds future
-    // backscroll), thread routing (publishes follow the conversation), and
-    // the location-header context.
-    this.forwardedWatermark.set(msg.channelId, msg.id);
+    // Advance the routing trackers before forwarding: thread routing
+    // (publishes follow the conversation) and the location-header context.
     this.lastIncomingThreadTs.set(msg.channelId, msg.threadTs);
     this.lastChannelId = msg.channelId;
 
@@ -1135,9 +1153,16 @@ export class SlackMcplServer {
     };
 
     // The reaction says "received". If the host does not take the message,
-    // take the reaction off.
+    // take the reaction off, and commit nothing: the next message from here
+    // is still a first interaction. Once the host has it, the note it carries
+    // is true, so the conversation is subscribed even if the peer has gone
+    // since; the per-peer state is recorded only for a peer still current.
     const taken = () => {
-      if (isCurrent() && noteReadOnly) this.readOnlyNoted.add(msg.channelId);
+      this.deliveredThisProcess.add(msg.channelId);
+      if (autoSubscribe) this.subscribe(msg.channelId);
+      if (!isCurrent()) return;
+      this.forwardedWatermark.set(msg.channelId, msg.id);
+      if (noteReadOnly) this.readOnlyNoted.add(msg.channelId);
     };
 
     // If this channel is open, use channels/incoming; otherwise push/event
