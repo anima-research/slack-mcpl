@@ -41,6 +41,7 @@ import type {
 
 import type { SlackAdapter, SlackMessageData } from './slack-adapter.js';
 import { toolDefinitions } from './tools.js';
+import { withToolClasses } from './tool-classes.js';
 import { buildFeatureSets, buildServerCapabilities, featureSetForTool, MESSAGING_FEATURE_SET } from './feature-sets.js';
 import { ChannelManager, mcplChannelId, parseMcplChannelId, toDescriptor } from './channels.js';
 import { StateTracker } from './state.js';
@@ -289,8 +290,9 @@ export class SlackMcplServer {
     try {
       switch (req.method) {
         case 'tools/list': {
-          const tools = this.slack.dmsWritable ? toolDefinitions : toolDefinitions.filter((t) => t.name !== 'send_dm');
-          conn.sendResponse(req.id, { tools });
+          const listed = this.slack.dmsWritable ? toolDefinitions : toolDefinitions.filter((t) => t.name !== 'send_dm');
+          // MCPL RFC-008: each tool carries its class in _meta['mcpl/class'].
+          conn.sendResponse(req.id, { tools: withToolClasses(listed) });
           break;
         }
 
@@ -1165,6 +1167,9 @@ export class SlackMcplServer {
           source: 'slack',
           messageId: msg.id,
           channelId: msg.channelId,
+          // The MCPL channel ID, so a host can route and type to a channel it
+          // has not opened (zulip-mcp sends the same field).
+          mcplChannelId: channelMcplId,
           threadTs: msg.threadTs,
           authorId: msg.authorId,
           authorName: msg.authorName,
