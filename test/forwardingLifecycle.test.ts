@@ -640,6 +640,23 @@ test('a header prepared while another conversation awaits the host still names i
   assert.doesNotMatch(pushText(peer.deliveries()[3]), /#general/, "C2's late acceptance doesn't change the context");
 });
 
+test("a refusal leaves another conversation's context standing", async (t) => {
+  const gate = deferred<boolean>();
+  const f = fixture();
+  const peer = connect(f.server, (req) => pushText(req).includes('id=111.1') ? gate.promise : true);
+  t.after(async () => { await peer.close(); gate.resolve(false); });
+  await peer.ready();
+  f.emit('111.1', 'C1');
+  await until(() => peer.deliveries().length === 1, "C1's message, its answer pending");
+  f.emit('111.2', 'C2');
+  await until(() => peer.deliveries().length === 2, "C2's message");
+  gate.resolve(false);
+  await until(() => f.cleared.length === 1, "C1's refusal");
+  f.emit('111.3', 'C2');
+  await until(() => peer.deliveries().length === 3, "C2's next message");
+  assert.doesNotMatch(pushText(peer.deliveries()[2]), /#general/, 'the host last saw C2, so its next message needs no name');
+});
+
 test('an unsubscribe handled during the last lookup withholds the auto-subscribe note', async (t) => {
   const gate = deferred<void>();
   let lookups = 0;
