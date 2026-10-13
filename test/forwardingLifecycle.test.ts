@@ -1,6 +1,9 @@
 import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { McplConnection, method, type JsonRpcRequest } from '@animalabs/mcpl-core';
 import { SlackMcplServer } from '../src/server.js';
 import type { SlackAdapter, SlackMessageData, HistoryMessage } from '../src/slack-adapter.js';
@@ -26,6 +29,7 @@ function fixture(
   const posts: Array<{ channel: string; threadTs?: string }> = [];
   const histories: string[] = [];
   const cleared: string[] = [];
+  const acknowledged: string[] = [];
   const slack = {
     teamName: 'acme', botUserId: 'UBOT', dmsWritable: true,
     canWrite,
@@ -39,7 +43,7 @@ function fixture(
       histories.push(channel);
       return { messages: await history(channel), truncated: false };
     },
-    async acknowledge() {},
+    async acknowledge(channel: string, ts: string) { acknowledged.push(`${channel}/${ts}`); },
     async clearAck(channel: string, ts?: string) { cleared.push(`${channel}/${ts}`); },
     async sendMessage(channel: string, _text: string, opts: { threadTs?: string } = {}) {
       posts.push({ channel, ...opts });
@@ -48,7 +52,7 @@ function fixture(
   } as unknown as SlackAdapter;
   const server = new SlackMcplServer(slack);
   return {
-    server, handlers, histories, posts, cleared,
+    server, slack, handlers, histories, posts, cleared, acknowledged,
     emit(id: string, channelId = 'C1', overrides: Partial<SlackMessageData> = {}) {
       const msg: SlackMessageData = {
         channelId, id, authorId: 'U2', authorName: 'Ann', content: 'hello', cleanContent: 'hello',
@@ -61,24 +65,30 @@ function fixture(
 }
 
 /** `accepts` decides the host's answer to each delivery (default: taken). */
-function connect(server: SlackMcplServer, accepts: (delivery: JsonRpcRequest) => boolean = () => true) {
+function connect(server: SlackMcplServer, accepts: (delivery: JsonRpcRequest) => boolean | Promise<boolean> = () => true) {
   const toServer = new PassThrough();
   const toHost = new PassThrough();
   const conn = McplConnection.fromStreams(toServer, toHost);
   conn.requestTimeout = 500;
   const host = McplConnection.fromStreams(toHost, toServer);
   const requests: JsonRpcRequest[] = [];
-  host.on('request', (req) => {
+  host.on('request', async (req) => {
     requests.push(req);
     if (host.isClosed) return; // An old peer cannot answer a stale delivery.
     if (req.method === method.CHANNELS_REGISTER) {
       const params = req.params as { channels: { id: string }[] };
       host.sendResponse(req.id, { results: params.channels.map((c) => ({ id: c.id, accepted: true })) });
-    } else if (req.method === method.CHANNELS_INCOMING) {
-      host.sendResponse(req.id, { results: [{ accepted: accepts(req) }] });
     } else {
-      assert.equal(req.method, method.PUSH_EVENT);
-      host.sendResponse(req.id, { accepted: accepts(req) });
+      assert.ok(req.method === method.CHANNELS_INCOMING || req.method === method.PUSH_EVENT);
+      try {
+        const accepted = await accepts(req);
+        if (host.isClosed) return;
+        host.sendResponse(req.id, req.method === method.CHANNELS_INCOMING
+          ? { results: [{ accepted }] }
+          : { accepted });
+      } catch (err) {
+        if (!host.isClosed) host.sendError(req.id, -32001, (err as Error).message);
+      }
     }
   });
   const served = server.serve(conn);
@@ -278,9 +288,9 @@ test('a new peer does not publish into the previous peer\x27s last thread', asyn
 });
 
 test('a message whose peer leaves during a metadata lookup changes nothing for the next peer', async () => {
-  // Lookup 1 is the first-interaction one, before the mention auto-subscribes.
-  // Lookup 2 is the location header's, before the conversation's thread and
-  // watermark are recorded. Each has its own check.
+  // Lookup 1 prepares the first-interaction note; lookup 2 prepares the
+  // location header. The later check catches either abandonment. The earlier
+  // check saves the location lookup; neither lookup commits delivery state.
   for (const gated of [1, 2]) {
     const gate = deferred<void>();
     let lookups = 0;
@@ -494,4 +504,288 @@ test('a connection whose serving fails while its peer is still there is closed, 
   } finally {
     await next.close();
   }
+});
+
+const logLines = (errors: ReturnType<typeof mock.method>) =>
+  errors.mock.calls.map((c) => c.arguments.join(' '));
+const subscriptions = async (peer: ReturnType<typeof connect>) => {
+  const result = await peer.host.sendRequest('tools/call', { name: 'list_subscriptions', arguments: {} });
+  return JSON.stringify(result);
+};
+
+test('arrival drops name addressed messages with no peer or messaging off, but stay quiet for plain MCP', async (t) => {
+  const f = fixture();
+  const errors = t.mock.method(console, 'error', () => {});
+  f.emit('111.1');
+  f.emit('111.2', 'C1', { mentionsBot: false });
+  assert.deepEqual(logLines(errors).filter((l) => l.includes('Dropped addressed message')), [
+    '[slack-mcpl] Dropped addressed message 111.1 in C1: no peer connected before delivery',
+  ]);
+
+  const plain = connect(f.server);
+  await plain.host.sendRequest(method.INITIALIZE, { capabilities: {} });
+  plain.host.sendNotification('notifications/initialized');
+  f.emit('112.1');
+  await settle();
+  await plain.close();
+
+  const peer = connect(f.server);
+  t.after(() => peer.close());
+  await peer.ready();
+  await peer.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: ['tools'] });
+  f.emit('113.1');
+  await settle();
+  assert.deepEqual(logLines(errors).filter((l) => l.includes('Dropped addressed message')), [
+    '[slack-mcpl] Dropped addressed message 111.1 in C1: no peer connected before delivery',
+    '[slack-mcpl] Dropped addressed message 113.1 in C1: slack.messaging was switched off before delivery',
+  ]);
+  assert.deepEqual(f.acknowledged, []);
+  assert.equal(peer.deliveries().length, 0);
+});
+
+for (const lookup of ['history', 'first metadata', 'location metadata'] as const) {
+  test(`a stalled ${lookup} lookup times out and lets its conversation continue`, async (t) => {
+    const gate = deferred<void>();
+    let metaCalls = 0;
+    const f = fixture(
+      async () => { if (lookup === 'history') await gate.promise; return [historyMessage]; },
+      async () => {
+        metaCalls++;
+        if (lookup === 'first metadata' && metaCalls === 1 ||
+            lookup === 'location metadata' && metaCalls === 2) await gate.promise;
+      },
+    );
+    const peer = connect(f.server);
+    try {
+      await peer.ready();
+      t.mock.timers.enable({ apis: ['setTimeout'] });
+      f.emit('111.1');
+      f.emit('111.2');
+      await settle();
+      assert.equal(peer.deliveries().length, 0);
+      t.mock.timers.tick(5000);
+      await settle();
+      await settle();
+      assert.equal(peer.deliveries().length, 2, 'optional data cannot hold the conversation indefinitely');
+      const text = pushText(peer.deliveries()[0]);
+      if (lookup === 'history') assert.doesNotMatch(text, /<backscroll/);
+      else assert.match(text, /<backscroll/);
+      assert.doesNotMatch(pushText(peer.deliveries()[1]), /<backscroll/);
+      gate.resolve();
+      await settle();
+      assert.equal(peer.deliveries().length, 2, 'a late result sends nothing more');
+    } finally {
+      t.mock.timers.reset();
+      await peer.close();
+      gate.resolve();
+    }
+  });
+}
+
+test('an explicit unsubscribe before any delivery settles auto-subscription across peers', async (t) => {
+  const f = fixture();
+  const first = connect(f.server);
+  await first.ready();
+  await first.host.sendRequest('tools/call', { name: 'unsubscribe_channel', arguments: { channelId: 'C1' } });
+  await first.close();
+  const peer = connect(f.server);
+  t.after(() => peer.close());
+  await peer.ready();
+  f.emit('111.1');
+  await until(() => peer.deliveries().length === 1, 'mention');
+  await settle();
+  assert.doesNotMatch(pushText(peer.deliveries()[0]), /Auto-subscribed/);
+  assert.doesNotMatch(await subscriptions(peer), /C1/);
+});
+
+test('an unsubscribe during host acceptance wins over the prepared auto-subscribe note', async (t) => {
+  const gate = deferred<boolean>();
+  const f = fixture();
+  const peer = connect(f.server, () => gate.promise);
+  t.after(async () => { await peer.close(); gate.resolve(true); });
+  await peer.ready();
+  f.emit('111.1');
+  await until(() => peer.deliveries().length === 1, 'pending acceptance');
+  assert.match(pushText(peer.deliveries()[0]), /Auto-subscribed/);
+  await peer.host.sendRequest('tools/call', { name: 'unsubscribe_channel', arguments: { channelId: 'C1' } });
+  gate.resolve(true);
+  await settle();
+  assert.doesNotMatch(await subscriptions(peer), /C1/);
+});
+
+for (const opened of [false, true]) {
+  test(`a refused ${opened ? 'incoming' : 'push'} message preserves routing and location context`, async (t) => {
+    const f = fixture();
+    let deliveries = 0;
+    const peer = connect(f.server, () => ++deliveries > 1);
+    t.after(() => peer.close());
+    await peer.ready();
+    if (opened) await peer.open();
+    f.emit('111.1', 'C1', { threadTs: '110.0' });
+    await until(() => f.cleared.length === 1, 'refusal');
+    await peer.publish();
+    assert.deepEqual(f.posts, [{ channel: 'C1' }], 'the refused thread is not a publish destination');
+    f.emit('111.2', 'C2');
+    await until(() => peer.deliveries().length === 2, 'another conversation');
+    await settle();
+    f.emit('111.3', 'C1');
+    await until(() => peer.deliveries().length === 3, 'return to first conversation');
+    const req = peer.deliveries()[2];
+    const text = req.method === method.PUSH_EVENT ? pushText(req)
+      : (req.params as { messages: { content: { text: string }[] }[] }).messages[0].content[0].text;
+    assert.match(text, /#general \(acme\)/);
+  });
+}
+
+test('a refused first message leaves the next location header complete', async (t) => {
+  const f = fixture();
+  let deliveries = 0;
+  const peer = connect(f.server, () => ++deliveries > 1);
+  t.after(() => peer.close());
+  await peer.ready();
+  f.emit('111.1');
+  await until(() => f.cleared.length === 1, 'refusal');
+  f.emit('111.2');
+  await until(() => peer.deliveries().length === 2, 'next mention');
+  assert.match(pushText(peer.deliveries()[1]), /#general \(acme\)/);
+});
+
+test('an acceptance after messaging is switched off still records this peer\'s delivery context', async (t) => {
+  const gate = deferred<boolean>();
+  const f = fixture(undefined, undefined, () => false);
+  let first = true;
+  const peer = connect(f.server, () => {
+    if (first) { first = false; return gate.promise; }
+    return true;
+  });
+  t.after(async () => { await peer.close(); gate.resolve(true); });
+  await peer.ready();
+  f.emit('111.1', 'C1', { threadTs: '110.0' });
+  await until(() => peer.deliveries().length === 1, 'pending acceptance');
+  await peer.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: ['tools'] });
+  gate.resolve(true);
+  await settle();
+  await peer.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await peer.publish();
+  assert.deepEqual(f.posts, [{ channel: 'C1', threadTs: '110.0' }]);
+  f.emit('111.2');
+  await until(() => peer.deliveries().length === 2, 'next accepted message');
+  assert.equal(f.histories.length, 1, 'the accepted backscroll is recorded despite the changed grant');
+  assert.doesNotMatch(pushText(peer.deliveries()[1]), /You cannot write|#general/);
+});
+
+test('addressed messages are acknowledged at enqueue and released when messaging switches off at a lookup', async (t) => {
+  const gate = deferred<void>();
+  let lookups = 0;
+  const f = fixture(undefined, async () => { if (++lookups === 1) await gate.promise; });
+  const errors = t.mock.method(console, 'error', () => {});
+  const peer = connect(f.server);
+  t.after(async () => { await peer.close(); gate.resolve(); });
+  await peer.ready();
+  f.emit('111.1');
+  f.emit('111.2');
+  await until(() => lookups === 1, 'metadata lookup');
+  const acknowledgedAtEnqueue = [...f.acknowledged];
+  await peer.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: ['tools'] });
+  gate.resolve();
+  await until(() => f.cleared.length === 2, 'both reactions released');
+  assert.deepEqual(acknowledgedAtEnqueue, ['C1/111.1', 'C1/111.2'], 'the queued mention is already acknowledged');
+  assert.equal(peer.deliveries().length, 0);
+  assert.deepEqual(logLines(errors).filter((l) => l.includes('Dropped addressed message')), [
+    '[slack-mcpl] Dropped addressed message 111.1 in C1: slack.messaging was switched off before delivery',
+    '[slack-mcpl] Dropped addressed message 111.2 in C1: slack.messaging was switched off before delivery',
+  ]);
+});
+
+for (const opened of [false, true]) {
+  test(`a failed ${opened ? 'incoming' : 'push'} send logs its message and conversation`, async (t) => {
+    const f = fixture();
+    const errors = t.mock.method(console, 'error', () => {});
+    const peer = connect(f.server, () => { throw new Error('delivery refused by transport'); });
+    t.after(() => peer.close());
+    await peer.ready();
+    if (opened) await peer.open();
+    f.emit('111.1');
+    await until(() => f.cleared.length === 1, 'failed send releases reaction');
+    const methodName = opened ? 'channels/incoming' : 'push/event';
+    assert.ok(logLines(errors).some((l) => l.includes(methodName + ' failed') &&
+      l.includes('111.1') && l.includes('C1')));
+  });
+
+  test(`an error after accepted ${opened ? 'incoming' : 'push'} delivery is not reported as a failed send`, async (t) => {
+    const f = fixture();
+    const errors = t.mock.method(console, 'error', () => {});
+    const peer = connect(f.server);
+    t.after(() => peer.close());
+    await peer.ready();
+    if (opened) await peer.open();
+    const internal = f.server as unknown as { subscribe(id: string): boolean };
+    t.mock.method(internal, 'subscribe', () => { throw new Error('subscription commit failed'); });
+    f.emit('111.1');
+    await until(() => logLines(errors).some((l) => l.includes('subscription commit failed')), 'commit error');
+    assert.equal(peer.deliveries().length, 1);
+    assert.deepEqual(f.cleared, [], 'the received reaction belongs to an accepted delivery');
+    assert.ok(logLines(errors).some((l) => l.includes('Error forwarding Slack message')));
+    assert.ok(!logLines(errors).some((l) => l.includes(' failed:')));
+  });
+}
+
+test('a second serve closes its rejected connection and leaves the first usable', async (t) => {
+  const f = fixture();
+  const first = connect(f.server);
+  t.after(() => first.close());
+  await first.ready();
+  const second = connect(f.server);
+  t.after(() => second.host.close());
+  await assert.rejects(second.served, /already connected/);
+  assert.equal(second.serverSide.destroyed, true);
+  f.emit('111.1');
+  await until(() => first.deliveries().length === 1, 'first peer still receives messages');
+});
+
+test('a first DM has backscroll but neither an auto-subscribe note nor a subscription', async (t) => {
+  const f = fixture();
+  const peer = connect(f.server);
+  t.after(() => peer.close());
+  await peer.ready();
+  f.emit('111.1', 'D1', { isDM: true, mentionsBot: false, mentionIds: [] });
+  await until(() => peer.deliveries().length === 1, 'DM');
+  await settle();
+  const text = pushText(peer.deliveries()[0]);
+  assert.match(text, /<backscroll dm="true"/);
+  assert.doesNotMatch(text, /Auto-subscribed/);
+  assert.doesNotMatch(await subscriptions(peer), /D1/);
+});
+
+test('a first mention in a saved subscription brings no auto-subscribe note', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'slack-subscription-'));
+  const file = join(directory, 'subscriptions.json');
+  writeFileSync(file, JSON.stringify(['C1']));
+  const original = process.env.SLACK_SUBSCRIPTIONS_FILE;
+  process.env.SLACK_SUBSCRIPTIONS_FILE = file;
+  t.after(() => {
+    if (original === undefined) delete process.env.SLACK_SUBSCRIPTIONS_FILE;
+    else process.env.SLACK_SUBSCRIPTIONS_FILE = original;
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const f = fixture();
+  const peer = connect(f.server);
+  t.after(() => peer.close());
+  await peer.ready();
+  f.emit('111.1');
+  await until(() => peer.deliveries().length === 1, 'mention in saved subscription');
+  assert.match(pushText(peer.deliveries()[0]), /<backscroll/);
+  assert.doesNotMatch(pushText(peer.deliveries()[0]), /Auto-subscribed/);
+});
+
+test('a first mention in an already-subscribed conversation brings no auto-subscribe note', async (t) => {
+  const f = fixture();
+  const peer = connect(f.server);
+  t.after(() => peer.close());
+  await peer.ready();
+  await peer.host.sendRequest('tools/call', { name: 'subscribe_channel', arguments: { channelId: 'C1' } });
+  f.emit('111.1');
+  await until(() => peer.deliveries().length === 1, 'mention');
+  assert.match(pushText(peer.deliveries()[0]), /<backscroll/);
+  assert.doesNotMatch(pushText(peer.deliveries()[0]), /Auto-subscribed/);
 });

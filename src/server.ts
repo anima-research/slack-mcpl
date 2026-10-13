@@ -145,14 +145,13 @@ export class SlackMcplServer {
    *  done, so a new peer gets its own first-interaction backscroll. */
   private forwardedWatermark = new Map<string, string>();
 
-  /** Conversations this process has delivered a message from, to any peer.
-   *  A mention auto-subscribes a conversation only on the process's first
-   *  delivery from it, so an agent's unsubscribe_channel holds until the
-   *  process restarts, whichever peer it reconnects as. */
-  private deliveredThisProcess = new Set<string>();
+  /** Conversations whose auto-subscribe decision is settled for this process,
+   *  by a delivery or an explicit subscribe_channel/unsubscribe_channel choice.
+   *  A later mention cannot override that choice, even across reconnects. */
+  private autoSubscriptionSettled = new Set<string>();
 
   /** Thread routing for host publishes: the thread_ts of the most recent
-   *  incoming message per conversation. channels/publish carries no thread
+   *  incoming message this peer took per conversation. channels/publish carries no thread
    *  information, so "reply where the conversation is" is reconstructed
    *  here — a publish goes into the last incoming message's thread, or
    *  top-level when the conversation isn't threaded. */
@@ -201,7 +200,10 @@ export class SlackMcplServer {
    * this.
    */
   async serve(conn: McplConnection): Promise<void> {
-    if (this.conn) throw new Error('A client is already connected');
+    if (this.conn) {
+      conn.close();
+      throw new Error('A client is already connected');
+    }
     this.conn = conn;
 
     // Every connection starts from nothing (§5.3). Subscriptions and rollback
@@ -669,6 +671,7 @@ export class SlackMcplServer {
       case 'subscribe_channel': {
         this.ensureSubscriptionsLoaded();
         const channelId = this.requireString(args, 'channelId');
+        this.autoSubscriptionSettled.add(channelId);
         return this.subscribe(channelId)
           ? this.opts.subscribeMemberChannels
             ? `Unmuted conversation ${channelId}: its ambient messages arrive again.`
@@ -681,6 +684,7 @@ export class SlackMcplServer {
       case 'unsubscribe_channel': {
         this.ensureSubscriptionsLoaded();
         const channelId = this.requireString(args, 'channelId');
+        this.autoSubscriptionSettled.add(channelId);
         return this.unsubscribe(channelId)
           ? this.opts.subscribeMemberChannels
             ? `Muted ambient messages in conversation ${channelId} until you subscribe_channel it again. Mentions and DMs from there will still arrive.`
@@ -993,7 +997,14 @@ export class SlackMcplServer {
   private setupSlackForwarding(): void {
     this.slack.onMessage((msg) => {
       const conn = this.conn;
-      if (!conn || !this.mcplEnabled || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
+      if (!conn || !this.mcplEnabled || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) {
+        if ((msg.mentionsBot || msg.isDM) && (!conn || this.mcplEnabled)) {
+          const why = conn ? 'slack.messaging was switched off' : 'no peer connected';
+          console.error(`[slack-mcpl] Dropped addressed message ${msg.id} in ${msg.channelId}: ${why} before delivery`);
+        }
+        return;
+      }
+      if (msg.mentionsBot || msg.isDM) void this.slack.acknowledge(msg.channelId, msg.id);
       const previous = this.forwarding.get(msg.channelId) ?? Promise.resolve();
       const pending = previous.then(() => this.handleSlackMessage(msg, conn)).catch((err) => {
         console.error('[slack-mcpl] Error forwarding Slack message:', err);
@@ -1013,6 +1024,22 @@ export class SlackMcplServer {
       `- ${a.name} (${a.mimeType})${a.isImage ? ' — image' : ''}, fetchable via fetch_attachment: ${a.path}`,
     );
     return `[attachments: ${attachments.length}]\n${lines.join('\n')}`;
+  }
+
+  /** Optional delivery context must not hold a conversation behind a stalled
+   *  Slack call. A late result is ignored; the client may still finish its call. */
+  private async deliveryLookup<T>(lookup: Promise<T>): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        lookup,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('Delivery lookup timed out')), 5000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private async handleSlackMessage(msg: SlackMessageData, conn: McplConnection): Promise<void> {
@@ -1053,11 +1080,10 @@ export class SlackMcplServer {
       dbg('handleSlackMessage:drop', { reason: 'ambient-not-subscribed', channelId: msg.channelId });
       return;
     }
-    if (isAddressed) void this.slack.acknowledge(msg.channelId, msg.id);
 
     // First-interaction handling: when about to forward the very first
     // message from this conversation for this peer, pull backscroll for
-    // context. A mention in a channel the process has never delivered from
+    // context. A mention whose subscription decision is still unsettled
     // also auto-subscribes it, with a system note. DMs always come through,
     // so no subscription note for them — just the backscroll. Both are
     // committed in taken(), once the host has the message that carries them.
@@ -1068,10 +1094,10 @@ export class SlackMcplServer {
     if (isFirstInteraction && isAddressed) {
       let backscroll: Awaited<ReturnType<typeof this.slack.fetchHistory>>['messages'] = [];
       try {
-        const res = await this.slack.fetchHistory(msg.channelId, {
+        const res = await this.deliveryLookup(this.slack.fetchHistory(msg.channelId, {
           limit: this.backscrollLimit,
           latest: msg.id, // never include the triggering message itself
-        });
+        }));
         // Drop the bot's own past messages — already in the agent's
         // chronicle as assistant turns, no need to re-echo.
         backscroll = res.messages.filter((m) => m.authorId !== this.slack.botUserId);
@@ -1080,12 +1106,12 @@ export class SlackMcplServer {
       }
 
       if (!isCurrent()) return abandon();
-      const meta = await this.slack.getConversationMeta(msg.channelId).catch(() => null);
+      const meta = await this.deliveryLookup(this.slack.getConversationMeta(msg.channelId)).catch(() => null);
       if (!isCurrent()) return abandon();
       const blocks: string[] = [];
       // In member mode every conversation is subscribed unless muted, and a
       // mention must not undo a mute.
-      if (!msg.isDM && !this.opts.subscribeMemberChannels && !this.deliveredThisProcess.has(msg.channelId)) {
+      if (!msg.isDM && !this.opts.subscribeMemberChannels && !this.autoSubscriptionSettled.has(msg.channelId)) {
         const where = meta?.name ? `#${meta.name}` : `conversation ${msg.channelId}`;
         const wasSubscribed = this.isChannelSubscribed(msg.channelId);
         if (!wasSubscribed) {
@@ -1124,7 +1150,7 @@ export class SlackMcplServer {
     // a message needs its ID.
     const contextChanged = this.lastChannelId !== msg.channelId;
     const meta = contextChanged
-      ? await this.slack.getConversationMeta(msg.channelId).catch(() => null)
+      ? await this.deliveryLookup(this.slack.getConversationMeta(msg.channelId)).catch(() => null)
       : null;
     if (!isCurrent()) return abandon();
     const channelIsOpen = this.channelManager.isOpen(channelMcplId);
@@ -1135,11 +1161,6 @@ export class SlackMcplServer {
       messageId: msg.id,
     });
     const renderedContent = `${prefixBlock}${location}${msg.authorName}: ${msg.cleanContent}`;
-
-    // Advance the routing trackers before forwarding: thread routing
-    // (publishes follow the conversation) and the location-header context.
-    this.lastIncomingThreadTs.set(msg.channelId, msg.threadTs);
-    this.lastChannelId = msg.channelId;
 
     const contentBlocks: ContentBlock[] = [textContent(renderedContent)];
     if (msg.attachments.length > 0) {
@@ -1177,13 +1198,16 @@ export class SlackMcplServer {
 
     // The reaction says "received". If the host does not take the message,
     // take the reaction off, and commit nothing: the next message from here
-    // is still a first interaction. Once the host has it, the note it carries
-    // is true, so the conversation is subscribed even if the peer has gone
-    // since; the per-peer state is recorded only for a peer still current.
+    // is still a first interaction. Once the host takes the auto-subscribe
+    // note, subscribe unless an explicit choice settled it during the send.
+    // Record per-peer context only for the connection that took the message.
     const taken = () => {
-      this.deliveredThisProcess.add(msg.channelId);
-      if (autoSubscribe) this.subscribe(msg.channelId);
-      if (!isCurrent()) return;
+      if (autoSubscribe && !this.autoSubscriptionSettled.has(msg.channelId)) this.subscribe(msg.channelId);
+      this.autoSubscriptionSettled.add(msg.channelId);
+      // Acceptance records what this peer received, even if its grant changed.
+      if (this.conn !== conn) return;
+      this.lastIncomingThreadTs.set(msg.channelId, msg.threadTs);
+      this.lastChannelId = msg.channelId;
       this.forwardedWatermark.set(msg.channelId, msg.id);
       if (noteReadOnly) this.readOnlyNoted.add(msg.channelId);
     };
@@ -1203,17 +1227,17 @@ export class SlackMcplServer {
         }],
       };
 
+      let res: { results?: Array<{ accepted?: boolean }> } | undefined;
       try {
-        const res = (await conn.sendRequest(method.CHANNELS_INCOMING, incomingParams)) as
-          | { results?: Array<{ accepted?: boolean }> }
-          | undefined;
+        res = await conn.sendRequest(method.CHANNELS_INCOMING, incomingParams) as typeof res;
         dbg('handleSlackMessage:sent', { method: 'channels/incoming', channelMcplId });
-        if (res?.results?.[0]?.accepted === false) releaseAck();
-        else taken();
       } catch (err) {
-        console.error('[slack-mcpl] channels/incoming failed:', (err as Error).message);
+        console.error(`[slack-mcpl] channels/incoming failed for message ${msg.id} in ${msg.channelId}:`, (err as Error).message);
         releaseAck();
+        return;
       }
+      if (res?.results?.[0]?.accepted === false) releaseAck();
+      else taken();
     } else {
       const pushParams: PushEventParams = {
         featureSet: MESSAGING_FEATURE_SET,
@@ -1237,15 +1261,17 @@ export class SlackMcplServer {
         payload: { content: contentBlocks },
       };
 
+      let res: { accepted?: boolean } | undefined;
       try {
-        const res = (await conn.sendRequest(method.PUSH_EVENT, pushParams)) as { accepted?: boolean } | undefined;
+        res = await conn.sendRequest(method.PUSH_EVENT, pushParams) as typeof res;
         dbg('handleSlackMessage:sent', { method: 'push/event', channelMcplId });
-        if (res?.accepted === false) releaseAck();
-        else taken();
       } catch (err) {
-        console.error('[slack-mcpl] push/event failed:', (err as Error).message);
+        console.error(`[slack-mcpl] push/event failed for message ${msg.id} in ${msg.channelId}:`, (err as Error).message);
         releaseAck();
+        return;
       }
+      if (res?.accepted === false) releaseAck();
+      else taken();
     }
   }
 }
