@@ -256,6 +256,38 @@ test('old queued and in-flight messages cannot change a new peer or hold up its 
   }
 });
 
+test('a DM whose peer leaves during its backscroll fetch changes nothing for the next peer', async (t) => {
+  // A DM looks up no name, so the check after its backscroll fetch is the
+  // last one before it would be sent.
+  const gate = deferred<HistoryMessage[]>();
+  let historyCalls = 0;
+  const errors = t.mock.method(console, 'error', () => {});
+  const f = fixture(() => ++historyCalls === 1 ? gate.promise : Promise.resolve([historyMessage]));
+  const dm = { isDM: true, mentionsBot: false, mentionIds: [] };
+  const first = connect(f.server);
+  await first.ready();
+  f.emit('111.1', 'D1', dm);
+  await until(() => f.histories.length > 0, "the first DM's backscroll fetch");
+  await first.close();
+
+  const next = connect(f.server);
+  try {
+    await next.ready();
+    gate.resolve([historyMessage]);
+    await until(() => f.cleared.length > 0, 'the abandoned DM releases its reaction');
+    f.emit('112.1', 'D1', dm);
+    await until(() => next.deliveries().length > 0, "the new peer's DM");
+    assert.match(pushText(next.deliveries()[0]), /\[DM \(acme\) id=112\.1\] /, 'the abandoned DM left the new peer no context');
+    assert.ok(errors.mock.calls.map((c) => c.arguments.join(' ')).includes(
+      '[slack-mcpl] Dropped addressed message 111.1 in D1 before delivery: its peer disconnected',
+    ));
+    assert.equal(first.deliveries().length, 0);
+  } finally {
+    gate.resolve([]);
+    await next.close();
+  }
+});
+
 test('closing during initialization releases the peer and allows another handshake', async () => {
   const f = fixture();
   const first = connect(f.server);
