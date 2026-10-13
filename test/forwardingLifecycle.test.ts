@@ -468,9 +468,11 @@ test("a message whose handling throws doesn't stop its conversation's later mess
 
 test('a connection whose serving fails while its peer is still there is closed, and the next peer is served', async () => {
   const f = fixture();
-  const slack = (f.server as unknown as { slack: { onMessage: (h: unknown) => void } }).slack;
-  const onMessage = slack.onMessage;
-  slack.onMessage = () => { throw new Error('forwarding setup failed'); };
+  // Forwarding is installed once, with the server, so the failure is made in
+  // the handshake, the first thing serve() does for a connection.
+  const server = f.server as unknown as { handleInitialize: () => Promise<void> };
+  const handleInitialize = server.handleInitialize;
+  server.handleInitialize = async () => { throw new Error('handshake failed'); };
   const errors = mock.method(console, 'error', () => {});
   const first = connect(f.server);
   try {
@@ -478,12 +480,12 @@ test('a connection whose serving fails while its peer is still there is closed, 
     // The peer never closed its side; the server closed the connection, so a
     // TCP client isn't left on a socket nobody serves.
     assert.equal(first.serverSide.destroyed, true);
-    assert.ok(errors.mock.calls.some((c) => String(c.arguments[1]).includes('forwarding setup failed')));
+    assert.ok(errors.mock.calls.some((c) => String(c.arguments[1]).includes('handshake failed')));
   } finally {
     first.host.close();
     errors.mock.restore();
   }
-  slack.onMessage = onMessage;
+  server.handleInitialize = handleInitialize;
   const next = connect(f.server);
   try {
     await next.ready();

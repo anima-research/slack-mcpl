@@ -41,6 +41,7 @@ import type {
 
 import type { SlackAdapter, SlackMessageData } from './slack-adapter.js';
 import { toolDefinitions } from './tools.js';
+import { withToolClasses } from './tool-classes.js';
 import { buildFeatureSets, buildServerCapabilities, featureSetForTool, MESSAGING_FEATURE_SET } from './feature-sets.js';
 import { ChannelManager, mcplChannelId, parseMcplChannelId, toDescriptor } from './channels.js';
 import { StateTracker } from './state.js';
@@ -54,6 +55,14 @@ import {
 } from './content.js';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { createRequire } from 'node:module';
+
+// tsx runs from src/; the built executable runs from dist/src/. Read the
+// release metadata from the package root in either layout, independent of cwd.
+const require = createRequire(import.meta.url);
+const { version: serverVersion } = require(
+  existsSync(new URL('../package.json', import.meta.url)) ? '../package.json' : '../../package.json',
+) as { version: string };
 
 // Diagnostic file logger — bypasses the host's stderr capture. Set
 // SLACK_MCPL_DEBUG_LOG in the spawn env to a writable absolute path to
@@ -122,7 +131,6 @@ export class SlackMcplServer {
   private stateTracker = new StateTracker();
   /** Serial delivery within a conversation; different conversations stay independent. */
   private forwarding = new Map<string, Promise<void>>();
-  private forwardingInstalled = false;
 
   /** Conversations the agent has opted into for ambient (non-mention,
    *  non-DM) message delivery. Mentions and DMs always come through
@@ -178,11 +186,19 @@ export class SlackMcplServer {
   constructor(
     private slack: SlackAdapter,
     private opts: { subscribeMemberChannels?: boolean } = {},
-  ) {}
+  ) {
+    // Once for the server's life: the adapter keeps every handler it's
+    // given, and each forwards to whichever connection is being served, so
+    // one per connection forwarded each message once per connection served.
+    this.setupSlackForwarding();
+  }
 
   /**
-   * Serve a single connection. Blocks until the connection closes.
-   * The Slack adapter should already be connected before calling this.
+   * Serve a single connection. Blocks until the connection closes, and
+   * resolves however it ends, a client that leaves before initialize
+   * included: what ends a connection is that connection's business, not the
+   * caller's. The Slack adapter should already be connected before calling
+   * this.
    */
   async serve(conn: McplConnection): Promise<void> {
     if (this.conn) throw new Error('A client is already connected');
@@ -200,8 +216,15 @@ export class SlackMcplServer {
     this.lastChannelId = null;
     this.forwarding.clear();
 
+    // The connection emits 'error' for a line that isn't JSON. Unheard,
+    // EventEmitter throws it from the stream's callback, where nothing here
+    // can catch it, and the process exits. Logged instead, so a bad line
+    // costs only itself. (A stream's own error, such as a client's reset,
+    // also reaches mcpl-core's readline interface, which hears none, so it
+    // still ends the process: mcpl-core-ts#11 is that fix.)
+    conn.on('error', (err: unknown) => console.error('[slack-mcpl] Connection error:', err));
+
     try {
-      this.setupSlackForwarding();
       await this.handleInitialize();
       while (!conn.isClosed) {
         const msg = await conn.nextMessage();
@@ -212,8 +235,10 @@ export class SlackMcplServer {
         }
       }
     } catch (err) {
+      // stderr, as every log line here: on the stdio transport, stdout is the
+      // protocol channel.
       if ((err as Error).name === 'ConnectionClosedError') {
-        console.log('[slack-mcpl] Client disconnected');
+        console.error('[slack-mcpl] Client disconnected');
       } else {
         console.error('[slack-mcpl] Connection error:', err);
       }
@@ -264,7 +289,7 @@ export class SlackMcplServer {
     const result: McplInitializeResult = {
       protocolVersion: '2024-11-05',
       capabilities,
-      serverInfo: { name: 'slack-mcpl', version: '0.1.0' },
+      serverInfo: { name: 'slack-mcpl', version: serverVersion },
     };
 
     conn.sendResponse(msg.request.id, result);
@@ -272,7 +297,7 @@ export class SlackMcplServer {
     // Wait for initialized notification
     const initedMsg = await conn.nextMessage();
     if (initedMsg.type === 'notification' && initedMsg.notification.method === 'notifications/initialized') {
-      console.log('[slack-mcpl] Client initialized' + (this.mcplEnabled ? ' (MCPL mode)' : ' (MCP mode)'));
+      console.error('[slack-mcpl] Client initialized' + (this.mcplEnabled ? ' (MCPL mode)' : ' (MCP mode)'));
     }
 
     // No default grant here (§5.3): until the host's featureSets/update
@@ -296,8 +321,9 @@ export class SlackMcplServer {
     try {
       switch (req.method) {
         case 'tools/list': {
-          const tools = this.slack.dmsWritable ? toolDefinitions : toolDefinitions.filter((t) => t.name !== 'send_dm');
-          conn.sendResponse(req.id, { tools });
+          const listed = this.slack.dmsWritable ? toolDefinitions : toolDefinitions.filter((t) => t.name !== 'send_dm');
+          // MCPL RFC-008: each tool carries its class in _meta['mcpl/class'].
+          conn.sendResponse(req.id, { tools: withToolClasses(listed) });
           break;
         }
 
@@ -965,8 +991,6 @@ export class SlackMcplServer {
   // ── Slack Event Forwarding ──
 
   private setupSlackForwarding(): void {
-    // The adapter outlives each TCP peer: install one callback per server.
-    if (this.forwardingInstalled) return;
     this.slack.onMessage((msg) => {
       const conn = this.conn;
       if (!conn || !this.mcplEnabled || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
@@ -979,7 +1003,6 @@ export class SlackMcplServer {
         if (this.forwarding.get(msg.channelId) === pending) this.forwarding.delete(msg.channelId);
       });
     });
-    this.forwardingInstalled = true;
   }
 
   /** Render attachment refs as a text block the agent can act on. Slack
@@ -1200,6 +1223,9 @@ export class SlackMcplServer {
           source: 'slack',
           messageId: msg.id,
           channelId: msg.channelId,
+          // The MCPL channel ID, so a host can route and type to a channel it
+          // has not opened (zulip-mcp sends the same field).
+          mcplChannelId: channelMcplId,
           threadTs: msg.threadTs,
           authorId: msg.authorId,
           authorName: msg.authorName,
