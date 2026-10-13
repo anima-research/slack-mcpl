@@ -11,6 +11,8 @@ export interface ToolDefinition {
     properties: Record<string, unknown>;
     required?: string[];
   };
+  /** MCP `_meta`. `tools/list` adds `mcpl/class` from src/tool-classes.ts. */
+  _meta?: Record<string, unknown>;
 }
 
 export const toolDefinitions: ToolDefinition[] = [
