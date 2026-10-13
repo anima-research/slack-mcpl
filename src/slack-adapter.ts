@@ -266,6 +266,11 @@ export class SlackAdapter {
     // cannot, and leaves them on Slack. No new ones while that runs.
     this.stopping = true;
     await Promise.all([...this.ackPending.keys()].map((c) => this.clearAck(c)));
+    // A removal that failed just before stop() began has armed its retry, and
+    // the clear above only joined it. Nothing is tried again after a stop.
+    for (const [channelId, pending] of [...this.ackPending]) {
+      for (const [ts, entry] of [...pending]) this.dropAck(channelId, ts, entry);
+    }
     if (this.socketStarted) {
       await this.socket.disconnect().catch(() => {});
       this.socketStarted = false;

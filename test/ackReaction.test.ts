@@ -228,6 +228,41 @@ test('stop joins an in-flight removal and leaves no retry after disconnect', { t
   assert.equal(h.removes, 1);
 });
 
+test('stop joining a removal that has just failed leaves no retry', { timeout: 5000 }, async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let fail!: (err: Error) => void;
+  const answer = new Promise<void>((_, reject) => { fail = reject; });
+  let removes = 0;
+  let started!: () => void;
+  const removing = new Promise<void>((resolve) => { started = resolve; });
+  let disconnected = false;
+  const socket = { on() {}, async start() {}, async disconnect() { disconnected = true; } };
+  const web = {
+    chat: { async postMessage() { return { ts: '9.0' }; } },
+    reactions: {
+      async add() {},
+      remove() { removes++; started(); return answer; },
+    },
+  } as any;
+  const adapter = new SlackAdapter(web, socket as any, 'UBOT', 'acme', undefined, undefined, false, 'eyes');
+  await adapter.start();
+  await adapter.acknowledge('C1', '1.0');
+  const clearing = adapter.clearAck('C1');
+  await removing;
+  // Registered after the removal's own await: its failure arms a retry first,
+  // then this starts stop() while that removal is still the shared one.
+  let stopping!: Promise<void>;
+  const stopStarted = answer.catch(() => { stopping = adapter.stop(); });
+  fail(new Error('network failure'));
+  await stopStarted;
+  await Promise.all([clearing, stopping]);
+  assert.equal(disconnected, true);
+  assert.equal(removes, 1);
+  t.mock.timers.tick(20 * 60 * 1000);
+  await flush();
+  assert.equal(removes, 1, 'no removal is tried after stop() resolves');
+});
+
 test('a failed shutdown cleanup drops the scheduled retry and expiry timers', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const { adapter, calls, release } = makeSlowAdapter(() => new Error('network failure'));
