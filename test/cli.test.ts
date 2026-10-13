@@ -27,9 +27,10 @@ test('a bad switch stops startup with one line, before Slack is contacted', () =
     ['SLACK_DISABLE_DMS', 'maybe'],
     ['SLACK_DISABLE_DMS', ''],
     ['SLACK_SUBSCRIBE_MEMBER_CHANNELS', ' '],
+    ['SLACK_DISABLE_DMS', '\t\n'],
   ]) {
     const run = startWith({ [name]: raw });
     assert.equal(run.status, 1, `${name}=${JSON.stringify(raw)}`);
-    assert.equal(run.stderr, `${name} must be true or false, got "${raw}"\n`);
+    assert.equal(run.stderr, `${name} must be true or false, got ${JSON.stringify(raw)}\n`);
   }
 });

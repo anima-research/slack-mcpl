@@ -4,5 +4,6 @@ export function booleanFlag(name: string, raw: string | undefined): boolean {
   const value = raw?.trim().toLowerCase();
   if (value === undefined || value === 'false' || value === '0' || value === 'no') return false;
   if (value === 'true' || value === '1' || value === 'yes') return true;
-  throw new Error(`${name} must be true or false, got "${raw}"`);
+  // Quoted as JSON, so whitespace shows and the line stays one line.
+  throw new Error(`${name} must be true or false, got ${JSON.stringify(raw)}`);
 }

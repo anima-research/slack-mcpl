@@ -16,7 +16,7 @@ test('operator switches refuse present empty, whitespace, and unrecognized value
   for (const name of ['SLACK_DISABLE_DMS', 'SLACK_SUBSCRIBE_MEMBER_CHANNELS']) {
     for (const raw of ['', '   ', '\t\n', 'maybe', 'enabled', '2']) {
       assert.throws(() => booleanFlag(name, raw), {
-        message: `${name} must be true or false, got "${raw}"`,
+        message: `${name} must be true or false, got ${JSON.stringify(raw)}`,
       });
     }
   }
