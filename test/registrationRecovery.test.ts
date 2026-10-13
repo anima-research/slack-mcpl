@@ -136,7 +136,7 @@ test('only individually accepted descriptors become known after a pending batch'
 });
 
 for (const accepted of [false, true]) {
-  test(`a refresh supersedes a pending registration's ${accepted ? 'acceptance' : 'refusal'}`, async (t) => {
+  test(`refresh_channels waits for a pending registration's ${accepted ? 'acceptance' : 'refusal'}, which applies first`, async (t) => {
     let calls = 0;
     const { slack } = fakeSlack(async () => [conversation('C1', ++calls === 1 ? 'stale' : 'fresh')]);
     const h = connect(new SlackMcplServer(slack), () => {});
@@ -144,18 +144,77 @@ for (const accepted of [false, true]) {
     await h.initialize();
     await h.grant();
     await until(() => h.requests.length === 1, 'pending registration');
-    assert.deepEqual(ids(await h.listed()), []);
 
-    await h.refresh();
-    const changed = h.notifications.find((n) => n.method === method.CHANNELS_CHANGED)!.params as { added: { id: string }[] };
-    assert.deepEqual(changed.added.map((d) => d.id), ['slack:C1']);
-    h.host.sendResponse(h.requests[0].id, { results: [{ id: 'slack:C1', accepted }] });
+    const refreshed = h.refresh();
     await settle();
+    await settle();
+    assert.equal(calls, 1, 'refresh lists only once the pending answer is in');
+    h.host.sendResponse(h.requests[0].id, { results: [{ id: 'slack:C1', accepted }] });
+    await refreshed;
+    assert.equal(calls, 2);
+    const announced = h.notifications.filter((n) => n.method === method.CHANNELS_CHANGED)
+      .flatMap((n) => (n.params as { added: { id: string }[] }).added.map((d) => d.id));
+    // An accepted channel is known before refresh lists, so it isn't announced
+    // again; a refused one is unknown again, so refresh announces it.
+    assert.deepEqual(announced, accepted ? [] : ['slack:C1']);
     const listed = await h.listed();
-    assert.deepEqual(ids(listed), ['slack:C1'], 'the older answer cannot forget the announced channel');
-    assert.equal(listed.channels[0].label, '#fresh (acme)', 'the older answer cannot overwrite the refreshed descriptor');
+    assert.deepEqual(ids(listed), ['slack:C1']);
+    assert.equal(listed.channels[0].label, '#fresh (acme)', "the registry holds refresh's newer listing");
   });
 }
+
+test("a refresh whose listing fails leaves a pending registration's accepted channels known", async (t) => {
+  let calls = 0;
+  const { slack } = fakeSlack(async () => {
+    if (++calls === 2) throw new Error('the Slack listing failed');
+    return [conversation('C1')];
+  });
+  const h = connect(new SlackMcplServer(slack), () => {});
+  t.after(() => h.close());
+  serverLog(t);
+  await h.initialize();
+  await h.grant();
+  await until(() => h.requests.length === 1, 'pending registration');
+
+  const refreshed = h.refresh() as Promise<{ isError?: boolean; content: { text: string }[] }>;
+  await settle();
+  await settle();
+  h.host.sendResponse(h.requests[0].id, { results: [{ id: 'slack:C1', accepted: true }] });
+  const result = await refreshed;
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /the Slack listing failed/);
+  assert.deepEqual(ids(await h.listed()), ['slack:C1'], 'the accepted answer stands');
+});
+
+test('a registration still listing when refresh starts sends its whole batch first', async (t) => {
+  const listing = deferred<SlackConversationInfo[]>();
+  let calls = 0;
+  const { slack } = fakeSlack(() => ++calls === 2 ? listing.promise : Promise.resolve([conversation('C1')]));
+  const h = connect(new SlackMcplServer(slack));
+  t.after(() => h.close());
+  await h.initialize();
+  await h.grant();
+  await until(() => h.requests.length === 1, 'first registration');
+  await settle();
+  assert.deepEqual(ids(await h.listed()), ['slack:C1']);
+  await h.grant(['tools']);
+  await h.grant();
+  await until(() => calls === 2, "the re-grant's listing");
+
+  const refreshed = h.refresh();
+  await settle();
+  await settle();
+  assert.equal(calls, 2, 'refresh waits for the registration in flight');
+  listing.resolve([conversation('C1'), conversation('C2')]);
+  await refreshed;
+  assert.equal(h.requests.length, 2, 'the re-grant registers');
+  assert.deepEqual(
+    (h.requests[1].params as ChannelsRegisterParams).channels.map((d) => d.id),
+    ['slack:C1', 'slack:C2'],
+    'its batch includes the channel known before the revoke',
+  );
+  assert.equal(h.notifications.filter((n) => n.method === method.CHANNELS_CHANGED).length, 0, 'refresh then finds nothing new');
+});
 
 test('a registration timeout leaves descriptors available to refresh', async (t) => {
   const log = serverLog(t);
@@ -293,6 +352,9 @@ for (const [name, params, expected] of [
   ['an address naming only a user fails', { type: 'slack', address: { userId: 'U2' } }, undefined],
   ['an address channelId opens that channel', { type: 'slack', address: { channelId: 'C2' } }, 'slack:C2'],
   ['an empty channelId leaves the address usable', { channelId: '', type: 'slack', address: { channelId: 'C2' } }, 'slack:C2'],
+  ['an exact channelId outranks a different address', { channelId: 'slack:C1', type: 'slack', address: { channelId: 'C2' } }, 'slack:C1'],
+  ['an address with an empty channelId fails', { type: 'slack', address: { channelId: '' } }, undefined],
+  ['another type does not read address.channelId', { type: 'other', address: { channelId: 'C2' } }, undefined],
 ] as const) {
   test(`channels/open: ${name}`, async (t) => {
     const { slack } = fakeSlack(async () => [conversation('C1'), conversation('C2')]);

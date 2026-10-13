@@ -130,6 +130,8 @@ export class SlackMcplServer {
   private channelManager = new ChannelManager();
   /** A new registration supersedes work started under an earlier grant. */
   private registrationGeneration = 0;
+  /** The latest registration, which refresh_channels waits for. */
+  private registration: Promise<void> = Promise.resolve();
   private stateTracker = new StateTracker();
 
   /** Conversations the agent has opted into for ambient (non-mention,
@@ -333,7 +335,7 @@ export class SlackMcplServer {
           // when the grant first allows it, and again if a later policy turns
           // it from denied to granted. The receipt above is sent first.
           if (!couldRegister && this.grant.has('channels.register')) {
-            void this.registerSlackChannels();
+            this.registration = this.registerSlackChannels();
           }
           break;
         }
@@ -913,9 +915,10 @@ export class SlackMcplServer {
     note: string;
   }> {
     const conn = this.conn;
-    // A refresh supersedes pending registrations, including their host answers.
-    // The serial request loop prevents a newer registration during this listing.
-    ++this.registrationGeneration;
+    // A registration still in flight finishes first, its host answer applied,
+    // so neither overwrites what the other writes. Requests are handled one at
+    // a time, so no newer registration starts while this one is awaited.
+    await this.registration;
     const convs = await this.slack.listConversations();
     const descriptors = convs.map((c) => toDescriptor(c, this.slack.teamName, this.slack.canWrite(c.id)));
     // As registration does after its listing: a listing begun for a peer that
