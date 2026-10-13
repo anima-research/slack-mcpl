@@ -1,7 +1,8 @@
 /**
- * The TCP transport (`serveTcp`): one client served at a time, a client that
- * connects meanwhile refused, the server's errors logged in every state, and
- * a client whose serving fails ending only its own connection.
+ * The TCP transport (`serveTcp`): one client served at a time, until its
+ * serving ends, a client that connects meanwhile refused, the server's
+ * errors logged in every state, and a client whose serving fails, or who
+ * leaves, ending only its own connection.
  *
  * Run: node --import tsx --test test/tcp.test.ts
  */
@@ -68,18 +69,29 @@ async function servedAs(conn: McplConnection): Promise<number> {
   return ((await conn.sendRequest('ping', {}, 2000)) as { client: number }).client;
 }
 
-const closed = (socket: net.Socket) => new Promise<void>((resolve) => {
-  if (socket.destroyed) resolve();
-  else socket.once('close', () => resolve());
+/** Wait for a socket to close, failing after `ms`, so a socket left open
+ *  fails the test rather than hanging it. */
+const closed = (socket: net.Socket, ms = 2000) => new Promise<void>((resolve, reject) => {
+  if (socket.destroyed) return resolve();
+  const timer = setTimeout(() => reject(new Error('timed out waiting for the socket to close')), ms);
+  socket.once('close', () => {
+    clearTimeout(timer);
+    resolve();
+  });
 });
 
 const lines = (logged: unknown[][], first: string) => logged.filter((args) => args[0] === first);
 
 test("needs a listening server, so a failure to listen stays the caller's", () => {
+  const unlistened = net.createServer();
   assert.throws(
-    () => serveTcp(net.createServer(), async () => {}, () => {}),
+    () => serveTcp(unlistened, async () => {}, () => {}),
     /serveTcp needs a listening server/,
   );
+  // Nothing was added to it: its 'error' still ends the process, as a
+  // failure to listen should.
+  assert.equal(unlistened.listenerCount('error'), 0);
+  assert.equal(unlistened.listenerCount('connection'), 0);
 });
 
 test('serves one client at a time: one that connects meanwhile is refused at once, and the first is still served', async (t) => {
@@ -172,6 +184,67 @@ test('a client whose serving fails ends only its own connection, and the next cl
   assert.equal(failed.length, 1);
   assert.equal((failed[0]![1] as Error).message, 'serving broke');
 
+  const next = await client();
+  assert.equal(await servedAs(next.conn), 0);
+});
+
+test('a serve function that throws at once is logged, and the next client is served', async (t) => {
+  const { tcpServer, client } = await listening(t);
+  const logged: unknown[][] = [];
+  const s = server();
+  let calls = 0;
+  serveTcp(tcpServer, (conn) => {
+    if (calls++ === 0) throw new Error('threw at once');
+    return s.serve(conn);
+  }, (...args) => logged.push(args));
+
+  const first = await client();
+  await closed(first.socket);
+  assert.deepEqual(lines(logged, '[slack-mcpl] Serving a client failed:').map((args) => (args[1] as Error).message), ['threw at once']);
+
+  const next = await client();
+  assert.equal(await servedAs(next.conn), 0);
+});
+
+test('a served client that leaves on its own is let go, and the next client is served', async (t) => {
+  const { tcpServer, client } = await listening(t);
+  const logged: unknown[][] = [];
+  const s = server();
+  serveTcp(tcpServer, s.serve, (...args) => logged.push(args));
+
+  const first = await client();
+  assert.equal(await servedAs(first.conn), 0);
+  first.socket.end(); // its FIN
+  await until(() => lines(logged, '[slack-mcpl] Client disconnected, waiting for next...').length === 1, 'the first client to be let go');
+
+  const next = await client();
+  assert.equal(await servedAs(next.conn), 1);
+});
+
+test('a client counts as served until its serving ends, after its socket has closed too', async (t) => {
+  const { tcpServer, client } = await listening(t);
+  const logged: unknown[][] = [];
+  const s = server();
+  let finish!: () => void;
+  const finishing = new Promise<void>((resolve) => { finish = resolve; });
+  let calls = 0;
+  serveTcp(tcpServer, async (conn) => {
+    if (calls++ > 0) return s.serve(conn);
+    // The first client's serving outlives its socket, as a request still
+    // being answered would.
+    await conn.nextMessage().catch(() => {});
+    await finishing;
+  }, (...args) => logged.push(args));
+
+  const first = await client();
+  first.socket.end();
+  await closed(first.socket);
+  const meanwhile = await client();
+  await closed(meanwhile.socket);
+  assert.equal(lines(logged, '[slack-mcpl] Refused a client: one client is served at a time').length, 1);
+
+  finish();
+  await until(() => lines(logged, '[slack-mcpl] Client disconnected, waiting for next...').length === 1, 'the first serving to end');
   const next = await client();
   assert.equal(await servedAs(next.conn), 0);
 });

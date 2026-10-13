@@ -270,7 +270,7 @@ export class SlackMcplServer {
     // Wait for initialized notification
     const initedMsg = await conn.nextMessage();
     if (initedMsg.type === 'notification' && initedMsg.notification.method === 'notifications/initialized') {
-      console.log('[slack-mcpl] Client initialized' + (this.mcplEnabled ? ' (MCPL mode)' : ' (MCP mode)'));
+      console.error('[slack-mcpl] Client initialized' + (this.mcplEnabled ? ' (MCPL mode)' : ' (MCP mode)'));
     }
 
     // No default grant here (§5.3): until the host's featureSets/update
