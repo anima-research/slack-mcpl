@@ -135,6 +135,28 @@ test('only individually accepted descriptors become known after a pending batch'
   assert.deepEqual(changed.added.map((d) => d.id), ['slack:C2', 'slack:C3']);
 });
 
+for (const accepted of [false, true]) {
+  test(`a refresh supersedes a pending registration's ${accepted ? 'acceptance' : 'refusal'}`, async (t) => {
+    let calls = 0;
+    const { slack } = fakeSlack(async () => [conversation('C1', ++calls === 1 ? 'stale' : 'fresh')]);
+    const h = connect(new SlackMcplServer(slack), () => {});
+    t.after(() => h.close());
+    await h.initialize();
+    await h.grant();
+    await until(() => h.requests.length === 1, 'pending registration');
+    assert.deepEqual(ids(await h.listed()), []);
+
+    await h.refresh();
+    const changed = h.notifications.find((n) => n.method === method.CHANNELS_CHANGED)!.params as { added: { id: string }[] };
+    assert.deepEqual(changed.added.map((d) => d.id), ['slack:C1']);
+    h.host.sendResponse(h.requests[0].id, { results: [{ id: 'slack:C1', accepted }] });
+    await settle();
+    const listed = await h.listed();
+    assert.deepEqual(ids(listed), ['slack:C1'], 'the older answer cannot forget the announced channel');
+    assert.equal(listed.channels[0].label, '#fresh (acme)', 'the older answer cannot overwrite the refreshed descriptor');
+  });
+}
+
 test('a registration timeout leaves descriptors available to refresh', async (t) => {
   const log = serverLog(t);
   const { slack } = fakeSlack();
@@ -265,6 +287,63 @@ test('channels/open that names an unregistered channel fails rather than opening
   assert.equal(await wasOpen('slack:C1'), false);
   // A request that names no channel still opens the type's first.
   assert.equal(await open({ type: 'slack', address: {} }), 'slack:C1');
+});
+
+for (const [name, params, expected] of [
+  ['an address naming only a user fails', { type: 'slack', address: { userId: 'U2' } }, undefined],
+  ['an address channelId opens that channel', { type: 'slack', address: { channelId: 'C2' } }, 'slack:C2'],
+  ['an empty channelId leaves the address usable', { channelId: '', type: 'slack', address: { channelId: 'C2' } }, 'slack:C2'],
+] as const) {
+  test(`channels/open: ${name}`, async (t) => {
+    const { slack } = fakeSlack(async () => [conversation('C1'), conversation('C2')]);
+    const h = connect(new SlackMcplServer(slack));
+    t.after(() => h.close());
+    await h.initialize();
+    await h.grant();
+    await until(() => h.requests.length === 1, 'registration');
+    await settle();
+    assert.deepEqual(ids(await h.listed()), ['slack:C1', 'slack:C2']);
+
+    const opened = h.host.sendRequest(method.CHANNELS_OPEN, params);
+    if (expected === undefined) {
+      await assert.rejects(opened, /No matching channel found/);
+    } else {
+      assert.equal(((await opened) as { channel: { id: string } }).channel.id, expected);
+    }
+    for (const channelId of ['slack:C1', 'slack:C2']) {
+      const result = await h.host.sendRequest(method.CHANNELS_CLOSE, { channelId }) as { closed: boolean };
+      assert.equal(result.closed, channelId === expected, 'only the named channel may have opened');
+    }
+  });
+}
+
+test('a later policy dropping slack.messaging refuses rollback and preserves its checkpoint', async (t) => {
+  const { slack, deleted } = fakeSlack();
+  const h = connect(new SlackMcplServer(slack));
+  t.after(() => h.close());
+  await h.initialize();
+  await h.grant();
+  const sent = await h.host.sendRequest('tools/call', {
+    name: 'send_message', arguments: { channelId: 'C1', content: 'first' },
+  }) as { state: { checkpoint: string } };
+  await h.host.sendRequest('tools/call', {
+    name: 'send_message', arguments: { channelId: 'C1', content: 'second' },
+  });
+  const rollback = () => h.host.sendRequest(method.STATE_ROLLBACK, {
+    featureSet: 'slack.messaging', checkpoint: sent.state.checkpoint,
+  }) as Promise<{ checkpoint: string; success: boolean; reason?: string }>;
+
+  await h.grant([]);
+  assert.deepEqual(await rollback(), {
+    checkpoint: sent.state.checkpoint,
+    success: false,
+    reason: "Feature set 'slack.messaging' is not active on this connection",
+  });
+  assert.deepEqual(deleted, [], 'the withdrawn grant permits no deletion');
+
+  await h.grant();
+  assert.equal((await rollback()).success, true, 'the refusal left the checkpoint usable');
+  assert.deepEqual(deleted, ['2']);
 });
 
 test('a refresh whose host leaves during its listing writes nothing for the next host', async (t) => {

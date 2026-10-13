@@ -819,13 +819,11 @@ export class SlackMcplServer {
   }
 
   /**
-   * Record the host's itemized channels/register answer (§14.5), descriptor by
-   * descriptor, so the registry holds what the host's latest answer accepted.
-   * `accepted: true` makes a descriptor known. `accepted: false` forgets it,
-   * and closes it if it was open. A descriptor the answer leaves out, or
-   * answers without a boolean `accepted`, stays as it was: that says nothing
-   * about what the host holds, and an unknown one stays for refresh_channels
-   * to announce again.
+   * Apply the host's channels/register answer (§14.5) to each descriptor it
+   * itemizes. `accepted: true` makes a descriptor known. `accepted: false`
+   * forgets it and closes it if it was open. An omitted or malformed entry
+   * counts as unanswered: its descriptor stays as it was, and an unknown
+   * one remains available for refresh_channels to announce again.
    */
   private applyRegistrationAnswer(sent: ChannelDescriptor[], answer: unknown): void {
     const results = (answer as { results?: unknown } | null | undefined)?.results;
@@ -893,6 +891,9 @@ export class SlackMcplServer {
     note: string;
   }> {
     const conn = this.conn;
+    // A refresh supersedes pending registrations, including their host answers.
+    // The serial request loop prevents a newer registration during this listing.
+    ++this.registrationGeneration;
     const convs = await this.slack.listConversations();
     const descriptors = convs.map((c) => toDescriptor(c, this.slack.teamName, this.slack.canWrite(c.id)));
     // As registration does after its listing: a listing begun for a peer that
@@ -920,15 +921,14 @@ export class SlackMcplServer {
   }
 
   private handleChannelOpen(params: ChannelsOpenParams): ChannelsOpenResult {
-    // A request that names a channel, by its exact id (which mcpl-core prefers)
-    // or by its conversation's address, opens that channel or fails. Opening
-    // another instead would send that other conversation's messages to the
-    // host as channels/incoming, while the named one stays closed.
+    // A non-empty exact id (which mcpl-core prefers) or any address field
+    // names something. Open the named channel or fail; even an address we
+    // cannot resolve must not open an unrelated conversation instead.
     const addr = params.address as { channelId?: string } | undefined;
     const named = params.channelId
-      ?? (params.type === 'slack' && addr?.channelId ? mcplChannelId(addr.channelId) : undefined);
-    if (named !== undefined) {
-      const desc = this.channelManager.open(named);
+      || (params.type === 'slack' && addr?.channelId ? mcplChannelId(addr.channelId) : undefined);
+    if (named || Object.keys(addr ?? {}).length > 0) {
+      const desc = named ? this.channelManager.open(named) : undefined;
       if (desc) {
         return { channel: desc };
       }
