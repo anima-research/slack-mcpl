@@ -160,8 +160,7 @@ export class SlackMcplServer {
   /** The conversation this peer was last sent a message from, or the bot last
    *  posted in: an incoming message from any other conversation names its
    *  own in its location header. null before the first, and after a message
-   *  the host didn't take, unless a message from another conversation or a
-   *  bot post has set it since. */
+   *  the host didn't take, unless another conversation is current by then. */
   private lastChannelId: string | null = null;
 
   /** How many backscroll messages to fetch on first interaction. Tunable via
