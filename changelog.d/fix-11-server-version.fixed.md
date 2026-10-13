@@ -1,0 +1,1 @@
+- `initialize` reports the release version from `package.json` in both source and built deployments, so hosts can identify the running release after `npm version` (#11).

@@ -18,7 +18,7 @@ const call = (server: SlackMcplServer, name: string, args: Record<string, unknow
 
 test('without the switch, a channel is subscribed only after subscribe_channel', async () => {
   delete process.env.SLACK_SUBSCRIPTIONS_FILE;
-  const server = new SlackMcplServer({} as any);
+  const server = new SlackMcplServer({ onMessage() {} } as any);
   assert.equal((server as any).isChannelSubscribed('C1'), false);
   await call(server, 'subscribe_channel', { channelId: 'C1' });
   assert.equal((server as any).isChannelSubscribed('C1'), true);
@@ -26,7 +26,7 @@ test('without the switch, a channel is subscribed only after subscribe_channel',
 
 test('with the switch, unsubscribe_channel mutes and subscribe_channel unmutes', async () => {
   delete process.env.SLACK_SUBSCRIPTIONS_FILE;
-  const server = new SlackMcplServer({} as any, { subscribeMemberChannels: true });
+  const server = new SlackMcplServer({ onMessage() {} } as any, { subscribeMemberChannels: true });
   const is = (id: string) => (server as any).isChannelSubscribed(id);
   assert.equal(is('C1'), true);
 
@@ -44,11 +44,11 @@ test('a mute survives a restart when SLACK_SUBSCRIPTIONS_FILE is set', async () 
   const file = join(mkdtempSync(join(tmpdir(), 'slack-mcpl-')), 'subs.json');
   process.env.SLACK_SUBSCRIPTIONS_FILE = file;
   try {
-    const first = new SlackMcplServer({} as any, { subscribeMemberChannels: true });
+    const first = new SlackMcplServer({ onMessage() {} } as any, { subscribeMemberChannels: true });
     await call(first, 'unsubscribe_channel', { channelId: 'C1' });
     assert.deepEqual(JSON.parse(readFileSync(file, 'utf-8')), { subscribed: [], muted: ['C1'] });
 
-    const second = new SlackMcplServer({} as any, { subscribeMemberChannels: true });
+    const second = new SlackMcplServer({ onMessage() {} } as any, { subscribeMemberChannels: true });
     assert.equal((second as any).isChannelSubscribed('C1'), false);
 
     // Nothing muted: the file is a plain array again, as older versions write it.
