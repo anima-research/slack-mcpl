@@ -600,12 +600,17 @@ for (const lookup of ['history', 'name', 'location'] as const) {
       const [first, second] = peer.deliveries().slice(before).map(pushText);
       assert.equal(/<backscroll/.test(first), lookup === 'name');
       assert.doesNotMatch(second, /<backscroll/);
-      // A header that couldn't name its conversation leaves the next message
-      // to name it.
-      assert.equal(/#general \(acme\)/.test(first), lookup === 'history');
-      assert.match(second, lookup === 'history' ? /^(?![\s\S]*#general)/ : /#general \(acme\)/);
-      assert.equal(logLines(errors).filter((l) => l.includes('Gave up on')).length, 1);
-      assert.equal(metaCalls, { history: 1, name: 2, location: 4 }[lookup], 'one metadata lookup per message');
+      // A conversation whose name didn't come in time is named by its ID, and
+      // its next message, in the same context, names nothing and looks up
+      // nothing.
+      assert.match(first, lookup === 'history' ? /\[#general \(acme\) id=111\.1\] / : /\[C1 \(acme\) id=111\.1\] /);
+      assert.match(second, /\[id=111\.2\] /);
+      assert.deepEqual(logLines(errors).filter((l) => l.includes('Gave up on')), [
+        lookup === 'history'
+          ? '[slack-mcpl] Gave up on the backscroll for message 111.1 in C1 after 5 s; delivering without it'
+          : '[slack-mcpl] Gave up on the name of conversation C1 after 5 s; delivering without it',
+      ]);
+      assert.equal(metaCalls, { history: 1, name: 1, location: 3 }[lookup], 'one metadata lookup per change of context');
       gate.resolve();
       await settle();
       assert.equal(peer.deliveries().length, before + 2, 'a late result sends nothing more');
@@ -707,7 +712,7 @@ test('an unsubscribe during host acceptance wins over the prepared auto-subscrib
 });
 
 for (const opened of [false, true]) {
-  test(`a refused ${opened ? 'incoming' : 'push'} message preserves routing and location context`, async (t) => {
+  test(`a refused ${opened ? 'incoming' : 'push'} message leaves publish routing as it was`, async (t) => {
     const f = fixture();
     let deliveries = 0;
     const peer = connect(f.server, () => ++deliveries > 1);
@@ -858,6 +863,25 @@ test('a first DM has backscroll but neither an auto-subscribe note nor a subscri
   assert.match(text, /<backscroll dm="true"/);
   assert.doesNotMatch(text, /Auto-subscribed/);
   assert.doesNotMatch(await subscriptions(peer), /D1/);
+});
+
+test('a DM looks up no conversation name, and its header says DM', async (t) => {
+  let metaCalls = 0;
+  const f = fixture(undefined, async () => { metaCalls++; });
+  const peer = connect(f.server);
+  t.after(() => peer.close());
+  await peer.ready();
+  const dm = { isDM: true, mentionsBot: false, mentionIds: [] };
+  f.emit('111.1', 'D1', dm);
+  await until(() => peer.deliveries().length === 1, 'the first DM');
+  f.emit('111.2', 'C1');
+  await until(() => peer.deliveries().length === 2, "C1's mention");
+  f.emit('111.3', 'D1', dm);
+  await until(() => peer.deliveries().length === 3, 'a DM after another conversation');
+  const texts = peer.deliveries().map(pushText);
+  assert.match(texts[0], /\[DM \(acme\) id=111\.1\] /);
+  assert.match(texts[2], /\[DM \(acme\) id=111\.3\] /);
+  assert.equal(metaCalls, 1, "only C1's name is looked up");
 });
 
 test('a first mention in a saved subscription brings no auto-subscribe note', async (t) => {

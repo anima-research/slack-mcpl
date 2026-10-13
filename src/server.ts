@@ -159,8 +159,9 @@ export class SlackMcplServer {
 
   /** The conversation this peer was last sent a message from, or the bot last
    *  posted in: an incoming message from any other conversation names its
-   *  own in its location header. null when none stands, as after a header
-   *  that couldn't name its conversation, or a message the host didn't take. */
+   *  own in its location header. null before the first, and after a message
+   *  the host didn't take, unless a message from another conversation or a
+   *  bot post has set it since. */
   private lastChannelId: string | null = null;
 
   /** How many backscroll messages to fetch on first interaction. Tunable via
@@ -1093,15 +1094,16 @@ export class SlackMcplServer {
       return;
     }
 
-    // First-interaction handling: when about to forward the very first
-    // message from this conversation for this peer, pull backscroll for
-    // context. A mention may also auto-subscribe the conversation, with a
-    // system note (below). Both are committed in taken(), once the host has
-    // the message that carries them.
+    // First-interaction handling: when the very first message from this
+    // conversation for this peer is addressed, pull backscroll for context.
+    // A mention may also auto-subscribe the conversation, with a system note
+    // (below). Both are committed in taken(), once the host has the message
+    // that carries them.
     this.ensureSubscriptionsLoaded();
     const isFirstInteraction = !this.forwardedWatermark.has(msg.channelId);
     // The conversation's metadata is looked up at most once per message: the
     // first interaction's note and backscroll and the location header share it.
+    // A DM's header says DM and a DM gets no note, so a DM looks up none.
     let meta: Awaited<ReturnType<typeof this.slack.getConversationMeta>> | undefined;
     let backscroll: Awaited<ReturnType<typeof this.slack.fetchHistory>>['messages'] = [];
     if (isFirstInteraction && isAddressed) {
@@ -1117,16 +1119,20 @@ export class SlackMcplServer {
         dbg('backscroll:fetch-failed', { channelId: msg.channelId, error: (err as Error).message });
       }
       if (!isCurrent()) return abandon();
-      meta = await this.lookUpMeta(msg);
-      if (!isCurrent()) return abandon();
+      if (!msg.isDM) {
+        meta = await this.lookUpMeta(msg);
+        if (!isCurrent()) return abandon();
+      }
     }
 
     // The conversation is named only when it differs from the last context
-    // this peer was sent. The thread and the message ID are given every time:
-    // two threads in one channel are otherwise indistinguishable, and replying
-    // or reacting to a message needs its ID.
+    // this peer was sent, which is read here, after the lookups above, since
+    // another conversation's message can go out while they run. The thread
+    // and the message ID are given every time: two threads in one channel are
+    // otherwise indistinguishable, and replying or reacting to a message needs
+    // its ID.
     const contextChanged = this.lastChannelId !== msg.channelId;
-    if (contextChanged && meta === undefined) {
+    if (contextChanged && meta === undefined && !msg.isDM) {
       meta = await this.lookUpMeta(msg);
       if (!isCurrent()) return abandon();
     }
@@ -1165,7 +1171,8 @@ export class SlackMcplServer {
 
     const channelMcplId = mcplChannelId(msg.channelId);
     const channelIsOpen = this.channelManager.isOpen(channelMcplId);
-    const conversation = !contextChanged ? undefined : msg.isDM ? 'DM' : meta?.name ? `#${meta.name}` : undefined;
+    // A conversation whose name Slack didn't give is named by its ID.
+    const conversation = !contextChanged ? undefined : msg.isDM ? 'DM' : meta?.name ? `#${meta.name}` : msg.channelId;
     const location = locationHeader({
       conversation,
       teamName: contextChanged ? this.slack.teamName : undefined,
@@ -1173,9 +1180,8 @@ export class SlackMcplServer {
       messageId: msg.id,
     });
     // The context is recorded as the message goes out, so the next message
-    // is compared with what this peer was sent last. A header that couldn't
-    // name its conversation leaves none, so the next message names its own.
-    this.lastChannelId = !contextChanged || conversation ? msg.channelId : null;
+    // is compared with what this peer was sent last.
+    this.lastChannelId = msg.channelId;
     const renderedContent = `${prefixBlock}${location}${msg.authorName}: ${msg.cleanContent}`;
 
     const contentBlocks: ContentBlock[] = [textContent(renderedContent)];
