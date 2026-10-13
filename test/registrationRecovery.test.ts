@@ -163,6 +163,49 @@ for (const accepted of [false, true]) {
   });
 }
 
+test("a pending refusal of a known, open channel applies before the refresh waiting on it, which announces the channel again", async (t) => {
+  let answer: (sent: string[]) => unknown = (sent) => ({ results: sent.map((id) => ({ id, accepted: true })) });
+  const h = connect(new SlackMcplServer(fakeSlack().slack), (req, host) => {
+    const result = answer((req.params as ChannelsRegisterParams).channels.map((c) => c.id));
+    if (result !== undefined) host.sendResponse(req.id, result);
+  });
+  t.after(() => h.close());
+  await h.initialize();
+  await h.grant();
+  await until(() => h.requests.length === 1, 'first registration');
+  await settle();
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'slack:C1', type: 'slack', address: { channelId: 'C1' } });
+
+  answer = () => undefined; // the re-grant's answer is sent below
+  await h.grant(['tools']);
+  await h.grant();
+  await until(() => h.requests.length === 2, "the re-grant's registration");
+  const refreshed = h.refresh();
+  await settle();
+  await settle();
+  h.host.sendResponse(h.requests[1].id, { results: [{ id: 'slack:C1', accepted: false }] });
+  await refreshed;
+  const announced = h.notifications.filter((n) => n.method === method.CHANNELS_CHANGED)
+    .flatMap((n) => (n.params as { added: { id: string }[] }).added.map((d) => d.id));
+  assert.deepEqual(announced, ['slack:C1'], 'the refusal forgot C1 before the refresh listed it');
+  const closing = await h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'slack:C1' }) as { closed: boolean };
+  assert.equal(closing.closed, false, 'the refusal closed C1');
+});
+
+test("a refresh waiting on an unanswered registration lists once that request times out", async (t) => {
+  const log = serverLog(t);
+  const { slack } = fakeSlack();
+  const h = connect(new SlackMcplServer(slack), () => {});
+  h.serverConn.requestTimeout = 200;
+  t.after(() => h.close());
+  await h.initialize();
+  await h.grant();
+  await until(() => h.requests.length === 1, 'registration');
+  await h.refresh();
+  assert.ok(log.some(registrationTimedOut), 'the refresh waited for the timeout');
+  assert.equal(h.notifications.filter((n) => n.method === method.CHANNELS_CHANGED).length, 1, 'then it listed and announced');
+});
+
 test("a refresh whose listing fails leaves a pending registration's accepted channels known", async (t) => {
   let calls = 0;
   const { slack } = fakeSlack(async () => {
@@ -250,6 +293,7 @@ test('a registration still listing when refresh starts sends its whole batch fir
     'its batch includes the channel known before the revoke',
   );
   assert.equal(h.notifications.filter((n) => n.method === method.CHANNELS_CHANGED).length, 0, 'refresh then finds nothing new');
+  assert.deepEqual(ids(await h.listed()), ['slack:C1', 'slack:C2'], "the re-grant's answer made both known");
 });
 
 test('a registration timeout leaves descriptors available to refresh', async (t) => {

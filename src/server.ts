@@ -919,9 +919,11 @@ export class SlackMcplServer {
     note: string;
   }> {
     const conn = this.conn;
-    // A registration still in flight finishes first, its host answer applied,
-    // so neither overwrites what the other writes. Requests are handled one at
-    // a time, so no newer registration starts while this one is awaited.
+    // The latest registration finishes first, so its host answer, if it still
+    // applies, lands before this listing instead of racing it. A channel that
+    // answer refuses is unknown again, so this refresh announces it, as any
+    // refresh after a refusal does. Requests are handled one at a time, so no
+    // newer registration starts during the wait.
     await this.registration;
     const gone = () => this.conn !== conn || !!conn?.isClosed;
     // A host that left during the wait gets nothing, so nothing is listed for it.
