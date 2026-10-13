@@ -263,6 +263,37 @@ test('stop joining a removal that has just failed leaves no retry', { timeout: 5
   assert.equal(removes, 1, 'no removal is tried after stop() resolves');
 });
 
+test('a removal that fails while stop() is still draining is not retried', { timeout: 5000 }, async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const removes: string[] = [];
+  const socket = { on() {}, async start() {}, async disconnect() {} };
+  const web = {
+    chat: { async postMessage() { return { ts: '9.0' }; } },
+    reactions: {
+      async add() {},
+      async remove({ channel }: any) {
+        removes.push(channel);
+        if (channel === 'C1') return held; // keeps stop() draining
+        throw new Error('network failure');
+      },
+    },
+  } as any;
+  const adapter = new SlackAdapter(web, socket as any, 'UBOT', 'acme', undefined, undefined, false, 'eyes');
+  await adapter.start();
+  await adapter.acknowledge('C1', '1.0');
+  await adapter.acknowledge('C2', '2.0');
+  const stopping = adapter.stop();
+  await flush();
+  // C2's removal has failed and C1's is still open, so stop() hasn't resolved.
+  t.mock.timers.tick(20 * 60 * 1000);
+  await flush();
+  assert.deepEqual(removes.sort(), ['C1', 'C2'], 'no retry while stop() drains');
+  release();
+  await stopping;
+});
+
 test('a failed shutdown cleanup drops the scheduled retry and expiry timers', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const { adapter, calls, release } = makeSlowAdapter(() => new Error('network failure'));
