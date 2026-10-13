@@ -287,61 +287,80 @@ test('a new peer does not publish into the previous peer\x27s last thread', asyn
   }
 });
 
-test('a message whose peer leaves during a metadata lookup changes nothing for the next peer', async () => {
-  // Lookup 1 prepares the first-interaction note; lookup 2 prepares the
-  // location header. The later check catches either abandonment. The earlier
-  // check saves the location lookup; neither lookup commits delivery state.
-  for (const gated of [1, 2]) {
-    const gate = deferred<void>();
-    let lookups = 0;
-    const f = fixture(undefined, async () => { if (++lookups === gated) await gate.promise; });
-    const first = connect(f.server);
-    await first.ready();
-    f.emit('111.1', 'C1', { threadTs: '110.0' });
-    await until(() => lookups === gated, `lookup ${gated} under way`);
-    await first.close();
+test('a message whose peer leaves during its metadata lookup changes nothing for the next peer', async () => {
+  const gate = deferred<void>();
+  let lookups = 0;
+  const f = fixture(undefined, async () => { if (++lookups === 1) await gate.promise; });
+  const first = connect(f.server);
+  await first.ready();
+  f.emit('111.1', 'C1', { threadTs: '110.0' });
+  await until(() => lookups === 1, 'the metadata lookup under way');
+  await first.close();
 
-    const next = connect(f.server);
-    try {
-      await next.ready();
-      if (gated === 1) {
-        gate.resolve();
-        await until(() => f.cleared.length > 0, 'the abandoned mention releases its reaction');
-        // The abandoned mention did not subscribe the conversation: an ambient
-        // message is dropped, and the mention after it is the one delivery.
-        f.emit('112.1', 'C1', { mentionsBot: false, mentionIds: [] });
-        f.emit('112.2', 'C1');
-        await until(() => next.deliveries().length > 0, 'the mention');
-        await settle();
-        assert.equal(next.deliveries().length, 1, `lookup ${gated}`);
-        assert.match(pushText(next.deliveries()[0]), /id=112.2/);
-      } else {
-        f.emit('112.1', 'C1', { threadTs: '112.0' });
-        await until(() => next.deliveries().length > 0, 'the new peer\'s mention');
-        gate.resolve();
-        await until(() => f.cleared.length > 0, 'the abandoned mention releases its reaction');
-        await next.publish();
-        assert.deepEqual(f.posts, [{ channel: 'C1', threadTs: '112.0' }], `lookup ${gated}`);
-      }
-      assert.deepEqual(f.cleared, ['C1/111.1'], `lookup ${gated}`);
-      assert.equal(first.deliveries().length, 0, `lookup ${gated}`);
-    } finally {
-      gate.resolve();
-      await next.close();
-    }
+  const next = connect(f.server);
+  try {
+    await next.ready();
+    gate.resolve();
+    await until(() => f.cleared.length > 0, 'the abandoned mention releases its reaction');
+    // The abandoned mention did not subscribe the conversation: an ambient
+    // message is dropped, and the mention after it is the one delivery.
+    f.emit('112.1', 'C1', { mentionsBot: false, mentionIds: [] });
+    f.emit('112.2', 'C1');
+    await until(() => next.deliveries().length > 0, 'the mention');
+    await settle();
+    assert.equal(next.deliveries().length, 1);
+    assert.match(pushText(next.deliveries()[0]), /id=112.2/);
+    assert.deepEqual(f.cleared, ['C1/111.1']);
+    assert.equal(first.deliveries().length, 0);
+  } finally {
+    gate.resolve();
+    await next.close();
+  }
+});
+
+test('a message whose peer leaves during its location lookup changes nothing for the next peer', async () => {
+  // C1's first interaction, then C2's: C1's next message is no first
+  // interaction but changes context, so its one lookup is the location's.
+  const gate = deferred<void>();
+  let lookups = 0;
+  const f = fixture(undefined, async () => { if (++lookups === 3) await gate.promise; });
+  const first = connect(f.server);
+  await first.ready();
+  f.emit('110.1', 'C1');
+  await until(() => first.deliveries().length === 1, "C1's first interaction");
+  f.emit('110.2', 'C2');
+  await until(() => first.deliveries().length === 2, "C2's first interaction");
+  f.emit('111.1', 'C1', { threadTs: '110.0' });
+  await until(() => lookups === 3, 'the location lookup under way');
+  await first.close();
+
+  const next = connect(f.server);
+  try {
+    await next.ready();
+    f.emit('112.1', 'C1', { threadTs: '112.0' });
+    await until(() => next.deliveries().length > 0, "the new peer's mention");
+    gate.resolve();
+    await until(() => f.cleared.length > 0, 'the abandoned mention releases its reaction');
+    await next.publish();
+    assert.deepEqual(f.posts, [{ channel: 'C1', threadTs: '112.0' }]);
+    assert.deepEqual(f.cleared, ['C1/111.1']);
+    assert.equal(first.deliveries().length, 2, 'the first peer got nothing after its lookup');
+  } finally {
+    gate.resolve();
+    await next.close();
   }
 });
 
 test('a mention abandoned at its last lookup subscribes nothing, and says so on stderr', async () => {
   const gate = deferred<void>();
   let lookups = 0;
-  const f = fixture(undefined, async () => { if (++lookups === 2) await gate.promise; });
+  const f = fixture(undefined, async () => { if (++lookups === 1) await gate.promise; });
   const errors = mock.method(console, 'error', () => {});
   try {
     const first = connect(f.server);
     await first.ready();
     f.emit('111.1');
-    await until(() => lookups === 2, 'the location lookup under way');
+    await until(() => lookups === 1, 'the metadata lookup under way');
     await first.close();
 
     const next = connect(f.server);
@@ -350,7 +369,7 @@ test('a mention abandoned at its last lookup subscribes nothing, and says so on 
       gate.resolve();
       await until(() => f.cleared.length > 0, 'the abandoned mention releases its reaction');
       const dropped = errors.mock.calls.map((c) => c.arguments.join(' ')).filter((l) => l.includes('Dropped addressed message'));
-      assert.deepEqual(dropped, ['[slack-mcpl] Dropped addressed message 111.1 in C1: its peer disconnected before delivery']);
+      assert.deepEqual(dropped, ['[slack-mcpl] Dropped addressed message 111.1 in C1 before delivery: its peer disconnected']);
       // Its auto-subscribe note never reached a host, so neither did the
       // subscription: the ambient message is dropped, and the next mention
       // brings the note.
@@ -519,7 +538,7 @@ test('arrival drops name addressed messages with no peer or messaging off, but s
   f.emit('111.1');
   f.emit('111.2', 'C1', { mentionsBot: false });
   assert.deepEqual(logLines(errors).filter((l) => l.includes('Dropped addressed message')), [
-    '[slack-mcpl] Dropped addressed message 111.1 in C1: no peer connected before delivery',
+    '[slack-mcpl] Dropped addressed message 111.1 in C1 before delivery: no peer is connected',
   ]);
 
   const plain = connect(f.server);
@@ -536,44 +555,60 @@ test('arrival drops name addressed messages with no peer or messaging off, but s
   f.emit('113.1');
   await settle();
   assert.deepEqual(logLines(errors).filter((l) => l.includes('Dropped addressed message')), [
-    '[slack-mcpl] Dropped addressed message 111.1 in C1: no peer connected before delivery',
-    '[slack-mcpl] Dropped addressed message 113.1 in C1: slack.messaging was switched off before delivery',
+    '[slack-mcpl] Dropped addressed message 111.1 in C1 before delivery: no peer is connected',
+    '[slack-mcpl] Dropped addressed message 113.1 in C1 before delivery: slack.messaging is not active',
   ]);
   assert.deepEqual(f.acknowledged, []);
   assert.equal(peer.deliveries().length, 0);
 });
 
-for (const lookup of ['history', 'first metadata', 'location metadata'] as const) {
-  test(`a stalled ${lookup} lookup times out and lets its conversation continue`, async (t) => {
+for (const lookup of ['history', 'name', 'location'] as const) {
+  test(`a stalled ${lookup} lookup gives up after five seconds, says so, and lets its conversation continue`, async (t) => {
     const gate = deferred<void>();
     let metaCalls = 0;
+    const errors = t.mock.method(console, 'error', () => {});
     const f = fixture(
       async () => { if (lookup === 'history') await gate.promise; return [historyMessage]; },
       async () => {
         metaCalls++;
-        if (lookup === 'first metadata' && metaCalls === 1 ||
-            lookup === 'location metadata' && metaCalls === 2) await gate.promise;
+        if (lookup === 'name' && metaCalls === 1 || lookup === 'location' && metaCalls === 3) await gate.promise;
       },
     );
     const peer = connect(f.server);
     try {
       await peer.ready();
+      let before = 0;
+      if (lookup === 'location') {
+        // C1's first interaction, then C2's: C1's next message is no first
+        // interaction but changes context, so its one lookup is the location's.
+        f.emit('110.1', 'C1');
+        await until(() => peer.deliveries().length === 1, "C1's first interaction");
+        f.emit('110.2', 'C2');
+        await until(() => peer.deliveries().length === 2, "C2's first interaction");
+        before = 2;
+      }
       t.mock.timers.enable({ apis: ['setTimeout'] });
       f.emit('111.1');
       f.emit('111.2');
       await settle();
-      assert.equal(peer.deliveries().length, 0);
-      t.mock.timers.tick(5000);
+      t.mock.timers.tick(4999);
       await settle();
-      await settle();
-      assert.equal(peer.deliveries().length, 2, 'optional data cannot hold the conversation indefinitely');
-      const text = pushText(peer.deliveries()[0]);
-      if (lookup === 'history') assert.doesNotMatch(text, /<backscroll/);
-      else assert.match(text, /<backscroll/);
-      assert.doesNotMatch(pushText(peer.deliveries()[1]), /<backscroll/);
+      assert.equal(peer.deliveries().length, before, 'still waiting just short of five seconds');
+      t.mock.timers.tick(1);
+      for (let i = 0; i < 50 && peer.deliveries().length < before + 2; i++) await settle();
+      assert.equal(peer.deliveries().length, before + 2, 'optional data cannot hold the conversation indefinitely');
+      const [first, second] = peer.deliveries().slice(before).map(pushText);
+      assert.equal(/<backscroll/.test(first), lookup === 'name');
+      assert.doesNotMatch(second, /<backscroll/);
+      // A header that couldn't name its conversation leaves the next message
+      // to name it.
+      assert.equal(/#general \(acme\)/.test(first), lookup === 'history');
+      assert.match(second, lookup === 'history' ? /^(?![\s\S]*#general)/ : /#general \(acme\)/);
+      assert.equal(logLines(errors).filter((l) => l.includes('Gave up on')).length, 1);
+      assert.equal(metaCalls, { history: 1, name: 2, location: 4 }[lookup], 'one metadata lookup per message');
       gate.resolve();
       await settle();
-      assert.equal(peer.deliveries().length, 2, 'a late result sends nothing more');
+      assert.equal(peer.deliveries().length, before + 2, 'a late result sends nothing more');
     } finally {
       t.mock.timers.reset();
       await peer.close();
@@ -581,6 +616,47 @@ for (const lookup of ['history', 'first metadata', 'location metadata'] as const
     }
   });
 }
+
+test('a header prepared while another conversation awaits the host still names its conversation', async (t) => {
+  const gate = deferred<boolean>();
+  const f = fixture();
+  const peer = connect(f.server, (req) => {
+    const text = req.method === method.PUSH_EVENT ? pushText(req) : '';
+    return text.includes('id=111.2') ? gate.promise : true;
+  });
+  t.after(async () => { await peer.close(); gate.resolve(true); });
+  await peer.ready();
+  f.emit('111.1', 'C1');
+  await until(() => peer.deliveries().length === 1, "C1's first message");
+  f.emit('111.2', 'C2');
+  await until(() => peer.deliveries().length === 2, "C2's message, its acceptance pending");
+  f.emit('111.3', 'C1');
+  await until(() => peer.deliveries().length === 3, "C1's next message");
+  assert.match(pushText(peer.deliveries()[2]), /#general \(acme\)/, 'the host last saw C2, so C1 names itself');
+  gate.resolve(true);
+  await settle();
+  f.emit('111.4', 'C1');
+  await until(() => peer.deliveries().length === 4, "C1's message after that");
+  assert.doesNotMatch(pushText(peer.deliveries()[3]), /#general/, "C2's late acceptance doesn't change the context");
+});
+
+test('an unsubscribe handled during the last lookup withholds the auto-subscribe note', async (t) => {
+  const gate = deferred<void>();
+  let lookups = 0;
+  const f = fixture(undefined, async () => { if (++lookups === 1) await gate.promise; });
+  const peer = connect(f.server);
+  t.after(async () => { await peer.close(); gate.resolve(); });
+  await peer.ready();
+  f.emit('111.1');
+  await until(() => lookups === 1, 'the metadata lookup under way');
+  await peer.host.sendRequest('tools/call', { name: 'unsubscribe_channel', arguments: { channelId: 'C1' } });
+  gate.resolve();
+  await until(() => peer.deliveries().length === 1, 'the mention');
+  await settle();
+  assert.match(pushText(peer.deliveries()[0]), /<backscroll/);
+  assert.doesNotMatch(pushText(peer.deliveries()[0]), /Auto-subscribed/);
+  assert.doesNotMatch(await subscriptions(peer), /C1/);
+});
 
 test('an explicit unsubscribe before any delivery settles auto-subscription across peers', async (t) => {
   const f = fixture();
@@ -692,8 +768,8 @@ test('addressed messages are acknowledged at enqueue and released when messaging
   assert.deepEqual(acknowledgedAtEnqueue, ['C1/111.1', 'C1/111.2'], 'the queued mention is already acknowledged');
   assert.equal(peer.deliveries().length, 0);
   assert.deepEqual(logLines(errors).filter((l) => l.includes('Dropped addressed message')), [
-    '[slack-mcpl] Dropped addressed message 111.1 in C1: slack.messaging was switched off before delivery',
-    '[slack-mcpl] Dropped addressed message 111.2 in C1: slack.messaging was switched off before delivery',
+    '[slack-mcpl] Dropped addressed message 111.1 in C1 before delivery: slack.messaging is not active',
+    '[slack-mcpl] Dropped addressed message 111.2 in C1 before delivery: slack.messaging is not active',
   ]);
 });
 
@@ -710,6 +786,15 @@ for (const opened of [false, true]) {
     const methodName = opened ? 'channels/incoming' : 'push/event';
     assert.ok(logLines(errors).some((l) => l.includes(methodName + ' failed') &&
       l.includes('111.1') && l.includes('C1')));
+    // Nothing was committed: the next message is still a first interaction,
+    // and its header names its conversation again.
+    f.emit('111.2');
+    await until(() => f.cleared.length === 2, 'the next failed send');
+    assert.deepEqual(f.histories, ['C1', 'C1']);
+    const second = peer.deliveries()[1];
+    const text = second.method === method.PUSH_EVENT ? pushText(second)
+      : (second.params as { messages: { content: { text: string }[] }[] }).messages[0].content[0].text;
+    assert.match(text, /#general \(acme\)/);
   });
 
   test(`an error after accepted ${opened ? 'incoming' : 'push'} delivery is not reported as a failed send`, async (t) => {
@@ -749,6 +834,7 @@ test('a first DM has backscroll but neither an auto-subscribe note nor a subscri
   t.after(() => peer.close());
   await peer.ready();
   f.emit('111.1', 'D1', { isDM: true, mentionsBot: false, mentionIds: [] });
+  assert.deepEqual(f.acknowledged, ['D1/111.1'], 'a DM is acknowledged as it enters the queue');
   await until(() => peer.deliveries().length === 1, 'DM');
   await settle();
   const text = pushText(peer.deliveries()[0]);
