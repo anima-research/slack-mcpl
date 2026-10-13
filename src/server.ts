@@ -923,13 +923,22 @@ export class SlackMcplServer {
     // so neither overwrites what the other writes. Requests are handled one at
     // a time, so no newer registration starts while this one is awaited.
     await this.registration;
+    const gone = () => this.conn !== conn || !!conn?.isClosed;
+    // A host that left during the wait gets nothing, so nothing is listed for it.
+    if (gone()) {
+      return {
+        visible: 0,
+        added: [],
+        note: "The host's connection closed before the refresh could list conversations; nothing was announced.",
+      };
+    }
     const convs = await this.slack.listConversations();
     const descriptors = convs.map((c) => toDescriptor(c, this.slack.teamName, this.slack.canWrite(c.id)));
     // As registration does after its listing: a listing begun for a peer that
     // has since gone neither writes the registry nor announces. The grant is
     // checked next, in registerAndNotifyNew (serve() handles one request at a
     // time, so no featureSets/update lands during the listing).
-    if (this.conn !== conn || conn?.isClosed) {
+    if (gone()) {
       return {
         visible: descriptors.length,
         added: [],

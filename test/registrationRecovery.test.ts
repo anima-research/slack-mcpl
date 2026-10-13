@@ -203,6 +203,25 @@ test('a registration that throws is logged, and refresh_channels still works', a
   assert.deepEqual(changed.added.map((d) => d.id), ['slack:C1']);
 });
 
+test('a refresh whose host leaves while it waits for a registration lists nothing more', async () => {
+  const listing = deferred<SlackConversationInfo[]>();
+  let calls = 0;
+  const { slack } = fakeSlack(() => { calls++; return listing.promise; });
+  const h = connect(new SlackMcplServer(slack));
+  await h.initialize();
+  await h.grant();
+  await until(() => calls === 1, "the registration's listing");
+  const refreshed = h.refresh().catch(() => undefined); // its answer can't arrive: the host leaves
+  await settle();
+  const leaving = h.close();
+  await until(() => h.serverConn.isClosed, 'the host leaving');
+  listing.resolve([conversation('C1')]);
+  await leaving;
+  await refreshed;
+  assert.equal(calls, 1, 'nothing is listed for a host that has gone');
+  assert.equal(h.requests.length, 0, 'nor registered');
+});
+
 test('a registration still listing when refresh starts sends its whole batch first', async (t) => {
   const listing = deferred<SlackConversationInfo[]>();
   let calls = 0;
