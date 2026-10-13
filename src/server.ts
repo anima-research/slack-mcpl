@@ -55,6 +55,14 @@ import {
 } from './content.js';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { createRequire } from 'node:module';
+
+// tsx runs from src/; the built executable runs from dist/src/. Read the
+// release metadata from the package root in either layout, independent of cwd.
+const require = createRequire(import.meta.url);
+const { version: serverVersion } = require(
+  existsSync(new URL('../package.json', import.meta.url)) ? '../package.json' : '../../package.json',
+) as { version: string };
 
 // Diagnostic file logger — bypasses the host's stderr capture. Set
 // SLACK_MCPL_DEBUG_LOG in the spawn env to a writable absolute path to
@@ -250,7 +258,7 @@ export class SlackMcplServer {
     const result: McplInitializeResult = {
       protocolVersion: '2024-11-05',
       capabilities,
-      serverInfo: { name: 'slack-mcpl', version: '0.1.0' },
+      serverInfo: { name: 'slack-mcpl', version: serverVersion },
     };
 
     conn.sendResponse(msg.request.id, result);
