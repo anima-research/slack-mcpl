@@ -335,7 +335,11 @@ export class SlackMcplServer {
           // when the grant first allows it, and again if a later policy turns
           // it from denied to granted. The receipt above is sent first.
           if (!couldRegister && this.grant.has('channels.register')) {
-            this.registration = this.registerSlackChannels();
+            // Kept for refresh_channels to wait on. A registration that throws
+            // past its own catches is logged here, so it neither ends the
+            // process nor fails every later refresh with its old error.
+            this.registration = this.registerSlackChannels()
+              .catch((err) => console.error('[slack-mcpl] Channel registration failed:', err));
           }
           break;
         }

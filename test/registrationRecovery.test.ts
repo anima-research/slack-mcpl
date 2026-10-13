@@ -186,6 +186,23 @@ test("a refresh whose listing fails leaves a pending registration's accepted cha
   assert.deepEqual(ids(await h.listed()), ['slack:C1'], 'the accepted answer stands');
 });
 
+test('a registration that throws is logged, and refresh_channels still works', async (t) => {
+  const log = serverLog(t);
+  const { slack } = fakeSlack();
+  const server = new SlackMcplServer(slack);
+  const internal = server as unknown as { applyRegistrationAnswer(...args: unknown[]): void };
+  t.mock.method(internal, 'applyRegistrationAnswer', () => { throw new Error('applying the answer failed'); });
+  const h = connect(server);
+  t.after(() => h.close());
+  await h.initialize();
+  await h.grant();
+  await until(() => log.some((l) => l.includes('Channel registration failed') && l.includes('applying the answer failed')), 'the logged failure');
+  const result = await h.refresh() as { isError?: boolean };
+  assert.notEqual(result.isError, true, "refresh doesn't rethrow the registration's failure");
+  const changed = h.notifications.find((n) => n.method === method.CHANNELS_CHANGED)!.params as { added: { id: string }[] };
+  assert.deepEqual(changed.added.map((d) => d.id), ['slack:C1']);
+});
+
 test('a registration still listing when refresh starts sends its whole batch first', async (t) => {
   const listing = deferred<SlackConversationInfo[]>();
   let calls = 0;
