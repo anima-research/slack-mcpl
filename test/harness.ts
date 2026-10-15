@@ -116,12 +116,8 @@ export interface Harness {
   close(): Promise<void>;
 }
 
-export function harness(opts: HarnessOptions = {}): Harness {
-  const toServer = new PassThrough();
-  const toHost = new PassThrough();
-  const serverConn = McplConnection.fromStreams(toServer, toHost);
-  const host = McplConnection.fromStreams(toHost, toServer);
-
+/** A Slack adapter over a fake Socket Mode client and a fake Web API. */
+export function fakeSlack(opts: HarnessOptions = {}) {
   const socket = fakeSocket();
   const posts: unknown[] = [];
   const reactions: string[] = [];
@@ -129,8 +125,12 @@ export function harness(opts: HarnessOptions = {}): Harness {
     fakeWeb(posts, reactions), socket, 'UBOT', 'acme',
     undefined, opts.sendChannels, opts.disableDms, opts.ackReaction,
   );
-  const server = new SlackMcplServer(slack, { subscribeMemberChannels: opts.subscribeMemberChannels });
+  return { slack, socket, posts, reactions };
+}
 
+/** Answer the server's requests on `host` as an MCPL host would; returns the
+ *  requests it saw. */
+export function answerAsHost(host: McplConnection, opts: HarnessOptions = {}): JsonRpcRequest[] {
   const hostSaw: JsonRpcRequest[] = [];
   host.on('request', (req) => {
     hostSaw.push(req);
@@ -152,15 +152,21 @@ export function harness(opts: HarnessOptions = {}): Harness {
         host.sendError(req.id, -32601, `unexpected ${req.method}`);
     }
   });
+  return hostSaw;
+}
 
+/** A host connected to `server` over an in-memory stream pair, the server
+ *  serving it. */
+export function connectHost(server: SlackMcplServer, opts: HarnessOptions = {}) {
+  const toServer = new PassThrough();
+  const toHost = new PassThrough();
+  const serverConn = McplConnection.fromStreams(toServer, toHost);
+  const host = McplConnection.fromStreams(toHost, toServer);
+  const hostSaw = answerAsHost(host, opts);
   const served = server.serve(serverConn);
   return {
-    server,
-    socket,
     host,
     hostSaw,
-    posts,
-    reactions,
     served,
     async close() {
       toServer.end();
@@ -170,7 +176,14 @@ export function harness(opts: HarnessOptions = {}): Harness {
   };
 }
 
-export async function initialize(h: Harness, mcpl: boolean) {
+export function harness(opts: HarnessOptions = {}): Harness {
+  const { slack, socket, posts, reactions } = fakeSlack(opts);
+  const server = new SlackMcplServer(slack, { subscribeMemberChannels: opts.subscribeMemberChannels });
+  const { host, hostSaw, served, close } = connectHost(server, opts);
+  return { server, socket, host, hostSaw, posts, reactions, served, close };
+}
+
+export async function initialize(h: { host: McplConnection }, mcpl: boolean) {
   const result = (await h.host.sendRequest(method.INITIALIZE, {
     protocolVersion: '2024-11-05',
     capabilities: mcpl ? { experimental: { mcpl: { version: '0.5' } } } : {},
