@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { cpSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
@@ -21,7 +21,11 @@ test('initialize follows package.json version from source and built layouts, out
   const config = JSON.parse(readFileSync(join(root, 'tsconfig.json'), 'utf8'));
   writeFileSync(join(fixture, 'tsconfig.json'), JSON.stringify({ ...config, include: ['src/**/*'] }));
 
-  const build = spawnSync(process.execPath, [require.resolve('typescript/bin/tsc'), '-p', join(fixture, 'tsconfig.json')], {
+  // The repository's own compiler, by the bin entry npm links as tsc:
+  // TypeScript 7's exports map doesn't include `typescript/bin/tsc`.
+  const typescriptPackage = require.resolve('typescript/package.json');
+  const tsc = join(dirname(typescriptPackage), JSON.parse(readFileSync(typescriptPackage, 'utf8')).bin.tsc);
+  const build = spawnSync(process.execPath, [tsc, '-p', join(fixture, 'tsconfig.json')], {
     encoding: 'utf8', timeout: 30000,
   });
   assert.equal(build.status, 0, build.stdout + build.stderr);
