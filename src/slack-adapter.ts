@@ -37,6 +37,14 @@ const ACK_TTL_MS = 10 * 60 * 1000;
 const ACK_RETRY_MS = 60 * 1000;
 const ACK_MAX_TRIES = 5;
 
+/** The read scope conversations.list needs for each conversation type. */
+const TYPE_SCOPE: Record<string, string> = {
+  public_channel: 'channels:read',
+  private_channel: 'groups:read',
+  im: 'im:read',
+  mpim: 'mpim:read',
+};
+
 type AckEntry = { timer: ReturnType<typeof setTimeout>; added: Promise<boolean>; tries: number };
 
 /** Message subtypes that represent real user content. Everything else
@@ -167,6 +175,8 @@ export async function connectSlack(config: SlackAdapterConfig): Promise<SlackAda
     config.sendChannels,
     config.disableDms,
     config.ackReaction,
+    // Granted scopes, from the x-oauth-scopes header of auth.test.
+    (auth.response_metadata as { scopes?: string[] } | undefined)?.scopes,
   );
 }
 
@@ -229,6 +239,8 @@ export class SlackAdapter {
     private sendChannels?: string[],
     private disableDms = false,
     private ackReaction?: string,
+    /** The bot token's scopes; undefined = unknown, ask for every type. */
+    private scopes?: string[],
   ) {
     // Register the handler at construction so start() ordering can't race
     // an early event past an unregistered listener.
@@ -278,7 +290,11 @@ export class SlackAdapter {
     let cursor: string | undefined;
     do {
       const result = await this.web.conversations.list({
-        types: this.disableDms ? 'public_channel,private_channel' : 'public_channel,private_channel,im,mpim',
+        // Slack refuses the whole call when one type lacks its read scope
+        // (a DM-enabled bot without mpim:read), so ask only for granted types.
+        types: (this.disableDms ? ['public_channel', 'private_channel'] : Object.keys(TYPE_SCOPE))
+          .filter((t) => !this.scopes || this.scopes.includes(TYPE_SCOPE[t]))
+          .join(','),
         exclude_archived: true,
         limit: 200,
         cursor,
