@@ -19,11 +19,17 @@ jobs:
       # node_modules tree records only that machine's native binaries, so a
       # lock made on macOS breaks Linux installs and vice versa. Each runner
       # catches the lock the other's platform produced.
-      # Node: the engines floor and current LTS — stdio flushing semantics
-      # around process exit differ between versions and platforms.
+      # Node: both ends of the range package.json's engines admits, its floor
+      # pinned exactly (keep the two in step) and the newest release, and on
+      # ubuntu also each maintained line between those two majors (24 today).
+      # stdio flushing semantics around process exit, and the built-in fetch,
+      # differ between versions and platforms.
       matrix:
         os: [ubuntu-latest, macos-latest]
-        node: [20, 24]
+        node: ['22.12.0', 'latest']
+        include:
+          - os: ubuntu-latest
+            node: '24'
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
