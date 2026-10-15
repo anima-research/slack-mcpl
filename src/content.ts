@@ -223,30 +223,55 @@ export interface SlackUserInfoClient {
   };
 }
 
+/** Slack's codes for its own failure while handling a call, or for a call it
+ *  couldn't take then, which say nothing about what the call asked for. */
+export const SLACK_FAILED = new Set(['internal_error', 'fatal_error', 'service_unavailable', 'request_timeout', 'ratelimited']);
+
+/** Node's codes for a connection never made, which the client's request error
+ *  keeps on `original`: nothing reached Slack, so nothing was done. Every code
+ *  the resolver reports (ENOTFOUND, and EAI_AGAIN, EAI_FAIL and the other EAI_
+ *  codes) comes before a connection. */
+const NEVER_CONNECTED = new Set(['ECONNREFUSED', 'ENOTFOUND', 'ENETUNREACH', 'EHOSTUNREACH']);
+export const connectionNeverMade = (nodeCode: unknown): boolean =>
+  typeof nodeCode === 'string' && (NEVER_CONNECTED.has(nodeCode) || nodeCode.startsWith('EAI_'));
+
 /**
  * Resolve Slack user IDs to display names into the caller's cache, memoized
- * for the cache's lifetime. Failures leave the raw ID in place (best-effort).
+ * for the cache's lifetime. A user Slack refuses to look up (user_not_found,
+ * missing_scope, …) is cached as the raw ID for the process's life, as a name
+ * is: a refusal answers for the user, the app's scopes or token, or the
+ * workspace's settings, which seldom change while the process runs, and a
+ * restart asks again, as it does for a renamed user. A lookup that fails
+ * otherwise (a rate limit, a failure in transit, or Slack failing) isn't
+ * cached, so the next message that names the user asks again; meanwhile
+ * callers show the raw ID (best-effort). Returns the error of each lookup
+ * left uncached, by user ID.
  */
 export async function resolveSlackUserNames(
   client: SlackUserInfoClient,
   cache: Map<string, string>,
   userIds: string[],
-): Promise<void> {
+): Promise<Map<string, unknown>> {
+  const failed = new Map<string, unknown>();
   const unresolved = Array.from(new Set(userIds)).filter(id => id && !cache.has(id));
   // Chunked, not one big Promise.all — a busy channel can reference dozens of
-  // distinct users, and an unbounded users.info fan-out just queues up 429
-  // retries inside the SDK.
+  // distinct users, and an unbounded users.info fan-out runs into Slack's
+  // rate limit for users.info.
   const CONCURRENCY = 8;
   for (let i = 0; i < unresolved.length; i += CONCURRENCY) {
     await Promise.all(unresolved.slice(i, i + CONCURRENCY).map(async (id) => {
       try {
         const { user } = await client.users.info({ user: id });
         cache.set(id, user?.profile?.display_name || user?.real_name || user?.name || id);
-      } catch {
-        cache.set(id, id);
+      } catch (err) {
+        // Slack's own answer is in data.error (the client's platform error).
+        const refused = (err as { data?: { error?: unknown } } | null)?.data?.error;
+        if (typeof refused === 'string' && !SLACK_FAILED.has(refused)) cache.set(id, id);
+        else failed.set(id, err);
       }
     }));
   }
+  return failed;
 }
 
 /** The fields of a conversations.history message the server reads —
