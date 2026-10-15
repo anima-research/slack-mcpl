@@ -148,9 +148,11 @@ npm test              # node --test via tsx, straight from the sources
 npm run build         # tsc into dist/, which is what the bin runs
 ```
 
-Push-time CI (`ci.yml`) typechecks, builds and tests every push and PR on
-ubuntu and macos, on Node 20 (the `engines` floor) and 24. It installs with
-`npm ci`, so a `package-lock.json` that is out of sync with `package.json`,
-or that only carries one platform's native packages, fails the build.
+Push-time CI (`ci.yml`) typechecks, builds and tests every push to `main`
+and every pull request on ubuntu and macos, on Node 22.12.0 (the `engines`
+floor) and the newest release, and on ubuntu also on each maintained Node
+line between them (24 today). It installs with `npm ci`, so a
+`package-lock.json` that is out of sync with `package.json`, or that only
+carries one platform's native packages, fails the build.
 Regenerate the lock from a clean tree (`rm -rf node_modules
 package-lock.json && npm install`), not over an existing `node_modules`.
