@@ -49,6 +49,7 @@ import { CapabilityGrant } from './grant.js';
 import { McplRpcError, capabilityDenied } from './errors.js';
 import {
   fetchAttachmentBytes,
+  MAX_ATTACHMENT_BYTES,
   parseSlackAttachmentUrl,
   toFetchResult,
   type AttachmentRef,
@@ -575,6 +576,22 @@ export class SlackMcplServer {
         this.stateTracker.recordSent(result.messageId, channelId, content);
         this.markOutbound(channelId);
         return { messageId: result.messageId, threadTs };
+      }
+
+      case 'upload_file': {
+        const channelId = this.requireString(args, 'channelId');
+        const filename = this.requireString(args, 'filename');
+        const str = (k: string) => (typeof args[k] === 'string' && args[k] ? (args[k] as string) : undefined);
+        const text = str('content');
+        const b64 = str('contentBase64');
+        if ((text === undefined) === (b64 === undefined)) throw new Error('pass exactly one of content or contentBase64');
+        const data = text !== undefined ? Buffer.from(text, 'utf8') : Buffer.from(b64!, 'base64');
+        if (data.byteLength > MAX_ATTACHMENT_BYTES) throw new Error(`file too large: ${data.byteLength} bytes (max ${MAX_ATTACHMENT_BYTES})`);
+        const result = await this.slack.uploadFile(channelId, {
+          filename, data, title: str('title'), comment: str('comment'), threadTs: str('messageId'),
+        });
+        this.markOutbound(channelId);
+        return { fileId: result.fileId };
       }
 
       case 'send_dm': {

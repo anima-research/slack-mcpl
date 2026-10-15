@@ -103,6 +103,7 @@ export function featureSetForTool(toolName: string): string | undefined {
   switch (toolName) {
     case 'send_message':
     case 'reply_message':
+    case 'upload_file':
     case 'send_dm':
     case 'add_reaction':
     case 'edit_message':
