@@ -36,7 +36,7 @@ that grant arrives; plain MCP tool calls are unaffected.
 
 ## Tools
 
-`send_message`, `reply_message`, `upload_file`, `send_dm`, `add_reaction`,
+`send_message`, `reply_message`, `upload_file` (path, text or base64), `send_dm`, `add_reaction`,
 `edit_message`, `delete_message`, `list_channels`, `refresh_channels`, `fetch_history`,
 `fetch_thread`, `find_user`, `fetch_attachment`, `subscribe_channel`,
 `unsubscribe_channel`, `list_subscriptions`.

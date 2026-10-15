@@ -81,3 +81,11 @@ test('upload_file follows the allow-list and passes the file to Slack', async ()
     { channel_id: 'CALLOWED', file: 'a,b', filename: 'a.csv', title: 'a.csv', initial_comment: 'please load:', thread_ts: '1.0' },
   );
 });
+
+test('upload_file with a path hands the path to Slack, so the exact bytes go', async () => {
+  const uploads: any[] = [];
+  const web = { filesUploadV2: async (args: any) => { uploads.push(args); return { files: [] }; } } as any;
+  const adapter = new SlackAdapter(web, { on() {} } as any, 'UBOT', 'acme', undefined, ['CALLOWED']);
+  await adapter.uploadFile('CALLOWED', { filename: 'a.csv', data: '/srv/out/a.csv' });
+  assert.equal(uploads[0].file, '/srv/out/a.csv');
+});
