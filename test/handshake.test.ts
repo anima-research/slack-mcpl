@@ -120,7 +120,11 @@ test('a grant missing a capability degrades the feature set and suppresses its d
     arguments: { channelId: 'C1', content: 'hi' },
   })) as { isError?: boolean; content: { text: string }[] };
   assert.equal(send.isError, true);
-  assert.match(send.content[0].text, /slack\.messaging/);
+  assert.equal(
+    send.content[0].text,
+    "send_message is turned off on this host: the host's policy hasn't enabled its feature set, slack.messaging, so " +
+      "nothing ran, and calling again won't change that until the host enables it.",
+  );
 
   // And no delivery reaches the host for an addressed message either.
   await h.socket.emitMessage(MENTION_EVENT);
@@ -196,9 +200,16 @@ test('registration follows a policy that first grants channels.register, even af
 
   await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: ['tools'] });
   const refreshed = (await h.host.sendRequest('tools/call', { name: 'refresh_channels', arguments: {} })) as {
+    isError?: boolean;
     content: { text: string }[];
   };
-  assert.match(refreshed.content[0].text, /channels\.register/);
+  // A refresh that can't announce anything fails, rather than reading as a success.
+  assert.equal(refreshed.isError, true);
+  assert.equal(
+    refreshed.content[0].text,
+    "Nothing was announced to the host: its policy hasn't granted this server channels.register, so it can't register " +
+      "conversations with the host, and calling again won't change that until the host grants it.",
+  );
   assert.equal(registers(), 0, 'nothing registered while denied');
 
   await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });

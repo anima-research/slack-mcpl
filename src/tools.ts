@@ -116,9 +116,9 @@ export const toolDefinitions: ToolDefinition[] = [
   {
     name: 'refresh_channels',
     description:
-      'Re-scan every Slack conversation the bot can currently see and register any that the ' +
-      'host does not yet know about. Use this if the bot was invited to a new channel after ' +
-      'startup and it is not showing up in your channel list.',
+      'Re-scan the Slack conversations the bot is in and register any that the host does not ' +
+      'yet know about. Use this if the bot was invited to a new channel after startup and it ' +
+      'is not showing up in your channel list.',
     inputSchema: {
       type: 'object',
       properties: {},
@@ -152,7 +152,7 @@ export const toolDefinitions: ToolDefinition[] = [
     name: 'fetch_thread',
     description:
       'Fetch all replies in a Slack thread, oldest-first (the parent message comes first). ' +
-      'Use the thread\'s parent message ID — incoming thread replies carry it as threadId.',
+      'Use the thread\'s parent message ID: a reply shows it as thread=, and fetch_history shows the parent\'s own ID.',
     inputSchema: {
       type: 'object',
       properties: {
