@@ -5,6 +5,7 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { McplConnection, method, type JsonRpcRequest } from '@animalabs/mcpl-core';
+import { ErrorCode } from '@slack/web-api';
 import { SlackMcplServer } from '../src/server.js';
 import type { SlackAdapter, SlackMessageData, HistoryMessage } from '../src/slack-adapter.js';
 import { FULL_GRANT, until } from './harness.js';
@@ -947,4 +948,75 @@ test('a first mention in an already-subscribed conversation brings no auto-subsc
   await until(() => peer.deliveries().length === 1, 'mention');
   assert.match(pushText(peer.deliveries()[0]), /<backscroll/);
   assert.doesNotMatch(pushText(peer.deliveries()[0]), /Auto-subscribed/);
+});
+
+test('a top-level publish Slack fails is explained for the conversation it named', async (t) => {
+  const f = fixture();
+  const peer = connect(f.server);
+  t.after(() => peer.close());
+  await peer.ready();
+  const slack = f.slack as unknown as { sendMessage: unknown };
+  slack.sendMessage = async (channel: string, _text: string, opts: { threadTs?: string } = {}) => {
+    f.posts.push({ channel, ...opts });
+    throw Object.assign(new Error('An API error occurred: internal_error'), {
+      code: ErrorCode.PlatformError,
+      data: { ok: false, error: 'internal_error' },
+    });
+  };
+  await assert.rejects(peer.publish(), /Check fetch_history for conversation C1 before posting again/);
+  assert.deepEqual(f.posts, [{ channel: 'C1' }]);
+});
+
+test("a publish Slack fails is explained for the thread it posted into, though a delivery moved the thread meanwhile", async (t) => {
+  const f = fixture();
+  const peer = connect(f.server);
+  t.after(() => peer.close());
+  await peer.ready();
+  f.emit('111.1', 'C1', { threadTs: '110.0' });
+  await until(() => peer.deliveries().length === 1, 'the first delivery');
+  await settle();
+  await settle();
+  // Slack's failure arrives after a second delivery, in another thread, is taken.
+  const slack = f.slack as unknown as { sendMessage: unknown };
+  slack.sendMessage = async (channel: string, _text: string, opts: { threadTs?: string } = {}) => {
+    f.posts.push({ channel, ...opts });
+    f.emit('113.1', 'C1', { threadTs: '112.0' });
+    await until(() => peer.deliveries().length === 2, 'the second delivery');
+    await settle();
+    await settle();
+    // The client's shape for Slack's refusal, as test/slackErrors.test.ts gets it from a real WebClient.
+    throw Object.assign(new Error('An API error occurred: internal_error'), {
+      code: ErrorCode.PlatformError,
+      data: { ok: false, error: 'internal_error' },
+    });
+  };
+  await assert.rejects(
+    peer.publish(),
+    /Check fetch_thread for the thread under message 110\.0 in conversation C1 before posting again/,
+  );
+  assert.deepEqual(f.posts, [{ channel: 'C1', threadTs: '110.0' }]);
+});
+
+test('a publish Slack refuses leaves the thread where it was, so the next publish to that conversation goes there too', async (t) => {
+  const f = fixture();
+  const peer = connect(f.server);
+  t.after(() => peer.close());
+  await peer.ready();
+  f.emit('111.1', 'C1', { threadTs: '110.0' });
+  await until(() => peer.deliveries().length === 1, 'the delivery');
+  await settle();
+  await settle();
+  const slack = f.slack as unknown as { sendMessage: unknown };
+  slack.sendMessage = async (channel: string, _text: string, opts: { threadTs?: string } = {}) => {
+    f.posts.push({ channel, ...opts });
+    throw Object.assign(new Error('An API error occurred: thread_not_found'), {
+      code: ErrorCode.PlatformError,
+      data: { ok: false, error: 'thread_not_found' },
+    });
+  };
+  const refused =
+    /Here that was the thread under message 110\.0 in conversation C1, and Slack refused it\. Another publish to conversation C1 now would go to the same thread\./;
+  await assert.rejects(peer.publish(), refused);
+  await assert.rejects(peer.publish(), refused);
+  assert.deepEqual(f.posts, [{ channel: 'C1', threadTs: '110.0' }, { channel: 'C1', threadTs: '110.0' }]);
 });

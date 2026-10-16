@@ -47,6 +47,7 @@ import { ChannelManager, mcplChannelId, parseMcplChannelId, toDescriptor } from 
 import { StateTracker } from './state.js';
 import { CapabilityGrant } from './grant.js';
 import { McplRpcError, capabilityDenied } from './errors.js';
+import { explainSlackError } from './slack-errors.js';
 import {
   fetchAttachmentBytes,
   MAX_ATTACHMENT_BYTES,
@@ -326,6 +327,9 @@ export class SlackMcplServer {
   private async handleRequest(req: JsonRpcRequest): Promise<void> {
     const conn = this.conn!;
     const params = (req.params ?? {}) as Record<string, unknown>;
+    // What a channels/publish posted to, as handlePublish chose it, so that
+    // Slack's refusal is explained for the conversation and thread it used.
+    const published: Record<string, unknown> = {};
 
     try {
       switch (req.method) {
@@ -401,7 +405,7 @@ export class SlackMcplServer {
           this.requireMcpl();
           if (!this.grant.has('channels.publish')) throw capabilityDenied('channels.publish');
           const pubP = params as unknown as ChannelsPublishParams;
-          const result = await this.handlePublish(pubP);
+          const result = await this.handlePublish(pubP, published);
           conn.sendResponse(req.id, result);
           break;
         }
@@ -458,7 +462,15 @@ export class SlackMcplServer {
         error: e.message,
         stack: e.stack?.split('\n').slice(0, 8).join('\n'),
       });
-      conn.sendError(req.id, -32603, e.message);
+      // channels/publish is the request whose Slack refusal reaches the host
+      // (state/rollback deletes best-effort and reports a count), so it's
+      // explained as a tool's is. It names the conversation by its Slack id,
+      // without the host's slack: prefix, since the tools the explanation
+      // points to take that id.
+      const sent = req.method === method.CHANNELS_PUBLISH
+        ? explainSlackError(err, { tool: 'channels/publish', args: published })
+        : e.message;
+      conn.sendError(req.id, -32603, sent);
     }
   }
 
@@ -548,7 +560,7 @@ export class SlackMcplServer {
       };
     } catch (err) {
       return {
-        content: [textContent((err as Error).message)],
+        content: [textContent(explainSlackError(err, { tool: name, args }))],
         isError: true,
       };
     }
@@ -1027,7 +1039,13 @@ export class SlackMcplServer {
     throw new Error('No matching channel found');
   }
 
-  private async handlePublish(params: ChannelsPublishParams): Promise<ChannelsPublishResult> {
+  /** `published` gets the conversation and thread the post goes to, before
+   *  Slack is asked, for explaining a refusal: an incoming message can move
+   *  the conversation's thread while the post is under way. */
+  private async handlePublish(
+    params: ChannelsPublishParams,
+    published: Record<string, unknown>,
+  ): Promise<ChannelsPublishResult> {
     const parsed = parseMcplChannelId(params.channelId);
     if (!parsed) {
       throw new Error(`Invalid channel ID: ${params.channelId}`);
@@ -1047,6 +1065,7 @@ export class SlackMcplServer {
     // Reply in the thread of the most recent incoming message on this
     // conversation; top-level when it wasn't threaded.
     const threadTs = this.lastIncomingThreadTs.get(parsed.conversationId);
+    Object.assign(published, { channelId: parsed.conversationId, threadTs });
     const result = await this.slack.sendMessage(
       parsed.conversationId,
       text,
