@@ -32,7 +32,12 @@ before(async () => {
       const called = (req.url ?? '').split('/').pop() ?? '';
       lastCall = { method: called, params: new URLSearchParams(body) };
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify(called === 'conversations.list' ? { ok: true, channels: [] } : answer));
+      const response = called === 'conversations.list'
+        ? { ok: true, channels: [] }
+        : called === 'files.getUploadURLExternal'
+          ? { ok: true, file_id: 'FTEST', upload_url: `http://127.0.0.1:${(endpoint.address() as { port: number }).port}/file-upload` }
+          : called === 'file-upload' ? { ok: true } : answer;
+      res.end(JSON.stringify(response));
     });
   });
   await new Promise<void>((resolve) => endpoint.listen(0, '127.0.0.1', () => resolve()));
@@ -90,6 +95,7 @@ const CALLS: Array<[tool: string, lead: string, writes: boolean]> = [
   ['reply_message', 'Nothing was posted', true],
   ['channels/publish', 'Nothing was posted', true],
   ['send_dm', 'Nothing was sent', true],
+  ['upload_file', 'Nothing was uploaded', true],
   ['edit_message', "The message wasn't changed", true],
   ['delete_message', 'Nothing was deleted', true],
   ['add_reaction', 'No reaction was added', true],
@@ -416,6 +422,48 @@ test("a tool's refusal reaches the agent explained, still marked as an error", a
     /^An API error occurred: channel_not_found\n\nNothing was posted: Slack doesn't know conversation C0NOPE/,
   );
   await h.close();
+});
+
+test("an upload refusal reaches the agent with an upload-specific explanation", async () => {
+  const slack = new SlackAdapter(client as unknown as SlackWebLike, socket, 'UBOT', 'acme');
+  const h = connectHost(new SlackMcplServer(slack));
+  await initialize(h, false);
+  try {
+    for (const [error, messageId] of [
+      ['missing_scope', undefined],
+      ['not_in_channel', undefined],
+      ['internal_error', undefined],
+      ['internal_error', '1.7'],
+    ] as const) {
+      answer = { ok: false, error, needed: 'files:write' };
+      const result = (await h.host.sendRequest('tools/call', {
+        name: 'upload_file',
+        arguments: { channelId: 'CFILES', filename: 'report.txt', content: 'report', ...(messageId ? { messageId } : {}) },
+      })) as { isError?: boolean; content: { text: string }[] };
+      assert.equal(result.isError, true);
+      assert.equal(lastCall?.method, 'files.completeUploadExternal');
+      const text = result.content[0].text;
+      assert.ok(text.startsWith(`An API error occurred: ${error}\n\n`), text);
+      assert.doesNotMatch(text, /Nothing was done|Nothing was sent|the message was posted/);
+      if (error === 'internal_error') {
+        assert.match(text, /whether the file was uploaded is unknown/);
+        assert.doesNotMatch(text, /Nothing was uploaded/);
+        assert.ok(text.includes(messageId
+          ? 'fetch_thread for the thread under message 1.7 in conversation CFILES'
+          : 'fetch_history for conversation CFILES'), text);
+        assert.match(text, /before uploading again, so it isn't uploaded twice\.$/);
+      } else {
+        assert.match(text, /\n\nNothing was uploaded: /);
+        if (error === 'missing_scope') assert.match(text, /Slack names files:write/);
+        else {
+          assert.match(text, /Slack didn't let it upload there/);
+          assert.doesNotMatch(text, /chat:write.public/);
+        }
+      }
+    }
+  } finally {
+    await h.close();
+  }
 });
 
 test('an emoji Slack refuses is named as add_reaction sent it', async () => {
