@@ -55,7 +55,7 @@ import {
   type AttachmentRef,
 } from './content.js';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { basename, dirname, isAbsolute } from 'node:path';
+import { dirname } from 'node:path';
 import { createRequire } from 'node:module';
 
 // tsx runs from src/; the built executable runs from dist/src/. Read the
@@ -580,21 +580,13 @@ export class SlackMcplServer {
 
       case 'upload_file': {
         const channelId = this.requireString(args, 'channelId');
+        const filename = this.requireString(args, 'filename');
         const str = (k: string) => (typeof args[k] === 'string' && args[k] ? (args[k] as string) : undefined);
-        const path = str('path');
         const text = str('content');
         const b64 = str('contentBase64');
-        if ([path, text, b64].filter((v) => v !== undefined).length !== 1) throw new Error('pass exactly one of path, content or contentBase64');
-        let data: Buffer | string;
-        if (path !== undefined) {
-          if (!isAbsolute(path) || !existsSync(path)) throw new Error(`path must be an absolute path of an existing file: ${path}`);
-          data = path;
-        } else {
-          data = text !== undefined ? Buffer.from(text, 'utf8') : Buffer.from(b64!, 'base64');
-          if (data.byteLength > MAX_ATTACHMENT_BYTES) throw new Error(`file too large: ${data.byteLength} bytes (max ${MAX_ATTACHMENT_BYTES})`);
-        }
-        const filename = str('filename') ?? (path !== undefined ? basename(path) : undefined);
-        if (!filename) throw new Error('filename is required');
+        if ((text === undefined) === (b64 === undefined)) throw new Error('pass exactly one of content or contentBase64');
+        const data = text !== undefined ? Buffer.from(text, 'utf8') : Buffer.from(b64!, 'base64');
+        if (data.byteLength > MAX_ATTACHMENT_BYTES) throw new Error(`file too large: ${data.byteLength} bytes (max ${MAX_ATTACHMENT_BYTES})`);
         const result = await this.slack.uploadFile(channelId, {
           filename, data, title: str('title'), comment: str('comment'), threadTs: str('messageId'),
         });

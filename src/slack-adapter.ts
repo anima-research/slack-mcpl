@@ -419,11 +419,10 @@ export class SlackAdapter {
   }
 
   /** Upload a file (files.getUploadURLExternal + completeUploadExternal).
-   *  `data` is the bytes, or a path the Slack client reads itself. Same write
-   *  checks as sendMessage. Needs the files:write scope. */
+   *  Same write checks as sendMessage. Needs the files:write scope. */
   async uploadFile(
     channelId: string,
-    file: { filename: string; data: Buffer | string; title?: string; comment?: string; threadTs?: string },
+    file: { filename: string; data: Buffer; title?: string; comment?: string; threadTs?: string },
   ): Promise<{ fileId: string }> {
     this.assertWritable(channelId);
     await this.assertNotDm(channelId);

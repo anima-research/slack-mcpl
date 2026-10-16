@@ -51,22 +51,20 @@ export const toolDefinitions: ToolDefinition[] = [
     name: 'upload_file',
     description:
       'Upload a file to a Slack conversation, optionally into a thread and with a message. ' +
-      'Pass exactly one of: path (an absolute path on this host; the exact bytes are sent), ' +
-      'content (text) or contentBase64 (binary). Inline content is limited to 5MB. ' +
+      'Pass the file as text (content) or as base64 (contentBase64), not both. Max 5MB. ' +
       'Same write rules as send_message.',
     inputSchema: {
       type: 'object',
       properties: {
         channelId: { type: 'string', description: 'Slack conversation ID' },
-        filename: { type: 'string', description: 'File name shown in Slack, with extension (e.g. positions.csv); defaults to the path\'s file name' },
-        path: { type: 'string', description: 'Absolute path of the file on this host' },
+        filename: { type: 'string', description: 'File name shown in Slack, with extension (e.g. positions.csv)' },
         content: { type: 'string', description: 'File contents as text' },
         contentBase64: { type: 'string', description: 'File contents as base64, for binary files' },
         messageId: { type: 'string', description: 'Thread to upload into: the message\'s `thread=` if it has one, else its `id=`' },
         comment: { type: 'string', description: 'Message posted with the file (Slack mrkdwn)' },
         title: { type: 'string', description: 'Title shown above the file; defaults to the file name' },
       },
-      required: ['channelId'],
+      required: ['channelId', 'filename'],
     },
   },
   {
