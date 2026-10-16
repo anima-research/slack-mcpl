@@ -83,7 +83,9 @@ as they do to message sends. Successful uploads belong to `slack.messaging`
 checkpoints, so rollback attempts to delete them along with later messages.
 An uploaded file is undone through Slack's file deletion API. Rollback is
 best-effort and reports partial failures; checkpoint history is kept in
-memory across host reconnects, but does not survive a server restart.
+memory across host reconnects, but does not survive a server restart. As with
+message rollback, failed deletions are reported in the partial count but are
+not retained for another rollback attempt.
 
 **Operators:** the bot token needs `files:write`. After adding that scope to
 an existing Slack app, reinstall the app to the workspace through Slack's

@@ -440,7 +440,9 @@ export class SlackAdapter {
       ...(file.threadTs ? { thread_ts: file.threadTs } : {}),
     });
     const fileId = result.files?.[0]?.files?.[0]?.id;
-    if (!fileId) throw new Error("Slack's upload response named no file; the upload could not be confirmed");
+    if (typeof fileId !== 'string' || !fileId.trim()) {
+      throw new Error("Slack's upload response named no file with a valid ID; the upload could not be confirmed");
+    }
     void this.clearAck(channelId);
     return { fileId };
   }

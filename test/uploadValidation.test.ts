@@ -105,7 +105,8 @@ test('upload handler preserves valid text, binary base64 and optional metadata',
 });
 
 test('Slack upload responses naming no file return a tool error', async (t) => {
-  for (const response of [{}, { files: [] }, { files: [{}] }, { files: [{ files: [] }] }, { files: [{ files: [{}] }] }, { files: [{ files: [{ id: '' }] }] }]) {
+  for (const response of [{}, { files: [] }, { files: [{}] }, { files: [{ files: [] }] }, { files: [{ files: [{}] }] },
+    { files: [{ files: [{ id: '' }] }] }, { files: [{ files: [{ id: 123 }] }] }, { files: [{ files: [{ id: '   ' }] }] }]) {
     const { uploads, call } = await fixture(t, response);
     const result = await call({ content: 'hello' });
     assert.equal(result.isError, true, JSON.stringify(response));
