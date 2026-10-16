@@ -32,7 +32,8 @@ that grant arrives; plain MCP tool calls are unaffected.
   via `fetch_attachment`, which is auth-locked to `files.slack.com` (the bot
   token is never sent to any other host) and size-capped at 5MB.
 - **Rollback**: `slack.messaging` supports MCPL checkpoints — rolling back
-  deletes the messages the bot sent after the checkpoint (best-effort).
+  deletes the messages and uploaded files the bot sent after the checkpoint
+  (best-effort).
 
 ## Tools
 
@@ -63,6 +64,32 @@ capabilities, not feature-set selection.
 
 The host receives each reply once, through `channels/publish`. The server
 does not declare `channels.streaming`.
+
+## Upload a file
+
+Use `upload_file` with a Slack `channelId`, a required `filename`, and exactly
+one of `content` (UTF-8 text) or `contentBase64` (canonical RFC 4648 base64,
+with padding where required, and no whitespace or data-URI prefix). The
+content must be nonempty. This server limits inline content to 5 MiB
+(5,242,880 bytes), measured after UTF-8 encoding or base64 decoding; this is
+the server's inline limit, not Slack's file-size limit. The tool accepts
+inline content only; it does not read a path on the server.
+
+Optional `messageId` selects the thread root (the message's `thread=` value,
+or its `id=` when it has no `thread=`). `title` names the
+file in Slack (defaulting to `filename`), and `comment` adds an initial
+comment. `SLACK_SEND_CHANNELS` and `SLACK_DISABLE_DMS` apply to uploads just
+as they do to message sends. Successful uploads belong to `slack.messaging`
+checkpoints, so rollback attempts to delete them along with later messages.
+An uploaded file is undone through Slack's file deletion API. Rollback is
+best-effort and reports partial failures; checkpoint history is kept in
+memory across host reconnects, but does not survive a server restart.
+
+**Operators:** the bot token needs `files:write`. After adding that scope to
+an existing Slack app, reinstall the app to the workspace through Slack's
+OAuth flow so the installed token receives the new scope. Editing the app's
+scope list alone does not update the token. Without the scope, Slack refuses
+uploads with `missing_scope`.
 
 ## Reply to a specific thread
 
@@ -134,6 +161,10 @@ settings:
 3. Invite the bot to channels you want it to see:
    `/invite @connectome-agent` (DMs work without invites — users can message
    the bot directly)
+
+If you add scopes such as `files:write` to an already installed app,
+reinstall it to the workspace through the OAuth flow to grant those scopes
+to the bot token.
 
 ### 3. Run
 
