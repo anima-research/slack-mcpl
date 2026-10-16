@@ -436,8 +436,10 @@ export class SlackAdapter {
       ...(file.comment ? { initial_comment: file.comment } : {}),
       ...(file.threadTs ? { thread_ts: file.threadTs } : {}),
     });
+    const fileId = result.files?.[0]?.files?.[0]?.id;
+    if (!fileId) throw new Error("Slack's upload response named no file; the upload could not be confirmed");
     void this.clearAck(channelId);
-    return { fileId: result.files?.[0]?.files?.[0]?.id ?? '' };
+    return { fileId };
   }
 
   /** With SLACK_DISABLE_DMS, only a conversation Slack confirmed to be a

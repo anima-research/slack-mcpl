@@ -594,11 +594,28 @@ export class SlackMcplServer {
         const channelId = this.requireString(args, 'channelId');
         const filename = this.requireString(args, 'filename');
         const str = (k: string) => (typeof args[k] === 'string' && args[k] ? (args[k] as string) : undefined);
-        const text = str('content');
-        const b64 = str('contentBase64');
+        const text = args.content;
+        const b64 = args.contentBase64;
         if ((text === undefined) === (b64 === undefined)) throw new Error('pass exactly one of content or contentBase64');
-        const data = text !== undefined ? Buffer.from(text, 'utf8') : Buffer.from(b64!, 'base64');
-        if (data.byteLength > MAX_ATTACHMENT_BYTES) throw new Error(`file too large: ${data.byteLength} bytes (max ${MAX_ATTACHMENT_BYTES})`);
+        const input = text ?? b64;
+        if (typeof input !== 'string') throw new Error(`${text !== undefined ? 'content' : 'contentBase64'} must be a string`);
+        if (input.length === 0) throw new Error('file content is empty');
+        let data: Buffer;
+        if (text !== undefined) {
+          data = Buffer.from(input, 'utf8');
+        } else {
+          // Buffer.from is intentionally permissive: it skips punctuation and
+          // accepts data-URI prefixes as bytes. Require canonical RFC 4648
+          // base64, including padding and zero unused bits, before uploading.
+          if (input.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(input)) {
+            throw new Error('contentBase64 must be valid base64 (canonical RFC 4648 with padding; no data URI)');
+          }
+          data = Buffer.from(input, 'base64');
+          if (data.toString('base64') !== input) {
+            throw new Error('contentBase64 must be valid base64 (canonical RFC 4648 with padding; no data URI)');
+          }
+        }
+        if (data.byteLength > MAX_ATTACHMENT_BYTES) throw new Error(`inline file too large: ${data.byteLength} bytes (this server's inline limit is ${MAX_ATTACHMENT_BYTES})`);
         const result = await this.slack.uploadFile(channelId, {
           filename, data, title: str('title'), comment: str('comment'), threadTs: str('messageId'),
         });

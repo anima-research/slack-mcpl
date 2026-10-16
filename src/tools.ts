@@ -59,7 +59,7 @@ export const toolDefinitions: ToolDefinition[] = [
         channelId: { type: 'string', description: 'Slack conversation ID' },
         filename: { type: 'string', description: 'File name shown in Slack, with extension (e.g. positions.csv)' },
         content: { type: 'string', description: 'File contents as text' },
-        contentBase64: { type: 'string', description: 'File contents as base64, for binary files' },
+        contentBase64: { type: 'string', description: 'File contents as canonical RFC 4648 base64 with required padding, for binary files; no whitespace or data URI prefix' },
         messageId: { type: 'string', description: 'Thread to upload into: the message\'s `thread=` if it has one, else its `id=`' },
         comment: { type: 'string', description: 'Message posted with the file (Slack mrkdwn)' },
         title: { type: 'string', description: 'Title shown above the file; defaults to the file name' },
