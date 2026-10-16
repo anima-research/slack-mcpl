@@ -16,6 +16,7 @@ export const FULL_GRANT = [
   'channels.publish',
   'channels.incoming',
   'pushEvents',
+  'channels.typing',
 ];
 
 interface FakeSocket extends SlackSocketLike {
@@ -42,8 +43,16 @@ function fakeSocket(): FakeSocket {
   };
 }
 
-function fakeWeb(posts: unknown[], reactions: string[]): SlackWebLike {
+function fakeWeb(posts: unknown[], reactions: string[], statuses: string[]): SlackWebLike {
   return {
+    assistant: {
+      threads: {
+        async setStatus({ channel_id, thread_ts, status }) {
+          statuses.push(`${channel_id}:${thread_ts}:${status}`);
+          return {};
+        },
+      },
+    },
     conversations: {
       async list() {
         return { channels: [{ id: 'C1', name: 'general', is_member: true, is_im: false, is_mpim: false }] };
@@ -112,6 +121,8 @@ export interface Harness {
   posts: unknown[];
   /** reactions.add / reactions.remove calls, as `add:<channel>:<ts>:<name>`. */
   reactions: string[];
+  /** assistant.threads.setStatus calls, as `<channel>:<thread_ts>:<status>`. */
+  statuses: string[];
   served: Promise<void>;
   close(): Promise<void>;
 }
@@ -121,11 +132,12 @@ export function fakeSlack(opts: HarnessOptions = {}) {
   const socket = fakeSocket();
   const posts: unknown[] = [];
   const reactions: string[] = [];
+  const statuses: string[] = [];
   const slack = new SlackAdapter(
-    fakeWeb(posts, reactions), socket, 'UBOT', 'acme',
+    fakeWeb(posts, reactions, statuses), socket, 'UBOT', 'acme',
     undefined, opts.sendChannels, opts.disableDms, opts.ackReaction,
   );
-  return { slack, socket, posts, reactions };
+  return { slack, socket, posts, reactions, statuses };
 }
 
 /** Answer the server's requests on `host` as an MCPL host would; returns the
@@ -177,10 +189,10 @@ export function connectHost(server: SlackMcplServer, opts: HarnessOptions = {}) 
 }
 
 export function harness(opts: HarnessOptions = {}): Harness {
-  const { slack, socket, posts, reactions } = fakeSlack(opts);
+  const { slack, socket, posts, reactions, statuses } = fakeSlack(opts);
   const server = new SlackMcplServer(slack, { subscribeMemberChannels: opts.subscribeMemberChannels });
   const { host, hostSaw, served, close } = connectHost(server, opts);
-  return { server, socket, host, hostSaw, posts, reactions, served, close };
+  return { server, socket, host, hostSaw, posts, reactions, statuses, served, close };
 }
 
 export async function initialize(h: { host: McplConnection }, mcpl: boolean) {

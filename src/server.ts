@@ -161,6 +161,9 @@ export class SlackMcplServer {
    *  here — a publish goes into the last incoming message's thread, or
    *  top-level when the conversation isn't threaded. */
   private lastIncomingThreadTs = new Map<string, string | undefined>();
+  /** Thread of each conversation's newest incoming message (its own ts when
+   *  top-level): where the typing status goes. */
+  private lastIncomingRoot = new Map<string, string>();
 
   /** The conversation this peer was last sent a message from, or the bot last
    *  posted in: an incoming message from any other conversation names its
@@ -501,11 +504,17 @@ export class SlackMcplServer {
       case method.CHANNELS_OUTGOING_COMPLETE:
         break;
 
-      // Slack's Web API has no typing indicator for bots (the RTM one is
-      // deprecated), so typing notifications are accepted and ignored.
-      case 'channels/typing':
-      case 'notifications/typing':
+      // Shown as "is thinking…" on the thread of the conversation's newest
+      // incoming message: the message that woke the agent.
+      case method.CHANNELS_TYPING:
+      case 'notifications/typing': {
+        if (this.mcplEnabled && !this.grant.has('channels.typing')) break;
+        const p = (notif.params ?? {}) as { channelId?: unknown; op?: unknown };
+        if (typeof p.channelId !== 'string') break;
+        const id = parseMcplChannelId(p.channelId)?.conversationId ?? p.channelId;
+        void this.slack.setThreadStatus(id, p.op === 'stop' ? undefined : this.lastIncomingRoot.get(id));
         break;
+      }
 
       default:
         // Ignore unknown notifications
@@ -1301,6 +1310,7 @@ export class SlackMcplServer {
     });
     // The context is recorded as the message goes out, so the next message
     // is compared with what this peer was sent last.
+    this.lastIncomingRoot.set(msg.channelId, msg.threadTs ?? msg.id);
     this.lastChannelId = msg.channelId;
     const renderedContent = `${prefixBlock}${location}${msg.authorName}: ${msg.cleanContent}`;
 
