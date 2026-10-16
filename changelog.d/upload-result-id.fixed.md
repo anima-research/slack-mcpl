@@ -1,0 +1,1 @@
+- Reject upload responses whose file ID is not a nonblank string instead of returning success with an unusable ID. A malformed completion response leaves the actual upload outcome unconfirmed.
