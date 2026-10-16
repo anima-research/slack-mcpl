@@ -156,9 +156,10 @@ export interface SlackAdapterConfig {
 
 /**
  * Connect to Slack and build an adapter: auth.test resolves the bot's own
- * user ID (for self-filtering and mention detection) and the team name
- * (for channel labels), then Socket Mode is wired but not yet started —
- * call start() after registering the message handler.
+ * user ID (for self-filtering and mention detection), team name (for channel
+ * labels), and token scopes used to narrow conversation listings. Socket
+ * Mode is wired but not yet started — call start() after registering the
+ * message handler.
  */
 export async function connectSlack(config: SlackAdapterConfig): Promise<SlackAdapter> {
   const web = new WebClient(config.botToken);
@@ -184,7 +185,7 @@ export async function connectSlack(config: SlackAdapterConfig): Promise<SlackAda
 /** The client surfaces the adapter needs — structural, so tests can inject fakes. */
 export interface SlackWebLike {
   conversations: {
-    list(args: Record<string, unknown>): Promise<{ channels?: unknown[]; response_metadata?: { next_cursor?: string } }>;
+    list(args: Record<string, unknown>): Promise<{ channels?: unknown[]; response_metadata?: { next_cursor?: string; scopes?: string[] } }>;
     info(args: { channel: string }): Promise<{ channel?: unknown }>;
     open(args: { users: string }): Promise<{ channel?: { id?: string } }>;
     history(args: Record<string, unknown>): Promise<{ messages?: unknown[]; response_metadata?: { next_cursor?: string } }>;
@@ -243,6 +244,12 @@ export class SlackAdapter {
     /** The bot token's scopes; undefined = unknown, ask for every type. */
     private scopes?: string[],
   ) {
+    if (this.scopes) {
+      const omitted = this.conversationTypes().filter((type) => !this.scopes!.includes(TYPE_SCOPE[type]));
+      if (omitted.length) {
+        console.error(`[slack-mcpl] Conversation listing omits types without a granted read scope: ${omitted.map((type) => `${type} (requires ${TYPE_SCOPE[type]})`).join(', ')}.`);
+      }
+    }
     // Register the handler at construction so start() ordering can't race
     // an early event past an unregistered listener.
     this.socket.on('message', ({ event, ack }) => {
@@ -282,24 +289,40 @@ export class SlackAdapter {
 
   // ── Conversations ──
 
+  private conversationTypes(): string[] {
+    return this.disableDms ? ['public_channel', 'private_channel'] : Object.keys(TYPE_SCOPE);
+  }
+
   /** Enumerate conversations the bot can act in: member channels, DMs, and
-   *  group DMs. conversations.list also returns public channels the bot is
-   *  NOT a member of (no events, no posting without joining) — those are
-   *  excluded here; list_channels with includeNonMember surfaces them. */
+   *  group DMs, limited to types whose read scopes the token reports. Each
+   *  response refreshes those scopes for the next listing; missing metadata
+   *  retains the last known scopes, and unknown scopes keep the legacy request
+   *  for every enabled type. conversations.list also returns public channels
+   *  the bot is NOT a member of (no events, no posting without joining) — those
+   *  are excluded here; list_channels with includeNonMember surfaces them. */
   async listConversations(includeNonMember = false): Promise<SlackConversationInfo[]> {
+    // Slack refuses the whole call when one type lacks its read scope.
+    // Keep the type set stable across pagination; refreshed scopes apply to
+    // the next listing rather than changing the meaning of an existing cursor.
+    const types = this.conversationTypes()
+      .filter((type) => !this.scopes || this.scopes.includes(TYPE_SCOPE[type]))
+      .join(',');
+    // An empty types value has undocumented behavior; do not rely on Slack's
+    // default public_channel listing when no readable type is available.
+    if (!types) return [];
     const out: SlackConversationInfo[] = [];
     let cursor: string | undefined;
     do {
       const result = await this.web.conversations.list({
-        // Slack refuses the whole call when one type lacks its read scope
-        // (a DM-enabled bot without mpim:read), so ask only for granted types.
-        types: (this.disableDms ? ['public_channel', 'private_channel'] : Object.keys(TYPE_SCOPE))
-          .filter((t) => !this.scopes || this.scopes.includes(TYPE_SCOPE[t]))
-          .join(','),
+        types,
         exclude_archived: true,
         limit: 200,
         cursor,
       });
+      const scopes = result.response_metadata?.scopes;
+      if (Array.isArray(scopes) && scopes.every((scope) => typeof scope === 'string')) {
+        this.scopes = [...scopes];
+      }
       for (const raw of (result.channels ?? []) as SlackApiConversation[]) {
         const info = await this.describeConversation(raw);
         if (!info) continue;
