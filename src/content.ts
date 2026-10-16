@@ -197,6 +197,13 @@ export function formatSlackText(text: string, userNames: Map<string, string>): s
   return formatted;
 }
 
+/** The name reactions.add is sent for an emoji as given: Slack wants the bare
+ *  name, so every colon is removed, which also takes the pair out of a skin
+ *  tone such as thumbsup::skin-tone-2. */
+export function reactionName(emoji: string): string {
+  return emoji.replace(/:/g, '');
+}
+
 /** Extract user IDs referenced as <@U123> in Slack mrkdwn, for pre-resolution. */
 export function extractSlackUserIds(text: string): string[] {
   const ids = new Set<string>();
