@@ -66,7 +66,7 @@ export function buildFeatureSets(): Record<string, FeatureSetDeclaration> {
       description: 'Send, read, react to messages in Slack conversations',
       uses: messagingUses,
       // §8.1: what this server sent since a checkpoint can be undone
-      // (state/rollback deletes the bot's own messages).
+      // (state/rollback deletes the bot's own messages and uploaded files).
       rollback: true,
       tagOntology: SLACK_TAG_ONTOLOGY,
     },

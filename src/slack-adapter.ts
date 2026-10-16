@@ -191,6 +191,9 @@ export interface SlackWebLike {
   };
   /** Optional so test fakes need not carry it; the real WebClient has it. */
   filesUploadV2?(args: Record<string, unknown>): Promise<{ files?: Array<{ files?: Array<{ id?: string }> }> }>;
+  files?: {
+    delete(args: { file: string }): Promise<unknown>;
+  };
   users: {
     info(args: { user: string }): Promise<{ user?: { profile?: { display_name?: string }; real_name?: string; name?: string } }>;
     list(args: { limit?: number; cursor?: string }): Promise<{ members?: unknown[]; response_metadata?: { next_cursor?: string } }>;
@@ -484,6 +487,14 @@ export class SlackAdapter {
     this.assertWritable(channelId);
     await this.assertNotDm(channelId);
     await this.web.chat.delete({ channel: channelId, ts });
+  }
+
+  /** Remove a file uploaded by this bot, retaining its destination write guards. */
+  async deleteUploadedFile(channelId: string, fileId: string): Promise<void> {
+    this.assertWritable(channelId);
+    await this.assertNotDm(channelId);
+    if (!this.web.files) throw new Error('File deletion is not available');
+    await this.web.files.delete({ file: fileId });
   }
 
   async addReaction(channelId: string, ts: string, emoji: string): Promise<void> {

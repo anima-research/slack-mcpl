@@ -620,6 +620,7 @@ export class SlackMcplServer {
           filename, data, title: str('title'), comment: str('comment'), threadTs: str('messageId'),
         });
         this.markOutbound(channelId);
+        this.stateTracker.recordUploaded(result.fileId, channelId);
         return { fileId: result.fileId };
       }
 
@@ -1107,7 +1108,7 @@ export class SlackMcplServer {
     }
 
     // This server's rule, not the spec's: rollback deletes the bot's messages
-    // through chat.delete, a slack.messaging write, so it runs only while
+    // and uploaded files, a slack.messaging write, so it runs only while
     // slack.messaging is active on the connection asking. §5.3 keeps it
     // inactive until that connection's initial policy. A refusal leaves the
     // checkpoint in place.
@@ -1128,14 +1129,15 @@ export class SlackMcplServer {
       };
     }
 
-    // Best-effort delete sent messages
+    // Best-effort delete sent messages and uploaded files
     let deleted = 0;
     for (const msg of toDelete) {
       try {
-        await this.slack.deleteMessage(msg.channelId, msg.messageId);
+        if (msg.kind === 'file') await this.slack.deleteUploadedFile(msg.channelId, msg.fileId);
+        else await this.slack.deleteMessage(msg.channelId, msg.messageId);
         deleted++;
       } catch {
-        // Best-effort — message may have been deleted by someone else
+        // Best-effort — an item may have been deleted by someone else
       }
     }
 
@@ -1143,7 +1145,7 @@ export class SlackMcplServer {
       checkpoint: params.checkpoint,
       success: true,
       reason: deleted < toDelete.length
-        ? `Rolled back (${deleted}/${toDelete.length} messages deleted)`
+        ? `Rolled back (${deleted}/${toDelete.length} ${toDelete.some((item) => item.kind === 'file') ? 'messages/files' : 'messages'} deleted)`
         : undefined,
     };
   }
