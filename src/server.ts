@@ -47,6 +47,7 @@ import { ChannelManager, mcplChannelId, parseMcplChannelId, toDescriptor } from 
 import { StateTracker } from './state.js';
 import { CapabilityGrant } from './grant.js';
 import { McplRpcError, capabilityDenied } from './errors.js';
+import { explainSlackError } from './slack-errors.js';
 import {
   fetchAttachmentBytes,
   MAX_ATTACHMENT_BYTES,
@@ -326,6 +327,9 @@ export class SlackMcplServer {
   private async handleRequest(req: JsonRpcRequest): Promise<void> {
     const conn = this.conn!;
     const params = (req.params ?? {}) as Record<string, unknown>;
+    // What a channels/publish posted to, as handlePublish chose it, so that
+    // Slack's refusal is explained for the conversation and thread it used.
+    const published: Record<string, unknown> = {};
 
     try {
       switch (req.method) {
@@ -401,7 +405,7 @@ export class SlackMcplServer {
           this.requireMcpl();
           if (!this.grant.has('channels.publish')) throw capabilityDenied('channels.publish');
           const pubP = params as unknown as ChannelsPublishParams;
-          const result = await this.handlePublish(pubP);
+          const result = await this.handlePublish(pubP, published);
           conn.sendResponse(req.id, result);
           break;
         }
@@ -458,7 +462,15 @@ export class SlackMcplServer {
         error: e.message,
         stack: e.stack?.split('\n').slice(0, 8).join('\n'),
       });
-      conn.sendError(req.id, -32603, e.message);
+      // channels/publish is the request whose Slack refusal reaches the host
+      // (state/rollback deletes best-effort and reports a count), so it's
+      // explained as a tool's is. It names the conversation by its Slack id,
+      // without the host's slack: prefix, since the tools the explanation
+      // points to take that id.
+      const sent = req.method === method.CHANNELS_PUBLISH
+        ? explainSlackError(err, { tool: 'channels/publish', args: published })
+        : e.message;
+      conn.sendError(req.id, -32603, sent);
     }
   }
 
@@ -548,7 +560,7 @@ export class SlackMcplServer {
       };
     } catch (err) {
       return {
-        content: [textContent((err as Error).message)],
+        content: [textContent(explainSlackError(err, { tool: name, args }))],
         isError: true,
       };
     }
@@ -582,15 +594,33 @@ export class SlackMcplServer {
         const channelId = this.requireString(args, 'channelId');
         const filename = this.requireString(args, 'filename');
         const str = (k: string) => (typeof args[k] === 'string' && args[k] ? (args[k] as string) : undefined);
-        const text = str('content');
-        const b64 = str('contentBase64');
+        const text = args.content;
+        const b64 = args.contentBase64;
         if ((text === undefined) === (b64 === undefined)) throw new Error('pass exactly one of content or contentBase64');
-        const data = text !== undefined ? Buffer.from(text, 'utf8') : Buffer.from(b64!, 'base64');
-        if (data.byteLength > MAX_ATTACHMENT_BYTES) throw new Error(`file too large: ${data.byteLength} bytes (max ${MAX_ATTACHMENT_BYTES})`);
+        const input = text ?? b64;
+        if (typeof input !== 'string') throw new Error(`${text !== undefined ? 'content' : 'contentBase64'} must be a string`);
+        if (input.length === 0) throw new Error('file content is empty');
+        let data: Buffer;
+        if (text !== undefined) {
+          data = Buffer.from(input, 'utf8');
+        } else {
+          // Buffer.from is intentionally permissive: it skips punctuation and
+          // accepts data-URI prefixes as bytes. Require canonical RFC 4648
+          // base64, including padding and zero unused bits, before uploading.
+          if (input.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(input)) {
+            throw new Error('contentBase64 must be valid base64 (canonical RFC 4648 with padding; no data URI)');
+          }
+          data = Buffer.from(input, 'base64');
+          if (data.toString('base64') !== input) {
+            throw new Error('contentBase64 must be valid base64 (canonical RFC 4648 with padding; no data URI)');
+          }
+        }
+        if (data.byteLength > MAX_ATTACHMENT_BYTES) throw new Error(`inline file too large: ${data.byteLength} bytes (this server's inline limit is ${MAX_ATTACHMENT_BYTES})`);
         const result = await this.slack.uploadFile(channelId, {
           filename, data, title: str('title'), comment: str('comment'), threadTs: str('messageId'),
         });
         this.markOutbound(channelId);
+        this.stateTracker.recordUploaded(result.fileId, channelId);
         return { fileId: result.fileId };
       }
 
@@ -1027,7 +1057,13 @@ export class SlackMcplServer {
     throw new Error('No matching channel found');
   }
 
-  private async handlePublish(params: ChannelsPublishParams): Promise<ChannelsPublishResult> {
+  /** `published` gets the conversation and thread the post goes to, before
+   *  Slack is asked, for explaining a refusal: an incoming message can move
+   *  the conversation's thread while the post is under way. */
+  private async handlePublish(
+    params: ChannelsPublishParams,
+    published: Record<string, unknown>,
+  ): Promise<ChannelsPublishResult> {
     const parsed = parseMcplChannelId(params.channelId);
     if (!parsed) {
       throw new Error(`Invalid channel ID: ${params.channelId}`);
@@ -1047,6 +1083,7 @@ export class SlackMcplServer {
     // Reply in the thread of the most recent incoming message on this
     // conversation; top-level when it wasn't threaded.
     const threadTs = this.lastIncomingThreadTs.get(parsed.conversationId);
+    Object.assign(published, { channelId: parsed.conversationId, threadTs });
     const result = await this.slack.sendMessage(
       parsed.conversationId,
       text,
@@ -1071,7 +1108,7 @@ export class SlackMcplServer {
     }
 
     // This server's rule, not the spec's: rollback deletes the bot's messages
-    // through chat.delete, a slack.messaging write, so it runs only while
+    // and uploaded files, a slack.messaging write, so it runs only while
     // slack.messaging is active on the connection asking. §5.3 keeps it
     // inactive until that connection's initial policy. A refusal leaves the
     // checkpoint in place.
@@ -1092,14 +1129,15 @@ export class SlackMcplServer {
       };
     }
 
-    // Best-effort delete sent messages
+    // Best-effort delete sent messages and uploaded files
     let deleted = 0;
     for (const msg of toDelete) {
       try {
-        await this.slack.deleteMessage(msg.channelId, msg.messageId);
+        if (msg.kind === 'file') await this.slack.deleteUploadedFile(msg.channelId, msg.fileId);
+        else await this.slack.deleteMessage(msg.channelId, msg.messageId);
         deleted++;
       } catch {
-        // Best-effort — message may have been deleted by someone else
+        // Best-effort — an item may have been deleted by someone else
       }
     }
 
@@ -1107,7 +1145,7 @@ export class SlackMcplServer {
       checkpoint: params.checkpoint,
       success: true,
       reason: deleted < toDelete.length
-        ? `Rolled back (${deleted}/${toDelete.length} messages deleted)`
+        ? `Rolled back (${deleted}/${toDelete.length} ${toDelete.some((item) => item.kind === 'file') ? 'messages/files' : 'messages'} deleted)`
         : undefined,
     };
   }

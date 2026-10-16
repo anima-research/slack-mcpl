@@ -1,0 +1,1 @@
+- Refuse malformed or empty inline upload content before contacting Slack, enforce this server's inline size limit on decoded bytes, and report an unconfirmed upload when Slack's response names no file.

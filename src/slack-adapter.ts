@@ -26,6 +26,7 @@ import {
   resolveSlackUserNames,
   fetchSlackHistory,
   classifyExtension,
+  reactionName,
   type AttachmentRef,
   type SlackHistoryMessage,
 } from './content.js';
@@ -190,6 +191,9 @@ export interface SlackWebLike {
   };
   /** Optional so test fakes need not carry it; the real WebClient has it. */
   filesUploadV2?(args: Record<string, unknown>): Promise<{ files?: Array<{ files?: Array<{ id?: string }> }> }>;
+  files?: {
+    delete(args: { file: string }): Promise<unknown>;
+  };
   users: {
     info(args: { user: string }): Promise<{ user?: { profile?: { display_name?: string }; real_name?: string; name?: string } }>;
     list(args: { limit?: number; cursor?: string }): Promise<{ members?: unknown[]; response_metadata?: { next_cursor?: string } }>;
@@ -435,8 +439,10 @@ export class SlackAdapter {
       ...(file.comment ? { initial_comment: file.comment } : {}),
       ...(file.threadTs ? { thread_ts: file.threadTs } : {}),
     });
+    const fileId = result.files?.[0]?.files?.[0]?.id;
+    if (!fileId) throw new Error("Slack's upload response named no file; the upload could not be confirmed");
     void this.clearAck(channelId);
-    return { fileId: result.files?.[0]?.files?.[0]?.id ?? '' };
+    return { fileId };
   }
 
   /** With SLACK_DISABLE_DMS, only a conversation Slack confirmed to be a
@@ -483,11 +489,18 @@ export class SlackAdapter {
     await this.web.chat.delete({ channel: channelId, ts });
   }
 
+  /** Remove a file uploaded by this bot, retaining its destination write guards. */
+  async deleteUploadedFile(channelId: string, fileId: string): Promise<void> {
+    this.assertWritable(channelId);
+    await this.assertNotDm(channelId);
+    if (!this.web.files) throw new Error('File deletion is not available');
+    await this.web.files.delete({ file: fileId });
+  }
+
   async addReaction(channelId: string, ts: string, emoji: string): Promise<void> {
     this.assertWritable(channelId);
     await this.assertNotDm(channelId);
-    // Slack wants the bare emoji name; accept :name: and strip the colons.
-    await this.web.reactions.add({ channel: channelId, timestamp: ts, name: emoji.replace(/:/g, '') });
+    await this.web.reactions.add({ channel: channelId, timestamp: ts, name: reactionName(emoji) });
   }
 
   // ── History ──
