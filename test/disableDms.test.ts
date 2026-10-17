@@ -131,3 +131,13 @@ test('an incoming event Slack does not mark as a channel is dropped', async () =
   await emit({ type: 'message', channel: 'G8', channel_type: 'group', user: 'U1', ts: '1718000000.000200', text: 'private channel' });
   assert.deepEqual(received.map((m) => m.channelId), ['G8']);
 });
+
+test('conversations.list asks only for the types the token has a read scope for', async () => {
+  const listTypes: string[] = [];
+  const web = { conversations: { list: async ({ types }: any) => { listTypes.push(types); return { channels: [] }; } } } as any;
+  const socket = { on() {} } as any;
+  const scopes = ['channels:read', 'groups:read', 'im:read', 'chat:write'];
+  await new SlackAdapter(web, socket, 'UBOT', 'acme', undefined, undefined, false, undefined, scopes).listConversations();
+  await new SlackAdapter(web, socket, 'UBOT', 'acme', undefined, undefined, false).listConversations();
+  assert.deepEqual(listTypes, ['public_channel,private_channel,im', 'public_channel,private_channel,im,mpim']);
+});
