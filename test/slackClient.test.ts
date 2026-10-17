@@ -1,0 +1,375 @@
+/**
+ * The Web API client's settings (SLACK_CLIENT_OPTIONS): each call answers at
+ * once with what happened, instead of the client waiting out rate limits and
+ * retrying failures inside the call for up to about 30 minutes. Driven through
+ * a real WebClient against a local endpoint that answers as Slack does.
+ */
+
+import { test, before, after } from 'node:test';
+import assert from 'node:assert/strict';
+import { WebClient } from '@slack/web-api';
+import { GaveUp, SLACK_CLIENT_OPTIONS, SlackAdapter, slackClients, type SlackSocketLike, type SlackWebLike } from '../src/slack-adapter.js';
+import { SlackMcplServer } from '../src/server.js';
+import { resolveSlackUserNames, type SlackUserInfoClient } from '../src/content.js';
+import { connectHost, initialize } from './harness.js';
+import { fakeSlackApi, silentSlackApi, unreachableSlackApiUrl, type FakeSlackApi } from './slackApi.js';
+
+let api: FakeSlackApi;
+let client: WebClient;
+
+before(async () => {
+  api = await fakeSlackApi();
+  client = new WebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: api.url });
+});
+
+after(() => api.close());
+
+/** The error a call fails with, and how many requests it sent. */
+async function failure(call: () => Promise<unknown>): Promise<{ err: unknown; sent: number }> {
+  const before = api.calls.length;
+  try {
+    await call();
+  } catch (err) {
+    return { err, sent: api.calls.length - before };
+  }
+  throw new Error('the call did not fail');
+}
+
+// Each test that would wait out a rate limit or a retry under the client's
+// defaults has a 5 s timeout, so a regression fails it instead of waiting: a
+// Retry-After of 30 s, or ten retries over about 30 minutes, can't fit. The
+// request counts show that nothing was sent twice.
+test("a rate limit answers at once with Slack's Retry-After, and the request is sent once", { timeout: 5000 }, async () => {
+  api.answer({ status: 429, headers: { 'retry-after': '30' }, body: { ok: false, error: 'ratelimited' } });
+  const { err, sent } = await failure(() => client.chat.postMessage({ channel: 'C1', text: 'hi' }));
+  assert.equal((err as { code?: string }).code, 'slack_webapi_rate_limited_error');
+  assert.equal((err as { retryAfter?: number }).retryAfter, 30);
+  assert.equal(sent, 1);
+});
+
+test('a failure in transit answers at once, and the request is not sent again', { timeout: 5000 }, async () => {
+  api.answer({ status: 503, body: { ok: false } });
+  const answered = await failure(() => client.chat.postMessage({ channel: 'C1', text: 'hi' }));
+  assert.equal((answered.err as { code?: string }).code, 'slack_webapi_http_error');
+  assert.equal(answered.sent, 1, 'a post that may have reached Slack is not posted again');
+
+  // Nothing listens, so there is no request to count: retries would hold the
+  // call past the test's timeout. Node's code for the refused connection
+  // stays on the error, which is how the explainer tells it from a request
+  // that may have reached Slack.
+  const unreachable = new WebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: await unreachableSlackApiUrl() });
+  await assert.rejects(unreachable.chat.postMessage({ channel: 'C1', text: 'hi' }), (err: { code?: string; original?: { code?: string } }) => {
+    assert.equal(err.code, 'slack_webapi_request_error');
+    assert.equal(err.original?.code, 'ECONNREFUSED');
+    return true;
+  });
+});
+
+test("a request Slack doesn't answer fails at the client's timeout, and is not sent again", { timeout: 5000 }, async () => {
+  const silent = await silentSlackApi();
+  try {
+    // The options' own timeout is 10 s; a shorter one keeps the test short.
+    const waiting = new WebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, timeout: 300, slackApiUrl: silent.url });
+    await assert.rejects(waiting.chat.postMessage({ channel: 'C1', text: 'hi' }), (err: { code?: string; original?: { code?: string } }) => {
+      assert.equal(err.code, 'slack_webapi_request_error');
+      assert.equal(err.original?.code, 'ECONNABORTED');
+      return true;
+    });
+    assert.equal(silent.requests(), 1);
+  } finally {
+    await silent.close();
+  }
+});
+
+test("connectSlack's clients: the adapter's is built with these options, and auth.test's keeps the default retries", () => {
+  // The settings each client was built with are its own private fields, read
+  // here because connectSlack itself calls the real Slack.
+  type Built = { rejectRateLimitedCalls: boolean; retryConfig: unknown; axios: { defaults: { timeout?: number } } };
+  const { auth, web } = slackClients('xoxb-test');
+  const adapter = web as unknown as Built;
+  assert.equal(adapter.rejectRateLimitedCalls, true);
+  assert.deepEqual(adapter.retryConfig, { retries: 0 });
+  assert.equal(adapter.axios.defaults.timeout, 10_000);
+  const startup = auth as unknown as Built;
+  const defaults = new WebClient('xoxb-test') as unknown as Built;
+  assert.equal(startup.rejectRateLimitedCalls, false);
+  assert.equal(startup.retryConfig, defaults.retryConfig, 'a launch while Slack is unreachable still waits');
+  assert.equal(startup.axios.defaults.timeout, 10_000);
+});
+
+const socket: SlackSocketLike = { on() {}, async start() {}, async disconnect() {} };
+
+test("each write makes at most two Slack requests, which the client's timeout keeps inside the host's own", { timeout: 5000 }, async () => {
+  // mcpl-core's default request timeout is 30 s and agent-framework's 60 s.
+  assert.ok(SLACK_CLIENT_OPTIONS.timeout > 0 && SLACK_CLIENT_OPTIONS.timeout * 2 < 30_000);
+  // With DMs off, a write to a conversation the adapter hasn't seen asks Slack
+  // what it is first, and send_dm opens the DM first.
+  api.answer({ body: { ok: true, ts: '1.1', channel: { id: 'C7', is_im: false, is_mpim: false } } });
+  for (const [what, disableDms, write, asked] of [
+    ['send_message', true, (s: SlackAdapter) => s.sendMessage('C7', 'hi'), 'chat.postMessage'],
+    ['reply_message', true, (s: SlackAdapter) => s.sendMessage('C7', 'hi', { threadTs: '1.0' }), 'chat.postMessage'],
+    ['edit_message', true, (s: SlackAdapter) => s.editMessage('C7', '1.0', 'hi'), 'chat.update'],
+    ['delete_message', true, (s: SlackAdapter) => s.deleteMessage('C7', '1.0'), 'chat.delete'],
+    ['add_reaction', true, (s: SlackAdapter) => s.addReaction('C7', '1.0', 'eyes'), 'reactions.add'],
+    ['send_dm', false, (s: SlackAdapter) => s.sendDM('U7', 'hi'), 'chat.postMessage'],
+  ] as const) {
+    const slack = new SlackAdapter(client as unknown as SlackWebLike, socket, 'UBOT', 'acme', undefined, undefined, disableDms);
+    const before = api.calls.length;
+    await write(slack);
+    const first = what === 'send_dm' ? 'conversations.open' : 'conversations.info';
+    assert.deepEqual(api.calls.slice(before), [first, asked], what);
+  }
+});
+
+test("a rate-limited send answers the agent at once with Slack's seconds, and the next Slack call isn't held", { timeout: 5000 }, async () => {
+  const slack = new SlackAdapter(client as unknown as SlackWebLike, socket, 'UBOT', 'acme');
+  const h = connectHost(new SlackMcplServer(slack));
+  await initialize(h, false);
+  api.answer({ status: 429, headers: { 'retry-after': '45' }, body: { ok: false, error: 'ratelimited' } });
+  const sent = (await h.host.sendRequest('tools/call', {
+    name: 'send_message',
+    arguments: { channelId: 'C1', content: 'hi' },
+  })) as { isError?: boolean; content: { text: string }[] };
+  assert.equal(sent.isError, true);
+  assert.match(sent.content[0].text, /Nothing was posted: Slack is rate-limiting this kind of call for the workspace, and asks to wait 45 seconds/);
+  // conversations.list goes through the same client, and the fake endpoint
+  // answers it; a client that paused its queue for the 45 s would hold it.
+  const next = (await h.host.sendRequest('tools/call', { name: 'list_channels', arguments: {} })) as {
+    isError?: boolean;
+  };
+  assert.notEqual(next.isError, true);
+  await h.close();
+});
+
+test('a user Slack refuses to look up is kept as the id, and a lookup that fails otherwise is asked again', { timeout: 5000 }, async () => {
+  const users = client as unknown as SlackUserInfoClient;
+  const cache = new Map<string, string>();
+  const asks = () => api.calls.filter((c) => c === 'users.info').length;
+  api.answer({ body: { ok: false, error: 'user_not_found' } });
+  const refused = await resolveSlackUserNames(users, cache, ['U1']);
+  assert.equal(cache.get('U1'), 'U1', 'Slack answers the same until the user or the app changes');
+  assert.equal(refused.has('U1'), false, 'a refusal is cached, so its error is not returned');
+  const asked = asks();
+  await resolveSlackUserNames(users, cache, ['U1']);
+  assert.equal(asks(), asked, 'a refused lookup is not asked again');
+
+  for (const answer of [
+    { status: 429, headers: { 'retry-after': '30' }, body: { ok: false, error: 'ratelimited' } },
+    { status: 503, body: { ok: false } },
+    { body: { ok: false, error: 'internal_error' } },
+    { body: { ok: false, error: 'request_timeout' } },
+    { body: { ok: false, error: 'ratelimited' } },
+  ]) {
+    api.answer(answer);
+    const failed = await resolveSlackUserNames(users, cache, ['U2']);
+    assert.equal(cache.has('U2'), false, `after ${JSON.stringify(answer.body)}, the name is still unknown, not the id`);
+    assert.ok(failed.has('U2'), 'and its error comes back to the caller');
+  }
+  api.answer({ body: { ok: true, user: { profile: { display_name: 'ann' } } } });
+  await resolveSlackUserNames(users, cache, ['U2']);
+  assert.equal(cache.get('U2'), 'ann');
+});
+
+test("an acknowledgement's add counts as there, and is removed, only when it may have landed", { timeout: 5000 }, async (t) => {
+  const unreachable = new WebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: await unreachableSlackApiUrl() });
+  // A Slack that takes the request and never answers, so the client's timeout ends it, shortened here.
+  const silent = await silentSlackApi();
+  t.after(() => silent.close());
+  const timedOut = new WebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, timeout: 200, slackApiUrl: silent.url });
+  const removals = () => api.calls.filter((c) => c === 'reactions.remove').length;
+  for (const [what, add, removed] of [
+    ['an HTTP 503', { status: 503, body: { ok: false } }, true],
+    ['a request Slack took and never answered', 'timed out', true],
+    ["Slack's own failure", { body: { ok: false, error: 'internal_error' } }, true],
+    ['fatal_error', { body: { ok: false, error: 'fatal_error' } }, true],
+    ['service_unavailable', { body: { ok: false, error: 'service_unavailable' } }, true],
+    ["already_reacted, this bot's reaction being there already", { body: { ok: false, error: 'already_reacted' } }, true],
+    ['a connection never made', 'unreachable', false],
+    ['a rate limit', { status: 429, headers: { 'retry-after': '30' }, body: { ok: false, error: 'ratelimited' } }, false],
+    ['ratelimited in an HTTP 200', { body: { ok: false, error: 'ratelimited' } }, false],
+    ['request_timeout, Slack having received the request only in part', { body: { ok: false, error: 'request_timeout' } }, false],
+    ['a refusal', { body: { ok: false, error: 'invalid_name' } }, false],
+    ["this server's own refusal, the conversation being outside the write allow-list", 'not writable', false],
+  ] as const) {
+    // The add goes to the endpoint, to a port nothing listens on, or to a Slack
+    // that never answers; the removal always goes to the endpoint.
+    const adds = add === 'unreachable' ? unreachable : add === 'timed out' ? timedOut : client;
+    const web = {
+      reactions: {
+        add: (args: Record<string, unknown>) => adds.reactions.add(args as never),
+        remove: (args: Record<string, unknown>) => client.reactions.remove(args as never),
+      },
+    } as unknown as SlackWebLike;
+    const writable = add === 'not writable' ? ['C2'] : undefined;
+    const slack = new SlackAdapter(web, socket, 'UBOT', 'acme', undefined, writable, false, 'eyes');
+    if (typeof add !== 'string') api.answer(add);
+    await slack.acknowledge('C1', '1.1');
+    const before = removals();
+    api.answer({ body: { ok: false, error: 'no_reaction' } });
+    await slack.clearAck('C1', '1.1');
+    assert.equal(removals() - before, removed ? 1 : 0, what);
+  }
+});
+
+test('a listing in the background waits out each rate-limited page, then asks for that page again', { timeout: 5000 }, async () => {
+  // The client's own rate-limit error, so the listing reads its real shape.
+  api.answer({ status: 429, headers: { 'retry-after': '3' }, body: { ok: false, error: 'ratelimited' } });
+  const { err: limited } = await failure(() => client.conversations.info({ channel: 'C1' }));
+  // Page 1, then page 2 rate-limited twice, then page 3 rate-limited once.
+  const script: Array<'limited' | { id: string; next?: string }> = [
+    { id: 'C1', next: 'p2' }, 'limited', 'limited', { id: 'C2', next: 'p3' }, 'limited', { id: 'C3' },
+  ];
+  const asked: Array<string | undefined> = [];
+  const web = {
+    conversations: {
+      async list({ cursor }: { cursor?: string }) {
+        asked.push(cursor);
+        const answer = script.shift();
+        if (answer === 'limited') throw limited;
+        const channel = { id: answer!.id, is_member: true, is_im: false, is_mpim: false };
+        return { channels: [channel], ...(answer!.next ? { response_metadata: { next_cursor: answer!.next } } : {}) };
+      },
+    },
+  } as unknown as SlackWebLike;
+  const slack = new SlackAdapter(web, socket, 'UBOT', 'acme');
+  const waits: Array<[string, number, string, number]> = [];
+  const listed = await slack.listConversations(false, async (wait, inARow) => { waits.push([wait.method, wait.seconds, wait.why, inARow]); });
+  assert.deepEqual(listed.map((c) => c.id), ['C1', 'C2', 'C3']);
+  assert.deepEqual(asked, [undefined, 'p2', 'p2', 'p2', 'p3', 'p3']);
+  assert.deepEqual(waits, [
+    ['conversations.list', 3, 'limited', 1], ['conversations.list', 3, 'limited', 2], ['conversations.list', 3, 'limited', 1],
+  ], "each page's count starts again");
+
+  // Without a wait, the page Slack rate-limits ends the listing at once.
+  script.push({ id: 'C1', next: 'p2' }, 'limited');
+  await assert.rejects(slack.listConversations(), (err) => err === limited);
+});
+
+test('a listing in the background asks again 30 s after a failure that can pass, and ends at a refusal', { timeout: 5000 }, async () => {
+  // The client's own errors, so the listing reads their real shapes.
+  const errors: Record<string, unknown> = {};
+  for (const [name, answer] of [
+    ['503', { status: 503, body: { ok: false } }],
+    ['internal_error', { body: { ok: false, error: 'internal_error' } }],
+    ['missing_scope', { body: { ok: false, error: 'missing_scope' } }],
+  ] as const) {
+    api.answer(answer);
+    errors[name] = (await failure(() => client.conversations.info({ channel: 'C1' }))).err;
+  }
+  const unreachable = new WebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: await unreachableSlackApiUrl() });
+  errors.unsent = (await failure(() => unreachable.conversations.info({ channel: 'C1' }))).err;
+  const script = ['503', 'unsent', 'internal_error', 'ok'];
+  const web = {
+    conversations: {
+      async list() {
+        const next = script.shift()!;
+        if (next !== 'ok') throw errors[next];
+        return { channels: [{ id: 'C1', is_member: true, is_im: false, is_mpim: false }] };
+      },
+    },
+  } as unknown as SlackWebLike;
+  const slack = new SlackAdapter(web, socket, 'UBOT', 'acme');
+  const waits: Array<[string, number, string, number]> = [];
+  const listed = await slack.listConversations(false, async (wait, inARow) => { waits.push([wait.method, wait.seconds, wait.why, inARow]); });
+  assert.deepEqual(listed.map((c) => c.id), ['C1']);
+  assert.deepEqual(waits, [['conversations.list', 30, 'failed', 1], ['conversations.list', 30, 'failed', 2], ['conversations.list', 30, 'failed', 3]]);
+
+  // Slack's answer to a refusal will be the same next time, so the listing ends with it.
+  script.push('missing_scope');
+  await assert.rejects(slack.listConversations(false, async () => {}), (err) => err === errors.missing_scope);
+});
+
+test("a listing in the background waits out a DM's name lookup that can pass, and keeps a refused one's id", { timeout: 5000 }, async () => {
+  api.answer({ status: 429, headers: { 'retry-after': '7' }, body: { ok: false, error: 'ratelimited' } });
+  const { err: limitedLookup } = await failure(() => client.users.info({ user: 'U1' }));
+  api.answer({ body: { ok: false, error: 'user_not_found' } });
+  const { err: refusedLookup } = await failure(() => client.users.info({ user: 'U2' }));
+  api.answer({ body: { ok: false, error: 'internal_error' } });
+  const { err: failedLookup } = await failure(() => client.users.info({ user: 'U3' }));
+  const lookups: Record<string, unknown[]> = { U1: [limitedLookup, limitedLookup], U2: [refusedLookup], U3: [failedLookup] };
+  const web = {
+    conversations: {
+      async list() {
+        return {
+          channels: [{ id: 'D1', is_im: true, user: 'U1' }, { id: 'D2', is_im: true, user: 'U2' }, { id: 'D3', is_im: true, user: 'U3' }],
+        };
+      },
+    },
+    users: {
+      async info({ user }: { user: string }) {
+        const next = lookups[user].shift();
+        if (next) throw next;
+        return { user: { profile: { display_name: 'ann' } } };
+      },
+    },
+  } as unknown as SlackWebLike;
+  const slack = new SlackAdapter(web, socket, 'UBOT', 'acme');
+  const waits: Array<[string, number, string, number]> = [];
+  const listed = await slack.listConversations(false, async (wait, inARow) => { waits.push([wait.method, wait.seconds, wait.why, inARow]); });
+  assert.deepEqual(listed.map((c) => [c.id, c.name]), [['D1', 'ann'], ['D2', 'U2'], ['D3', 'ann']]);
+  // Slack's seconds for a rate limit, and 30 s after Slack's own failure.
+  assert.deepEqual(waits, [['users.info', 7, 'limited', 1], ['users.info', 7, 'limited', 2], ['users.info', 30, 'failed', 1]]);
+
+  // Without a wait, as on a call's own listing, a rate-limited or failed lookup leaves the id.
+  const fresh = new SlackAdapter(web, socket, 'UBOT', 'acme');
+  lookups.U1.push(limitedLookup);
+  lookups.U2.push(refusedLookup);
+  lookups.U3.push(failedLookup);
+  const now = await fresh.listConversations();
+  assert.deepEqual(now.map((c) => c.name), ['U1', 'U2', 'U3']);
+  // A name that's still missing says how long to wait before asking again; a refused one's id is its name.
+  assert.deepEqual(now.map((c) => c.nameWait), [
+    { method: 'users.info', seconds: 7, why: 'limited' }, undefined, { method: 'users.info', seconds: 30, why: 'failed' },
+  ]);
+});
+
+test("a DM whose user's name the listing gives up on is labelled with the id, and later DMs aren't waited for", { timeout: 5000 }, async (t) => {
+  api.answer({ body: { ok: false, error: 'internal_error' } });
+  const { err: failedLookup } = await failure(() => client.users.info({ user: 'U1' }));
+  const asked: Record<string, number> = {};
+  const web = {
+    conversations: {
+      async list() {
+        return {
+          channels: [
+            { id: 'D1', is_im: true, user: 'U1' },
+            { id: 'C2', name: 'general', is_member: true, is_im: false, is_mpim: false },
+            { id: 'D3', is_im: true, user: 'U3' },
+            { id: 'D4', is_im: true, user: 'U4' },
+          ],
+        };
+      },
+    },
+    users: {
+      async info({ user }: { user: string }) {
+        asked[user] = (asked[user] ?? 0) + 1;
+        if (user === 'U4') return { user: { profile: { display_name: 'dee' } } };
+        throw failedLookup;
+      },
+    },
+  } as unknown as SlackWebLike;
+  const logged: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+  t.after(() => { console.error = original; });
+  // Registration's wait gives up at its tenth try; here, at the third.
+  const waits: number[] = [];
+  const listed = await new SlackAdapter(web, socket, 'UBOT', 'acme').listConversations(false, async (_wait, inARow) => {
+    waits.push(inARow);
+    if (inARow >= 3) throw new GaveUp(`Slack rate-limited or failed the same request ${inARow} times in a row`);
+  });
+  assert.deepEqual(listed.map((c) => [c.id, c.name]), [['D1', 'U1'], ['C2', 'general'], ['D3', 'U3'], ['D4', 'dee']]);
+  assert.deepEqual(waits, [1, 2, 3], "only the first DM's name was waited for");
+  assert.deepEqual(asked, { U1: 3, U3: 1, U4: 1 }, 'a later DM is looked up once');
+  assert.deepEqual(listed.map((c) => c.nameWait?.why), ['failed', undefined, 'failed', undefined]);
+  assert.deepEqual(logged, [
+    '[slack-mcpl] Gave up on the name of user U1: Slack rate-limited or failed the same request 3 times in a row. ' +
+      "DM D1 is labelled with the user's id, and the listing's later DMs are looked up without waiting.",
+  ]);
+  // Any other rejection, such as a superseded registration's, still ends the listing.
+  const superseded = new Error('A newer registration superseded this one');
+  await assert.rejects(
+    new SlackAdapter(web, socket, 'UBOT', 'acme').listConversations(false, async () => { throw superseded; }),
+    (err) => err === superseded,
+  );
+});
