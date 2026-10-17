@@ -50,6 +50,7 @@ import { McplRpcError, capabilityDenied } from './errors.js';
 import { explainSlackError } from './slack-errors.js';
 import {
   fetchAttachmentBytes,
+  MAX_ATTACHMENT_BYTES,
   parseSlackAttachmentUrl,
   toFetchResult,
   type AttachmentRef,
@@ -589,6 +590,40 @@ export class SlackMcplServer {
         return { messageId: result.messageId, threadTs };
       }
 
+      case 'upload_file': {
+        const channelId = this.requireString(args, 'channelId');
+        const filename = this.requireString(args, 'filename');
+        const str = (k: string) => (typeof args[k] === 'string' && args[k] ? (args[k] as string) : undefined);
+        const text = args.content;
+        const b64 = args.contentBase64;
+        if ((text === undefined) === (b64 === undefined)) throw new Error('pass exactly one of content or contentBase64');
+        const input = text ?? b64;
+        if (typeof input !== 'string') throw new Error(`${text !== undefined ? 'content' : 'contentBase64'} must be a string`);
+        if (input.length === 0) throw new Error('file content is empty');
+        let data: Buffer;
+        if (text !== undefined) {
+          data = Buffer.from(input, 'utf8');
+        } else {
+          // Buffer.from is intentionally permissive: it skips punctuation and
+          // accepts data-URI prefixes as bytes. Require canonical RFC 4648
+          // base64, including padding and zero unused bits, before uploading.
+          if (input.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(input)) {
+            throw new Error('contentBase64 must be valid base64 (canonical RFC 4648 with padding; no data URI)');
+          }
+          data = Buffer.from(input, 'base64');
+          if (data.toString('base64') !== input) {
+            throw new Error('contentBase64 must be valid base64 (canonical RFC 4648 with padding; no data URI)');
+          }
+        }
+        if (data.byteLength > MAX_ATTACHMENT_BYTES) throw new Error(`inline file too large: ${data.byteLength} bytes (this server's inline limit is ${MAX_ATTACHMENT_BYTES})`);
+        const result = await this.slack.uploadFile(channelId, {
+          filename, data, title: str('title'), comment: str('comment'), threadTs: str('messageId'),
+        });
+        this.markOutbound(channelId);
+        this.stateTracker.recordUploaded(result.fileId, channelId);
+        return { fileId: result.fileId };
+      }
+
       case 'send_dm': {
         const userId = this.requireString(args, 'userId');
         const content = this.requireString(args, 'content');
@@ -1073,7 +1108,7 @@ export class SlackMcplServer {
     }
 
     // This server's rule, not the spec's: rollback deletes the bot's messages
-    // through chat.delete, a slack.messaging write, so it runs only while
+    // and uploaded files, a slack.messaging write, so it runs only while
     // slack.messaging is active on the connection asking. §5.3 keeps it
     // inactive until that connection's initial policy. A refusal leaves the
     // checkpoint in place.
@@ -1094,14 +1129,15 @@ export class SlackMcplServer {
       };
     }
 
-    // Best-effort delete sent messages
+    // Best-effort delete sent messages and uploaded files
     let deleted = 0;
     for (const msg of toDelete) {
       try {
-        await this.slack.deleteMessage(msg.channelId, msg.messageId);
+        if (msg.kind === 'file') await this.slack.deleteUploadedFile(msg.channelId, msg.fileId);
+        else await this.slack.deleteMessage(msg.channelId, msg.messageId);
         deleted++;
       } catch {
-        // Best-effort — message may have been deleted by someone else
+        // Best-effort — an item may have been deleted by someone else
       }
     }
 
@@ -1109,7 +1145,7 @@ export class SlackMcplServer {
       checkpoint: params.checkpoint,
       success: true,
       reason: deleted < toDelete.length
-        ? `Rolled back (${deleted}/${toDelete.length} messages deleted)`
+        ? `Rolled back (${deleted}/${toDelete.length} ${toDelete.some((item) => item.kind === 'file') ? 'messages/files' : 'messages'} deleted)`
         : undefined,
     };
   }

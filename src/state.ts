@@ -1,13 +1,14 @@
 /**
  * Checkpoint tracking for slack.messaging rollback.
  *
- * Tracks messages sent by the bot. On rollback, attempts to
- * delete messages sent after the target checkpoint (best-effort).
+ * Tracks messages and files sent by the bot. On rollback, attempts to
+ * delete items sent after the target checkpoint (best-effort).
  */
 
 import { randomUUID } from 'node:crypto';
 
 export interface SentMessage {
+  kind: 'message';
   /** Slack message ts. */
   messageId: string;
   channelId: string;
@@ -15,26 +16,41 @@ export interface SentMessage {
   timestamp: string;
 }
 
+export interface UploadedFile {
+  kind: 'file';
+  fileId: string;
+  channelId: string;
+  timestamp: string;
+}
+
+type SentItem = SentMessage | UploadedFile;
+
 export interface Checkpoint {
   id: string;
   parent: string | null;
-  /** Index into the sent messages array — everything at this index and after was sent post-checkpoint. */
+  /** Index into the sent items array — everything at this index and after was sent post-checkpoint. */
   sentCount: number;
 }
 
 export class StateTracker {
-  private sentMessages: SentMessage[] = [];
+  private sentItems: SentItem[] = [];
   private checkpoints: Map<string, Checkpoint> = new Map();
   private currentCheckpoint: string | null = null;
 
   /** Record a message we sent (so we can undo it on rollback). */
   recordSent(messageId: string, channelId: string, content: string): void {
-    this.sentMessages.push({
+    this.sentItems.push({
+      kind: 'message',
       messageId,
       channelId,
       content,
       timestamp: new Date().toISOString(),
     });
+  }
+
+  /** Track the Slack file itself: chat.delete cannot remove a file ID. */
+  recordUploaded(fileId: string, channelId: string): void {
+    this.sentItems.push({ kind: 'file', fileId, channelId, timestamp: new Date().toISOString() });
   }
 
   /** Create a new checkpoint. Returns the checkpoint ID. */
@@ -43,7 +59,7 @@ export class StateTracker {
     this.checkpoints.set(id, {
       id,
       parent: this.currentCheckpoint,
-      sentCount: this.sentMessages.length,
+      sentCount: this.sentItems.length,
     });
     this.currentCheckpoint = id;
     return id;
@@ -55,18 +71,18 @@ export class StateTracker {
   }
 
   /**
-   * Roll back to a checkpoint. Returns messages that should be deleted
+   * Roll back to a checkpoint. Returns items that should be deleted
    * (sent after the checkpoint).
    */
-  rollback(checkpointId: string): SentMessage[] | null {
+  rollback(checkpointId: string): SentItem[] | null {
     const checkpoint = this.checkpoints.get(checkpointId);
     if (!checkpoint) return null;
 
-    // Get messages sent after this checkpoint
-    const toDelete = this.sentMessages.slice(checkpoint.sentCount);
+    // Get items sent after this checkpoint
+    const toDelete = this.sentItems.slice(checkpoint.sentCount);
 
     // Create a new branch — don't delete old checkpoints, just branch from here
-    this.sentMessages = this.sentMessages.slice(0, checkpoint.sentCount);
+    this.sentItems = this.sentItems.slice(0, checkpoint.sentCount);
     this.currentCheckpoint = checkpointId;
 
     return toDelete;

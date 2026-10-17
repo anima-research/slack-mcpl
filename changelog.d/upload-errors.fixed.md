@@ -1,0 +1,1 @@
+- Explain Slack upload refusals as uploads, including missing scopes and channel membership; treat uncertain upload failures as writes and point to the destination history before retrying.

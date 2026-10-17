@@ -30,6 +30,7 @@ const NOT_DONE: Record<string, string> = {
   reply_message: 'Nothing was posted',
   'channels/publish': 'Nothing was posted',
   send_dm: 'Nothing was sent',
+  upload_file: 'Nothing was uploaded',
   edit_message: "The message wasn't changed",
   delete_message: 'Nothing was deleted',
   add_reaction: 'No reaction was added',
@@ -40,7 +41,7 @@ const NOT_DONE: Record<string, string> = {
   refresh_channels: 'Nothing was announced to the host',
 };
 
-const POSTS = new Set(['send_message', 'reply_message', 'channels/publish', 'send_dm']);
+const POSTS = new Set(['send_message', 'reply_message', 'channels/publish', 'send_dm', 'upload_file']);
 const WRITES = new Set([...POSTS, 'edit_message', 'delete_message', 'add_reaction']);
 
 const RECALLED = 'The id may be mistyped or remembered rather than copied';
@@ -80,9 +81,9 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
   const ts = given('messageId') ?? given('threadTs');
   const theMessage = ts ? `message ${ts}` : 'the message';
   // The thread a call reads or posts into: fetch_thread's threadTs, the parent
-  // reply_message replies under (its messageId), or, for channels/publish, the
+  // reply_message or upload_file replies under (its messageId), or, for channels/publish, the
   // thread its publish was sent to, which handleRequest passes as threadTs.
-  const thread = call.tool === 'reply_message' ? given('messageId') : given('threadTs');
+  const thread = call.tool === 'reply_message' || call.tool === 'upload_file' ? given('messageId') : given('threadTs');
   const userId = given('userId');
   const theUser = userId ? `user ${userId}` : 'the user given';
   const isWrite = WRITES.has(call.tool);
@@ -120,6 +121,9 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
         'list_channels shows the conversations this bot can use, with their ids.'
       );
     case 'not_in_channel':
+      if (call.tool === 'upload_file') {
+        return `${lead}: this bot isn't a member of ${conversation}, so Slack didn't let it upload there. ${invite}`;
+      }
       return POSTS.has(call.tool)
         ? `${lead}: this bot isn't a member of ${conversation}, so Slack didn't let it post there. ${invite} ` +
             'For a public channel, whoever runs this host can instead grant the Slack app the chat:write.public ' +
@@ -255,6 +259,12 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
           : thread
             ? `fetch_thread for the thread under message ${thread} in ${conversation}`
             : `fetch_history for ${conversation}`;
+        if (call.tool === 'upload_file') {
+          return (
+            `${failed} the file was uploaded is unknown${partly}. Check ${where} before uploading again, so it ` +
+            "isn't uploaded twice."
+          );
+        }
         return (
           `${failed} the message was posted is unknown${partly}. Check ${where} before posting again, so it ` +
           "isn't posted twice."

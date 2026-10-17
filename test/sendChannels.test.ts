@@ -64,3 +64,20 @@ test('canWrite follows the allow-list', () => {
   assert.equal(adapter.canWrite('COTHER'), false);
   assert.equal(makeAdapter().adapter.canWrite('COTHER'), true);
 });
+
+test('upload_file follows the allow-list and passes the file to Slack', async () => {
+  const uploads: any[] = [];
+  const socket = { on() {} } as any;
+  const web = {
+    filesUploadV2: async (args: any) => { uploads.push(args); return { files: [{ files: [{ id: 'F1' }] }] }; },
+  } as any;
+  const adapter = new SlackAdapter(web, socket, 'UBOT', 'acme', undefined, ['CALLOWED']);
+  await assert.rejects(adapter.uploadFile('COTHER', { filename: 'a.csv', data: Buffer.from('x') }), /not allowed/);
+  assert.equal(uploads.length, 0);
+  const r = await adapter.uploadFile('CALLOWED', { filename: 'a.csv', data: Buffer.from('a,b'), threadTs: '1.0', comment: 'please load:' });
+  assert.equal(r.fileId, 'F1');
+  assert.deepEqual(
+    { ...uploads[0], file: uploads[0].file.toString() },
+    { channel_id: 'CALLOWED', file: 'a,b', filename: 'a.csv', title: 'a.csv', initial_comment: 'please load:', thread_ts: '1.0' },
+  );
+});
