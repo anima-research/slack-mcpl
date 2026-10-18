@@ -52,12 +52,6 @@ export class ChannelManager {
   /** Set of open channel IDs (subset of registered). */
   private openChannels = new Set<string>();
 
-  registerAll(descriptors: ChannelDescriptor[]): void {
-    for (const d of descriptors) {
-      this.registered.set(d.id, d);
-    }
-  }
-
   register(descriptor: ChannelDescriptor): void {
     this.registered.set(descriptor.id, descriptor);
   }
@@ -73,11 +67,6 @@ export class ChannelManager {
       this.openChannels.add(id);
     }
     return desc;
-  }
-
-  /** Open a channel by Slack conversation ID. Returns the descriptor if found. */
-  openByConversationId(conversationId: string): ChannelDescriptor | undefined {
-    return this.open(mcplChannelId(conversationId));
   }
 
   close(id: string): boolean {

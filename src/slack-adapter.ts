@@ -26,6 +26,7 @@ import {
   resolveSlackUserNames,
   fetchSlackHistory,
   classifyExtension,
+  reactionName,
   type AttachmentRef,
   type SlackHistoryMessage,
 } from './content.js';
@@ -484,8 +485,7 @@ export class SlackAdapter {
   async addReaction(channelId: string, ts: string, emoji: string): Promise<void> {
     this.assertWritable(channelId);
     await this.assertNotDm(channelId);
-    // Slack wants the bare emoji name; accept :name: and strip the colons.
-    await this.web.reactions.add({ channel: channelId, timestamp: ts, name: emoji.replace(/:/g, '') });
+    await this.web.reactions.add({ channel: channelId, timestamp: ts, name: reactionName(emoji) });
   }
 
   // ── History ──

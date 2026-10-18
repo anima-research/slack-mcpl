@@ -38,7 +38,7 @@ test('ChannelManager tracks registered vs open channels', () => {
   mgr.register(desc);
 
   assert.equal(mgr.isOpen('slack:C1'), false);
-  assert.equal(mgr.openByConversationId('C1')?.id, 'slack:C1');
+  assert.equal(mgr.open('slack:C1')?.id, 'slack:C1');
   assert.equal(mgr.isOpen('slack:C1'), true);
   assert.equal(mgr.close('slack:C1'), true);
   assert.equal(mgr.isOpen('slack:C1'), false);
