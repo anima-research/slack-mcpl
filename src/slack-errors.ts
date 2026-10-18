@@ -178,8 +178,8 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
   }
   if (err instanceof NoReadableConversations) {
     // Not sent: Slack refuses a listing for a type whose read scope the token
-    // lacks, and Slack had just reported the token's scopes. Its message, which
-    // the answer opens with, names the read scopes.
+    // lacks, and the scopes Slack last reported read none of them. Its message,
+    // which the answer opens with, names the read scopes.
     return (
       `${lead}: Slack lists each kind of conversation only for a token with that kind's read scope. Calling ` +
       "again won't change that: whoever runs this host has to add one of those scopes to the app's bot token " +

@@ -1114,9 +1114,9 @@ export class SlackMcplServer {
     return added;
   }
 
-  /** Re-enumerate every conversation currently visible and register any the
-   *  host doesn't yet know about — the agent-facing catch-all for "I was
-   *  invited to a channel but don't see it". */
+  /** Re-enumerate every conversation currently visible, of the kinds the
+   *  token can read, and register any the host doesn't yet know about — the
+   *  agent-facing catch-all for "I was invited to a channel but don't see it". */
   private async refreshChannels(): Promise<{
     visible: number;
     added: Array<{ id: string; label: string }>;

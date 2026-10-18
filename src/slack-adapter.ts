@@ -124,11 +124,12 @@ export function leftOutNote(leftOut: string[]): string {
   const one = leftOut.length === 1;
   return `This listing leaves out ${andList(leftOut.map((type) => TYPE_WORDS[type]))}: this bot's token doesn't have ` +
     `${andList(scopes)}, the read scope${one ? '' : 's'} Slack needs to list ${one ? 'them' : 'those'}. Whoever runs ` +
-    `this host can add ${one ? 'it' : 'them'} to the app's bot token scopes and reinstall the app to the workspace.`;
+    `this host can add ${one ? 'it' : 'them'} to the app's bot token scopes and reinstall the app to the workspace. ` +
+    `Calling again won't list ${one ? 'them' : 'those'} until then.`;
 }
 
 /** A listing with no type to ask for: the token has the read scope of none of
- *  the types this server lists, as Slack has just reported its scopes. `needed`
+ *  the types this server lists, as Slack last reported its scopes. `needed`
  *  holds those read scopes. */
 export class NoReadableConversations extends Error {
   constructor(readonly needed: string[]) {
@@ -596,8 +597,9 @@ export class SlackAdapter {
 
   private stopping = false;
 
-  /** The bot token's scopes, as Slack has reported them, each answer's
-   *  added to those before; undefined while Slack hasn't. */
+  /** The bot token's scopes, as Slack has reported them with auth.test's
+   *  answers and with the listings' answers and refusals, each added to those
+   *  before; undefined while Slack hasn't. */
   private scopes: string[] | undefined;
 
   constructor(
@@ -697,22 +699,25 @@ export class SlackAdapter {
   /** Enumerate conversations the bot can act in: member channels, DMs, and
    *  group DMs, of the types whose read scopes Slack has reported the token
    *  has (every enabled type while it hasn't reported any). Slack reports the
-   *  scopes with each answer, a refusal's included. A listing whose types they
-   *  change, by its own answer or another listing's, starts over with the new
-   *  types, whether the change is seen at one of its answers or as it ends, so
-   *  its answer reflects the scopes known when it returns, and `leftOut` names
-   *  the enabled types it didn't ask for. With no type to ask for, auth.test is asked for the scopes, and if
-   *  they read no type either, NoReadableConversations says so.
-   *  conversations.list also returns public channels the bot is NOT a member
-   *  of (no events, no posting without joining) — those are excluded here;
-   *  list_channels with includeNonMember surfaces them.
+   *  scopes with each answer, and the client hands them on with an answer or a
+   *  refusal, though not with an HTTP error such as a 429. A listing whose
+   *  types they change, by its own answer or another listing's, starts over
+   *  with the new types, whether the change is seen at one of its answers or as
+   *  it ends, so its answer reflects the scopes known when it returns, and
+   *  `leftOut` names the enabled types it didn't ask for. With no type to ask
+   *  for, auth.test is asked for the scopes, and if they read no type either,
+   *  NoReadableConversations says so. conversations.list also returns public
+   *  channels the bot is NOT a member of (no events, no posting without
+   *  joining) — those are excluded here; list_channels with includeNonMember
+   *  surfaces them.
    *
    *  A page Slack rate-limits past what a call's client waits out, or that
    *  its call's deadline leaves no time for (SlackWebClient), or that fails in
    *  a way that can pass, ends the listing, unless `waitOut` is given, for a
    *  listing that runs in the background. Then the page, or the name of a DM's
    *  user, is asked for again once `waitOut` resolves (waitToAskAgain says how
-   *  long). A DM whose name is still missing carries `nameWait`. */
+   *  long), even when the types changed meanwhile. A DM whose name is still
+   *  missing carries `nameWait`. */
   async listConversations(includeNonMember = false, waitOut?: SlackWaitOut): Promise<SlackListing> {
     const noneReadable = () => new NoReadableConversations(this.conversationTypes().map((type) => TYPE_SCOPE[type]));
     let types = this.readableTypes();
@@ -756,12 +761,21 @@ export class SlackAdapter {
           cursor,
         });
       } catch (err) {
+        const method = types.length > 0 ? 'conversations.list' : 'auth.test';
         this.takeScopes(reportedScopes((err as { data?: { response_metadata?: unknown } } | null)?.data?.response_metadata));
-        if (startOver()) continue;
-        const wait = waitOut && waitToAskAgain(err, types.length > 0 ? 'conversations.list' : 'auth.test');
-        if (!wait) throw err;
-        await waitOut!(wait, ++limited);
-        continue;
+        const changed = startOver();
+        // A rate limit, or a failure that can pass, is waited out before
+        // anything is asked again, even when the types changed meanwhile, or
+        // ends a listing nothing waits out. A refusal whose scopes changed the
+        // types starts over at once.
+        const wait = waitToAskAgain(err, method);
+        if (wait) {
+          if (!waitOut) throw err;
+          await waitOut(wait, ++limited);
+          continue;
+        }
+        if (changed) continue;
+        throw err;
       }
       limited = 0;
       this.takeScopes(reportedScopes(result.response_metadata));

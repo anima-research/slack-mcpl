@@ -1,7 +1,8 @@
 - `list_channels`, `refresh_channels`, and the listing when a host grants
   `channels.register` ask `conversations.list` only for the conversation types
   the token has a read scope for, as Slack has reported its scopes: `auth.test`
-  at startup, then each listing's answer, a refusal's included. Slack never
+  at startup, then each listing's answer, a refusal's included, though not an
+  HTTP error such as a 429, which the client hands on without them. Slack never
   narrows a token's scopes, so an answer naming fewer than known takes none
   away. A token without `mpim:read` used to fail the whole call with
   `missing_scope` when DMs were enabled, since the server asked for `mpim`

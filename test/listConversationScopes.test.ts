@@ -8,6 +8,7 @@
 import test, { after, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { method } from '@animalabs/mcpl-core';
+import { ErrorCode } from '@slack/web-api';
 import {
   NoReadableConversations,
   SLACK_CLIENT_OPTIONS,
@@ -94,6 +95,43 @@ test('with no readable type, a type auth.test now reports is listed', async () =
   assert.equal(authCalls(), 1);
 });
 
+test('a rate limit whose answer reports a grant is waited out before the listing asks again, never resent at once', async () => {
+  const asked: string[] = [];
+  let limitedOnce = true;
+  const web = {
+    conversations: {
+      async list(args: Record<string, unknown>) {
+        asked.push(`list ${args.types}`);
+        if (!limitedOnce) return { channels: [] };
+        limitedOnce = false;
+        // Slack's ratelimited in an HTTP 200, as the client throws it: a
+        // refusal whose data carries the answer's scopes, here a grant.
+        throw Object.assign(new Error('An API error occurred: ratelimited'), {
+          code: ErrorCode.PlatformError,
+          data: { ok: false, error: 'ratelimited', response_metadata: { scopes: ALL } },
+        });
+      },
+    },
+  } as any;
+  const adapter = () =>
+    new SlackAdapter(web, { on() {} } as any, 'UBOT', 'acme', undefined, undefined, false, undefined, ['channels:read', 'groups:read', 'im:read']);
+  // Without waitOut, as list_channels and refresh_channels list, the listing
+  // fails with it and asks nothing more.
+  await assert.rejects(adapter().listConversations(), /An API error occurred: ratelimited/);
+  assert.deepEqual(asked, ['list public_channel,private_channel,im']);
+  // With waitOut, as registration lists, the wait comes first, then the
+  // listing asks with the types the grant made readable.
+  asked.length = 0;
+  limitedOnce = true;
+  const listed = await adapter().listConversations(false, async (wait) => { asked.push(`wait ${wait.method} ${wait.why}`); });
+  assert.deepEqual(asked, [
+    'list public_channel,private_channel,im',
+    'wait conversations.list failed',
+    'list public_channel,private_channel,im,mpim',
+  ]);
+  assert.deepEqual(listed, { conversations: [], leftOut: [] });
+});
+
 test("the stderr line names only the enabled types the token can't read, and says when that changes", async (t) => {
   const lines: string[] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => lines.push(args.join(' ')));
@@ -125,7 +163,7 @@ test("the note names three or more kinds as a list, each with its read scope", (
   assert.equal(leftOutNote(['private_channel', 'im', 'mpim']),
     "This listing leaves out private channels, DMs and group DMs: this bot's token doesn't have groups:read, " +
       "im:read and mpim:read, the read scopes Slack needs to list those. Whoever runs this host can add them to the " +
-      "app's bot token scopes and reinstall the app to the workspace.");
+      "app's bot token scopes and reinstall the app to the workspace. Calling again won't list those until then.");
 });
 
 // Through the real client: Slack's answer names the token's scopes in its
@@ -217,18 +255,18 @@ test("an answer naming fewer scopes than known takes none away, so the listing k
 test("a grant another listing reports while this one waits on a page starts this one over at that page's answer", { timeout: 5000 }, async (t) => {
   t.after(() => api.answerFor('conversations.list'));
   const from = api.calls.length;
-  let other: Promise<unknown> | undefined;
+  let otherDone!: () => void;
+  const other = new Promise<void>((resolve) => { otherDone = resolve; });
   api.answerFor('conversations.list',
-    // This listing's only page, slowed so the other listing, awaited below,
-    // has its answers well before.
-    { ...page('channels:read,groups:read,im:read', [channel('C1')]), delayMs: 2000 },
+    // This listing's only page, answered once the other listing has returned.
+    { ...page('channels:read,groups:read,im:read', [channel('C1')]), after: other },
     page('channels:read,groups:read,im:read,mpim:read'),
     page('channels:read,groups:read,im:read,mpim:read', [channel('C1')]));
   const slack = realAdapter(['channels:read', 'groups:read', 'im:read']);
   const mine = slack.listConversations();
   await until(() => api.calls.length > from, 'the first listing asked');
-  other = slack.listConversations();
-  await other;
+  await slack.listConversations();
+  otherDone();
   const listed = await mine;
   assert.deepEqual(listed.leftOut, []);
   assert.deepEqual(listed.conversations.map((c) => c.id), ['C1']);
@@ -244,7 +282,10 @@ test("a grant another listing reports while this one looks up a DM's name starts
   t.after(() => api.answerFor('conversations.list'));
   t.after(() => api.answerFor('users.info'));
   const from = api.calls.length;
-  api.answerFor('users.info', { body: { ok: true, user: { name: 'ann' } }, delayMs: 300 });
+  let otherDone!: () => void;
+  const other = new Promise<void>((resolve) => { otherDone = resolve; });
+  // The DM's name, answered once the other listing has returned.
+  api.answerFor('users.info', { body: { ok: true, user: { name: 'ann' } }, after: other });
   api.answerFor('conversations.list',
     page('channels:read,groups:read,im:read', [{ id: 'D1', is_im: true, user: 'U5' }]),
     page('channels:read,groups:read,im:read,mpim:read'));
@@ -252,6 +293,7 @@ test("a grant another listing reports while this one looks up a DM's name starts
   const mine = slack.listConversations();
   await until(() => api.calls.slice(from).includes('users.info'), "the DM's name lookup");
   await slack.listConversations();
+  otherDone();
   const listed = await mine;
   assert.deepEqual(listed.leftOut, [], 'the note names no scope the token holds');
   assert.equal(asked(from).at(-1)?.[0], 'public_channel,private_channel,im,mpim');
@@ -350,7 +392,7 @@ test('list_channels says which kinds a listing left out beside the list, and ans
   assert.equal(listed.content[1].text,
     "This listing leaves out DMs and group DMs: this bot's token doesn't have im:read and mpim:read, the read " +
       "scopes Slack needs to list those. Whoever runs this host can add them to the app's bot token scopes and " +
-      'reinstall the app to the workspace.');
+      "reinstall the app to the workspace. Calling again won't list those until then.");
   // A grant reported meanwhile: the listing starts over with it, and the list stands alone.
   api.answerFor('conversations.list', page('channels:read,groups:read,im:read,mpim:read,chat:write', [channel('C1')]));
   const all = (await h.host.sendRequest('tools/call', { name: 'list_channels', arguments: {} })) as ToolResult;
@@ -382,7 +424,7 @@ test("refresh_channels' note says which kinds the listing left out", { timeout: 
   assert.ok(note.endsWith(
     " This listing leaves out group DMs: this bot's token doesn't have mpim:read, the read scope Slack needs to " +
       "list them. Whoever runs this host can add it to the app's bot token scopes and reinstall the app to the " +
-      'workspace.'), note);
+      "workspace. Calling again won't list them until then."), note);
 });
 
 test('list_channels with no readable type says so, names the read scopes, and sends no listing', { timeout: 5000 }, async (t) => {
