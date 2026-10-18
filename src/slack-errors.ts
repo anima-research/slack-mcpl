@@ -51,11 +51,13 @@ const NOT_DONE: Record<string, string> = {
 };
 
 const POSTS = new Set(['send_message', 'reply_message', 'channels/publish', 'send_dm']);
-/** The requests a write tool's own write goes out as. A failure of any other
- *  request a write tool makes, such as the DM check's conversations.info or
- *  send_dm's conversations.open, came before its write, so nothing was
- *  written. */
-const WRITE_METHODS = new Set(['chat.postMessage', 'chat.update', 'chat.delete', 'reactions.add']);
+/** The requests a write tool makes before its write: the conversation check
+ *  under SLACK_DISABLE_DMS and send_dm's opening of the DM. A failure of one of
+ *  these wrote nothing. Any other request a write tool makes reads as its own
+ *  write, so a method missing here costs only a check before trying again,
+ *  where one missing from a list of writes would say nothing was written when
+ *  something may have been. */
+const BEFORE_WRITE = new Set(['conversations.info', 'conversations.open']);
 const WRITES = new Set([...POSTS, 'edit_message', 'delete_message', 'add_reaction']);
 /** Tools whose listing pages through Slack inside the call, from the first
  *  page each time, so in a workspace too large to list within Slack's rate
@@ -115,11 +117,11 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
   const userId = given('userId');
   const theUser = userId ? `user ${userId}` : 'the user given';
   const isWrite = WRITES.has(call.tool);
-  // A write's outcome is unknown only when the request that failed is its own
-  // write. An error no request of the client's threw keeps the tool's reading,
-  // since then which request failed can't be told.
+  // A write's outcome is unknown unless the request that failed is one known
+  // to come before the write. An error no request of the client's threw keeps
+  // the tool's reading, since then which request failed can't be told.
   const failed = failedRequest(err);
-  const mayHaveWritten = isWrite && (failed === undefined || WRITE_METHODS.has(failed));
+  const mayHaveWritten = isWrite && (failed === undefined || !BEFORE_WRITE.has(failed));
   /** For a listing tool: a new call starts over, so a listing too large for
    *  `limit` stops near the same place each time. */
   const startsOver = (limit: string) => LISTINGS.has(call.tool)
