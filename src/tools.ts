@@ -101,8 +101,9 @@ export const toolDefinitions: ToolDefinition[] = [
     name: 'list_channels',
     description:
       'List Slack conversations: channels the bot is a member of, private channels, DMs, ' +
-      'and group DMs. Set includeNonMember to also list public channels the bot has not joined ' +
-      '(it cannot receive events from or post to those without being invited).',
+      "and group DMs, each kind the bot's token has the read scope for. An answer that leaves a kind " +
+      'out says which, beside the list. Set includeNonMember to also list public channels the bot has not ' +
+      'joined (it cannot receive events from or post to those without being invited).',
     inputSchema: {
       type: 'object',
       properties: {

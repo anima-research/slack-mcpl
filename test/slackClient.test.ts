@@ -414,7 +414,7 @@ test("a DM whose name lookup its call has no time left for is marked to wait, no
   api.answerFor('conversations.list', { body: { ok: true, channels: [{ id: 'D5', is_im: true, user: 'U5' }] }, delayMs: 2000 });
   const before = api.calls.length;
   const arrived = Date.now() - (CALL_SECONDS - SLACK_CLIENT_OPTIONS.timeout / 1000 - 1.5) * 1000;
-  const [dm] = await withCallTime(arrived, () => slack.listConversations());
+  const { conversations: [dm] } = await withCallTime(arrived, () => slack.listConversations());
   assert.deepEqual(api.calls.slice(before), ['conversations.list'], 'users.info was not sent');
   assert.equal(dm.name, 'U5');
   // refresh_channels leaves out a new DM with a name wait, for a later refresh to announce by name.
@@ -546,7 +546,7 @@ test('a listing in the background waits out each rate-limited page, then asks fo
   } as unknown as SlackWebLike;
   const slack = new SlackAdapter(web, socket, 'UBOT', 'acme');
   const waits: Array<[string, number, string, number]> = [];
-  const listed = await slack.listConversations(false, async (wait, inARow) => { waits.push([wait.method, wait.seconds, wait.why, inARow]); });
+  const { conversations: listed } = await slack.listConversations(false, async (wait, inARow) => { waits.push([wait.method, wait.seconds, wait.why, inARow]); });
   assert.deepEqual(listed.map((c) => c.id), ['C1', 'C2', 'C3']);
   assert.deepEqual(asked, [undefined, 'p2', 'p2', 'p2', 'p3', 'p3']);
   assert.deepEqual(waits, [
@@ -583,7 +583,7 @@ test('a listing in the background asks again 30 s after a failure that can pass,
   } as unknown as SlackWebLike;
   const slack = new SlackAdapter(web, socket, 'UBOT', 'acme');
   const waits: Array<[string, number, string, number]> = [];
-  const listed = await slack.listConversations(false, async (wait, inARow) => { waits.push([wait.method, wait.seconds, wait.why, inARow]); });
+  const { conversations: listed } = await slack.listConversations(false, async (wait, inARow) => { waits.push([wait.method, wait.seconds, wait.why, inARow]); });
   assert.deepEqual(listed.map((c) => c.id), ['C1']);
   assert.deepEqual(waits, [['conversations.list', 30, 'failed', 1], ['conversations.list', 30, 'failed', 2], ['conversations.list', 30, 'failed', 3]]);
 
@@ -618,7 +618,7 @@ test("a listing in the background waits out a DM's name lookup that can pass, an
   } as unknown as SlackWebLike;
   const slack = new SlackAdapter(web, socket, 'UBOT', 'acme');
   const waits: Array<[string, number, string, number]> = [];
-  const listed = await slack.listConversations(false, async (wait, inARow) => { waits.push([wait.method, wait.seconds, wait.why, inARow]); });
+  const { conversations: listed } = await slack.listConversations(false, async (wait, inARow) => { waits.push([wait.method, wait.seconds, wait.why, inARow]); });
   assert.deepEqual(listed.map((c) => [c.id, c.name]), [['D1', 'ann'], ['D2', 'U2'], ['D3', 'ann']]);
   // Slack's seconds for a rate limit, and 30 s after Slack's own failure.
   assert.deepEqual(waits, [['users.info', 7, 'limited', 1], ['users.info', 7, 'limited', 2], ['users.info', 30, 'failed', 1]]);
@@ -628,7 +628,7 @@ test("a listing in the background waits out a DM's name lookup that can pass, an
   lookups.U1.push(limitedLookup);
   lookups.U2.push(refusedLookup);
   lookups.U3.push(failedLookup);
-  const now = await fresh.listConversations();
+  const { conversations: now } = await fresh.listConversations();
   assert.deepEqual(now.map((c) => c.name), ['U1', 'U2', 'U3']);
   // A name that's still missing says how long to wait before asking again; a refused one's id is its name.
   assert.deepEqual(now.map((c) => c.nameWait), [
@@ -667,7 +667,7 @@ test("a DM whose user's name the listing gives up on is labelled with the id, an
   t.after(() => { console.error = original; });
   // Registration's wait gives up at its tenth try; here, at the third.
   const waits: number[] = [];
-  const listed = await new SlackAdapter(web, socket, 'UBOT', 'acme').listConversations(false, async (_wait, inARow) => {
+  const { conversations: listed } = await new SlackAdapter(web, socket, 'UBOT', 'acme').listConversations(false, async (_wait, inARow) => {
     waits.push(inARow);
     if (inARow >= 3) throw new GaveUp(`Slack rate-limited or failed the same request ${inARow} times in a row`);
   });

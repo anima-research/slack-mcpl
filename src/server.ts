@@ -43,6 +43,7 @@ import {
   GaveUp,
   SLACK_CLIENT_OPTIONS,
   assertRequestFits,
+  leftOutNote,
   outsideCallTime,
   withCallTime,
   type SlackAdapter,
@@ -654,8 +655,8 @@ export class SlackMcplServer {
         return 'Message deleted';
 
       case 'list_channels': {
-        const convs = await this.slack.listConversations(args.includeNonMember === true);
-        return convs.map((c) => ({
+        const { conversations, leftOut } = await this.slack.listConversations(args.includeNonMember === true);
+        const listed = conversations.map((c) => ({
           id: c.id,
           kind: c.kind,
           name: c.kind === 'dm' ? `DM: @${c.name}` : c.name,
@@ -663,6 +664,11 @@ export class SlackMcplServer {
           ...(c.kind === 'channel' || c.kind === 'private_channel' ? { isMember: c.isMember } : {}),
           writable: this.slack.canWrite(c.id),
         }));
+        // A listing that left types out says which beside the list, so an
+        // agent asked about its DMs can tell "none" from "can't see them";
+        // one that left none out answers with the list alone.
+        if (leftOut.length === 0) return listed;
+        return { _content: [textContent(JSON.stringify(listed)), textContent(leftOutNote(leftOut))] };
       }
 
       case 'refresh_channels':
@@ -914,7 +920,7 @@ export class SlackMcplServer {
       // answers at once), so a request Slack rate-limits is waited out, as
       // Slack asks, and one that fails in a way that can pass is asked again
       // after a wait, and the listing goes on from there.
-      const convs = await this.slack.listConversations(false, (wait, inARow) =>
+      const { conversations: convs } = await this.slack.listConversations(false, (wait, inARow) =>
         this.waitToAskAgain(wait, inARow, isCurrent));
       descriptors = convs.map((c) => toDescriptor(c, this.slack.teamName, this.slack.canWrite(c.id)));
     } catch (err) {
@@ -1057,7 +1063,7 @@ export class SlackMcplServer {
       );
     }
     const gone = () => this.conn !== conn || !!conn?.isClosed;
-    const convs = await this.slack.listConversations();
+    const { conversations: convs, leftOut: typesLeftOut } = await this.slack.listConversations();
     // The host keeps the label a conversation is first announced with, and a
     // refresh never announces a known one again, so a new DM whose user's name
     // this server couldn't get from Slack just now waits for a later refresh
@@ -1097,7 +1103,8 @@ export class SlackMcplServer {
             ? 'The host has not granted channels.register; nothing was announced.'
             : unnamed.length > 0
               ? 'No conversation was registered.'
-              : 'No new conversations — the host already knows about every visible one.') + leftOut,
+              : 'No new conversations — the host already knows about every visible one.') + leftOut +
+        (typesLeftOut.length > 0 ? ` ${leftOutNote(typesLeftOut)}` : ''),
     };
   }
 

@@ -35,7 +35,7 @@ function fixture(
     teamName: 'acme', botUserId: 'UBOT', dmsWritable: true,
     canWrite,
     onMessage(handler: (msg: SlackMessageData) => void) { handlers.push(handler); },
-    async listConversations() { return [{ id: 'C1', name: 'general', kind: 'channel', isMember: true }]; },
+    async listConversations() { return { conversations: [{ id: 'C1', name: 'general', kind: 'channel', isMember: true }], leftOut: [] }; },
     async getConversationMeta(id: string) {
       await beforeMeta();
       return { id, name: 'general', kind: 'channel', isMember: true };
