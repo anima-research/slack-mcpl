@@ -37,7 +37,11 @@ export const NOTHING_RETURNED = 'No messages were returned';
 /** One of the read's own failures, which opens as every failure of a read does. */
 const refused = (text: string) => new Error(`${NOTHING_RETURNED}: ${text}`);
 /** What a Slack timestamp looks like, for a refusal of one. */
-const TS_FORM = 'which looks like 1718000000.000100';
+export const TS_FORM = 'which looks like 1718000000.000100';
+/** Where a thread's parent id comes from, for a refusal of an argument that
+ *  names one: fetch_thread's threadTs, and reply_message's messageId. */
+export const PARENT_IDS =
+  "Pass the thread's parent id: a reply's thread=, or a message's rootTs in fetch_history or fetch_thread results";
 /** What an answer this server can't read means for calling again. */
 const UNREADABLE = "Calling again may work; if it fails the same way, this server can't read Slack's answer for this range.";
 
@@ -45,9 +49,20 @@ const UNREADABLE = "Calling again may work; if it fails the same way, this serve
 export const SLACK_TS = /^\d{1,16}(?:\.\d{1,6})?$/;
 const isTimestamp = (value: unknown): value is string =>
   typeof value === 'string' && SLACK_TS.test(value) && Number.isFinite(new Date(Number(value) * 1000).getTime());
-/** A timestamp argument, refused with where a right one comes from. */
+/** The value a refusal names: a string as JSON quotes it, so a stray space
+ *  shows, or what else it is. */
+function passed(value: unknown): string {
+  if (typeof value === 'string') return JSON.stringify(value);
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'an array';
+  return typeof value === 'object' ? 'an object' : `a ${typeof value}`;
+}
+/** A timestamp argument, refused with what was passed and where a right one
+ *  comes from. */
 function timestamp(value: unknown, name: string, source: string): string {
-  if (!isTimestamp(value)) throw refused(`${name} must be a Slack timestamp, ${TS_FORM}. ${source}`);
+  if (!isTimestamp(value)) {
+    throw refused(`${name} must be a Slack timestamp, ${TS_FORM}, and this call passed ${passed(value)}. ${source}`);
+  }
   return value;
 }
 /** A message's ts, as Slack gave it: a read can't place a message without
@@ -80,10 +95,11 @@ const BY_ID = new (class extends Map<string, string> {
   }
 })();
 
-/** A read's arguments, checked before Slack is asked: an argument this tool
- *  doesn't take is refused, so a misspelled filter can't read as no filter. */
-export type ReadOptions = ReturnType<typeof readOptions>;
-export function readOptions(args: Record<string, unknown>, kind: Kind, channelId: string, threadTs?: string) {
+/** Refuses an argument this read tool doesn't take, naming any it looks like
+ *  a slip for, so a misspelled filter can't read as no filter. The server
+ *  checks this before the arguments it requires, so a slip for one of those
+ *  is named as one. */
+export function refuseUnknownArguments(args: Record<string, unknown>, kind: Kind): void {
   const takes: readonly string[] = READ_ARGUMENTS[kind];
   const unknown = Object.keys(args).filter((key) => !takes.includes(key));
   if (unknown.length) {
@@ -96,13 +112,19 @@ export function readOptions(args: Record<string, unknown>, kind: Kind, channelId
         `${named.join(', ')}. It takes ${takes.join(', ')}.`,
     );
   }
+}
+
+/** A read's arguments, checked before Slack is asked. */
+export type ReadOptions = ReturnType<typeof readOptions>;
+export function readOptions(args: Record<string, unknown>, kind: Kind, channelId: string, threadTs?: string) {
+  refuseUnknownArguments(args, kind);
   if (!/^[CGD][A-Z0-9]+$/.test(channelId)) {
-    throw refused("channelId must be a Slack conversation id, such as C0123456789. list_channels shows each conversation's id.");
+    throw refused(
+      `channelId must be a Slack conversation id, such as C0123456789, and this call passed ${passed(channelId)}. ` +
+        "list_channels shows each conversation's id.",
+    );
   }
-  if (kind === 'thread') {
-    timestamp(threadTs, 'threadTs',
-      "Pass the thread's parent id: a reply's thread=, or the id of the message the replies are under, which fetch_history shows.");
-  }
+  if (kind === 'thread') timestamp(threadTs, 'threadTs', `${PARENT_IDS}.`);
   const limits = {} as Record<keyof typeof READ_LIMITS, number>;
   for (const [name, bounds] of Object.entries(READ_LIMITS)) {
     const value = args[name] === undefined
@@ -343,5 +365,5 @@ function stoppedAtStart(opts: ReadOptions, stopReason: StopReason, held: { ts: s
         : `maxBytes goes up to ${n(most)}, so this tool can't return it whole; to read past it, ${past}.`);
   }
   return `${NOTHING_RETURNED}: Slack's page held no message past where this read started, though it said more ` +
-    "remain. Calling again may get them; if it stops the same way, Slack isn't giving the rest of this range just now.";
+    "remain. Calling again may get them; if it stops the same way, Slack's answers don't take this read past its start.";
 }

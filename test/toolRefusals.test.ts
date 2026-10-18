@@ -93,7 +93,8 @@ for (const [tool, args, text] of [
     'add_reaction',
     { channelId: 'C1' },
     'messageId must be a non-empty string, and this call left it out. Take it from the message: its id= ' +
-      "(reply_message takes its thread= when it shows one), or from fetch_history's ids.",
+      "(reply_message takes its thread= when it shows one, or its rootTs in fetch_history and fetch_thread results), or " +
+      "from fetch_history's ids.",
   ],
   [
     'add_reaction',
@@ -104,8 +105,9 @@ for (const [tool, args, text] of [
     'fetch_thread',
     { channelId: 'C1' },
     "threadTs must be a non-empty string, and this call left it out. Pass the thread's parent id: a reply's thread=, " +
-      'or the id of the message the replies are under, which fetch_history shows.',
+      "or a message's rootTs in fetch_history or fetch_thread results.",
   ],
+  ['fetch_thread', {}, `channelId must be a non-empty string, and this call left it out. ${CHANNEL_ID_SOURCE}`],
   ['send_dm', {}, "userId must be a non-empty string, and this call left it out. find_user returns each person's userId."],
   ['find_user', {}, "query must be a non-empty string, and this call left it out. Pass part of a person's name."],
   [

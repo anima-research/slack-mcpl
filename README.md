@@ -210,7 +210,8 @@ message once; a match held back by the byte budget is counted by the call that
 returns it. `pages` counts the pages Slack answered for this call. Stop reasons are
 `exhausted`, `match_limit`, `scan_limit`, `byte_limit`, `time_limit`,
 `rate_limited` and `pagination_stalled`. A rate limit includes
-`retryAfterSeconds` when Slack gave one; the caller chooses whether and when to
+`retryAfterSeconds` when Slack gave a count of seconds, unless it's negative
+or past `Number.MAX_SAFE_INTEGER`; the caller chooses whether and when to
 resume. A stalled pagination response is incomplete, never silently exhausted.
 
 **Zero matches in an incomplete scan does not mean no matching message exists.**
@@ -243,7 +244,8 @@ range. Previously unbounded or invalid numeric limits and unknown arguments now
 refuse; an unknown argument's refusal names the arguments the tool takes, and
 any it looks like a slip for. The default `maxBytes` of 64 KiB can end a default read before its
 match count, with `byte_limit` and a cursor. A failed read's explanation now
-leads with "No messages were returned", as do the read's own failures. Existing tool names, default match counts and
+leads with "No messages were returned", as do the read's own failures, and a
+failure the explanation doesn't cover is followed by it. Existing tool names, default match counts and
 `list_channels.writable` remain stable. No new scopes, regex, bulk expansion,
 native search or interaction-token handling are included.
 

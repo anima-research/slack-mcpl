@@ -17,6 +17,7 @@ import {
   type SlackWebLike,
 } from '../src/slack-adapter.js';
 import { READ_ARGUMENTS, readOptions } from '../src/history-read.js';
+import { explainSlackError } from '../src/slack-errors.js';
 import { toolDefinitions } from '../src/tools.js';
 import { fakeSlackApi, type FakeSlackApi, type SlackApiAnswer } from './slackApi.js';
 import { until } from './harness.js';
@@ -452,7 +453,25 @@ test("past a thread's start, a page that wants Slack's page size or more asks fo
 test("a first page with more to come but nothing in it fails the call, since the read can't move", { timeout: 5000 }, async (t) => {
   answers(t, { 'conversations.history': [page([], true)] });
   await assert.rejects(adapter().readHistory('C1', { channelId: 'C1' }),
-    /^Error: No messages were returned: Slack's page held no message past where this read started, though it said more remain\. Calling again may get them; if it stops the same way, Slack isn't giving the rest of this range just now\.$/);
+    /^Error: No messages were returned: Slack's page held no message past where this read started, though it said more remain\. Calling again may get them; if it stops the same way, Slack's answers don't take this read past its start\.$/);
+});
+
+test("a read Slack fails before it moves says that no messages were returned, with a rate limit's seconds when Slack gave them", { timeout: 5000 }, async (t) => {
+  for (const [answer, said] of [
+    [{ headers: { 'retry-after': '30' }, body: { ok: false, error: 'ratelimited' } },
+      /\n\nNo messages were returned: Slack is rate-limiting this kind of call for the workspace, and asks to wait 30 seconds before trying again\.$/],
+    [{ body: { ok: false, error: 'ratelimited' } },
+      /\n\nNo messages were returned: Slack is rate-limiting this kind of call for the workspace\. Try again shortly\.$/],
+    // A code the explainer doesn't know, and the client's own error for a 429
+    // without a Retry-After it can read, still say what the read returned.
+    [{ body: { ok: false, error: 'invalid_arguments' } }, /^An API error occurred: invalid_arguments\n\nNo messages were returned\.$/],
+    [{ status: 429, headers: { 'retry-after': 'soon' }, body: { ok: false, error: 'ratelimited' } },
+      /^Retry header did not contain a valid timeout .*\n\nNo messages were returned\.$/s],
+  ] as const) {
+    answers(t, { 'conversations.history': [answer] });
+    const err = await withCallTime(Date.now(), () => adapter().readHistory('C1', { channelId: 'C1' })).then(() => null, (e: unknown) => e);
+    assert.match(explainSlackError(err, { tool: 'fetch_history', args: { channelId: 'C1' } }), said, JSON.stringify(answer));
+  }
 });
 
 test('a later page with more to come but nothing in it stops the read as stalled, not covered', { timeout: 5000 }, async (t) => {
@@ -467,7 +486,7 @@ test('arguments are checked before Slack is asked: unknown names, bounds, timest
   const reader = adapter();
   const from = api.calls.length;
   const historyTakes = 'It takes channelId, limit, oldest, latest, cursor, maxScanned, maxBytes, textContains, caseSensitive, authorIds.';
-  const bound = "which looks like 1718000000.000100. Take one from fetch_history's ids, or from a message's id=.";
+  const bound = "Take one from fetch_history's ids, or from a message's id=.";
   const authors = "authorIds must contain 1 to 50 Slack user or bot IDs, as a message's authorId or authorBotId gives them, or " +
     "find_user's userId.";
   for (const [args, said] of [
@@ -484,8 +503,14 @@ test('arguments are checked before Slack is asked: unknown names, bounds, timest
     [{ limit: '50' }, 'limit must be an integer from 1 to 1000.'],
     [{ maxScanned: 10001 }, 'maxScanned must be an integer from 1 to 10000.'],
     [{ maxBytes: 1000 }, 'maxBytes must be an integer from 2048 to 1048576.'],
-    [{ oldest: 'yesterday' }, `oldest must be a Slack timestamp, ${bound}`],
-    [{ latest: 5 }, `latest must be a Slack timestamp, ${bound}`],
+    // The value given is named: a string quoted, so a stray space shows, or
+    // what else it is.
+    [{ oldest: 'yesterday' }, `oldest must be a Slack timestamp, which looks like 1718000000.000100, and this call passed "yesterday". ${bound}`],
+    [{ latest: '1.0 ' }, `latest must be a Slack timestamp, which looks like 1718000000.000100, and this call passed "1.0 ". ${bound}`],
+    [{ latest: 5 }, `latest must be a Slack timestamp, which looks like 1718000000.000100, and this call passed a number. ${bound}`],
+    [{ oldest: null }, `oldest must be a Slack timestamp, which looks like 1718000000.000100, and this call passed null. ${bound}`],
+    [{ oldest: ['1.0'] }, `oldest must be a Slack timestamp, which looks like 1718000000.000100, and this call passed an array. ${bound}`],
+    [{ oldest: {} }, `oldest must be a Slack timestamp, which looks like 1718000000.000100, and this call passed an object. ${bound}`],
     [{ oldest: '2.0', latest: '1.0' }, 'oldest must precede latest.'],
     [{ textContains: '' }, 'textContains must contain 1 to 256 characters.'],
     [{ caseSensitive: 'yes' }, 'caseSensitive must be a boolean.'],
@@ -498,12 +523,13 @@ test('arguments are checked before Slack is asked: unknown names, bounds, timest
       JSON.stringify(args));
   }
   await assert.rejects(reader.readHistory('U1', { channelId: 'U1' }), {
-    message: "No messages were returned: channelId must be a Slack conversation id, such as C0123456789. list_channels shows each " +
-      "conversation's id.",
+    message: 'No messages were returned: channelId must be a Slack conversation id, such as C0123456789, and this call passed "U1". ' +
+      "list_channels shows each conversation's id.",
   });
   await assert.rejects(reader.readThread('C1', 'nope', { channelId: 'C1', threadTs: 'nope' }), {
-    message: 'No messages were returned: threadTs must be a Slack timestamp, which looks like 1718000000.000100. Pass the ' +
-      "thread's parent id: a reply's thread=, or the id of the message the replies are under, which fetch_history shows.",
+    message: 'No messages were returned: threadTs must be a Slack timestamp, which looks like 1718000000.000100, and this call ' +
+      "passed \"nope\". Pass the thread's parent id: a reply's thread=, or a message's rootTs in fetch_history or fetch_thread " +
+      'results.',
   });
   await assert.rejects(reader.readThread('C1', '1.0', { channelId: 'C1', threadTs: '1.0', textContains: 'x' }), {
     message: 'No messages were returned: fetch_thread takes no argument named textContains. It takes channelId, threadTs, ' +
@@ -595,7 +621,8 @@ test("a thread read stopped by a long rate limit, or by the call's time, returns
 });
 
 test("Slack's ratelimited refusal after the first pages stops the read as a rate limit, with Slack's seconds when they came with it", { timeout: 5000 }, async (t) => {
-  for (const [headers, seconds] of [[{ 'retry-after': '30' }, 30], [{}, undefined]] as const) {
+  // Zero seconds are seconds; a negative count isn't one.
+  for (const [headers, seconds] of [[{ 'retry-after': '30' }, 30], [{ 'retry-after': '0' }, 0], [{ 'retry-after': '-1' }, undefined], [{}, undefined]] as const) {
     answers(t, { 'conversations.history': [page([row('9.0', 'U1', 'a')], true), { headers, body: { ok: false, error: 'ratelimited' } }] });
     const out = await withCallTime(Date.now(), () => adapter().readHistory('C1', { channelId: 'C1', latest: '10.0' }));
     assert.deepEqual(out.messages.map((m) => m.id), ['9.0']);
@@ -751,6 +778,7 @@ test("each read tool's schema takes what its read takes: the same arguments, eac
           else refuses([id]);
         }
       } else if (p.type === 'boolean') {
+        assert.equal(defaults[name], p.default, tool + ' ' + name + "'s default");
         at(true);
         refuses('true');
       } else if (p.maxLength !== undefined) {
@@ -776,8 +804,9 @@ test("a rate limit's seconds past Number.MAX_SAFE_INTEGER are left out", { timeo
 
 test('a read stopped by a rate limit stays within maxBytes with the longest seconds it can carry, at the largest message that fits', { timeout: 10_000 }, async (t) => {
   // Every other field of the result as long as its bound: the counts as wide
-  // as their limits, and the longest timestamp a cursor can hold.
-  const ts = '8639999999999.999999';
+  // as their limits, and the longest timestamp a cursor can hold, 16 digits
+  // and 6 decimals, whose leading zeros keep it within Date's range.
+  const ts = '0008639999999999.999999';
   const read = (size: number) => {
     api.answerFor('conversations.history', page([row(ts, 'U1', 'x'.repeat(size))], true),
       { status: 429, headers: { 'retry-after': String(Number.MAX_SAFE_INTEGER) }, body: { ok: false, error: 'ratelimited' } });

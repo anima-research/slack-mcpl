@@ -20,11 +20,13 @@
  * deadline left no time to send (OutOfCallTime), and fetch_attachment's
  * download running past its timeout. Each refusal code here is one Slack's
  * reference documents for a method these tools call. Other errors, and codes
- * not listed, pass through unchanged.
+ * not listed, pass through unchanged, except that a read's failure still says
+ * that no messages were returned.
  */
 import { ErrorCode } from '@slack/web-api';
 import { connectionNeverMade, reactionName } from './content.js';
-import { CALL_SECONDS, OutOfCallTime, SLACK_CLIENT_OPTIONS, failedRequest, slackRefusal } from './slack-adapter.js';
+import { NOTHING_RETURNED, PARENT_IDS, TS_FORM } from './history-read.js';
+import { CALL_SECONDS, OutOfCallTime, SLACK_CLIENT_OPTIONS, failedRequest, retryAfterSeconds, slackRefusal } from './slack-adapter.js';
 
 /** The call an error came from: a tool's name, or `channels/publish` for the
  *  host's publish, and the arguments it names Slack's objects by. */
@@ -44,8 +46,8 @@ const NOT_DONE: Record<string, string> = {
   add_reaction: 'No reaction was added',
   // A read can fail after its first pages, so its lead is what the caller
   // didn't get.
-  fetch_history: 'No messages were returned',
-  fetch_thread: 'No messages were returned',
+  fetch_history: NOTHING_RETURNED,
+  fetch_thread: NOTHING_RETURNED,
   fetch_attachment: 'Nothing was fetched',
   list_channels: 'Nothing was listed',
   find_user: 'No users were listed',
@@ -69,19 +71,20 @@ const LISTINGS = new Set(['list_channels', 'find_user', 'refresh_channels']);
 const RECALLED = 'The id may be mistyped or remembered rather than copied';
 const MESSAGE_IDS =
   "Copy the message's id= from where it arrived, or take it from fetch_history (fetch_thread for a thread's replies)";
-/** reply_message's messageId and fetch_thread's threadTs name a thread's parent. */
-const PARENT_IDS =
-  "Pass the thread's parent id: a reply's thread=, or the id of the message the replies are under, which " +
-  'fetch_history shows';
-const TS_FORM = 'which looks like 1718000000.000100';
 
 /** Slack's answers that the message or thread a call named isn't one. */
 const THREAD_REFUSALS = new Set(['thread_not_found', 'message_not_found', 'bad_timestamp']);
+/** The read tools, which return nothing when they fail. */
+const READS = new Set(['fetch_history', 'fetch_thread']);
 
 export function explainSlackError(err: unknown, call: SlackCall): string {
   const carried = (err as { message?: unknown } | null)?.message;
   const text = typeof carried === 'string' ? carried : String(err);
-  const why = explanation(err, call);
+  // A read that fails returns nothing, so a failure of one that nothing below
+  // explains still says so, unless its own text opens with it, as the read's
+  // own refusals do. A write's may have written, so it passes through.
+  const unexplained = READS.has(call.tool) && !text.startsWith(NOTHING_RETURNED) ? `${NOTHING_RETURNED}.` : undefined;
+  const why = explanation(err, call) ?? unexplained;
   return why ? `${text}\n\n${why}` : text;
 }
 
@@ -124,6 +127,12 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
     ? ` A new call starts the listing over from the first page, so if the workspace is too large to list within ${limit}, ` +
       'calling again stops near the same place.'
     : '';
+  /** Slack's rate limit, with the seconds it asks to wait when it gave them. */
+  const rateLimited = (seconds: number | undefined): string =>
+    seconds === undefined
+      ? `${lead}: Slack is rate-limiting this kind of call for the workspace. Try again shortly.${startsOver("Slack's limit")}`
+      : `${lead}: Slack is rate-limiting this kind of call for the workspace, and asks to wait ${seconds} ` +
+        `second${seconds === 1 ? '' : 's'} before trying again.${startsOver("Slack's limit")}`;
   const invite =
     "Someone in that conversation has to invite the bot (in Slack, /invite and the bot's name); until then, " +
     "calling again gets the same answer. list_channels shows the conversations it's in.";
@@ -182,11 +191,7 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
   }
   if (e?.code === ErrorCode.RateLimitedError) {
     // The client throws this only with Slack's Retry-After, in seconds.
-    const seconds = e.retryAfter;
-    return (
-      `${lead}: Slack is rate-limiting this kind of call for the workspace, and asks to wait ${seconds} ` +
-      `second${seconds === 1 ? '' : 's'} before trying again.${startsOver("Slack's limit")}`
-    );
+    return rateLimited(e.retryAfter);
   }
   if (e?.code === ErrorCode.RequestError && connectionNeverMade(e.original?.code)) {
     return (
@@ -356,8 +361,9 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
       // Slack: the POST data was either missing or truncated.
       return `${lead}: Slack didn't receive the whole request, so it didn't act on it. Try again shortly.`;
     case 'ratelimited':
-      // A rate limit in the body of a 200, without Retry-After.
-      return `${lead}: Slack is rate-limiting this kind of call for the workspace. Try again shortly.${startsOver("Slack's limit")}`;
+      // A rate limit in the body of a 200, which the client never waits out,
+      // with Slack's seconds when a Retry-After came with it.
+      return rateLimited(retryAfterSeconds(err));
     case 'internal_error':
     case 'fatal_error':
     case 'service_unavailable':

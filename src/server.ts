@@ -58,7 +58,7 @@ import { StateTracker } from './state.js';
 import { CapabilityGrant } from './grant.js';
 import { McplRpcError, capabilityDenied } from './errors.js';
 import { explainSlackError } from './slack-errors.js';
-import { NOTHING_RETURNED } from './history-read.js';
+import { NOTHING_RETURNED, PARENT_IDS, refuseUnknownArguments } from './history-read.js';
 import {
   fetchAttachmentBytes,
   parseSlackAttachmentUrl,
@@ -106,10 +106,9 @@ function dbg(tag: string, info: Record<string, unknown> = {}): void {
 const ARGUMENT_SOURCES = {
   channelId: "list_channels shows each conversation's id.",
   messageId:
-    "Take it from the message: its id= (reply_message takes its thread= when it shows one), or from fetch_history's ids.",
-  threadTs:
-    "Pass the thread's parent id: a reply's thread=, or the id of the message the replies are under, which " +
-    'fetch_history shows.',
+    "Take it from the message: its id= (reply_message takes its thread= when it shows one, or its rootTs in " +
+    "fetch_history and fetch_thread results), or from fetch_history's ids.",
+  threadTs: `${PARENT_IDS}.`,
   userId: "find_user returns each person's userId.",
   emoji: 'Pass an emoji name, such as thumbsup.',
   url: ATTACHMENT_URL_SOURCE,
@@ -710,12 +709,16 @@ export class SlackMcplServer {
       case 'refresh_channels':
         return await this.refreshChannels();
 
+      // A read's argument names are checked first, so a slip for one it
+      // requires, such as channelID, is named as one.
       case 'fetch_history': {
+        refuseUnknownArguments(args, 'history');
         const channelId = this.requireString(args, 'channelId', NOTHING_RETURNED);
         return await this.slack.readHistory(channelId, args);
       }
 
       case 'fetch_thread': {
+        refuseUnknownArguments(args, 'thread');
         const channelId = this.requireString(args, 'channelId', NOTHING_RETURNED);
         const threadTs = this.requireString(args, 'threadTs', NOTHING_RETURNED);
         return await this.slack.readThread(channelId, threadTs, args);
