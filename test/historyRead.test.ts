@@ -66,6 +66,20 @@ test('a filtered read scans every page, ANDs a case-insensitive substring with a
   ]);
 });
 
+test('one returned match can scan a full candidate page without 200 one-message requests', { timeout: 5000 }, async (t) => {
+  // theaspirational's case: a filtered read asks for whole pages, whatever
+  // its match limit, so one sparse match among 200 takes one request.
+  const many = Array.from({ length: 200 }, (_, i) => row(`${200 - i}.0`, 'U1', i === 199 ? 'target' : 'noise'));
+  answers(t, { 'conversations.history': [page(many, false)] });
+  const from = api.calls.length;
+  const out = await adapter().readHistory('C1', { channelId: 'C1', limit: 1, textContains: 'target' });
+  assert.deepEqual(out.messages.map((m) => m.id), ['1.0']);
+  assert.equal(out.pagination.scanned, 200);
+  assert.equal(out.pagination.pages, 1);
+  assert.equal(out.pagination.scanComplete, true);
+  assert.equal(sentTo('conversations.history', from)[0]!.limit, '200');
+});
+
 test('caseSensitive matches exact case only', { timeout: 5000 }, async (t) => {
   answers(t, { 'conversations.history': [page([row('2.0', 'U1', 'Target'), row('1.0', 'U1', 'target')], false)] });
   const out = await adapter().readHistory('C1', { channelId: 'C1', textContains: 'target', caseSensitive: true });
