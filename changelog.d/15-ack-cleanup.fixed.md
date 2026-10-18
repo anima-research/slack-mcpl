@@ -1,0 +1,1 @@
+- Acknowledgement cleanup makes at most five removal attempts per reaction, however posts, the ten-minute expiry and shutdown overlap: they share one attempt at a time (#9). At shutdown each pending reaction gets one attempt, and one that fails is dropped rather than retried a minute later.
