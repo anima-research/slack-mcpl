@@ -26,6 +26,8 @@
  *                       subscriptions across restarts
  *   SLACK_BACKSCROLL_LIMIT   - Optional: messages fetched on first interaction
  *                       with a conversation (default 50)
+ *   SLACK_PATH_UPLOADS - Optional: explicit JSON policy for local path inputs:
+ *                       restricted directories or trusted unrestricted mode
  */
 
 import * as net from 'node:net';
@@ -34,6 +36,7 @@ import { connectSlack } from './slack-adapter.js';
 import { SlackMcplServer } from './server.js';
 import { booleanFlag } from './config.js';
 import { serveTcp } from './tcp.js';
+import {validatePathUploadPolicy, type PathUploadPolicy} from './upload-path.js';
 
 /** A yes/no switch from the environment. A bad value stops the server with
  *  one line naming it: it is the operator's to fix, not a crash to trace. */
@@ -74,12 +77,18 @@ async function main(): Promise<void> {
     console.error('SLACK_SEND_CHANNELS is set but names no conversation; unset it to allow writing anywhere');
     process.exit(1);
   }
+  let pathUploads: PathUploadPolicy | undefined;
+  if (process.env.SLACK_PATH_UPLOADS !== undefined) {
+    try { pathUploads = validatePathUploadPolicy(JSON.parse(process.env.SLACK_PATH_UPLOADS)); }
+    catch { throw new Error('SLACK_PATH_UPLOADS must configure restricted directories or explicit unrestricted mode'); }
+  }
   const disableDms = flag('SLACK_DISABLE_DMS');
   const subscribeMemberChannels = flag('SLACK_SUBSCRIBE_MEMBER_CHANNELS');
   const ackReaction = process.env.SLACK_ACK_REACTION?.replace(/:/g, '').trim() || undefined;
   const slack = await connectSlack({ botToken, appToken, dmUsers, sendChannels, disableDms, ackReaction });
   const server = new SlackMcplServer(slack, {
     subscribeMemberChannels,
+    pathUploads,
   });
   await slack.start();
   console.error(
@@ -98,6 +107,7 @@ async function main(): Promise<void> {
     if (stopping) return;
     stopping = true;
     setTimeout(() => process.exit(0), 5000).unref();
+    server.close();
     void slack.stop().finally(() => process.exit(0));
   };
   process.once('SIGTERM', shutdown);

@@ -6,7 +6,8 @@
   surrogate, are refused, and so is an optional argument that isn't a string;
   JSON null counts as not given, and so does an empty optional argument.
   This server caps inline content at 5 MiB (5,242,880 bytes after encoding
-  or decoding); it does not accept filesystem paths. The same write rules
+  or decoding); it does not accept filesystem paths
+  unless the operator enables them (`SLACK_PATH_UPLOADS`). The same write rules
   as `send_message` apply
   (`SLACK_SEND_CHANNELS`, `SLACK_DISABLE_DMS`), the tool is in the
   `slack.messaging` feature set and classed `comms`, and rollback attempts

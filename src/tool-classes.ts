@@ -16,6 +16,7 @@
  * Every tool the server can list must be in TOOL_CLASSES or UNCLASSED;
  * test/toolClasses.test.ts fails otherwise.
  */
+import type { PathUploadPolicy } from './upload-path.js';
 
 /** The RFC-008 vocabulary. */
 export const TOOL_CLASS_VOCABULARY = [
@@ -61,9 +62,11 @@ export const UNCLASSED: ReadonlySet<string> = new Set<string>();
  *  keys. Unclassed tools are returned as they are. */
 export function withToolClasses<T extends { name: string; _meta?: Record<string, unknown> }>(
   tools: readonly T[],
+  opts: {pathUploads?: PathUploadPolicy} = {},
 ): T[] {
   return tools.map((tool) => {
     if (!Object.hasOwn(TOOL_CLASSES, tool.name)) return tool;
-    return { ...tool, _meta: { ...tool._meta, 'mcpl/class': [...TOOL_CLASSES[tool.name]] } };
+    const classes = tool.name === 'upload_file' && opts.pathUploads ? ['comms', 'files'] : TOOL_CLASSES[tool.name];
+    return { ...tool, _meta: { ...tool._meta, 'mcpl/class': [...classes] } };
   });
 }

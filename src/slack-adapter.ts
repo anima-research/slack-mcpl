@@ -27,6 +27,7 @@ import {
   resolveSlackUserNames,
   fetchSlackHistory,
   classifyExtension,
+  MAX_ATTACHMENT_BYTES,
   reactionName,
   SLACK_FAILED,
   connectionNeverMade,
@@ -892,6 +893,14 @@ export class SlackAdapter {
     return { messageId: result.ts ? String(result.ts) : '' };
   }
 
+  /** An upload's write checks, the same as sendMessage's. A path upload makes
+   *  them before it reads the local file, and uploadFile makes them again
+   *  before its first step. */
+  async requireUploadDestination(channelId: string): Promise<void> {
+    this.assertWritable(channelId, 'Nothing was uploaded');
+    await this.assertNotDm(channelId, 'Nothing was uploaded');
+  }
+
   /** Upload a file into a conversation, in the three steps of Slack's
    *  working-with-files page: files.getUploadURLExternal gives an upload URL
    *  and the file's ID, the file's bytes go to that URL, and
@@ -910,8 +919,10 @@ export class SlackAdapter {
     channelId: string,
     file: { filename: string; data: Buffer; title?: string; comment?: string; threadTs?: string },
   ): Promise<{ fileId: string; shareTs?: string }> {
-    this.assertWritable(channelId, 'Nothing was uploaded');
-    await this.assertNotDm(channelId, 'Nothing was uploaded');
+    if (!Buffer.isBuffer(file.data) || file.data.byteLength > MAX_ATTACHMENT_BYTES) {
+      throw new Error('Nothing was uploaded: upload data must be a bounded Buffer');
+    }
+    await this.requireUploadDestination(channelId);
     const target = await this.web.files.getUploadURLExternal({ filename: file.filename, length: file.data.byteLength });
     const url = target.upload_url;
     const fileId = target.file_id;
