@@ -139,20 +139,29 @@ path access is enabled, and remains `comms` when inline-only.
 
 In **restricted** mode, configured roots must be existing absolute directories.
 The connector canonicalizes them and pins directory descriptors at startup; a
-configured root may itself be an alias to its canonical directory. Reads walk
-below the chosen root in an isolated Node subprocess, opening and checking each
-component without following symlinks. All symlinks below a configured root are
-refused, including ones that point back inside it. The parent connector never
-changes its working directory. The worker verifies the opened directory's
-identity while walking and reads only the final open regular-file descriptor.
+configured root may itself be an alias to its canonical directory. This mode
+requires **Python 3.9 or newer** and supported descriptor-path facilities on
+Linux or macOS. A static Python standard-library worker runs with `-I -S` in a
+clean environment, without a shell or connector credentials. It opens each
+component relative to a directory descriptor with `O_NOFOLLOW`. All symlinks
+below a configured root are refused, including ones that point back inside it.
+The parent connector never changes its working directory.
+
+The worker checks the actual final file descriptor's path against the pinned
+root at admission, before reading, and again before returning any bytes. It uses
+Linux `/proc` descriptor paths or macOS `F_GETPATH`; directory names or a cwd
+ancestry check alone do not establish the final file's containment. No content
+is returned unless the checks pass. Missing Python, unsupported platform/path
+facilities or verification failure refuses the restricted read, with no downgrade
+to unrestricted access.
 
 In **unrestricted** mode, ordinary connector-account permissions determine which
 files can be read. Symlinks to regular files are allowed and there is no
 configured-directory boundary. Both modes refuse non-regular files, use a
 nonblocking open so a FIFO cannot wait for a writer, and enforce the same 5 MiB
 limit on the opened descriptor, including a bounded read if the file grows.
-The SDK receives the resulting bytes rather than a raw path. This needs Node,
-with no additional Python runtime.
+The SDK receives the resulting bytes rather than a raw path. Inline-only and
+unrestricted modes remain Node-only and require no Python runtime.
 
 The existing send-channel and DM guards run before the local read and are checked
 again by the adapter before upload. They restrict the Slack destination, while
@@ -161,10 +170,12 @@ and rollback behavior still applies; enabling paths does not grant a new Slack
 scope or bypass a denied destination.
 
 Pinned roots are directory capabilities, not immutable snapshots or an OS
-sandbox. Files may change while being read. Restricted mode does not isolate
-hard links, mounted filesystems or privileged administrative renames. It also
-does not constrain a shell or another process with equivalent account/sudo
-access. Use OS account/filesystem permissions for those boundaries, and choose
+sandbox. Descriptor-path checks observe containment at the stated check points;
+they do not create an atomic, perpetual boundary during concurrent filesystem
+changes. File contents may change while being read. Restricted mode does not
+isolate hard links, privileged mounts or administrative renames. It also does
+not constrain a shell or another process with equivalent account/sudo access.
+Use OS account/filesystem permissions for those boundaries, and choose
 unrestricted mode only when that broader local-file access is intended.
 
 ## Reply to a specific thread
@@ -260,7 +271,7 @@ Boolean switches take `true`/`false` (also `1`/`0`, `yes`/`no`); any other value
 |----------|----------|-------------|
 | `SLACK_BOT_TOKEN` | yes | Bot token (`xoxb-…`) for Web API calls |
 | `SLACK_APP_TOKEN` | yes | App-level token (`xapp-…`, `connections:write`) for Socket Mode |
-| `SLACK_PATH_UPLOADS` | no | Explicit JSON path policy: `{"mode":"restricted","directories":["/absolute/reports"]}` or `{"mode":"unrestricted"}`. Unset keeps inline-only uploads. Restricted roots are pinned at startup and below-root symlinks are refused; unrestricted uses ordinary connector-account file access. See [Optional path uploads](#optional-path-uploads) |
+| `SLACK_PATH_UPLOADS` | no | Explicit JSON path policy: `{"mode":"restricted","directories":["/absolute/reports"]}` or `{"mode":"unrestricted"}`. Unset keeps inline-only uploads. Restricted mode needs Python 3.9+ and Linux/macOS descriptor-path support, pins roots and refuses below-root symlinks; unrestricted uses ordinary connector-account file access and needs no Python. See [Optional path uploads](#optional-path-uploads) |
 | `SLACK_DM_USERS` | no | Comma-separated user-ID whitelist for DMs; others' DMs are dropped |
 | `SLACK_SEND_CHANNELS` | no | Comma-separated conversation-ID allow-list for writes (send, upload, DM, edit, delete, reaction, and the host's `channels/publish`); writes elsewhere are refused before the call reaches Slack. Other conversations are registered `inbound`, `list_channels` shows `writable: false`, and the first message the agent gets from one, addressed or not, carries a read-only note. A mention there still reaches the agent; whether it wakes is the host's policy. `send_dm` is refused before a DM is opened, and not offered, unless the list names a DM. Set but empty is refused at startup; the effective list is logged |
 | `SLACK_SUBSCRIBE_MEMBER_CHANNELS` | no | `true` delivers ambient messages from every channel the bot is a member of, so inviting the bot is the subscription. `unsubscribe_channel` then mutes a conversation (`subscribe_channel` unmutes it) and `list_subscriptions` lists the muted ones. Takes `true` or `false` (also `1`/`0`, `yes`/`no`); unset is off, and any other value, empty included, stops startup |
