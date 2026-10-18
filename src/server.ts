@@ -1408,8 +1408,8 @@ export class SlackMcplServer {
     // answer that says the item is already gone counts it as deleted.
     const sent = { message: 0, file: 0 };
     const deleted = { message: 0, file: 0 };
-    /** Each item a delete left, by kind, id and conversation. */
-    const left: string[] = [];
+    /** Each item a delete didn't confirm gone, by kind, id and conversation. */
+    const left: Array<{ kind: 'message' | 'file'; named: string }> = [];
     const attempt = async (
       kind: 'message' | 'file', id: string, channelId: string, gone: string[], remove: () => Promise<void>, sharedFile?: string,
     ) => {
@@ -1424,11 +1424,13 @@ export class SlackMcplServer {
           return;
         }
         // Best-effort otherwise: the delete was refused, rate-limited, out of
-        // this call's time, or failed on the way. The tracker has dropped it
-        // with the branch, so no later rollback tries it again: the reason
-        // names it, for the agent, and stderr says why, for an operator.
+        // this call's time, or failed in a way that leaves it unknown, on the
+        // way or by Slack's own failure. Either way the item may remain, and
+        // the tracker has dropped it with the branch, so no later rollback
+        // tries it again: the reason names it, for the agent, and stderr says
+        // why, for an operator.
         const shared = sharedFile ? `, which shared file ${sharedFile}` : '';
-        left.push(`${kind} ${id} in ${channelId}${shared}`);
+        left.push({ kind, named: `${kind} ${id} in ${channelId}${shared}` });
         console.error(
           `[slack-mcpl] Rollback couldn't delete ${kind} ${id}${shared && `${shared},`} in ${channelId}: ` +
             `${(err as Error)?.message ?? String(err)}`,
@@ -1462,8 +1464,17 @@ export class SlackMcplServer {
     // "may".
     const commentsLeft = toDelete.filter((item): item is UploadedFile => item.kind === 'file' && item.comment && !item.shareTs);
     const ids = "which fetch_history shows, or fetch_thread if the file went into a thread";
+    // What the agent can do about an item left, since no rollback tries it
+    // again.
+    const remedy = [
+      ...(left.some((item) => item.kind === 'message') ? ['delete_message may delete a message among them, by its id'] : []),
+      ...(left.some((item) => item.kind === 'file') ? ['no tool here deletes a file'] : []),
+    ].join(', and ');
     const notes = [
-      ...(left.length > 0 ? [`Rolled back (${counts} deleted). Not deleted: ${left.join('; ')}`] : []),
+      ...(left.length > 0
+        ? [`Rolled back (${counts} deleted). May remain: ${left.map((item) => item.named).join('; ')}. No rollback tries ` +
+          `these again: ${remedy}`]
+        : []),
       ...(commentsLeft.length === 1
         ? [`The comment of uploaded file ${commentsLeft[0].fileId} may remain in conversation ${commentsLeft[0].channelId}: ` +
           "this server doesn't know the message that shared the file, so no rollback can delete it. delete_message " +

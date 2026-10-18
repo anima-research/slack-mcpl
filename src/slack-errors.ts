@@ -255,7 +255,10 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
   // form, such as a body that isn't JSON, shows nothing about what Slack did.
   if (code === undefined && e?.code === ErrorCode.PlatformError) {
     const cause = "Slack answered in a form this server can't read";
-    return mayHaveWritten ? unknown(cause) : `${lead}: ${cause}. Try again shortly.`;
+    return mayHaveWritten
+      ? unknown(cause)
+      : `${lead}: ${cause}. Try again shortly. If it keeps failing, whoever runs this host has to check its ` +
+          'connection to Slack.';
   }
   if (code === undefined) return undefined;
   const messageIds = call.tool === 'reply_message' || call.tool === 'fetch_thread' || call.tool === 'upload_file' ? PARENT_IDS : MESSAGE_IDS;

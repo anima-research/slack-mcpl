@@ -28,6 +28,7 @@ import {
   fetchSlackHistory,
   classifyExtension,
   reactionName,
+  SLACK_CODE,
   SLACK_FAILED,
   connectionNeverMade,
   type AttachmentRef,
@@ -45,13 +46,8 @@ const ACK_MAX_TRIES = 5;
  *  explainer calls an unknown outcome. */
 const MAY_HAVE_LANDED = new Set(['already_reacted', 'internal_error', 'fatal_error', 'service_unavailable', 'file_update_failed']);
 
-/** The form of Slack's error codes. web-api 7.19.0 reads an answer whose body
- *  isn't JSON as a refusal whose code is the body itself (buildResult, in
- *  dist/WebClient.js), which shows nothing about what Slack did. */
-const SLACK_CODE = /^[a-z0-9_]+$/;
-
 /** Slack's code, when Slack refused the call; undefined for any other error,
- *  an answer with no code in Slack's form included. */
+ *  an answer with no code in Slack's form (SLACK_CODE) included. */
 export function slackRefusal(err: unknown): string | undefined {
   const e = err as { code?: unknown; data?: { error?: unknown } } | null;
   const code = e?.code === ErrorCode.PlatformError ? e.data?.error : undefined;
@@ -100,8 +96,9 @@ const FAILED_WAIT_SECONDS = 30;
 /** Why work no call waits on, such as channel registration, waits before
  *  asking Slack again after a request to `method`: Slack rate-limited it and
  *  asked for this many seconds (`limited`), or it failed in a way that can
- *  pass: in transit, with an HTTP error, by Slack's own failure, or by not
- *  being sent because its call was out of time (`failed`). */
+ *  pass: in transit, with an HTTP error, by Slack's own failure, with an
+ *  answer not in Slack's form, or by not being sent because its call was out
+ *  of time (`failed`). */
 export interface SlackWait {
   method: string;
   seconds: number;
@@ -123,7 +120,9 @@ export function waitToAskAgain(err: unknown, method: string): SlackWait | undefi
   if (err instanceof OutOfCallTime) return { method, seconds: 0, why: 'failed' };
   const refused = slackRefusal(err);
   const failedAtSlack = refused !== undefined && SLACK_FAILED.has(refused);
-  if (e?.code === ErrorCode.RequestError || e?.code === ErrorCode.HTTPError || failedAtSlack) {
+  // An answer not in Slack's form shows nothing about what Slack did.
+  const unreadable = e?.code === ErrorCode.PlatformError && refused === undefined;
+  if (e?.code === ErrorCode.RequestError || e?.code === ErrorCode.HTTPError || failedAtSlack || unreadable) {
     return { method, seconds: FAILED_WAIT_SECONDS, why: 'failed' };
   }
   return undefined;
@@ -818,21 +817,22 @@ export class SlackAdapter {
       // The add counts as there, and is removed like an added one, when it may
       // have landed: already_reacted says it's there; Slack's failure while
       // handling it leaves it unknown, as the explainer says (internal_error
-      // and fatal_error can take effect in part); and so does an HTTP error or
-      // a request that failed after it may have reached Slack. Slack's other
-      // refusals, its rate limits (a 429, or ratelimited in a 200) and
-      // request_timeout say it didn't act, a connection never made reached
-      // nothing, and this server's own refusal, such as the write allow-list's,
-      // sent nothing. So did a failure of a request before the add, such as
-      // the DM check's conversations.info. Slack answers a removal of one that
-      // isn't there with no_reaction.
+      // and fatal_error can take effect in part); and so does an HTTP error,
+      // an answer not in Slack's form, or a request that failed after it may
+      // have reached Slack. Slack's other refusals, its rate limits (a 429, or
+      // ratelimited in a 200) and request_timeout say it didn't act, a
+      // connection never made reached nothing, and this server's own refusal,
+      // such as the write allow-list's, sent nothing. So did a failure of a
+      // request before the add, such as the DM check's conversations.info.
+      // Slack answers a removal of one that isn't there with no_reaction.
       (err: { code?: unknown; original?: { code?: unknown } } | null) => {
         const failed = failedRequest(err);
         if (failed !== undefined && failed !== 'reactions.add') return false;
         if (err?.code === ErrorCode.RequestError) return !connectionNeverMade(err.original?.code);
         if (err?.code === ErrorCode.HTTPError) return true;
         const answer = slackRefusal(err);
-        return answer !== undefined && MAY_HAVE_LANDED.has(answer);
+        if (answer === undefined) return err?.code === ErrorCode.PlatformError;
+        return MAY_HAVE_LANDED.has(answer);
       },
     );
     // Recorded before the add resolves, so a reply that lands first still removes it.

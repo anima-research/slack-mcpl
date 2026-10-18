@@ -80,6 +80,19 @@ export function uploadEndpoint(): Promise<{ url: string; bytes: Map<string, Buff
   return byteEndpoint;
 }
 
+/** A `slackApiUrl` whose every answer is an HTTP 200 whose body isn't JSON,
+ *  such as a proxy's page, which the client reads as a refusal whose code is
+ *  the body itself. It closes when the test ends. */
+export async function htmlSlackApiUrl(t: { after(fn: () => void): void }): Promise<string> {
+  const page = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<html>Bad gateway</html>'); });
+  });
+  await new Promise<void>((resolve) => page.listen(0, '127.0.0.1', () => resolve()));
+  t.after(() => { page.closeAllConnections(); page.close(); });
+  return `http://127.0.0.1:${(page.address() as { port: number }).port}/api/`;
+}
+
 function fakeWeb(
   posts: unknown[], reactions: string[], uploads: unknown[], deletedMessages: unknown[], deletedFiles: string[], uploadsBegun: unknown[],
 ): SlackWebLike {

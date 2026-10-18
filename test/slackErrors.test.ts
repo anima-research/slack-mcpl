@@ -6,7 +6,6 @@
  * own shape (`code`, Slack's answer in `data`, `retryAfter`, `statusCode`).
  */
 
-import http from 'node:http';
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { WebClient } from '@slack/web-api';
@@ -23,7 +22,7 @@ import {
 } from '../src/slack-adapter.js';
 import { SlackMcplServer } from '../src/server.js';
 import { toolDefinitions } from '../src/tools.js';
-import { connectHost, initialize, FULL_GRANT } from './harness.js';
+import { connectHost, htmlSlackApiUrl, initialize, FULL_GRANT } from './harness.js';
 import { fakeSlackApi, silentSlackApi, unreachableSlackApiUrl, type FakeSlackApi } from './slackApi.js';
 
 let api: FakeSlackApi;
@@ -505,6 +504,12 @@ test('other errors and other codes pass through unchanged', async () => {
     explainSlackError(reacted, { tool: 'add_reaction', args: { channelId: 'C1', messageId: '1.1', emoji: 'eyes' } }),
     'An API error occurred: already_reacted',
   );
+  // file_not_found is explained for an upload's last step alone; chat.update's
+  // passes through.
+  assert.equal(
+    await explain('file_not_found', 'edit_message', { channelId: 'C1', messageId: '1.1', content: 'hi' }),
+    'An API error occurred: file_not_found',
+  );
   const local = new Error('channelId is required');
   assert.equal(explainSlackError(local, { tool: 'send_message', args: {} }), 'channelId is required');
   // A refusal's shape without the client's code is not read as one.
@@ -516,21 +521,15 @@ test('other errors and other codes pass through unchanged', async () => {
 test("an answer that isn't in Slack's form leaves a write's outcome unknown, and another call says to try again", async (t) => {
   // A body that isn't JSON, such as a proxy's page, which the client reads as
   // a refusal whose code is the body itself.
-  const page = http.createServer((req, res) => {
-    req.resume();
-    req.on('end', () => { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<html>Bad gateway</html>'); });
-  });
-  await new Promise<void>((resolve) => page.listen(0, '127.0.0.1', () => resolve()));
-  t.after(() => { page.closeAllConnections(); page.close(); });
-  const err = await clientError(new WebClient('xoxb-test', {
-    ...SLACK_CLIENT_OPTIONS, slackApiUrl: `http://127.0.0.1:${(page.address() as { port: number }).port}/api/`,
-  }));
+  const err = await clientError(new WebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: await htmlSlackApiUrl(t) }));
   const posted = explainSlackError(err, { tool: 'send_message', args: { channelId: 'C1', content: 'hi' } });
   assert.ok(posted.endsWith(
     "\n\nSlack answered in a form this server can't read, so whether the message was posted is unknown. Check " +
       "fetch_history for conversation C1 before posting again, so it isn't posted twice."), posted);
   const listed = explainSlackError(err, { tool: 'list_channels', args: {} });
-  assert.ok(listed.endsWith("\n\nNothing was listed: Slack answered in a form this server can't read. Try again shortly."), listed);
+  assert.ok(listed.endsWith(
+    "\n\nNothing was listed: Slack answered in a form this server can't read. Try again shortly. If it keeps failing, " +
+      'whoever runs this host has to check its connection to Slack.'), listed);
 });
 
 const socket: SlackSocketLike = { on() {}, async start() {}, async disconnect() {} };

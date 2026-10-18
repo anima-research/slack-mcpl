@@ -173,7 +173,7 @@ test('rollback reports a failed file deletion while still deleting its sharing m
     featureSet: MESSAGING_FEATURE_SET, checkpoint: before.state!.checkpoint,
   }) as { success: boolean; reason?: string };
   assert.equal(rollback.success, true, 'rollback retains the existing best-effort contract');
-  assert.equal(rollback.reason, 'Rolled back (2/2 messages and 0/1 files deleted). Not deleted: file F1 in C1');
+  assert.equal(rollback.reason, 'Rolled back (2/2 messages and 0/1 files deleted). May remain: file F1 in C1. No rollback tries these again: no tool here deletes a file');
   assert.deepEqual(ts(fake.deletedMessages), ['900.1', '100.2']);
 });
 

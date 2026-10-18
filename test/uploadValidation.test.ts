@@ -99,10 +99,11 @@ test("upload_file's schema names what its handler reads: these arguments, each a
   const { asked, call } = await fixture(t);
   for (const [name, property] of Object.entries(schema.properties)) {
     assert.equal(property.type, 'string', name);
-    // A number where the schema says a string is refused, naming the argument.
-    const result = await call({ content: 'hello', [name]: 17 });
+    // A number where the schema says a string is refused as one; contentBase64
+    // goes alone, since with content the call is refused for giving both.
+    const result = await call(name === 'contentBase64' ? { [name]: 17 } : { content: 'hello', [name]: 17 });
     assert.equal(result.isError, true, name);
-    assert.match(result.content[0].text, new RegExp(name), name);
+    assert.match(result.content[0].text, new RegExp(`${name} must be a (non-empty )?string`), name);
   }
   assert.equal(asked.length, 0);
 });
