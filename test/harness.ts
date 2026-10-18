@@ -3,6 +3,7 @@
  * with a fake Slack, driven the way an MCPL host would drive it.
  */
 
+import http from 'node:http';
 import { PassThrough } from 'node:stream';
 import { McplConnection, method, type JsonRpcRequest } from '@animalabs/mcpl-core';
 import { SlackAdapter, type SlackSocketLike, type SlackWebLike } from '../src/slack-adapter.js';
@@ -42,7 +43,34 @@ function fakeSocket(): FakeSocket {
   };
 }
 
+/** A local endpoint that takes an upload's bytes, as the upload URL Slack
+ *  gives does, for the fake Web API's uploads. It's started on first use and
+ *  doesn't hold the process open. `bytes` holds what each file's URL was sent,
+ *  by file ID. */
+let byteEndpoint: Promise<{ url: string; bytes: Map<string, Buffer> }> | undefined;
+export function uploadEndpoint(): Promise<{ url: string; bytes: Map<string, Buffer> }> {
+  byteEndpoint ??= new Promise((resolve) => {
+    const bytes = new Map<string, Buffer>();
+    const server = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (chunk: Buffer) => chunks.push(chunk));
+      req.on('end', () => {
+        const body = Buffer.concat(chunks);
+        bytes.set((req.url ?? '').split('/').pop() ?? '', body);
+        res.writeHead(200, { 'content-type': 'text/plain' });
+        res.end(`OK - ${body.length}`);
+      });
+    });
+    server.listen(0, '127.0.0.1', () => {
+      server.unref();
+      resolve({ url: `http://127.0.0.1:${(server.address() as { port: number }).port}/upload`, bytes });
+    });
+  });
+  return byteEndpoint;
+}
+
 function fakeWeb(posts: unknown[], reactions: string[], uploads: unknown[], deletedMessages: unknown[], deletedFiles: string[]): SlackWebLike {
+  let started = 0;
   return {
     conversations: {
       async list() {
@@ -64,7 +92,7 @@ function fakeWeb(posts: unknown[], reactions: string[], uploads: unknown[], dele
     chat: {
       async postMessage(args) {
         posts.push(args);
-        return { ts: '100.1' };
+        return { ts: `100.${posts.length}` };
       },
       async update() {
         return {};
@@ -84,11 +112,24 @@ function fakeWeb(posts: unknown[], reactions: string[], uploads: unknown[], dele
         return {};
       },
     },
-    async filesUploadV2(args) {
-      uploads.push(args);
-      return { files: [{ files: [{ id: `F${uploads.length}` }] }] };
-    },
     files: {
+      async getUploadURLExternal() {
+        const { url } = await uploadEndpoint();
+        const id = `F${++started}`;
+        return { upload_url: `${url}/${id}`, file_id: id };
+      },
+      // Each upload is shared by a message of its own, 900.<n>. One titled
+      // "refused" is refused, as Slack refuses to share where the bot isn't.
+      async completeUploadExternal(args) {
+        const [{ id, title }] = args.files as Array<{ id: string; title: string }>;
+        if (title === 'refused') {
+          throw Object.assign(new Error('An API error occurred: not_in_channel'), {
+            code: 'slack_webapi_platform_error', data: { ok: false, error: 'not_in_channel' },
+          });
+        }
+        uploads.push(args);
+        return { files: [{ id, shares: { public: { [args.channel_id as string]: [{ ts: `900.${uploads.length}` }] } } }] };
+      },
       async delete({ file }: { file: string }) {
         deletedFiles.push(file);
         return {};

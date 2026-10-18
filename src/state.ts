@@ -20,6 +20,11 @@ export interface UploadedFile {
   kind: 'file';
   fileId: string;
   channelId: string;
+  /** The message that shared the file, when Slack's answer named it: it holds
+   *  the upload's comment. */
+  shareTs?: string;
+  /** Whether the upload had a comment. */
+  comment: boolean;
   timestamp: string;
 }
 
@@ -48,9 +53,17 @@ export class StateTracker {
     });
   }
 
-  /** Track the Slack file itself: chat.delete cannot remove a file ID. */
-  recordUploaded(fileId: string, channelId: string): void {
-    this.sentItems.push({ kind: 'file', fileId, channelId, timestamp: new Date().toISOString() });
+  /** Track the Slack file itself, which files.delete removes, and the message
+   *  that shared it, when known, which chat.delete removes. */
+  recordUploaded(fileId: string, channelId: string, share: { shareTs?: string; comment: boolean }): void {
+    this.sentItems.push({
+      kind: 'file',
+      fileId,
+      channelId,
+      ...(share.shareTs ? { shareTs: share.shareTs } : {}),
+      comment: share.comment,
+      timestamp: new Date().toISOString(),
+    });
   }
 
   /** Create a new checkpoint. Returns the checkpoint ID. */

@@ -80,13 +80,25 @@ Optional `messageId` selects the thread root (the message's `thread=` value,
 or its `id=` when it has no `thread=`). `title` names the
 file in Slack (defaulting to `filename`), and `comment` adds an initial
 comment. `SLACK_SEND_CHANNELS` and `SLACK_DISABLE_DMS` apply to uploads just
-as they do to message sends. Successful uploads belong to `slack.messaging`
-checkpoints, so rollback attempts to delete them along with later messages.
-An uploaded file is undone through Slack's file deletion API. Rollback is
-best-effort and reports partial failures; checkpoint history is kept in
-memory across host reconnects, but does not survive a server restart. As with
-message rollback, failed deletions are reported in the partial count but are
-not retained for another rollback attempt.
+as they do to message sends.
+
+An upload runs in Slack's three steps: `files.getUploadURLExternal` gives an
+upload URL and the file's ID, the file's bytes go to that URL, and
+`files.completeUploadExternal` shares the file. Slack shares a file only at
+the last step, so an upload that fails before it shared nothing and can be
+called again. One whose last step fails may have shared the file anyway, and
+its error says what to check before uploading again.
+
+Uploads belong to `slack.messaging` checkpoints, so rollback attempts to
+delete them along with later messages: the file, through Slack's file
+deletion API, and the message that shared it, which holds the comment, when
+Slack's answer named that message. When it didn't, the rollback's answer says
+the comment may remain. An upload whose last step failed is rolled back the
+same way. Rollback is best-effort and reports partial failures, by kind;
+checkpoint history is kept in memory across host reconnects, but does not
+survive a server restart. As with message rollback, failed deletions are
+logged and reported in the partial count, but are not retained for another
+rollback attempt.
 
 **Operators:** the bot token needs `files:write`. After adding that scope to
 an existing Slack app, reinstall the app to the workspace through Slack's

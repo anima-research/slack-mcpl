@@ -16,6 +16,7 @@ import {
   OutOfCallTime,
   SLACK_CLIENT_OPTIONS,
   SlackAdapter,
+  SlackWebClient,
   type SlackSocketLike,
   type SlackWebLike,
 } from '../src/slack-adapter.js';
@@ -549,7 +550,10 @@ test("a tool's refusal reaches the agent explained, still marked as an error", a
 });
 
 test("an upload refusal reaches the agent with an upload-specific explanation", async () => {
-  const slack = new SlackAdapter(client as unknown as SlackWebLike, socket, 'UBOT', 'acme');
+  // The adapter's own client, which marks each error with its request, as
+  // connectSlack builds it: the last step's errors read as the sharing's.
+  const own = new SlackWebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: api.url });
+  const slack = new SlackAdapter(own as unknown as SlackWebLike, socket, 'UBOT', 'acme');
   const h = connectHost(new SlackMcplServer(slack));
   await initialize(h, false);
   try {
@@ -570,17 +574,18 @@ test("an upload refusal reaches the agent with an upload-specific explanation", 
       assert.ok(text.startsWith(`An API error occurred: ${error}\n\n`), text);
       assert.doesNotMatch(text, /Nothing was done|Nothing was sent|the message was posted/);
       if (error === 'internal_error') {
-        assert.match(text, /whether the file was uploaded is unknown/);
-        assert.doesNotMatch(text, /Nothing was uploaded/);
+        assert.match(text, /whether the file was shared is unknown/);
+        assert.doesNotMatch(text, /Nothing was (uploaded|shared)/);
         assert.ok(text.includes(messageId
           ? 'fetch_thread for the thread under message 1.7 in conversation CFILES'
           : 'fetch_history for conversation CFILES'), text);
-        assert.match(text, /before uploading again, so it isn't uploaded twice\.$/);
+        assert.match(text, /before uploading again, so it isn't shared twice\.$/);
       } else {
-        assert.match(text, /\n\nNothing was uploaded: /);
+        // The last step shares the file, so its refusal shared nothing.
+        assert.match(text, /\n\nNothing was shared: /);
         if (error === 'missing_scope') assert.match(text, /Slack names files:write/);
         else {
-          assert.match(text, /Slack didn't let it upload there/);
+          assert.match(text, /Slack didn't let it share the file there/);
           assert.doesNotMatch(text, /chat:write.public/);
         }
       }

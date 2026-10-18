@@ -42,7 +42,9 @@ import type {
 import {
   GaveUp,
   SLACK_CLIENT_OPTIONS,
+  UploadNotConfirmed,
   assertRequestFits,
+  fileLeftByUpload,
   outsideCallTime,
   withCallTime,
   type SlackAdapter,
@@ -53,13 +55,12 @@ import { toolDefinitions } from './tools.js';
 import { withToolClasses } from './tool-classes.js';
 import { buildFeatureSets, buildServerCapabilities, featureSetForTool, MESSAGING_FEATURE_SET } from './feature-sets.js';
 import { ChannelManager, mcplChannelId, parseMcplChannelId, toDescriptor } from './channels.js';
-import { StateTracker } from './state.js';
+import { StateTracker, type UploadedFile } from './state.js';
 import { CapabilityGrant } from './grant.js';
 import { McplRpcError, capabilityDenied } from './errors.js';
 import { explainSlackError, slackRefusal } from './slack-errors.js';
 import {
   fetchAttachmentBytes,
-  MAX_ATTACHMENT_BYTES,
   parseSlackAttachmentUrl,
   toFetchResult,
   type AttachmentRef,
@@ -82,6 +83,13 @@ const { version: serverVersion } = require(
  *  holds each request for nine waits at most: each as long as Slack asks
  *  after a rate limit, or 30 s after a failure. */
 const REGISTRATION_TRIES = 10;
+
+/** The most bytes upload_file takes inline: the file's bytes, after base64 is
+ *  decoded or text is encoded as UTF-8. */
+const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
+
+/** A UTF-16 surrogate without its pair. */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 
 // Diagnostic file logger — bypasses the host's stderr capture. Set
 // SLACK_MCPL_DEBUG_LOG in the spawn env to a writable absolute path to
@@ -617,34 +625,51 @@ export class SlackMcplServer {
       case 'upload_file': {
         const channelId = this.requireString(args, 'channelId');
         const filename = this.requireString(args, 'filename');
-        const str = (k: string) => (typeof args[k] === 'string' && args[k] ? (args[k] as string) : undefined);
-        const text = args.content;
-        const b64 = args.contentBase64;
-        if ((text === undefined) === (b64 === undefined)) throw new Error('pass exactly one of content or contentBase64');
-        const input = text ?? b64;
-        if (typeof input !== 'string') throw new Error(`${text !== undefined ? 'content' : 'contentBase64'} must be a string`);
+        // An argument given as JSON null is not given. An optional one given
+        // as anything but a string is refused, rather than dropped: a
+        // messageId dropped would put the file in the conversation, not its
+        // thread.
+        const given = (k: string) => args[k] !== undefined && args[k] !== null;
+        const optional = (k: string): string | undefined => {
+          if (!given(k) || args[k] === '') return undefined;
+          if (typeof args[k] !== 'string') throw new Error(`${k} must be a string`);
+          return args[k] as string;
+        };
+        if (given('content') === given('contentBase64')) throw new Error('pass exactly one of content or contentBase64');
+        const key = given('content') ? 'content' : 'contentBase64';
+        const input = args[key];
+        if (typeof input !== 'string') throw new Error(`${key} must be a string`);
         if (input.length === 0) throw new Error('file content is empty');
         let data: Buffer;
-        if (text !== undefined) {
+        if (key === 'content') {
+          // UTF-8 can't hold a lone surrogate: Buffer.from would write U+FFFD
+          // in its place, and the file would differ from what was given.
+          if (LONE_SURROGATE.test(input)) throw new Error("content holds a lone UTF-16 surrogate, which UTF-8 can't encode");
           data = Buffer.from(input, 'utf8');
         } else {
-          // Buffer.from is intentionally permissive: it skips punctuation and
-          // accepts data-URI prefixes as bytes. Require canonical RFC 4648
-          // base64, including padding and zero unused bits, before uploading.
-          if (input.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(input)) {
-            throw new Error('contentBase64 must be valid base64 (canonical RFC 4648 with padding; no data URI)');
-          }
+          // Buffer.from skips what isn't base64 and reads a data URI's prefix
+          // as bytes, so only base64 that it writes back the same is taken:
+          // canonical RFC 4648, with padding and zero unused bits.
           data = Buffer.from(input, 'base64');
           if (data.toString('base64') !== input) {
-            throw new Error('contentBase64 must be valid base64 (canonical RFC 4648 with padding; no data URI)');
+            throw new Error('contentBase64 must be canonical RFC 4648 base64 with padding, on one line: no line breaks, spaces or data URI');
           }
         }
-        if (data.byteLength > MAX_ATTACHMENT_BYTES) throw new Error(`inline file too large: ${data.byteLength} bytes (this server's inline limit is ${MAX_ATTACHMENT_BYTES})`);
-        const result = await this.slack.uploadFile(channelId, {
-          filename, data, title: str('title'), comment: str('comment'), threadTs: str('messageId'),
-        });
+        if (data.byteLength > MAX_UPLOAD_BYTES) throw new Error(`inline file too large: ${data.byteLength} bytes (this server's inline limit is ${MAX_UPLOAD_BYTES})`);
+        const comment = optional('comment');
+        let result: { fileId: string; shareTs?: string };
+        try {
+          result = await this.slack.uploadFile(channelId, {
+            filename, data, title: optional('title'), comment, threadTs: optional('messageId'),
+          });
+        } catch (err) {
+          // A last step that may have shared the file leaves it for rollback.
+          const left = fileLeftByUpload(err) ?? (err instanceof UploadNotConfirmed ? err.fileId : undefined);
+          if (left) this.stateTracker.recordUploaded(left, channelId, { comment: comment !== undefined });
+          throw err;
+        }
         this.markOutbound(channelId);
-        this.stateTracker.recordUploaded(result.fileId, channelId);
+        this.stateTracker.recordUploaded(result.fileId, channelId, { shareTs: result.shareTs, comment: comment !== undefined });
         return { fileId: result.fileId };
       }
 
@@ -1235,12 +1260,12 @@ export class SlackMcplServer {
     }
 
     // Best-effort delete sent messages and uploaded files
-    let deleted = 0;
+    const deleted = { message: 0, file: 0 };
     for (const msg of toDelete) {
       try {
-        if (msg.kind === 'file') await this.slack.deleteUploadedFile(msg.channelId, msg.fileId);
+        if (msg.kind === 'file') await this.slack.deleteUploadedFile(msg.channelId, msg.fileId, msg.shareTs);
         else await this.slack.deleteMessage(msg.channelId, msg.messageId);
-        deleted++;
+        deleted[msg.kind]++;
       } catch (err) {
         // Best-effort: someone else may have deleted the item already, or the
         // delete was rate-limited, out of this call's time, or failed on the
@@ -1253,12 +1278,27 @@ export class SlackMcplServer {
       }
     }
 
+    // What was deleted of each kind, when something wasn't; and an upload's
+    // comment that may be left, when Slack's answer named no message that
+    // shared the file.
+    const sent = { message: toDelete.filter((item) => item.kind === 'message').length, file: toDelete.filter((item) => item.kind === 'file').length };
+    const counts = (['message', 'file'] as const)
+      .filter((kind) => sent[kind] > 0)
+      .map((kind) => `${deleted[kind]}/${sent[kind]} ${kind}s`)
+      .join(' and ');
+    const commentsLeft = toDelete.filter((item) => item.kind === 'file' && item.comment && !item.shareTs).map((item) => (item as UploadedFile).fileId);
+    const notes = [
+      ...(deleted.message + deleted.file < toDelete.length ? [`Rolled back (${counts} deleted)`] : []),
+      ...(commentsLeft.length > 0
+        ? [commentsLeft.length === 1
+          ? `The comment of uploaded file ${commentsLeft[0]} may remain: Slack's answer named no message that shared it`
+          : `The comments of uploaded files ${commentsLeft.join(', ')} may remain: Slack's answers named no message that shared them`]
+        : []),
+    ];
     return {
       checkpoint: params.checkpoint,
       success: true,
-      reason: deleted < toDelete.length
-        ? `Rolled back (${deleted}/${toDelete.length} ${toDelete.some((item) => item.kind === 'file') ? 'messages/files' : 'messages'} deleted)`
-        : undefined,
+      reason: notes.length > 0 ? notes.join('. ') : undefined,
     };
   }
 

@@ -9,6 +9,8 @@ type ToolResult = { content: { text: string }[]; state?: { checkpoint: string };
 const call = (host: ReturnType<typeof connectHost>['host'], name: string, args: Record<string, unknown>) =>
   host.sendRequest('tools/call', { name, arguments: args }) as Promise<ToolResult>;
 const uploadArgs = { channelId: 'C1', filename: 'hello.txt', content: 'hello' };
+/** The ts of each chat.delete call, in order. */
+const ts = (deleted: unknown[]) => deleted.map((args) => (args as { ts: string }).ts);
 
 async function ready(h: Pick<ReturnType<typeof connectHost>, 'host' | 'hostSaw'>) {
   await initialize(h, true);
@@ -30,7 +32,9 @@ test('rollback deletes an uploaded file and later message, preserving the checkp
   assert.equal(rollback.success, true);
   assert.equal(rollback.reason, undefined);
   assert.deepEqual(h.deletedFiles, ['F1'], 'delete the Slack file, not a nonexistent message timestamp');
-  assert.equal(h.deletedMessages.length, 1, 'only the message after the upload is deleted');
+  // The message that shared the file, 900.1, and the message after it, 100.2;
+  // not the checkpoint's own message, 100.1.
+  assert.deepEqual(ts(h.deletedMessages), ['900.1', '100.2']);
 });
 
 test('rolling back to the upload checkpoint preserves that file', async (t) => {
@@ -44,7 +48,7 @@ test('rolling back to the upload checkpoint preserves that file', async (t) => {
   }) as { success: boolean };
   assert.equal(rollback.success, true);
   assert.deepEqual(h.deletedFiles, ['F2'], 'only files sent after the checkpoint are removed');
-  assert.deepEqual(h.deletedMessages, []);
+  assert.deepEqual(ts(h.deletedMessages), ['900.2'], 'and the message that shared it');
 });
 
 test('upload rollback tracking survives reconnect and waits for the new peer messaging grant', async (t) => {
@@ -103,6 +107,20 @@ test('a successful upload clears the acknowledgement reaction', async (t) => {
   await until(() => h.reactions.includes('remove:C1:111.1:eyes'), 'ack removal');
 });
 
+test('a refused upload keeps the acknowledgement reaction, which only a confirmed one clears', async (t) => {
+  const h = harness({ ackReaction: 'eyes' });
+  t.after(() => h.close());
+  await ready(h);
+  await h.socket.emitMessage(MENTION_EVENT);
+  await until(() => h.reactions.includes('add:C1:111.1:eyes'), 'ack reaction');
+  const refused = await call(h.host, 'upload_file', { ...uploadArgs, title: 'refused' });
+  assert.equal(refused.isError, true);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.ok(!h.reactions.includes('remove:C1:111.1:eyes'), 'the reaction stays');
+  assert.notEqual((await call(h.host, 'upload_file', uploadArgs)).isError, true);
+  await until(() => h.reactions.includes('remove:C1:111.1:eyes'), 'ack removal');
+});
+
 test('rollback reports a failed file deletion while still deleting later messages', async (t) => {
   const fake = fakeSlack();
   t.mock.method(fake.slack, 'deleteUploadedFile', async () => { throw new Error('Slack refused file deletion'); });
@@ -116,8 +134,27 @@ test('rollback reports a failed file deletion while still deleting later message
     featureSet: MESSAGING_FEATURE_SET, checkpoint: before.state!.checkpoint,
   }) as { success: boolean; reason?: string };
   assert.equal(rollback.success, true, 'rollback retains the existing best-effort contract');
-  assert.equal(rollback.reason, 'Rolled back (1/2 messages/files deleted)');
-  assert.equal(fake.deletedMessages.length, 1);
+  assert.equal(rollback.reason, 'Rolled back (1/1 messages and 0/1 files deleted)');
+  assert.deepEqual(ts(fake.deletedMessages), ['100.2']);
+});
+
+test('an upload marks its conversation as the one last posted in, so a message there names no conversation', async (t) => {
+  const h = harness();
+  t.after(() => h.close());
+  await ready(h);
+  await call(h.host, 'upload_file', uploadArgs);
+  await h.socket.emitMessage(MENTION_EVENT);
+  await until(() => h.hostSaw.some((r) => r.method === method.PUSH_EVENT), 'push/event');
+  const pushed = h.hostSaw.find((r) => r.method === method.PUSH_EVENT)!.params as { payload: { content: { text: string }[] } };
+  assert.doesNotMatch(pushed.payload.content.map((c) => c.text).join('\n'), /#general \(acme\)/);
+  // Without the upload, the same message names its conversation.
+  const fresh = harness();
+  t.after(() => fresh.close());
+  await ready(fresh);
+  await fresh.socket.emitMessage(MENTION_EVENT);
+  await until(() => fresh.hostSaw.some((r) => r.method === method.PUSH_EVENT), 'push/event');
+  const first = fresh.hostSaw.find((r) => r.method === method.PUSH_EVENT)!.params as { payload: { content: { text: string }[] } };
+  assert.match(first.payload.content.map((c) => c.text).join('\n'), /#general \(acme\)/);
 });
 
 test('file deletion retains the upload destination allow-list and DM guards', async () => {

@@ -51,7 +51,8 @@ export const toolDefinitions: ToolDefinition[] = [
     name: 'upload_file',
     description:
       'Upload a file to a Slack conversation, optionally into a thread and with a message. ' +
-      'Pass the file as text (content) or as base64 (contentBase64), not both. Max 5MB. ' +
+      'Pass the file as text (content) or as base64 (contentBase64), not both: at most 5 MiB of file bytes, ' +
+      'after base64 is decoded or text is encoded as UTF-8. ' +
       'Same write rules as send_message.',
     inputSchema: {
       type: 'object',
