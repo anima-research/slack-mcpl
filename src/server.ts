@@ -281,6 +281,7 @@ export class SlackMcplServer {
     this.readOnlyNoted.clear();
     this.forwardedWatermark.clear();
     this.lastIncomingThreadTs.clear();
+    this.lastIncomingRoot.clear();
     this.lastChannelId = null;
     this.forwarding.clear();
 

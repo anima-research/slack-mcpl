@@ -4,3 +4,5 @@
   conversations the bot may write to; cleared on `op: 'stop'`, when the bot
   posts in that thread, or by Slack after 2 minutes. The messaging feature set
   now declares `channels.typing`.
+  The thread it lands on is learned per connection: a new peer starts
+  without one, so its typing never shows on a thread from before it connected.

@@ -8,7 +8,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { method } from '@animalabs/mcpl-core';
 import { SlackAdapter } from '../src/slack-adapter.js';
-import { FULL_GRANT, MENTION_EVENT, harness, initialize, until, type Harness } from './harness.js';
+import { SlackMcplServer } from '../src/server.js';
+import { FULL_GRANT, MENTION_EVENT, connectHost, fakeSlack, harness, initialize, until, type Harness } from './harness.js';
 
 function makeAdapter(sendChannels?: string[]) {
   const calls: string[] = [];
@@ -58,7 +59,7 @@ test('a post in the thread ends the status, so the next refresh sets it again', 
   assert.deepEqual(calls, ['C1:1.0:is thinking…', 'C1:1.0:is thinking…']);
 });
 
-async function ready(h: Harness, grant = FULL_GRANT) {
+async function ready(h: Pick<Harness, 'host' | 'hostSaw'>, grant = FULL_GRANT) {
   await initialize(h, true);
   await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: grant });
   await until(() => h.hostSaw.some((r) => r.method === method.CHANNELS_REGISTER), 'channels/register');
@@ -74,6 +75,28 @@ test('host typing lands on the thread of the message that woke the agent', async
   await until(() => h.statuses.length === 2, 'status cleared');
   assert.deepEqual(h.statuses, ['C1:4.0:is thinking…', 'C1:4.0:']);
   await h.close();
+});
+
+test('typing context belongs to the peer: a new connection starts without one', async () => {
+  const { slack, socket, statuses } = fakeSlack();
+  const server = new SlackMcplServer(slack);
+  const first = connectHost(server);
+  await ready(first);
+  await socket.emitMessage(MENTION_EVENT);
+  await until(() => first.hostSaw.some((r) => r.method === method.PUSH_EVENT), 'push to the first client');
+  await first.close();
+  const second = connectHost(server);
+  await ready(second);
+  second.host.sendNotification(method.CHANNELS_TYPING, { channelId: 'slack:C1', op: 'start' });
+  // Time for a status to be set, were there a thread to set it on.
+  await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual(statuses, [], 'no status on a thread the new peer never saw');
+  await socket.emitMessage({ ...MENTION_EVENT, ts: '7.0' });
+  await until(() => second.hostSaw.some((r) => r.method === method.PUSH_EVENT), 'push to the second client');
+  second.host.sendNotification(method.CHANNELS_TYPING, { channelId: 'slack:C1', op: 'start' });
+  await until(() => statuses.length === 1, 'status set');
+  assert.deepEqual(statuses, ['C1:7.0:is thinking…']);
+  await second.close();
 });
 
 test('a top-level message gets the status on its own thread', async () => {
