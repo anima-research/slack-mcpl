@@ -32,17 +32,18 @@ import * as net from 'node:net';
 import { McplConnection } from '@animalabs/mcpl-core';
 import { connectSlack } from './slack-adapter.js';
 import { SlackMcplServer } from './server.js';
+import { booleanFlag } from './config.js';
 import { serveTcp } from './tcp.js';
 
-/** A yes/no switch. Anything but a clear yes or no stops the server: a typo
- *  must not silently leave a guard off. */
+/** A yes/no switch from the environment. A bad value stops the server with
+ *  one line naming it: it is the operator's to fix, not a crash to trace. */
 function flag(name: string): boolean {
-  const raw = process.env[name];
-  const v = raw?.trim().toLowerCase();
-  if (v === undefined || v === '' || v === 'false' || v === '0' || v === 'no') return false;
-  if (v === 'true' || v === '1' || v === 'yes') return true;
-  console.error(`${name} must be true or false, got "${raw}"`);
-  process.exit(1);
+  try {
+    return booleanFlag(name, process.env[name]);
+  } catch (err) {
+    console.error((err as Error).message);
+    process.exit(1);
+  }
 }
 
 async function main(): Promise<void> {
@@ -74,10 +75,11 @@ async function main(): Promise<void> {
     process.exit(1);
   }
   const disableDms = flag('SLACK_DISABLE_DMS');
+  const subscribeMemberChannels = flag('SLACK_SUBSCRIBE_MEMBER_CHANNELS');
   const ackReaction = process.env.SLACK_ACK_REACTION?.replace(/:/g, '').trim() || undefined;
   const slack = await connectSlack({ botToken, appToken, dmUsers, sendChannels, disableDms, ackReaction });
   const server = new SlackMcplServer(slack, {
-    subscribeMemberChannels: flag('SLACK_SUBSCRIBE_MEMBER_CHANNELS'),
+    subscribeMemberChannels,
   });
   await slack.start();
   console.error(
