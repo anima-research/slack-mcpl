@@ -7,7 +7,13 @@
   filesystem paths. The same write rules as `send_message` apply
   (`SLACK_SEND_CHANNELS`, `SLACK_DISABLE_DMS`), the tool is in the
   `slack.messaging` feature set and classed `comms`, and rollback attempts
-  to delete uploads made after the checkpoint. **Operators:** the tool
-  needs `files:write` on the bot token. After adding that scope, reinstall
-  the app to the workspace through Slack's OAuth flow so the installed
-  token receives it; otherwise Slack refuses uploads with `missing_scope`.
+  to delete uploads made after the checkpoint, with `files.delete` and the
+  same write rules. As for sent messages, uploads are tracked for the life
+  of the server process, across host reconnects. When Slack's answer names
+  no file, the call fails, saying the upload could not be confirmed. Its
+  errors name the upload: a refusal says nothing was uploaded, and a failure
+  that may have left the file uploaded says what to check before uploading
+  again. **Operators:** the tool needs `files:write` on the bot token. After
+  adding that scope, reinstall the app to the workspace through Slack's
+  OAuth flow so the installed token receives it; otherwise Slack refuses
+  uploads with `missing_scope`.
