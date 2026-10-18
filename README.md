@@ -189,13 +189,14 @@ All numeric inputs are bounded integers, applied **per call**:
 | `maxScanned` | 1,000 | 1–10,000 | Candidate messages examined |
 | `maxBytes` | 65,536 | 2,048–1,048,576 | UTF-8 bytes of the complete result JSON, before MCP text-block wrapping |
 
-Each page is one Slack request, made like every other request this server
+Each page is a Slack request, made like every other request this server
 makes: it goes out only if its 10-second timeout fits in what is left of the
 call's 25 seconds, and a rate limit that fits the call's 5-second budget for
-waiting is waited out. A page that doesn't fit, or a longer rate limit, ends the
+waiting is waited out and the request sent once more. A page that doesn't fit, or a longer rate limit, ends the
 read with what it found and a cursor.
 
-Every call either moves past where it started or fails, saying why. A call that
+Every call either covers its range, moves past where it started, or fails,
+saying why. A call that
 stops before it has moved fails instead of returning nothing: the call's time,
 a rate limit, an empty page that says more remain, or a first message too big
 for `maxBytes`, whose failure names the `maxBytes` that fits it and how to read
@@ -206,7 +207,7 @@ and calling again is safe.
 `stopReason`, `scope` and `threadRepliesSearched`. `scanned` and `matched`
 count the messages the cursor moved past, so a chain of calls counts each
 message once; a match held back by the byte budget is counted by the call that
-returns it. `pages` counts the requests for pages this call made. Stop reasons are
+returns it. `pages` counts the pages Slack answered for this call. Stop reasons are
 `exhausted`, `match_limit`, `scan_limit`, `byte_limit`, `time_limit`,
 `rate_limited` and `pagination_stalled`. A rate limit includes
 `retryAfterSeconds` when Slack gave one; the caller chooses whether and when to
@@ -240,8 +241,8 @@ Compatibility: the former truncation `note` is replaced by structured
 `pagination`; clients must check it and resume rather than assuming a complete
 range. Previously unbounded or invalid numeric limits and unknown arguments now
 refuse. The default `maxBytes` of 64 KiB can end a default read before its
-match count, with `byte_limit` and a cursor. A failed read now opens with "No
-messages were returned". Existing tool names, default match counts and
+match count, with `byte_limit` and a cursor. A failed read's explanation now
+leads with "No messages were returned", as do the read's own failures. Existing tool names, default match counts and
 `list_channels.writable` remain stable. No new scopes, regex, bulk expansion,
 native search or interaction-token handling are included.
 

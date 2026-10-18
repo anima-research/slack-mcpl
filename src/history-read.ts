@@ -29,12 +29,14 @@ function timestamp(value: unknown, name: string): string {
   if (!isTimestamp(value)) throw new Error(`${name} must be a Slack timestamp`);
   return value;
 }
-/** A message's ts, as Slack gave it: a read can't place a message without one. */
-function messageTs(m: SlackHistoryMessage): string {
-  if (!isTimestamp(m.ts)) {
+/** A message's ts, as Slack gave it: a read can't place a message without
+ *  one, or an entry that isn't a message at all. */
+function messageTs(m: SlackHistoryMessage | null | undefined): string {
+  const ts = m?.ts;
+  if (!isTimestamp(ts)) {
     throw new Error('No messages were returned: Slack gave a message without a valid ts, so this read can\'t place it');
   }
-  return m.ts;
+  return ts;
 }
 function compareTs(a: string, b: string): number {
   const micros = (s: string) => {
@@ -178,8 +180,8 @@ export interface ReadSource {
 
 /**
  * Reads pages until the matches, the messages scanned or the result's bytes
- * reach their limit, or the range is covered. A call either moves past where
- * it started or fails, saying why: a page the call's time has no room for, a
+ * reach their limit, or the range is covered. A call either covers its range,
+ * moves past where it started, or fails, saying why: a page the call's time has no room for, a
  * rate limit longer than the call can wait, a message too big for maxBytes
  * beside the ones before it, or a page that says more remain but holds
  * nothing new, stops the read with what it has and a cursor once it has
