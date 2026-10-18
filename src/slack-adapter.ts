@@ -285,22 +285,36 @@ export class OutOfCallTime extends Error {
  *  it. */
 const failedRequests = new WeakMap<object, string>();
 
-/** The Web API method of the request `err` came from: OutOfCallTime's own, or
- *  the one SlackWebClient marked it with; undefined for an error no request of
- *  SlackWebClient's threw. */
+/** The request `err` came from: the Web API method SlackWebClient marked it
+ *  with, or OutOfCallTime's own, which names a Web API method or what else the
+ *  request was, such as an upload's bytes; undefined for an error no request
+ *  of SlackWebClient's threw. */
 export function failedRequest(err: unknown): string | undefined {
   if (err instanceof OutOfCallTime) return err.method;
   return err !== null && typeof err === 'object' ? failedRequests.get(err) : undefined;
 }
 
-/** The file an upload left for rollback when its last step failed: Slack may
- *  have shared it. */
-const filesLeft = new WeakMap<object, string>();
+/** The file an upload left when its last step failed or named no file, and
+ *  whether Slack may have shared it. */
+export interface FileLeft {
+  fileId: string;
+  mayHaveShared: boolean;
+}
+const filesLeft = new WeakMap<object, FileLeft>();
 
-/** The ID of the file an upload's failed last step may have shared, which a
- *  rollback deletes too; undefined for any other error. */
-export function fileLeftByUpload(err: unknown): string | undefined {
+/** The file an upload's failed last step left, which a rollback deletes too,
+ *  and whether Slack may have shared it; undefined for any other error. */
+export function fileLeftByUpload(err: unknown): FileLeft | undefined {
   return err !== null && typeof err === 'object' ? filesLeft.get(err) : undefined;
+}
+
+/** Whether Slack refused a request or rate-limited it, either of which leaves
+ *  it undone. A failure Slack says may have taken effect (MAY_HAVE_LANDED), an
+ *  HTTP error, a timeout or a dropped connection doesn't say. */
+function refusedOutright(err: unknown): boolean {
+  const e = err as { code?: unknown; data?: { error?: unknown } } | null;
+  if (e?.code === ErrorCode.RateLimitedError) return true;
+  return e?.code === ErrorCode.PlatformError && typeof e.data?.error === 'string' && !MAY_HAVE_LANDED.has(e.data.error);
 }
 
 /** An upload's last step answered without the file: whether Slack shared it
@@ -801,11 +815,12 @@ export class SlackAdapter {
    *  sendMessage. Needs the files:write scope.
    *
    *  A file is shared only at the last step, so a failure before it shared
-   *  nothing. When the last step fails, Slack may have shared the file anyway,
-   *  so its ID rides on the error (fileLeftByUpload) for rollback. An answer
-   *  that names no file throws UploadNotConfirmed, which carries it too.
+   *  nothing. When the last step fails, its file rides on the error
+   *  (fileLeftByUpload) for rollback, with whether Slack may have shared it:
+   *  not when Slack refused or rate-limited the step. An answer that names no
+   *  file throws UploadNotConfirmed, whose file rides on it the same way.
    *  `shareTs` is the message that shared the file, when the answer names it:
-   *  it holds the comment, which rollback deletes with the file. */
+   *  it holds the comment, which rollback deletes after the file. */
   async uploadFile(
     channelId: string,
     file: { filename: string; data: Buffer; title?: string; comment?: string; threadTs?: string },
@@ -829,14 +844,22 @@ export class SlackAdapter {
       });
     } catch (err) {
       // A request the call's time left no room for wasn't sent. Anything else
-      // may have shared the file, a refusal included, whose file a rollback
-      // removes at no cost to the agent.
-      if (!(err instanceof OutOfCallTime) && err !== null && typeof err === 'object') filesLeft.set(err, fileId);
+      // leaves the file for a rollback to remove, at no cost to the agent, a
+      // refusal's private one included.
+      if (!(err instanceof OutOfCallTime) && err !== null && typeof err === 'object') {
+        filesLeft.set(err, { fileId, mayHaveShared: !refusedOutright(err) });
+      }
       throw err;
     }
     const shared = answer.files?.find((f) => f.id === fileId);
-    if (!shared) throw new UploadNotConfirmed(fileId);
-    void this.clearAck(channelId);
+    if (!shared) {
+      const err = new UploadNotConfirmed(fileId);
+      filesLeft.set(err, { fileId, mayHaveShared: true });
+      throw err;
+    }
+    // The working reaction comes off whatever time the call has left, as a
+    // sent message's does.
+    void outsideCallTime(() => this.clearAck(channelId));
     return { fileId, shareTs: sharingTs(shared, channelId) };
   }
 
@@ -912,24 +935,12 @@ export class SlackAdapter {
     await this.web.chat.delete({ channel: channelId, ts });
   }
 
-  /** Remove a file uploaded by this bot, retaining its destination write guards. */
-  /** Deletes an uploaded file, then the message that shared it, when its ts
-   *  is known: that message holds the upload's comment. A sharing message
-   *  that's already gone, as when deleting the file took it, counts as
-   *  deleted. */
-  async deleteUploadedFile(channelId: string, fileId: string, shareTs?: string): Promise<void> {
+  /** Deletes a file this bot uploaded, with the same write checks as a
+   *  message's delete. */
+  async deleteFile(channelId: string, fileId: string): Promise<void> {
     this.assertWritable(channelId);
     await this.assertNotDm(channelId);
     await this.web.files.delete({ file: fileId });
-    if (!shareTs) return;
-    try {
-      await this.web.chat.delete({ channel: channelId, ts: shareTs });
-    } catch (err) {
-      const e = err as { code?: unknown; data?: { error?: unknown } } | null;
-      if (e?.code === ErrorCode.PlatformError && e.data?.error === 'message_not_found') return;
-      const why = (err as { message?: unknown } | null)?.message;
-      throw new Error(`deleted the file, but not its sharing message ${shareTs}: ${typeof why === 'string' ? why : String(err)}`);
-    }
   }
 
   async addReaction(channelId: string, ts: string, emoji: string): Promise<void> {

@@ -117,8 +117,10 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
     return typeof v === 'string' && v.trim() ? v : undefined;
   };
   // An upload's file is shared only at its last step, so a failure there, or
-  // later, leads with what is true of the file by then.
-  const sharing = call.tool === 'upload_file' && failedRequest(err) === 'files.completeUploadExternal';
+  // of the bytes before it, which may have reached Slack's upload server,
+  // leads with what is true of the file by then.
+  const sharing = call.tool === 'upload_file' &&
+    (failedRequest(err) === 'files.completeUploadExternal' || err instanceof UploadBytesNotSent);
   const lead = sharing ? 'Nothing was shared' : NOT_DONE[call.tool] ?? 'Nothing was done';
   const channel = given('channelId');
   const conversation = channel ? `conversation ${channel}` : 'the conversation';
@@ -191,15 +193,16 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
   }
   if (err instanceof UploadBytesNotSent) {
     const seconds = SLACK_CLIENT_OPTIONS.timeout / 1000;
+    const unshared = "Slack shares a file only at the upload's last step, which wasn't sent";
     if (err.why === 'TimeoutError') {
       return (
-        `${lead}: Slack's upload server didn't take the file's bytes within ${seconds} seconds, and Slack shares a ` +
-        'file only once they have arrived, so calling again is safe. If it keeps timing out, this server\'s ' +
-        `connection to Slack is too slow to send this file within ${seconds} seconds.`
+        `${lead}: Slack's upload server didn't take the file's bytes within ${seconds} seconds. ${unshared}, so ` +
+        'calling again is safe. If it keeps timing out, calling again won\'t help: this server\'s connection to ' +
+        `Slack is too slow to send this file within ${seconds} seconds, which whoever runs this host can look into.`
       );
     }
     const cause = err.why === 'transit' ? "the connection to Slack's upload server failed" : `Slack's upload server answered HTTP ${err.why}`;
-    return `${lead}: ${cause} while it took the file's bytes, and Slack shares a file only once they have arrived. Try again shortly.`;
+    return `${lead}: ${cause} while it took the file's bytes. ${unshared}. Try again shortly.`;
   }
   if (err instanceof OutOfCallTime) {
     // Not sent: a call's request goes out only if its timeout fits

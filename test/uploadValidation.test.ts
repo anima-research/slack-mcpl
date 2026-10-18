@@ -109,7 +109,12 @@ test('text holding a lone UTF-16 surrogate is refused before Slack, and a whole 
   for (const content of ['\uD800', 'a\uDC00b', 'x\uD83D']) {
     const result = await call({ content });
     assert.equal(result.isError, true, JSON.stringify(content));
-    assert.match(result.content[0].text, /lone UTF-16 surrogate/);
+    assert.match(result.content[0].text, /^content holds a lone UTF-16 surrogate, which UTF-8 can't encode: remove it, or pass the file's bytes as contentBase64/);
+  }
+  for (const key of ['filename', 'title', 'comment']) {
+    const result = await call({ content: 'a', [key]: 'x\uD800y' });
+    assert.equal(result.isError, true, key);
+    assert.match(result.content[0].text, new RegExp(`^${key} holds a lone UTF-16 surrogate, which UTF-8 can't encode: remove it from the`));
   }
   assert.equal(asked.length, 0);
   assert.notEqual((await call({ content: 'smile \uD83D\uDE00' })).isError, true);
@@ -138,8 +143,7 @@ test('upload handler enforces the inline cap on UTF-8 bytes and decoded base64 b
   ]) {
     const result = await call(args);
     assert.equal(result.isError, true);
-    assert.match(result.content[0].text, /too large/);
-    assert.match(result.content[0].text, /server.*inline|inline.*server/i);
+    assert.match(result.content[0].text, /^inline file too large: \d+ bytes, past this server's inline limit of \d+ bytes, so upload_file can't send it\. A smaller file can go/);
   }
   assert.equal(asked.length, 0);
   // Base64's encoded representation exceeds the cap; its decoded bytes do not.

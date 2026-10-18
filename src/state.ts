@@ -23,7 +23,8 @@ export interface UploadedFile {
   /** The message that shared the file, when Slack's answer named it: it holds
    *  the upload's comment. */
   shareTs?: string;
-  /** Whether the upload had a comment. */
+  /** Whether a comment may have gone out with the file: the upload had one,
+   *  and Slack may have shared the file. */
   comment: boolean;
   timestamp: string;
 }

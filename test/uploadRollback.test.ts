@@ -121,9 +121,9 @@ test('a refused upload keeps the acknowledgement reaction, which only a confirme
   await until(() => h.reactions.includes('remove:C1:111.1:eyes'), 'ack removal');
 });
 
-test('rollback reports a failed file deletion while still deleting later messages', async (t) => {
+test('rollback reports a failed file deletion while still deleting its sharing message and later messages', async (t) => {
   const fake = fakeSlack();
-  t.mock.method(fake.slack, 'deleteUploadedFile', async () => { throw new Error('Slack refused file deletion'); });
+  t.mock.method(fake.slack, 'deleteFile', async () => { throw new Error('Slack refused file deletion'); });
   const h = connectHost(new SlackMcplServer(fake.slack));
   t.after(() => h.close());
   await ready(h);
@@ -134,8 +134,8 @@ test('rollback reports a failed file deletion while still deleting later message
     featureSet: MESSAGING_FEATURE_SET, checkpoint: before.state!.checkpoint,
   }) as { success: boolean; reason?: string };
   assert.equal(rollback.success, true, 'rollback retains the existing best-effort contract');
-  assert.equal(rollback.reason, 'Rolled back (1/1 messages and 0/1 files deleted)');
-  assert.deepEqual(ts(fake.deletedMessages), ['100.2']);
+  assert.equal(rollback.reason, 'Rolled back (2/2 messages and 0/1 files deleted)');
+  assert.deepEqual(ts(fake.deletedMessages), ['900.1', '100.2']);
 });
 
 test('an upload marks its conversation as the one last posted in, so a message there names no conversation', async (t) => {
@@ -159,9 +159,9 @@ test('an upload marks its conversation as the one last posted in, so a message t
 
 test('file deletion retains the upload destination allow-list and DM guards', async () => {
   const restricted = fakeSlack({ sendChannels: ['C1'] });
-  await assert.rejects(restricted.slack.deleteUploadedFile('C9', 'F1'), /not allowed/);
+  await assert.rejects(restricted.slack.deleteFile('C9', 'F1'), /not allowed/);
   assert.deepEqual(restricted.deletedFiles, []);
   const noDms = fakeSlack({ disableDms: true });
-  await assert.rejects(noDms.slack.deleteUploadedFile('D1', 'F1'), /SLACK_DISABLE_DMS/);
+  await assert.rejects(noDms.slack.deleteFile('D1', 'F1'), /SLACK_DISABLE_DMS/);
   assert.deepEqual(noDms.deletedFiles, []);
 });
