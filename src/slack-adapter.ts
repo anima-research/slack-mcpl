@@ -36,13 +36,47 @@ import {
 
 /** An acknowledgement reaction is removed after this, replied to or not. */
 const ACK_TTL_MS = 10 * 60 * 1000;
-/** A removal that failed without an answer from Slack is tried again after
- *  this, at most ACK_MAX_TRIES times in all. */
+/** A removal that failed in a way that can pass is tried again after this,
+ *  up to ACK_MAX_TRIES tries in all. */
 const ACK_RETRY_MS = 60 * 1000;
 const ACK_MAX_TRIES = 5;
 /** Slack's answers to an acknowledgement's add after which it may be there:
  *  already_reacted, and the failures the explainer calls an unknown outcome. */
 const MAY_HAVE_LANDED = new Set(['already_reacted', 'internal_error', 'fatal_error', 'service_unavailable']);
+
+/** Slack's code, when Slack refused the call; undefined for any other error. */
+export function slackRefusal(err: unknown): string | undefined {
+  const e = err as { code?: unknown; data?: { error?: unknown } } | null;
+  return e?.code === ErrorCode.PlatformError && typeof e.data?.error === 'string' ? e.data.error : undefined;
+}
+
+/** Slack's answers to conversations.info that it has no such conversation to
+ *  show this bot (channel_not_found), or that the id isn't one at all
+ *  (invalid_channel_id). */
+const NOT_SHOWN = new Set(['channel_not_found', 'invalid_channel_id']);
+
+/** What can change Slack's answer to a check of a conversation (with DMs off)
+ *  that a later one wouldn't pass either: another conversation, or whoever
+ *  runs this host. A check waitToAskAgain says can pass doesn't come here:
+ *  assertNotDm leaves its error to the explainer. A rate limit's answer
+ *  without the Retry-After the client needs does come here, and is told to
+ *  try again shortly. */
+function afterFailedCheck(err: unknown): string {
+  const e = err as { data?: { needed?: unknown } } | null;
+  const code = slackRefusal(err);
+  // Not Slack's refusal, nor a failure waitToAskAgain names, such as a rate
+  // limit's answer without the Retry-After the client needs.
+  if (code === undefined) return 'Try again shortly.';
+  if (NOT_SHOWN.has(code)) return 'list_channels shows the ones it can use.';
+  if (code === 'missing_scope') {
+    const needed = typeof e?.data?.needed === 'string' && e.data.needed ? ` (Slack names ${e.data.needed})` : '';
+    return (
+      `Calling again won't change that until whoever runs this host adds the scope it needs${needed} to the ` +
+      "Slack app's bot token scopes and reinstalls the app."
+    );
+  }
+  return "Calling again won't change Slack's answer; only whoever runs this host, or the workspace's admins, can.";
+}
 
 /** The read scope conversations.list needs for each conversation type. */
 const TYPE_SCOPE: Record<string, string> = {
@@ -130,7 +164,7 @@ export interface SlackWait {
  *  next time, or `err` isn't the client's. A request the host is waiting on
  *  waits out only a `limited` one, within its budget (SlackWebClient). */
 export function waitToAskAgain(err: unknown, method: string): SlackWait | undefined {
-  const e = err as { code?: unknown; retryAfter?: unknown; data?: { error?: unknown } } | null;
+  const e = err as { code?: unknown; retryAfter?: unknown } | null;
   if (e?.code === ErrorCode.RateLimitedError && typeof e.retryAfter === 'number') {
     return { method, seconds: e.retryAfter, why: 'limited' };
   }
@@ -138,8 +172,8 @@ export function waitToAskAgain(err: unknown, method: string): SlackWait | undefi
   // Only a request made for a call can get it, and work no call waits on
   // never does, so its wait is left at none.
   if (err instanceof OutOfCallTime) return { method, seconds: 0, why: 'failed' };
-  const failedAtSlack = e?.code === ErrorCode.PlatformError && typeof e.data?.error === 'string' &&
-    SLACK_FAILED.has(e.data.error);
+  const refused = slackRefusal(err);
+  const failedAtSlack = refused !== undefined && SLACK_FAILED.has(refused);
   if (e?.code === ErrorCode.RequestError || e?.code === ErrorCode.HTTPError || failedAtSlack) {
     return { method, seconds: FAILED_WAIT_SECONDS, why: 'failed' };
   }
@@ -812,10 +846,13 @@ export class SlackAdapter {
     return !this.sendChannels?.length || this.sendChannels.includes(channelId);
   }
 
-  private assertWritable(channelId: string): void {
+  /** `notDone` opens the refusal: what the call would have done, as not done. */
+  private assertWritable(channelId: string, notDone: string): void {
     if (!this.canWrite(channelId)) {
       throw new Error(
-        `Writing to ${channelId} is not allowed: this bot may only write to ${this.sendChannels?.join(', ')} (SLACK_SEND_CHANNELS)`,
+        `${notDone}: this bot may write only to ${this.sendChannels?.join(', ')}, and ${channelId} isn't one of ` +
+          'them. list_channels marks the conversations it may write to with writable: true. Calling again ' +
+          "won't change that; whoever runs this host decides where it may write.",
       );
     }
   }
@@ -855,17 +892,20 @@ export class SlackAdapter {
       // have landed: already_reacted says it's there; Slack's failure while
       // handling it leaves it unknown, as the explainer says (internal_error
       // and fatal_error can take effect in part); and so does an HTTP error or
-      // a request that failed after it may have reached Slack. Slack's
+      // a request that failed after it may have reached Slack. Slack's other
       // refusals, its rate limits (a 429, or ratelimited in a 200) and
       // request_timeout say it didn't act, a connection never made reached
       // nothing, and this server's own refusal, such as the write allow-list's,
-      // sent nothing. Slack answers a removal of one that isn't there with
-      // no_reaction.
-      (err: { code?: unknown; original?: { code?: unknown }; data?: { error?: unknown } } | null) => {
+      // sent nothing. So did a failure of a request before the add, such as
+      // the DM check's conversations.info. Slack answers a removal of one that
+      // isn't there with no_reaction.
+      (err: { code?: unknown; original?: { code?: unknown } } | null) => {
+        const failed = failedRequest(err);
+        if (failed !== undefined && failed !== 'reactions.add') return false;
         if (err?.code === ErrorCode.RequestError) return !connectionNeverMade(err.original?.code);
         if (err?.code === ErrorCode.HTTPError) return true;
-        const answer = err?.code === ErrorCode.PlatformError ? err.data?.error : undefined;
-        return typeof answer === 'string' && MAY_HAVE_LANDED.has(answer);
+        const answer = slackRefusal(err);
+        return answer !== undefined && MAY_HAVE_LANDED.has(answer);
       },
     );
     // Recorded before the add resolves, so a reply that lands first still removes it.
@@ -877,8 +917,9 @@ export class SlackAdapter {
   }
 
   /** Remove the reaction from one message, or from every pending message in the
-   *  conversation. A removal that failed without an answer from Slack (rate
-   *  limit, HTTP or network error) is tried again; one Slack refused is not. */
+   *  conversation. A removal that failed in a way that can pass (a rate
+   *  limit, an HTTP error, a network failure or Slack's own failure) is tried
+   *  again; one Slack refused is not. */
   async clearAck(channelId: string, ts?: string): Promise<void> {
     const pending = this.ackPending.get(channelId);
     if (!pending || !this.ackReaction) return;
@@ -903,21 +944,26 @@ export class SlackAdapter {
       await this.web.reactions.remove({ channel: channelId, timestamp: ts, name: this.ackReaction! });
       this.dropAck(channelId, ts, entry);
     } catch (err) {
-      // Slack's own answer (data.error) will be the same next time. The fifth
+      // Slack's refusal will be the same next time. A rate limit, an HTTP
+      // error, a failure in transit or Slack's own failure can pass. The fifth
       // failure drops the entry, so no sixth attempt can start.
-      const answered = !!(err as { data?: { error?: string } } | null)?.data?.error;
-      if (answered || this.stopping || entry.tries >= ACK_MAX_TRIES) this.dropAck(channelId, ts, entry);
+      const code = slackRefusal(err);
+      const lasting = code !== undefined && !SLACK_FAILED.has(code);
+      if (lasting || this.stopping || entry.tries >= ACK_MAX_TRIES) this.dropAck(channelId, ts, entry);
       else entry.timer = this.armAck(channelId, ts, ACK_RETRY_MS);
     }
   }
 
+  /** `notDone` opens this server's own refusals: send_dm's reads "Nothing was
+   *  sent". */
   async sendMessage(
     channelId: string,
     text: string,
     opts: { threadTs?: string } = {},
+    notDone = 'Nothing was posted',
   ): Promise<{ messageId: string }> {
-    this.assertWritable(channelId);
-    await this.assertNotDm(channelId);
+    this.assertWritable(channelId, notDone);
+    await this.assertNotDm(channelId, notDone);
     const result = await this.web.chat.postMessage({
       channel: channelId,
       text,
@@ -932,11 +978,14 @@ export class SlackAdapter {
    *  reads call this. An ID is not enough: a group DM ID looks like a channel
    *  ID, and a user ID (U…) posts into that user's DM. An unknown ID is asked
    *  about until Slack confirms it; if Slack cannot say, it is refused. */
-  private async assertNotDm(channelId: string): Promise<void> {
+  private async assertNotDm(channelId: string, notDone: string): Promise<void> {
     if (!this.disableDms || this.channelIds.has(channelId)) return;
     const refuse = (why: string) =>
-      new Error(`Conversation ${channelId} ${why}; direct messages are disabled for this bot (SLACK_DISABLE_DMS)`);
-    if (this.dmIds.has(channelId) || channelId.startsWith('D')) throw refuse('is a DM');
+      new Error(
+        `${notDone}: ${channelId} ${why}, and this bot works only in channels here, since direct messages are ` +
+          'turned off. list_channels shows the ones it can use.',
+      );
+    if (this.dmIds.has(channelId) || channelId.startsWith('D')) throw refuse('is a direct message or group DM');
     try {
       await this.getConversationMeta(channelId); // fills channelIds for this very ID, or not
     } catch (err) {
@@ -947,40 +996,62 @@ export class SlackAdapter {
       // the conversation. Anything else, Slack's refusal included, leaves it
       // unconfirmed, and the write is refused.
       if (waitToAskAgain(err, 'conversations.info')) throw err;
-      throw refuse(`could not be confirmed as a channel (${(err as Error).message})`);
+      const answer = slackRefusal(err);
+      const why = answer !== undefined ? `Slack answered ${answer}` : (err as Error).message;
+      throw new Error(
+        `${notDone}: Slack couldn't confirm ${channelId} is a channel (${why}), and with direct messages turned ` +
+          `off, this bot works only in conversations Slack confirms are channels. ${afterFailedCheck(err)}`,
+      );
     }
-    if (!this.channelIds.has(channelId)) throw refuse('is not a channel');
+    if (!this.channelIds.has(channelId)) throw refuse("isn't a channel");
   }
 
   async sendDM(userId: string, text: string): Promise<{ messageId: string; channelId: string }> {
-    if (this.disableDms) throw new Error('Direct messages are disabled for this bot (SLACK_DISABLE_DMS)');
+    const toChannels =
+      'To reach people, post in a channel with send_message; list_channels marks where this bot may write with ' +
+      'writable: true.';
+    if (this.disableDms) {
+      throw new Error(
+        "Nothing was sent: direct messages are turned off on this host, so send_dm can't reach anyone. Calling " +
+          `again won't change that; whoever runs this host decides whether this bot may send DMs. ${toChannels}`,
+      );
+    }
     // A DM ID starts with D. If the allow-list names none, no DM can be written,
     // so don't open one just to find that out.
     if (this.sendChannels?.length && !this.sendChannels.some((id) => id.startsWith('D'))) {
-      throw new Error('Writing to a direct message is not allowed: SLACK_SEND_CHANNELS lists no DM conversation');
+      throw new Error(
+        `Nothing was sent: this bot may write only to ${this.sendChannels.join(', ')}, none of them a direct ` +
+          "message, so send_dm can't reach anyone. Calling again won't change that; whoever runs this host decides " +
+          `where it may write. ${toChannels}`,
+      );
     }
     const open = await this.web.conversations.open({ users: userId });
     const channelId = open.channel?.id;
-    if (!channelId) throw new Error(`Could not open a DM with user ${userId}`);
-    const { messageId } = await this.sendMessage(channelId, text);
+    if (!channelId) {
+      throw new Error(
+        `Nothing was sent: Slack opened no DM with user ${userId}. Check the id with find_user, which returns ` +
+          "each person's userId, and call again.",
+      );
+    }
+    const { messageId } = await this.sendMessage(channelId, text, {}, 'Nothing was sent');
     return { messageId, channelId };
   }
 
   async editMessage(channelId: string, ts: string, text: string): Promise<void> {
-    this.assertWritable(channelId);
-    await this.assertNotDm(channelId);
+    this.assertWritable(channelId, "The message wasn't changed");
+    await this.assertNotDm(channelId, "The message wasn't changed");
     await this.web.chat.update({ channel: channelId, ts, text });
   }
 
   async deleteMessage(channelId: string, ts: string): Promise<void> {
-    this.assertWritable(channelId);
-    await this.assertNotDm(channelId);
+    this.assertWritable(channelId, 'Nothing was deleted');
+    await this.assertNotDm(channelId, 'Nothing was deleted');
     await this.web.chat.delete({ channel: channelId, ts });
   }
 
   async addReaction(channelId: string, ts: string, emoji: string): Promise<void> {
-    this.assertWritable(channelId);
-    await this.assertNotDm(channelId);
+    this.assertWritable(channelId, 'No reaction was added');
+    await this.assertNotDm(channelId, 'No reaction was added');
     await this.web.reactions.add({ channel: channelId, timestamp: ts, name: reactionName(emoji) });
   }
 
@@ -992,7 +1063,7 @@ export class SlackAdapter {
     channelId: string,
     opts: { limit?: number; oldest?: string; latest?: string } = {},
   ): Promise<{ messages: HistoryMessage[]; truncated: boolean }> {
-    await this.assertNotDm(channelId);
+    await this.assertNotDm(channelId, 'Nothing was read');
     const { messages, truncated } = await fetchSlackHistory(this.web, {
       channel: channelId,
       ...(opts.oldest !== undefined ? { oldest: opts.oldest } : {}),
@@ -1008,7 +1079,7 @@ export class SlackAdapter {
     threadTs: string,
     limit = 100,
   ): Promise<{ messages: HistoryMessage[]; truncated: boolean }> {
-    await this.assertNotDm(channelId);
+    await this.assertNotDm(channelId, 'Nothing was read');
     const collected: SlackHistoryMessage[] = [];
     let cursor: string | undefined;
     let truncated = false;

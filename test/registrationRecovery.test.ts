@@ -938,7 +938,7 @@ test("a wait for a DM's name is logged with the method it waits on", async (t) =
 
 // The registration below waits 30 s, past each test's 5 s timeout, so a
 // refresh held by that wait fails the test.
-test("after a revoke, a refresh isn't held by the wait of the registration the revoke ended", { timeout: 5000 }, async (t) => {
+test("after a revoke, a refresh is refused at once for the missing grant, not held by the registration the revoke ended", { timeout: 5000 }, async (t) => {
   let lists = 0;
   const { slack } = fakeSlack(async (_all?: boolean, waitOut?: SlackWaitOut) => {
     if (lists++ === 0) await waitOut!(limited(30), 1);
@@ -952,7 +952,8 @@ test("after a revoke, a refresh isn't held by the wait of the registration the r
   // Revoking channels.register with no grant after it starts no newer registration.
   await h.grant(['tools']);
   const answer = (await h.refresh()) as ToolResult;
-  assert.notEqual(answer.isError, true, answer.content[0].text);
+  assert.equal(answer.isError, true);
+  assert.match(answer.content[0].text, /hasn't granted this server channels\.register/, 'it answers at once that it can\'t register');
   assert.equal(h.requests.length, 0, 'nothing was registered');
 });
 
@@ -974,7 +975,8 @@ test("on a connection the host hasn't granted yet, or a plain MCP one, a refresh
   await ungranted.initialize();
   await ungranted.grant(['tools']);
   const ungrantedAnswer = (await ungranted.refresh()) as ToolResult;
-  assert.notEqual(ungrantedAnswer.isError, true, ungrantedAnswer.content[0].text);
+  assert.equal(ungrantedAnswer.isError, true);
+  assert.match(ungrantedAnswer.content[0].text, /hasn't granted this server channels\.register/);
   assert.equal(ungranted.requests.length, 0);
   await ungranted.close();
 
@@ -983,7 +985,8 @@ test("on a connection the host hasn't granted yet, or a plain MCP one, a refresh
   await plain.host.sendRequest(method.INITIALIZE, { capabilities: {} });
   plain.host.sendNotification('notifications/initialized');
   const plainAnswer = (await plain.refresh()) as ToolResult;
-  assert.notEqual(plainAnswer.isError, true, plainAnswer.content[0].text);
+  assert.equal(plainAnswer.isError, true);
+  assert.match(plainAnswer.content[0].text, /this connection is plain MCP/);
   assert.equal(plain.requests.length, 0);
 });
 

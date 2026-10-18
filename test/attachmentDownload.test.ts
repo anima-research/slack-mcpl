@@ -39,6 +39,28 @@ test('a download that gets no answer ends when its signal aborts', { timeout: 50
   await assert.rejects(download, timedOut);
 });
 
+test("a download its caller's signal ends rejects with the caller's own reason", { timeout: 5000 }, async (t) => {
+  const silent = await silentSlackApi();
+  t.after(() => silent.close());
+  const abort = new AbortController();
+  const download = fetchAttachmentBytes(`${silent.url}report.txt`, 'report.txt', { signal: abort.signal });
+  await until(() => silent.requests() === 1, 'the request');
+  const reason = new Error('stop');
+  abort.abort(reason);
+  await assert.rejects(download, (err: unknown) => err === reason);
+});
+
+test('a download every address of the file host refuses says why, for each address', { timeout: 5000 }, async (t) => {
+  const refused = (address: string) => Object.assign(new Error(`connect ECONNREFUSED ${address}`), { code: 'ECONNREFUSED' });
+  t.mock.method(globalThis, 'fetch', async () => {
+    throw new TypeError('fetch failed', { cause: new AggregateError([refused('10.0.0.1:443'), refused('[::1]:443')]) });
+  });
+  await assert.rejects(fetchAttachmentBytes(FILE_URL, 'report.txt'), {
+    message: 'Nothing was fetched: the download failed on the way (connect ECONNREFUSED 10.0.0.1:443; connect ' +
+      'ECONNREFUSED [::1]:443). Try again shortly.',
+  });
+});
+
 test('a download whose body stalls after the headers ends when its signal aborts too', { timeout: 5000 }, async (t) => {
   // The headers and the first bytes, then nothing more.
   const server = http.createServer((_req, res) => {

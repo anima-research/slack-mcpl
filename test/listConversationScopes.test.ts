@@ -361,9 +361,18 @@ test('list_channels says which kinds a listing left out beside the list, and ans
 test("refresh_channels' note says which kinds the listing left out", { timeout: 5000 }, async (t) => {
   t.after(() => api.answerFor('conversations.list'));
   api.answerFor('conversations.list', page('channels:read,groups:read,im:read', [channel('C1')]));
-  const h = connectHost(new SlackMcplServer(realAdapter(['channels:read', 'groups:read', 'im:read'])));
+  const server = new SlackMcplServer(realAdapter(['channels:read', 'groups:read', 'im:read']));
+  const h = connectHost(server);
   t.after(() => h.close());
-  await initialize(h, false);
+  // refresh_channels announces to a host, so it needs MCPL and channels.register, and it lists once the
+  // registration the grant starts has ended.
+  await initialize(h, true);
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await until(
+    () => h.hostSaw.some((req) => req.method === method.CHANNELS_REGISTER) &&
+      (server as unknown as { registering?: unknown }).registering === undefined,
+    'registration to end',
+  );
   const refreshed = (await h.host.sendRequest('tools/call', { name: 'refresh_channels', arguments: {} })) as {
     isError?: boolean;
     content: { text: string }[];

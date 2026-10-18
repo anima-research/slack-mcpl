@@ -605,6 +605,23 @@ test("an acknowledgement's add counts as there, and is removed, only when it may
   }
 });
 
+test("an acknowledgement whose DM check fails added nothing, so nothing is removed for it", { timeout: 5000 }, async () => {
+  // With DMs off, the add's DM check asks Slack about an unknown conversation
+  // first; that request failing leaves the add unsent.
+  const slack = new SlackAdapter(client as unknown as SlackWebLike, socket, 'UBOT', 'acme', undefined, undefined, true, 'eyes');
+  const from = api.calls.length;
+  const removals = () => api.calls.filter((c) => c === 'reactions.remove').length;
+  for (const answer of [{ body: { ok: false, error: 'internal_error' } }, { status: 503, body: { ok: false } }] as const) {
+    api.answer(answer);
+    await slack.acknowledge('C7', '1.1');
+    const before = removals();
+    api.answer({ body: { ok: false, error: 'no_reaction' } });
+    await slack.clearAck('C7', '1.1');
+    assert.equal(removals() - before, 0, JSON.stringify(answer));
+  }
+  assert.equal(api.calls.slice(from).filter((c) => c === 'reactions.add').length, 0, 'no add was sent');
+});
+
 test('a listing in the background waits out each rate-limited page, then asks for that page again', { timeout: 5000 }, async () => {
   // The client's own rate-limit error, so the listing reads its real shape.
   api.answer({ status: 429, headers: { 'retry-after': '3' }, body: { ok: false, error: 'ratelimited' } });

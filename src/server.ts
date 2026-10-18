@@ -45,6 +45,7 @@ import {
   assertRequestFits,
   leftOutNote,
   outsideCallTime,
+  slackRefusal,
   withCallTime,
   type SlackAdapter,
   type SlackMessageData,
@@ -57,10 +58,12 @@ import { ChannelManager, mcplChannelId, parseMcplChannelId, toDescriptor } from 
 import { StateTracker } from './state.js';
 import { CapabilityGrant } from './grant.js';
 import { McplRpcError, capabilityDenied } from './errors.js';
-import { explainSlackError, slackRefusal } from './slack-errors.js';
+import { explainSlackError } from './slack-errors.js';
 import {
   fetchAttachmentBytes,
   parseSlackAttachmentUrl,
+  attachmentName,
+  ATTACHMENT_URL_SOURCE,
   toFetchResult,
   type AttachmentRef,
 } from './content.js';
@@ -98,6 +101,21 @@ function dbg(tag: string, info: Record<string, unknown> = {}): void {
     // Logging is best-effort; never break the server because of it.
   }
 }
+
+/** Where the value of each argument a tool requires comes from, for a call that didn't give it. */
+const ARGUMENT_SOURCES = {
+  channelId: "list_channels shows each conversation's id.",
+  messageId:
+    "Take it from the message: its id= (reply_message takes its thread= when it shows one), or from fetch_history's ids.",
+  threadTs:
+    "Pass the thread's parent id: a reply's thread=, or the id of the message the replies are under, which " +
+    'fetch_history shows.',
+  userId: "find_user returns each person's userId.",
+  emoji: 'Pass an emoji name, such as thumbsup.',
+  url: ATTACHMENT_URL_SOURCE,
+  query: "Pass part of a person's name.",
+  content: "Pass the message's text.",
+} satisfies Record<string, string>;
 
 /** The bracketed header in front of an incoming message, e.g.
  *  `[#support (acme) thread=1718000000.000100 id=1718000000.000200] `. */
@@ -149,9 +167,10 @@ export class SlackMcplServer {
   private channelManager = new ChannelManager();
   /** A new registration supersedes work started under an earlier grant. */
   private registrationGeneration = 0;
-  /** The latest registration while it runs, and whether it is still the
-   *  current one. A refresh_channels then answers at once. */
-  private registering: { isCurrent: () => boolean } | undefined;
+  /** The generation of the newest registration, from its start until it
+   *  ends; a registration it superseded may still be finishing after that. A
+   *  refresh_channels answers at once while it's set. */
+  private registering: number | undefined;
   private stateTracker = new StateTracker();
   /** Serial delivery within a conversation; different conversations stay independent. */
   private forwarding = new Map<string, Promise<void>>();
@@ -341,6 +360,15 @@ export class SlackMcplServer {
     // unavailable. Plain MCP tool calls are unaffected; see callTool below.
   }
 
+  /** The tools tools/list offers: send_dm only where a DM can be written, and
+   *  refresh_channels only where MCPL was negotiated, since a plain MCP
+   *  connection has no host to register conversations with. Neither changes
+   *  during a connection, as a grant can. */
+  private offeredTools() {
+    return toolDefinitions.filter((t) =>
+      (t.name !== 'send_dm' || this.slack.dmsWritable) && (t.name !== 'refresh_channels' || this.mcplEnabled));
+  }
+
   private requireMcpl(): void {
     if (!this.mcplEnabled) {
       throw new McplRpcError(-32601, 'MCPL is not negotiated on this connection');
@@ -359,9 +387,8 @@ export class SlackMcplServer {
     try {
       switch (req.method) {
         case 'tools/list': {
-          const listed = this.slack.dmsWritable ? toolDefinitions : toolDefinitions.filter((t) => t.name !== 'send_dm');
           // MCPL RFC-008: each tool carries its class in _meta['mcpl/class'].
-          conn.sendResponse(req.id, { tools: withToolClasses(listed) });
+          conn.sendResponse(req.id, { tools: withToolClasses(this.offeredTools()) });
           break;
         }
 
@@ -557,7 +584,12 @@ export class SlackMcplServer {
     const fs = featureSetForTool(name);
     if (fs && this.mcplEnabled && !this.grant.isFeatureSetActive(fs)) {
       return {
-        content: [textContent(`Feature set '${fs}' is not enabled`)],
+        content: [
+          textContent(
+            `${name} is turned off on this host: the host's policy hasn't enabled its feature set, ${fs}, so nothing ` +
+              "ran, and calling again won't change that until the host enables it.",
+          ),
+        ],
         isError: true,
       };
     }
@@ -647,12 +679,21 @@ export class SlackMcplServer {
         );
         return 'Message edited';
 
-      case 'delete_message':
-        await this.slack.deleteMessage(
-          this.requireString(args, 'channelId'),
-          this.requireString(args, 'messageId'),
-        );
+      case 'delete_message': {
+        const channelId = this.requireString(args, 'channelId');
+        const messageId = this.requireString(args, 'messageId');
+        // Gone from Slack, deleted now or already, so no rollback tries to
+        // delete it again. Any other failure keeps it recorded, for a
+        // rollback to try.
+        try {
+          await this.slack.deleteMessage(channelId, messageId);
+        } catch (err) {
+          if (slackRefusal(err) === 'message_not_found') this.stateTracker.forgetSent(channelId, messageId);
+          throw err;
+        }
+        this.stateTracker.forgetSent(channelId, messageId);
         return 'Message deleted';
+      }
 
       case 'list_channels': {
         const { conversations, leftOut } = await this.slack.listConversations(args.includeNonMember === true);
@@ -685,7 +726,13 @@ export class SlackMcplServer {
         });
         return {
           messages: messages.map((m) => this.renderHistoryMessage(m)),
-          ...(truncated ? { note: 'Range holds more messages than the limit; the oldest were omitted.' } : {}),
+          ...(truncated
+            ? {
+                note:
+                  'The range holds more messages than the limit, so the oldest were left out. To get them, call ' +
+                  'again with latest set to the id of the oldest message shown, or with a higher limit.',
+              }
+            : {}),
         };
       }
 
@@ -699,13 +746,27 @@ export class SlackMcplServer {
         );
         return {
           messages: messages.map((m) => this.renderHistoryMessage(m)),
-          ...(truncated ? { note: 'Thread holds more messages than the limit; the newest were omitted.' } : {}),
+          ...(truncated
+            ? {
+                note:
+                  'The thread holds more messages than the limit, so the newest were left out. Call again with a ' +
+                  'higher limit to get them.',
+              }
+            : {}),
         };
       }
 
       case 'find_user': {
-        const matches = await this.slack.findUsers(this.requireString(args, 'query'));
-        if (matches.length === 0) return { found: false, note: 'No users matched.' };
+        const query = this.requireString(args, 'query');
+        const matches = await this.slack.findUsers(query);
+        if (matches.length === 0) {
+          return {
+            found: false,
+            note:
+              `No users matched "${query}". find_user matches part of a username, real name or display name, ` +
+              'ignoring case, and leaves out bots and deactivated accounts. Try a shorter part or another spelling.',
+          };
+        }
         return {
           found: true,
           users: matches.map((u) => ({
@@ -719,14 +780,26 @@ export class SlackMcplServer {
       }
 
       case 'fetch_attachment': {
-        // The bot token must only be sent to files.slack.com — never to
-        // workspace hosts. Enforcement lives in parseSlackAttachmentUrl.
+        // The bot token goes only to files.slack.com, never to workspace hosts:
+        // parseSlackAttachmentUrl checks the url given, and fetch() drops
+        // Authorization on a redirect to another origin (fetchAttachment.test.ts).
         const url = parseSlackAttachmentUrl(this.requireString(args, 'url'));
         const botToken = process.env.SLACK_BOT_TOKEN || '';
         const headers: Record<string, string> = botToken
           ? { Authorization: `Bearer ${botToken}` }
           : {};
-        const fileName = decodeURIComponent(url.pathname.split('/').pop() || 'attachment');
+        // fetch() refuses a header holding such a character with a message that
+        // quotes the header, token and all.
+        try {
+          new Headers(headers);
+        } catch {
+          throw new Error(
+            "Nothing was fetched: this server's bot token holds a character a request header can't carry, such as a " +
+              "line break, so fetch_attachment can't send it. Calling again won't change that until whoever runs " +
+              'this host fixes the token.',
+          );
+        }
+        const fileName = attachmentName(url);
         // The download is a request this call makes, so it keeps the start rule
         // the client's requests keep, with the client's timeout as its whole
         // time: a stalled file host costs that timeout, not what's left of the
@@ -785,14 +858,24 @@ export class SlackMcplServer {
       }
 
       default:
-        throw new Error(`Unknown tool: ${name}`);
+        throw new Error(
+          `There's no tool named "${name}" here, so nothing ran. This server's tools are: ` +
+            `${this.offeredTools().map((t) => t.name).join(', ')}.`,
+        );
     }
   }
 
-  private requireString(args: Record<string, unknown>, key: string): string {
+  private requireString(args: Record<string, unknown>, key: keyof typeof ARGUMENT_SOURCES): string {
     const v = args[key];
     if (typeof v !== 'string' || v.length === 0) {
-      throw new Error(`${key} is required`);
+      const passed =
+        v === undefined ? 'left it out'
+        : v === '' ? 'passed an empty string'
+        : v === null ? 'passed null'
+        : Array.isArray(v) ? 'passed an array'
+        : typeof v === 'object' ? 'passed an object'
+        : `passed a ${typeof v}`;
+      throw new Error(`Nothing was done: ${key} must be a non-empty string, and this call ${passed}. ${ARGUMENT_SOURCES[key]}`);
     }
     return v;
   }
@@ -904,14 +987,14 @@ export class SlackMcplServer {
     const generation = ++this.registrationGeneration;
     const isCurrent = () => this.conn === conn && !conn.isClosed &&
       this.registrationGeneration === generation && this.grant.has('channels.register');
-    // Until it ends, however it ends, a refresh_channels answers at once
-    // while this registration is current.
-    const running = { isCurrent };
-    this.registering = running;
+    // Until it ends, however it ends, a refresh_channels answers at once.
+    // A registration that ends clears only its own record, not a later
+    // one's.
+    this.registering = generation;
     try {
       await this.listAndRegister(conn, isCurrent);
     } finally {
-      if (this.registering === running) this.registering = undefined;
+      if (this.registering === generation) this.registering = undefined;
     }
   }
 
@@ -1020,12 +1103,6 @@ export class SlackMcplServer {
    *  re-registering a known channel refreshes its descriptor but does NOT
    *  re-announce it. Returns the descriptors that were newly added. */
   private registerAndNotifyNew(descriptors: ChannelDescriptor[]): ChannelDescriptor[] {
-    // Without the grant, record nothing: a channel marked known here would
-    // never be announced after the grant widens.
-    if (this.conn && this.mcplEnabled && !this.grant.has('channels.register')) {
-      console.error('[slack-mcpl] channels.register not granted; channels stay unannounced');
-      return [];
-    }
     const added: ChannelDescriptor[] = [];
     for (const d of descriptors) {
       if (!this.channelManager.get(d.id)) added.push(d);
@@ -1045,18 +1122,37 @@ export class SlackMcplServer {
     added: Array<{ id: string; label: string }>;
     note: string;
   }> {
+    // Without MCPL there's no host to announce to, and without the grant
+    // nothing can be announced, so the call fails before Slack is asked, as a
+    // tool whose feature set the host hasn't enabled does. tools/list leaves
+    // it out on a plain MCP connection; this answers a call that comes anyway.
+    // Nothing is recorded either: a channel marked known now would never be
+    // announced after the grant widens. serve() handles one request at a time,
+    // so the grant can't change before this call returns.
+    if (!this.mcplEnabled) {
+      throw new Error(
+        "Nothing was announced: this connection is plain MCP, without MCPL's channels, so there's no host to " +
+          "register conversations with, and calling again won't change that.",
+      );
+    }
+    if (!this.grant.has('channels.register')) {
+      throw new Error(
+        "Nothing was announced to the host: its policy hasn't granted this server channels.register, so it can't " +
+          "register conversations with the host, and calling again won't change that until the host grants it.",
+      );
+    }
     const conn = this.conn;
     // A refresh doesn't list while the latest registration is running and can
     // still register, so that registration's host answer, if it still applies,
     // is applied before this listing instead of racing it; a channel that
     // answer refuses is unknown again, so a refresh after it announces it.
     // Waiting for registration can take longer than the host waits for this
-    // call, so a refresh meanwhile answers at once. A registration that is no
-    // longer current, after a revoke or a re-grant, on an earlier connection,
-    // or on a connection the host hasn't granted channels.register, plain MCP
-    // ones included, applies no answer from the host, so it holds no refresh
-    // back.
-    if (this.registering?.isCurrent()) {
+    // call, so a refresh meanwhile answers at once. A registration on record
+    // here is the current one: past the two refusals above, this
+    // connection's grant holds channels.register, the grant starts over with
+    // each connection, and each change of the grant to hold channels.register
+    // starts a registration that takes the record over.
+    if (this.registering !== undefined) {
       throw new Error(
         "Nothing was announced to the host: this server is still registering the workspace's conversations. " +
           'Registration announces what it finds, unless it stops early. Once it has ended, refresh_channels lists ' +
@@ -1076,9 +1172,7 @@ export class SlackMcplServer {
       .filter((c) => !c.nameWait)
       .map((c) => toDescriptor(c, this.slack.teamName, this.slack.canWrite(c.id)));
     // As registration does after its listing: a listing begun for a peer that
-    // has since gone neither writes the registry nor announces. The grant is
-    // checked next, in registerAndNotifyNew (serve() handles one request at a
-    // time, so no featureSets/update lands during the listing).
+    // has since gone neither writes the registry nor announces.
     if (gone()) {
       return {
         visible: convs.length,
@@ -1087,10 +1181,9 @@ export class SlackMcplServer {
       };
     }
     const added = this.registerAndNotifyNew(descriptors);
-    const notGranted = this.mcplEnabled && !this.grant.has('channels.register');
     const wait = Math.max(1, ...unnamed.map((c) => c.nameWait?.seconds ?? 0));
     const unnamedIds = unnamed.map((c) => `${mcplChannelId(c.id)} (user ${c.userId})`).join(', ');
-    const leftOut = notGranted || unnamed.length === 0 ? '' :
+    const leftOut = unnamed.length === 0 ? '' :
       ` Left out ${unnamed.length} DM(s) whose user's name this server couldn't get from Slack just now, since ` +
         `the host keeps the label a conversation is first announced with: ${unnamedIds}. Call refresh_channels ` +
         `again in about ${wait} second${wait === 1 ? '' : 's'} to announce them by name. This server still sends ` +
@@ -1101,11 +1194,9 @@ export class SlackMcplServer {
       note:
         (added.length > 0
           ? `Registered ${added.length} newly-visible conversation(s).`
-          : notGranted
-            ? 'The host has not granted channels.register; nothing was announced.'
-            : unnamed.length > 0
-              ? 'No conversation was registered.'
-              : 'No new conversations — the host already knows about every visible one.') + leftOut +
+          : unnamed.length > 0
+            ? 'No conversation was registered.'
+            : 'No new conversations: the host already has every one this listing found.') + leftOut +
         (typesLeftOut.length > 0 ? ` ${leftOutNote(typesLeftOut)}` : ''),
     };
   }
@@ -1122,7 +1213,23 @@ export class SlackMcplServer {
       if (desc) {
         return { channel: desc };
       }
-      throw new Error('No matching channel found');
+      if (!named) {
+        throw new Error(
+          'No matching channel found: this server opens a channel by its id, such as slack:C0123ABCD, or by an ' +
+            `address of type slack with a channelId, and this request gave neither, so nothing was opened. ` +
+            this.howChannelsRegister(),
+        );
+      }
+      if (!parseMcplChannelId(named)) {
+        throw new Error(
+          `No matching channel found: "${named}" isn't one of this server's channel ids, which look like ` +
+            'slack:C0123ABCD, so nothing was opened.',
+        );
+      }
+      throw new Error(
+        `No matching channel found: ${named} isn't a channel this server has registered with this host, so ` +
+          `nothing was opened. ${this.howChannelsRegister()}`,
+      );
     }
 
     // A request that names no channel opens the first registered channel of its type
@@ -1133,7 +1240,18 @@ export class SlackMcplServer {
       }
     }
 
-    throw new Error('No matching channel found');
+    throw new Error(
+      `No matching channel found: no channel of type ${params.type} is registered, and the request named none, so ` +
+        `nothing was opened. This server's channels are of type slack. ${this.howChannelsRegister()}`,
+    );
+  }
+
+  /** For a channels/open that found nothing registered: how this server's
+   *  conversations come to be registered with the host, or that they can't. */
+  private howChannelsRegister(): string {
+    return this.grant.has('channels.register')
+      ? `refresh_channels registers the conversations this bot is in${this.slack.dmsDisabled ? ', channels only while direct messages are turned off' : ''}; open one by the id it announces.`
+      : "This host hasn't granted this server channels.register, so this server can't register conversations with it.";
   }
 
   /** `published` gets the conversation and thread the post goes to, before
@@ -1145,7 +1263,10 @@ export class SlackMcplServer {
   ): Promise<ChannelsPublishResult> {
     const parsed = parseMcplChannelId(params.channelId);
     if (!parsed) {
-      throw new Error(`Invalid channel ID: ${params.channelId}`);
+      throw new Error(
+        `Nothing was posted: "${params.channelId}" isn't one of this server's channel ids, which look like ` +
+          'slack:C0123ABCD.',
+      );
     }
 
     // Extract text from content blocks
@@ -1215,10 +1336,16 @@ export class SlackMcplServer {
         await this.slack.deleteMessage(msg.channelId, msg.messageId);
         deleted++;
       } catch (err) {
-        // Best-effort: someone else may have deleted the message already, or
-        // the delete was rate-limited, out of this call's time, or failed on
-        // the way. The tracker has dropped it with the branch, so no later
-        // rollback tries it again, and an operator finds it here.
+        // A message Slack says is gone, deleted by someone else or by a
+        // delete whose answer was lost, is as the rollback wants it.
+        if (slackRefusal(err) === 'message_not_found') {
+          deleted++;
+          continue;
+        }
+        // Best-effort otherwise: the delete was rate-limited, out of this
+        // call's time, or failed on the way. The tracker has dropped it with
+        // the branch, so no later rollback tries it again, and an operator
+        // finds it here.
         console.error(
           `[slack-mcpl] Rollback couldn't delete message ${msg.messageId} in ${msg.channelId}: ${(err as Error)?.message ?? String(err)}`,
         );
