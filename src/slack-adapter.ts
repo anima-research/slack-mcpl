@@ -731,6 +731,8 @@ export interface SlackSocketLike {
 }
 
 export class SlackAdapter {
+  /** The event being handled in each conversation, which the next waits for. */
+  private inbound = new Map<string, Promise<void>>();
   private userNameCache = new Map<string, string>();
   private messageHandlers: Array<(msg: SlackMessageData) => void> = [];
   private socketStarted = false;
@@ -772,17 +774,20 @@ export class SlackAdapter {
     const omitted = this.leftOutTypes();
     if (omitted.length) this.logLeftOut(omitted, '');
     // Register the handler at construction so start() ordering can't race
-    // an early event past an unregistered listener.
+    // an early event past an unregistered listener. Events are handled one
+    // at a time per conversation, in arrival order: the lookups before a
+    // message is delivered (its author's and mentions' names) take different
+    // times, and a later message must not
+    // reach the host, or become the reply target, before an earlier one.
     this.socket.on('message', ({ event, ack }) => {
-      void (async () => {
-        // Always ack first — Slack redelivers unacked envelopes.
-        try { await ack(); } catch { /* ignore */ }
-        try {
-          await this.handleMessageEvent(event);
-        } catch (error) {
-          console.error('[slack-mcpl] Failed to handle Slack message event:', error);
-        }
-      })();
+      // Always ack first — Slack redelivers unacked envelopes.
+      void Promise.resolve().then(() => ack()).catch(() => { /* ignore */ });
+      const key = typeof event?.channel === 'string' ? event.channel : '';
+      const turn = (this.inbound.get(key) ?? Promise.resolve())
+        .then(() => this.handleMessageEvent(event))
+        .catch((error) => console.error('[slack-mcpl] Failed to handle Slack message event:', error));
+      this.inbound.set(key, turn);
+      void turn.then(() => { if (this.inbound.get(key) === turn) this.inbound.delete(key); });
     });
   }
 
