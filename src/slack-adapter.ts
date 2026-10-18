@@ -854,8 +854,9 @@ export class SlackAdapter {
     });
   }
 
-  /** Channel-level history, oldest-first. Thread replies are NOT included
-   *  (Slack requires conversations.replies per thread — see fetchThread). */
+  /** Channel-level history, oldest-first, for backscroll. Thread replies
+   *  are NOT included (Slack requires conversations.replies per thread, as
+   *  readThread asks). */
   async fetchHistory(
     channelId: string,
     opts: { limit?: number; oldest?: string; latest?: string } = {},
@@ -868,34 +869,6 @@ export class SlackAdapter {
       maxMessages: opts.limit ?? 50,
     });
     return { messages: await this.shapeHistory(messages), truncated };
-  }
-
-  /** All replies in a thread (the parent message is included first). */
-  async fetchThread(
-    channelId: string,
-    threadTs: string,
-    limit = 100,
-  ): Promise<{ messages: HistoryMessage[]; truncated: boolean }> {
-    await this.assertNotDm(channelId);
-    const collected: SlackHistoryMessage[] = [];
-    let cursor: string | undefined;
-    let truncated = false;
-    do {
-      const result = await this.web.conversations.replies({
-        channel: channelId,
-        ts: threadTs,
-        limit: Math.min(200, limit - collected.length),
-        cursor,
-      });
-      collected.push(...((result.messages ?? []) as SlackHistoryMessage[]));
-      cursor = result.response_metadata?.next_cursor || undefined;
-      if (cursor && collected.length >= limit) {
-        truncated = true;
-        cursor = undefined;
-      }
-    } while (cursor);
-    // conversations.replies returns oldest-first already.
-    return { messages: await this.shapeHistory(collected), truncated };
   }
 
   private async shapeHistory(messages: SlackHistoryMessage[]): Promise<HistoryMessage[]> {

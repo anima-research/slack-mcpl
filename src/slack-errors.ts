@@ -42,8 +42,10 @@ const NOT_DONE: Record<string, string> = {
   edit_message: "The message wasn't changed",
   delete_message: 'Nothing was deleted',
   add_reaction: 'No reaction was added',
-  fetch_history: 'Nothing was read',
-  fetch_thread: 'Nothing was read',
+  // A read can fail after its first pages, so its lead is what the caller
+  // didn't get.
+  fetch_history: 'No messages were returned',
+  fetch_thread: 'No messages were returned',
   fetch_attachment: 'Nothing was fetched',
   list_channels: 'Nothing was listed',
   find_user: 'No users were listed',

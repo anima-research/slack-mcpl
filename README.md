@@ -169,12 +169,16 @@ optional `threadTs` and attachment hints, as before, and add:
 Slack's own refusal of a read is passed on as the other tools' are.
 
 `fetch_history` also accepts `textContains`, `caseSensitive` (default `false`)
-and `authorIds`. The literal substring is matched against **raw Slack text**,
-before formatting. Case-insensitive matching uses JavaScript Unicode
-`toLowerCase`, without locale rules or normalization. Author IDs are exact
-Slack user IDs, ORed within the list and ANDed with the substring. Missing
-authors do not match an author filter. Regex is not supported. Filtering reduces
-returned context; it still retrieves candidate messages from Slack.
+and `authorIds`. The literal substring is matched against each message's
+`content` as the tools return it, Slack's escapes decoded and links shown by
+their labels, except that a mentioned user appears by their user ID
+(`uid:U…`), since names aren't looked up for matching. Case-insensitive
+matching uses JavaScript Unicode `toLowerCase`, without locale rules or
+normalization. Author IDs are exact: a user's ID, matched against `authorId`,
+or a bot's, matched against `authorBotId`. They're ORed within the list and
+ANDed with the substring. Missing authors do not match an author filter. Regex
+is not supported. Filtering reduces returned context; it still retrieves
+candidate messages from Slack.
 
 All numeric inputs are bounded integers, applied **per call**:
 
@@ -188,12 +192,20 @@ Each page is one Slack request, made like every other request this server
 makes: it goes out only if its 10-second timeout fits in what is left of the
 call's 25 seconds, and a rate limit that fits the call's 5-second budget for
 waiting is waited out. A page that doesn't fit, or a longer rate limit, ends the
-read with what it found and a cursor. A read that has scanned nothing yet fails
-instead, saying why, as any call does.
+read with what it found and a cursor.
+
+Every call either moves past where it started or fails, saying why. A call that
+stops before it has moved fails instead of returning nothing: the call's time,
+a rate limit, an empty page that says more remain, or a first message too big
+for `maxBytes`, whose failure names the `maxBytes` that fits it and how to read
+past it. Any other failure fails the call too, before or after its first pages,
+and calling again is safe.
 
 `pagination` reports `scanned`, `matched`, `returned`, `pages`, `scanComplete`,
-`stopReason`, `scope` and `threadRepliesSearched`. `matched` counts examined
-matches, including a match held back by the byte budget. Stop reasons are
+`stopReason`, `scope` and `threadRepliesSearched`. `scanned` and `matched`
+count the messages the cursor moved past, so a chain of calls counts each
+message once; a match held back by the byte budget is counted by the call that
+returns it. Stop reasons are
 `exhausted`, `match_limit`, `scan_limit`, `byte_limit`, `time_limit`,
 `rate_limited` and `pagination_stalled`. A rate limit includes
 `retryAfterSeconds` when Slack gave one; the caller chooses whether and when to
@@ -201,32 +213,36 @@ resume. A stalled pagination response is incomplete, never silently exhausted.
 
 **Zero matches in an incomplete scan does not mean no matching message exists.**
 `scanComplete` describes only the selected channel-message range or single
-thread, never all channel threads. A default upper timestamp is fixed when the
-initial read starts. `oldest` and `latest` are exclusive bounds on both tools.
-Slack history remains live: edits and deletions can affect later pages; this is
-not an immutable export.
+thread, never all channel threads. `oldest` and `latest` are exclusive bounds
+on both tools; without `latest`, the first page reads up to Slack's own now.
+History continues toward older messages from the cursor, so its continuations
+never return a message posted after the first call; a thread read's
+continuations go toward newer replies and include ones posted since. Slack history remains
+live: edits and deletions can affect later pages; this is not an immutable
+export.
 
 For incomplete reads, pass `pagination.nextCursor` as `cursor` and repeat the
 original channel, thread, time bounds and filters. Budget values may change
 within their bounds. History traverses newest toward older messages, returning
 each batch oldest-first; thread traversal proceeds oldest toward newer replies.
 Append thread batches, but prepend later history batches when building a
-chronological list. When `byte_limit` returns no messages, increase `maxBytes`
-to fit the held match; it is not silently skipped. A match larger than the hard
-maximum cannot be returned whole by this tool.
+chronological list. A match that doesn't fit `maxBytes` beside the ones before
+it is held back, never skipped, and the next call starts at it.
 
 A cursor carries the position to continue from and a hash of its query. The
 server keeps nothing for it, so it doesn't expire and survives a restart. A
-cursor used with another channel, thread, time bounds or filters, or one this
-server didn't give, is refused before Slack is asked. Every continuation reads
-Slack again; a cursor never grants access or holds message content.
+cursor that doesn't decode as one, or one passed with another channel, thread,
+time bounds or filters, is refused before Slack is asked. Every continuation
+reads Slack again; a cursor never grants access or holds message content.
 
 Compatibility: the former truncation `note` is replaced by structured
 `pagination`; clients must check it and resume rather than assuming a complete
 range. Previously unbounded or invalid numeric limits and unknown arguments now
-refuse. Existing tool names, default match counts and `list_channels.writable`
-remain stable. No new scopes, regex, bulk expansion, native search or
-interaction-token handling are included.
+refuse. The default `maxBytes` of 64 KiB can end a default read before its
+match count, with `byte_limit` and a cursor. A failed read now opens with "No
+messages were returned". Existing tool names, default match counts and
+`list_channels.writable` remain stable. No new scopes, regex, bulk expansion,
+native search or interaction-token handling are included.
 
 ## Environment
 
