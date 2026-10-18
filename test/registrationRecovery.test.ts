@@ -527,6 +527,35 @@ test('a later policy dropping slack.messaging refuses rollback and preserves its
   assert.deepEqual(deleted, ['2']);
 });
 
+test("a rollback counts the deletes Slack confirmed, and logs each message it couldn't delete", async (t) => {
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+  const { slack, deleted } = fakeSlack();
+  (slack as unknown as { deleteMessage(channel: string, id: string): Promise<void> }).deleteMessage = async (_channel, id) => {
+    if (id === '2') throw new Error("chat.delete: out of this call's time");
+    deleted.push(id);
+  };
+  const h = connect(new SlackMcplServer(slack));
+  t.after(() => h.close());
+  await h.initialize();
+  await h.grant();
+  const sent = await h.host.sendRequest('tools/call', {
+    name: 'send_message', arguments: { channelId: 'C1', content: 'first' },
+  }) as { state: { checkpoint: string } };
+  for (const content of ['second', 'third']) {
+    await h.host.sendRequest('tools/call', { name: 'send_message', arguments: { channelId: 'C1', content } });
+  }
+  const rolledBack = await h.host.sendRequest(method.STATE_ROLLBACK, {
+    featureSet: 'slack.messaging', checkpoint: sent.state.checkpoint,
+  }) as { checkpoint: string; success: boolean; reason?: string };
+  assert.deepEqual(rolledBack, { checkpoint: sent.state.checkpoint, success: true, reason: 'Rolled back (1/2 messages deleted)' });
+  assert.deepEqual(deleted, ['3']);
+  assert.deepEqual(
+    lines.filter((line) => line.includes('Rollback')),
+    ["[slack-mcpl] Rollback couldn't delete message 2 in C1: chat.delete: out of this call's time"],
+  );
+});
+
 test('a refresh whose host leaves during its listing writes nothing for the next host', async (t) => {
   const listing = deferred<SlackConversationInfo[]>();
   let calls = 0;

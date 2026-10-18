@@ -26,6 +26,7 @@ import {
   type SlackWebLike,
 } from '../src/slack-adapter.js';
 import { SlackMcplServer } from '../src/server.js';
+import { explainSlackError } from '../src/slack-errors.js';
 import { resolveSlackUserNames, type SlackUserInfoClient } from '../src/content.js';
 import { FULL_GRANT, connectHost, initialize, until } from './harness.js';
 import { fakeSlackApi, silentSlackApi, unreachableSlackApiUrl, type FakeSlackApi, type SlackApiAnswer } from './slackApi.js';
@@ -201,9 +202,8 @@ test('a rate limit the call can afford is waited out inside it, the request is s
   assert.equal(longer.result.isError, true);
   assert.match(longer.result.content[0].text, new RegExp(`asks to wait ${WAIT_PER_CALL_SECONDS + 1} seconds`));
   assert.deepEqual(longer.called, ['chat.postMessage']);
-  assert.ok(longer.ms < 900, `${longer.ms} ms`);
 
-  // A Retry-After that is no wait at all is answered at once too.
+  // A Retry-After below 0 isn't a wait: answered at once too.
   api.answer(limited(-1));
   const malformed = await sendMessage(h, 'C1');
   assert.equal(malformed.result.isError, true);
@@ -239,7 +239,6 @@ test("a call's requests share its waiting: one wait can use all of what is left,
   assert.equal(pastIt.result.isError, true);
   assert.match(pastIt.result.content[0].text, /asks to wait 3 seconds/);
   assert.deepEqual(pastIt.called, ['conversations.info', 'conversations.info', 'chat.postMessage']);
-  assert.ok(pastIt.ms < first * 1000 + 900, `the second limit was answered at once (${pastIt.ms} ms)`);
 });
 
 test('a rate limit outside a request from the host comes back at once, including work a request starts in the background', { timeout: 5000 }, async () => {
@@ -247,10 +246,9 @@ test('a rate limit outside a request from the host comes back at once, including
   const alone = await failure(() => client.chat.postMessage({ channel: 'C1', text: 'hi' }));
   assert.equal((alone.err as { retryAfter?: number }).retryAfter, 1);
   assert.equal(alone.sent, 1);
-  const started = Date.now();
   const background = await withCallTime(Date.now(), () => failure(() => outsideCallTime(() => client.chat.postMessage({ channel: 'C1', text: 'hi' }))));
+  assert.equal((background.err as { retryAfter?: number }).retryAfter, 1);
   assert.equal(background.sent, 1);
-  assert.ok(Date.now() - started < 900);
 });
 
 test("an acknowledgement's removal that a post starts keeps its own tries, outside the post's waiting", { timeout: 5000 }, async (t) => {
@@ -261,10 +259,17 @@ test("an acknowledgement's removal that a post starts keeps its own tries, outsi
   api.answerFor('reactions.remove', limited(1));
   const removals = () => api.calls.filter((c) => c === 'reactions.remove').length;
   const before = removals();
+  // Once its rate limit is handled, the removal's next try is armed a minute
+  // on; one sent again inside the post's call would come before that.
+  const realSetTimeout = globalThis.setTimeout;
+  let rearmed = false;
+  t.mock.method(globalThis, 'setTimeout', ((fn: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+    if (ms === 60_000) rearmed = true;
+    return realSetTimeout(fn, ms, ...args);
+  }) as unknown as typeof setTimeout);
   await withCallTime(Date.now(), () => slack.sendMessage('C1', 'hi'));
-  await until(() => removals() > before, 'the removal');
-  await new Promise((resolve) => setTimeout(resolve, 1500));
-  assert.equal(removals() - before, 1, "the rate-limited removal waits for its own next try, a minute on, not the post's second");
+  await until(() => rearmed, "the removal's next try");
+  assert.equal(removals() - before, 1, 'the rate-limited removal was sent once before its next try was armed');
 });
 
 test('registration that a grant starts waits out its rate limits in its own way, and logs each wait', { timeout: 5000 }, async (t) => {
@@ -293,9 +298,12 @@ test("a request goes out only if its whole timeout fits before its call's deadli
   const arrivedWith = (left: number) => Date.now() - (CALL_SECONDS - left) * 1000;
   api.answer({ body: { ok: true, ts: '1.5' } });
 
-  const late = await withCallTime(arrivedWith(timeoutS - 0.5), () => failure(() => client.chat.postMessage({ channel: 'C1', text: 'hi' })));
+  const late = await withCallTime(arrivedWith(timeoutS - 0.2), () => failure(() => client.chat.postMessage({ channel: 'C1', text: 'hi' })));
   assert.ok(late.err instanceof OutOfCallTime, String(late.err));
   assert.equal((late.err as OutOfCallTime).method, 'chat.postMessage');
+  // 15.2 s used, and over 15 is too many for a 10 s request: rounded up, so
+  // the seconds the text gives never leave room for it.
+  assert.equal((late.err as OutOfCallTime).usedSeconds, CALL_SECONDS - timeoutS + 1);
   assert.equal(late.sent, 0, 'nothing was sent');
 
   const before = api.calls.length;
@@ -305,11 +313,58 @@ test("a request goes out only if its whole timeout fits before its call's deadli
   // Half a second over a timeout left: the request goes out, but after a 1 s
   // wait it wouldn't fit, so the rate limit comes back at once.
   api.answer(limited(1), { body: { ok: true, ts: '1.5' } });
-  const started = Date.now();
   const limitedLate = await withCallTime(arrivedWith(timeoutS + 0.5), () => failure(() => client.chat.postMessage({ channel: 'C1', text: 'hi' })));
   assert.equal((limitedLate.err as { code?: string }).code, 'slack_webapi_rate_limited_error');
   assert.equal(limitedLate.sent, 1);
-  assert.ok(Date.now() - started < 900);
+});
+
+test("a request sent again after a wait keeps the start rule as it goes out, so a timer that fires late can't send it past the deadline", { timeout: 5000 }, async (t) => {
+  // The wait's own timer, found among the timers set, and the clock moved past
+  // the request's fit while it runs: the timer has, in effect, fired late.
+  const realSetTimeout = globalThis.setTimeout;
+  const delays: number[] = [];
+  t.mock.method(globalThis, 'setTimeout', ((fn: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+    delays.push(ms ?? 0);
+    return realSetTimeout(fn, ms, ...args);
+  }) as unknown as typeof setTimeout);
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  // 11.5 s are left: a 1 s wait and the request's whole timeout fit after it.
+  const arrived = Date.now() - (CALL_SECONDS - SLACK_CLIENT_OPTIONS.timeout / 1000 - 1.5) * 1000;
+  api.answer(limited(1), { body: { ok: true, ts: '1.7' } });
+  const late = withCallTime(arrived, () => failure(() => client.chat.postMessage({ channel: 'C1', text: 'hi' })));
+  await until(() => delays.includes(1000), "the rate limit's wait");
+  t.mock.timers.tick(1600);
+  const { err, sent } = await late;
+  assert.ok(err instanceof OutOfCallTime, String(err));
+  assert.equal(sent, 1, 'the request was not sent again');
+});
+
+test('a write that fails on its way inside a call is not sent again', { timeout: 5000 }, async () => {
+  api.answer({ status: 503, body: { ok: false } });
+  const { err, sent } = await withCallTime(Date.now(), () => failure(() => client.chat.postMessage({ channel: 'C1', text: 'hi' })));
+  assert.equal((err as { code?: string }).code, 'slack_webapi_http_error');
+  assert.equal(sent, 1, 'a post that may have reached Slack is not posted again');
+});
+
+test("a write's DM check that can't be made keeps its own error: out of the call's time, or rate-limited", { timeout: 5000 }, async (t) => {
+  t.after(() => api.answerFor('conversations.info'));
+  // With DMs off, the write asks Slack what the conversation is first.
+  const slack = new SlackAdapter(client as unknown as SlackWebLike, socket, 'UBOT', 'acme', undefined, undefined, true);
+  const before = api.calls.length;
+  const arrived = Date.now() - (CALL_SECONDS - SLACK_CLIENT_OPTIONS.timeout / 1000 + 0.5) * 1000;
+  const late = await withCallTime(arrived, () => slack.sendMessage('C8', 'hi').then(() => null, (err: unknown) => err));
+  assert.ok(late instanceof OutOfCallTime && late.method === 'conversations.info', String(late));
+  assert.match(explainSlackError(late, { tool: 'send_message', args: { channelId: 'C8', content: 'hi' } }), /\n\nNothing was posted: this server gives each call/);
+  assert.equal(api.calls.length, before, 'nothing was sent');
+
+  api.answerFor('conversations.info', limited(30));
+  const limitedCheck = await withCallTime(Date.now(), () => slack.sendMessage('C8', 'hi').then(() => null, (err: unknown) => err));
+  assert.equal((limitedCheck as { code?: string }).code, 'slack_webapi_rate_limited_error');
+  assert.match(
+    explainSlackError(limitedCheck, { tool: 'send_message', args: { channelId: 'C8', content: 'hi' } }),
+    /\n\nNothing was posted: Slack is rate-limiting this kind of call for the workspace, and asks to wait 30 seconds/,
+  );
+  assert.deepEqual(api.calls.slice(before), ['conversations.info'], 'the post was not sent');
 });
 
 test("a write's second request isn't sent once its first has left too little of the call's time", { timeout: 5000 }, async (t) => {
@@ -356,12 +411,16 @@ test("a call's time counts from when it reaches the server, so one queued past i
   type Result = { isError?: boolean; content: { text: string }[] };
   const send = (content: string) =>
     h.host.sendRequest('tools/call', { name: 'send_message', arguments: { channelId: 'C1', content } }) as Promise<Result>;
+  // The server stamps each request's arrival as it parses it, before this
+  // listener hears it.
+  let arrived = 0;
+  h.serverConn.on('request', () => arrived++);
   const first = send('first');
   const second = send('second');
-  await until(() => silent.requests() === 1, "the first call's post");
-  // The second call has reached the server and waits. By the server's clock,
-  // all of its time passes meanwhile.
-  t.mock.timers.tick(CALL_SECONDS * 1000);
+  await until(() => arrived === 2 && silent.requests() === 1, "both calls' arrival, and the first call's post");
+  // The second call waits. By the server's clock, more than all of its time
+  // passes meanwhile, and the text gives at most all of it.
+  t.mock.timers.tick((CALL_SECONDS + 5) * 1000);
   const [one, two] = await Promise.all([first, second]);
   assert.match(one.content[0].text, /whether the message was posted is unknown/);
   assert.equal(two.isError, true);

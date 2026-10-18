@@ -16,10 +16,11 @@
  * (`slack_webapi_request_error`, or `slack_webapi_http_error` with the HTTP
  * status), which leaves a write's outcome unknown, unless the connection
  * couldn't be made at all, which Node's code on the request error's
- * `original` tells. A fourth is this server's own: a request its call's
- * deadline left no time to send (OutOfCallTime). Each refusal code here is one
- * Slack's reference documents for a method these tools call. Other errors,
- * and codes not listed, pass through unchanged.
+ * `original` tells. Two more are this server's own: a request its call's
+ * deadline left no time to send (OutOfCallTime), and fetch_attachment's
+ * download running past its timeout. Each refusal code here is one Slack's
+ * reference documents for a method these tools call. Other errors, and codes
+ * not listed, pass through unchanged.
  */
 import { ErrorCode } from '@slack/web-api';
 import { connectionNeverMade, reactionName } from './content.js';
@@ -43,6 +44,7 @@ const NOT_DONE: Record<string, string> = {
   add_reaction: 'No reaction was added',
   fetch_history: 'Nothing was read',
   fetch_thread: 'Nothing was read',
+  fetch_attachment: 'Nothing was fetched',
   list_channels: 'Nothing was listed',
   find_user: 'No users were listed',
   refresh_channels: 'Nothing was announced to the host',
@@ -108,9 +110,11 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
   const userId = given('userId');
   const theUser = userId ? `user ${userId}` : 'the user given';
   const isWrite = WRITES.has(call.tool);
-  const startsOver = LISTINGS.has(call.tool)
-    ? " A new call starts the listing over from the first page, so if the workspace is too large to list within " +
-      "Slack's limit, calling again stops near the same place."
+  /** For a listing tool: a new call starts over, so a listing too large for
+   *  `limit` stops near the same place each time. */
+  const startsOver = (limit: string) => LISTINGS.has(call.tool)
+    ? ` A new call starts the listing over from the first page, so if the workspace is too large to list within ${limit}, ` +
+      'calling again stops near the same place.'
     : '';
   const invite =
     "Someone in that conversation has to invite the bot (in Slack, /invite and the bot's name); until then, " +
@@ -149,11 +153,23 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
   };
 
   if (err instanceof OutOfCallTime) {
-    // Not sent: SlackWebClient sends a request only if its timeout fits.
+    // Not sent: a call's request goes out only if its timeout fits
+    // (assertRequestFits).
     return (
       `${lead}: this server gives each call ${CALL_SECONDS} seconds from when it reaches this server, and this one ` +
       `had used ${err.usedSeconds} of them, waiting behind earlier calls or on its own earlier requests, so too ` +
-      `few were left to send this request to Slack. It wasn't sent, so calling again is safe.${startsOver}`
+      `few were left to send this request to Slack. It wasn't sent, so calling again is safe.` +
+      startsOver(`a call's ${CALL_SECONDS} seconds`)
+    );
+  }
+  if (call.tool === 'fetch_attachment' && (err as { name?: unknown } | null)?.name === 'TimeoutError') {
+    // The download's own timeout, the client's, set where fetch_attachment
+    // starts it: AbortSignal.timeout rejects with a TimeoutError.
+    const seconds = SLACK_CLIENT_OPTIONS.timeout / 1000;
+    return (
+      `${lead}: Slack's file host didn't finish sending the file within ${seconds} seconds. Fetching changes ` +
+      `nothing, so calling again is safe. If it keeps timing out, Slack's file host or this server's ` +
+      `connection to it is too slow to send this file within ${seconds} seconds.`
     );
   }
   if (e?.code === ErrorCode.RateLimitedError) {
@@ -161,7 +177,7 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
     const seconds = e.retryAfter;
     return (
       `${lead}: Slack is rate-limiting this kind of call for the workspace, and asks to wait ${seconds} ` +
-      `second${seconds === 1 ? '' : 's'} before trying again.${startsOver}`
+      `second${seconds === 1 ? '' : 's'} before trying again.${startsOver("Slack's limit")}`
     );
   }
   if (e?.code === ErrorCode.RequestError && connectionNeverMade(e.original?.code)) {
@@ -333,7 +349,7 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
       return `${lead}: Slack didn't receive the whole request, so it didn't act on it. Try again shortly.`;
     case 'ratelimited':
       // A rate limit in the body of a 200, without Retry-After.
-      return `${lead}: Slack is rate-limiting this kind of call for the workspace. Try again shortly.${startsOver}`;
+      return `${lead}: Slack is rate-limiting this kind of call for the workspace. Try again shortly.${startsOver("Slack's limit")}`;
     case 'internal_error':
     case 'fatal_error':
     case 'service_unavailable':

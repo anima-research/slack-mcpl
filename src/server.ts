@@ -41,6 +41,8 @@ import type {
 
 import {
   GaveUp,
+  SLACK_CLIENT_OPTIONS,
+  assertRequestFits,
   outsideCallTime,
   withCallTime,
   type SlackAdapter,
@@ -717,7 +719,15 @@ export class SlackMcplServer {
           ? { Authorization: `Bearer ${botToken}` }
           : {};
         const fileName = decodeURIComponent(url.pathname.split('/').pop() || 'attachment');
-        return toFetchResult(await fetchAttachmentBytes(url.toString(), fileName, { headers }));
+        // The download is a request this call makes, so it keeps the start rule
+        // the client's requests keep, with the client's timeout as its whole
+        // time: a stalled file host costs that timeout, not what's left of the
+        // call.
+        assertRequestFits('The download from files.slack.com', SLACK_CLIENT_OPTIONS.timeout);
+        return toFetchResult(await fetchAttachmentBytes(url.toString(), fileName, {
+          headers,
+          signal: AbortSignal.timeout(SLACK_CLIENT_OPTIONS.timeout),
+        }));
       }
 
       case 'subscribe_channel': {
@@ -1195,8 +1205,14 @@ export class SlackMcplServer {
       try {
         await this.slack.deleteMessage(msg.channelId, msg.messageId);
         deleted++;
-      } catch {
-        // Best-effort — message may have been deleted by someone else
+      } catch (err) {
+        // Best-effort: someone else may have deleted the message already, or
+        // the delete was rate-limited, out of this call's time, or failed on
+        // the way. The tracker has dropped it with the branch, so no later
+        // rollback tries it again, and an operator finds it here.
+        console.error(
+          `[slack-mcpl] Rollback couldn't delete message ${msg.messageId} in ${msg.channelId}: ${(err as Error)?.message ?? String(err)}`,
+        );
       }
     }
 

@@ -77,8 +77,10 @@ test('a value is named exactly as the call was given it, whitespace included', a
 /** Every call whose Slack errors reach the explainer: what its refusal says
  *  didn't happen, and whether it writes, so that Slack's own failure leaves
  *  its outcome unknown. The tools that call no Slack Web API method are
- *  listed apart: fetch_attachment downloads with its own fetch, and the
- *  subscription tools keep local state. */
+ *  listed apart: fetch_attachment downloads with its own fetch, whose texts
+ *  for a download out of its call's time and one that times out are tested
+ *  in attachmentDownload.test.ts, and the subscription tools keep local
+ *  state. */
 const CALLS: Array<[tool: string, lead: string, writes: boolean]> = [
   ['send_message', 'Nothing was posted', true],
   ['reply_message', 'Nothing was posted', true],
@@ -508,7 +510,7 @@ const socket: SlackSocketLike = { on() {}, async start() {}, async disconnect() 
 
 test("a request its call's deadline left no time for says it wasn't sent, and that calling again is safe", () => {
   const text = explainSlackError(new OutOfCallTime('chat.postMessage', 16), { tool: 'send_message', args: { channelId: 'C1', content: 'hi' } });
-  assert.ok(text.startsWith(`chat.postMessage wasn't sent: this call had used 16 of its ${CALL_SECONDS} seconds\n\n`), text);
+  assert.ok(text.startsWith("chat.postMessage: out of this call's time\n\n"), text);
   assert.ok(
     text.endsWith(
       `\n\nNothing was posted: this server gives each call ${CALL_SECONDS} seconds from when it reaches this server, and ` +
@@ -518,7 +520,10 @@ test("a request its call's deadline left no time for says it wasn't sent, and th
     text,
   );
   const listing = explainSlackError(new OutOfCallTime('conversations.list', 20), { tool: 'list_channels', args: {} });
-  assert.match(listing, /calling again is safe\. A new call starts the listing over from the first page/);
+  assert.match(
+    listing,
+    new RegExp(`calling again is safe\\. A new call starts the listing over from the first page, so if the workspace is too large to list within a call's ${CALL_SECONDS} seconds, calling again stops near the same place\\.$`),
+  );
 });
 
 test("a tool's refusal reaches the agent explained, still marked as an error", async () => {

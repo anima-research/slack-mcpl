@@ -30,7 +30,8 @@ that grant arrives; plain MCP tool calls are unaffected.
   channel-level history API does not include thread replies).
 - **Attachments**: incoming files are forwarded as refs and fetched on demand
   via `fetch_attachment`, which is auth-locked to `files.slack.com` (the bot
-  token is never sent to any other host) and size-capped at 5MB.
+  token is never sent to any other host) and size-capped at 5MB. A download
+  that takes longer than 10 seconds fails, and can be called again.
 - **Rollback**: `slack.messaging` supports MCPL checkpoints — rolling back
   deletes the messages the bot sent after the checkpoint (best-effort).
 

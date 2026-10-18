@@ -261,13 +261,29 @@ export function outsideCallTime<T>(start: () => T): T {
   return callTime.exit(start);
 }
 
-/** What SlackWebClient throws instead of sending a request whose timeout
- *  wouldn't end before its call's deadline. The request wasn't sent. */
+/** What assertRequestFits throws instead of letting a request go out whose
+ *  timeout wouldn't end before its call's deadline. The request wasn't sent.
+ *  `method` names it: a Web API method, or what else it was, such as
+ *  fetch_attachment's download. */
 export class OutOfCallTime extends Error {
   readonly code = 'slack_mcpl_out_of_call_time';
+  /** `usedSeconds`: whole seconds, rounded up, so a refusal never reads as
+   *  leaving room for the request; at most CALL_SECONDS. */
   constructor(readonly method: string, readonly usedSeconds: number) {
-    super(`${method} wasn't sent: this call had used ${usedSeconds} of its ${CALL_SECONDS} seconds`);
+    super(`${method}: out of this call's time`);
     this.name = 'OutOfCallTime';
+  }
+}
+
+/** The start rule for every request a request from the host makes, made
+ *  through SlackWebClient or not: one that can take up to `requestMs` goes out
+ *  only if it would end before the call's deadline, and otherwise this throws
+ *  OutOfCallTime and nothing is sent. Outside a request from the host there is
+ *  no deadline. */
+export function assertRequestFits(method: string, requestMs: number): void {
+  const call = callTime.getStore();
+  if (call && Date.now() + requestMs > call.deadline) {
+    throw new OutOfCallTime(method, Math.min(CALL_SECONDS, Math.ceil((Date.now() - call.arrived) / 1000)));
   }
 }
 
@@ -299,36 +315,44 @@ export class OutOfCallTime extends Error {
  *
  * A request made outside a request from the host has no deadline and answers a
  * rate limit at once. The client binds each of its methods to apiCall as it's
- * built (`dist/methods.js`, bindApiCall), so this override reaches every
- * request.
+ * built (`dist/methods.js`, bindApiCall), so this override reaches every Web
+ * API method call. filesUploadV2's upload of a file's bytes is the one request
+ * the client makes without it (`makeRequest`, `dist/WebClient.js`).
  */
 export class SlackWebClient extends WebClient {
   /** Each request's timeout, in ms: the longest a request can take. */
   private readonly requestMs: number;
 
-  constructor(token?: string, options: WebClientOptions = {}) {
+  /** `options.timeout` is required: the start rule needs each request's whole
+   *  time. */
+  constructor(token: string | undefined, options: WebClientOptions & { timeout: number }) {
     super(token, options);
-    this.requestMs = options.timeout ?? 0;
+    this.requestMs = options.timeout;
   }
 
-  override async apiCall(method: string, options?: Record<string, unknown>): Promise<WebAPICallResult> {
+  override apiCall(method: string, options?: Record<string, unknown>): Promise<WebAPICallResult> {
+    return this.send(method, options, true);
+  }
+
+  /** One send of a request, which keeps the start rule as it goes out. After a
+   *  rate limit the call can wait out, the request goes through here once more,
+   *  so a wait whose timer fires late can't send it past the deadline. */
+  private async send(method: string, options: Record<string, unknown> | undefined, mayWait: boolean): Promise<WebAPICallResult> {
+    assertRequestFits(method, this.requestMs);
     const call = callTime.getStore();
-    if (call && Date.now() + this.requestMs > call.deadline) {
-      throw new OutOfCallTime(method, Math.round((Date.now() - call.arrived) / 1000));
-    }
     try {
       return await super.apiCall(method, options);
     } catch (err) {
       const wait = waitToAskAgain(err, method);
       if (
-        !call || wait?.why !== 'limited' || !(wait.seconds >= 0 && wait.seconds <= call.secondsLeft) ||
+        !mayWait || !call || wait?.why !== 'limited' || !(wait.seconds >= 0 && wait.seconds <= call.secondsLeft) ||
         Date.now() + wait.seconds * 1000 + this.requestMs > call.deadline
       ) {
         throw err;
       }
       call.secondsLeft -= wait.seconds;
       await new Promise((resolve) => setTimeout(resolve, wait.seconds * 1000));
-      return super.apiCall(method, options);
+      return this.send(method, options, false);
     }
   }
 }
@@ -696,6 +720,12 @@ export class SlackAdapter {
     try {
       await this.getConversationMeta(channelId); // fills channelIds for this very ID, or not
     } catch (err) {
+      // A check that couldn't be made and can pass (rate-limited, out of its
+      // call's time, failed on the way or by Slack's own failure) keeps its
+      // error for the explainer: nothing was written, and calling again can
+      // confirm it. Anything else, Slack's refusal included, leaves the
+      // conversation unconfirmed, and the write is refused.
+      if (waitToAskAgain(err, 'conversations.info')) throw err;
       throw refuse(`could not be confirmed as a channel (${(err as Error).message})`);
     }
     if (!this.channelIds.has(channelId)) throw refuse('is not a channel');

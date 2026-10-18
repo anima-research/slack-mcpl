@@ -24,14 +24,16 @@ export interface FetchedAttachment {
 /**
  * Authenticated GET with an enforced size cap. Checks Content-Length when the
  * server provides one, and streams with a running byte budget as defense in
- * depth so a missing or lying header can't OOM the process.
+ * depth so a missing or lying header can't OOM the process. `signal` ends the
+ * download when it aborts, while the body is still arriving too, and the call
+ * rejects with its reason.
  */
 export async function fetchAttachmentBytes(
   url: string,
   fallbackName: string,
-  opts: { headers?: Record<string, string> } = {},
+  opts: { headers?: Record<string, string>; signal?: AbortSignal } = {},
 ): Promise<FetchedAttachment> {
-  const resp = await fetch(url, { headers: opts.headers ?? {}, redirect: 'follow' });
+  const resp = await fetch(url, { headers: opts.headers ?? {}, redirect: 'follow', signal: opts.signal });
   if (!resp.ok) throw new Error(`fetch failed: ${resp.status} ${resp.statusText}`);
 
   // Pre-check Content-Length so an oversized declared body never starts buffering.
