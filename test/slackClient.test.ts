@@ -367,6 +367,29 @@ test("a write's DM check that can't be made keeps its own error: out of the call
   assert.deepEqual(api.calls.slice(before), ['conversations.info'], 'the post was not sent');
 });
 
+test("a request before a write that fails on the way, or by Slack's own failure, says nothing was written", { timeout: 5000 }, async (t) => {
+  t.after(() => {
+    api.answerFor('conversations.info');
+    api.answerFor('conversations.open');
+  });
+  // With DMs off, the write asks Slack what the conversation is first.
+  const checked = new SlackAdapter(client as unknown as SlackWebLike, socket, 'UBOT', 'acme', undefined, undefined, true);
+  const said = async (tool: string, write: () => Promise<unknown>) => {
+    const err = await withCallTime(Date.now(), () => write().then(() => null, (e: unknown) => e));
+    return explainSlackError(err, { tool, args: { channelId: 'C8', userId: 'U8', content: 'hi' } });
+  };
+  const before = api.calls.length;
+  api.answerFor('conversations.info', { status: 503, body: { ok: false } });
+  assert.match(await said('send_message', () => checked.sendMessage('C8', 'hi')), /\n\nNothing was posted: Slack answered with HTTP 503\. Try again shortly\.$/);
+  api.answerFor('conversations.info', { body: { ok: false, error: 'internal_error' } });
+  assert.match(await said('send_message', () => checked.sendMessage('C8', 'hi')), /\n\nNothing was posted: Slack failed while handling the call\. Try again shortly\.$/);
+  // send_dm opens the DM first.
+  const dms = new SlackAdapter(client as unknown as SlackWebLike, socket, 'UBOT', 'acme');
+  api.answerFor('conversations.open', { status: 503, body: { ok: false } });
+  assert.match(await said('send_dm', () => dms.sendDM('U8', 'hi')), /\n\nNothing was sent: Slack answered with HTTP 503\. Try again shortly\.$/);
+  assert.deepEqual(api.calls.slice(before), ['conversations.info', 'conversations.info', 'conversations.open'], 'no write was sent');
+});
+
 test("a write's second request isn't sent once its first has left too little of the call's time", { timeout: 5000 }, async (t) => {
   t.after(() => api.answerFor('conversations.info'));
   // With DMs off, the write asks Slack what the conversation is first.

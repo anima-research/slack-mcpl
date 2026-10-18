@@ -280,6 +280,19 @@ export class OutOfCallTime extends Error {
   }
 }
 
+/** The Web API method of the request each error SlackWebClient passes on came
+ *  from, so the explainer can tell a write's own request from one made before
+ *  it. */
+const failedRequests = new WeakMap<object, string>();
+
+/** The Web API method of the request `err` came from: OutOfCallTime's own, or
+ *  the one SlackWebClient marked it with; undefined for an error no request of
+ *  SlackWebClient's threw. */
+export function failedRequest(err: unknown): string | undefined {
+  if (err instanceof OutOfCallTime) return err.method;
+  return err !== null && typeof err === 'object' ? failedRequests.get(err) : undefined;
+}
+
 /** The start rule for every request a request from the host makes, made
  *  through SlackWebClient or not: one that can take up to `requestMs` goes out
  *  only if it would end before the call's deadline, and otherwise this throws
@@ -348,6 +361,7 @@ export class SlackWebClient extends WebClient {
     try {
       return await super.apiCall(method, options);
     } catch (err) {
+      if (err !== null && typeof err === 'object') failedRequests.set(err, method);
       const wait = waitToAskAgain(err, method);
       if (
         !mayWait || !call || wait?.why !== 'limited' || !(wait.seconds >= 0 && wait.seconds <= call.secondsLeft) ||
@@ -743,9 +757,10 @@ export class SlackAdapter {
     } catch (err) {
       // A check that couldn't be made and can pass (rate-limited, out of its
       // call's time, failed on the way or by Slack's own failure) keeps its
-      // error for the explainer: nothing was written, and calling again can
-      // confirm it. Anything else, Slack's refusal included, leaves the
-      // conversation unconfirmed, and the write is refused.
+      // error for the explainer, which reads it as this request's, made
+      // before the write: nothing was written, and calling again can confirm
+      // the conversation. Anything else, Slack's refusal included, leaves it
+      // unconfirmed, and the write is refused.
       if (waitToAskAgain(err, 'conversations.info')) throw err;
       throw refuse(`could not be confirmed as a channel (${(err as Error).message})`);
     }

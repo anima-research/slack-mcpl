@@ -24,7 +24,7 @@
  */
 import { ErrorCode } from '@slack/web-api';
 import { connectionNeverMade, reactionName } from './content.js';
-import { CALL_SECONDS, OutOfCallTime, SLACK_CLIENT_OPTIONS } from './slack-adapter.js';
+import { CALL_SECONDS, OutOfCallTime, SLACK_CLIENT_OPTIONS, failedRequest } from './slack-adapter.js';
 
 /** The call an error came from: a tool's name, or `channels/publish` for the
  *  host's publish, and the arguments it names Slack's objects by. */
@@ -51,6 +51,11 @@ const NOT_DONE: Record<string, string> = {
 };
 
 const POSTS = new Set(['send_message', 'reply_message', 'channels/publish', 'send_dm']);
+/** The requests a write tool's own write goes out as. A failure of any other
+ *  request a write tool makes, such as the DM check's conversations.info or
+ *  send_dm's conversations.open, came before its write, so nothing was
+ *  written. */
+const WRITE_METHODS = new Set(['chat.postMessage', 'chat.update', 'chat.delete', 'reactions.add']);
 const WRITES = new Set([...POSTS, 'edit_message', 'delete_message', 'add_reaction']);
 /** Tools whose listing pages through Slack inside the call, from the first
  *  page each time, so in a workspace too large to list within Slack's rate
@@ -110,6 +115,11 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
   const userId = given('userId');
   const theUser = userId ? `user ${userId}` : 'the user given';
   const isWrite = WRITES.has(call.tool);
+  // A write's outcome is unknown only when the request that failed is its own
+  // write. An error no request of the client's threw keeps the tool's reading,
+  // since then which request failed can't be told.
+  const failed = failedRequest(err);
+  const mayHaveWritten = isWrite && (failed === undefined || WRITE_METHODS.has(failed));
   /** For a listing tool: a new call starts over, so a listing too large for
    *  `limit` stops near the same place each time. */
   const startsOver = (limit: string) => LISTINGS.has(call.tool)
@@ -190,7 +200,7 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
     const cause = e.code === ErrorCode.HTTPError
       ? `Slack answered with HTTP ${e.statusCode}`
       : `Slack went ${SLACK_CLIENT_OPTIONS.timeout / 1000} seconds without answering, or the connection to it failed`;
-    return isWrite ? unknown(cause) : `${lead}: ${cause}. Try again shortly.`;
+    return mayHaveWritten ? unknown(cause) : `${lead}: ${cause}. Try again shortly.`;
   }
   const code = slackRefusal(err);
   if (code === undefined) return undefined;
@@ -353,7 +363,7 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
     case 'internal_error':
     case 'fatal_error':
     case 'service_unavailable':
-      if (!isWrite) return `${lead}: Slack failed while handling the call. Try again shortly.`;
+      if (!mayHaveWritten) return `${lead}: Slack failed while handling the call. Try again shortly.`;
       return unknown(
         'Slack failed while handling the call',
         code === 'service_unavailable' ? '' : ' (Slack says part of a call can take effect before this error)',
