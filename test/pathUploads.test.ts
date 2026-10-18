@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtempSync, writeFileSync, rmSync} from 'node:fs';
+import {mkdtempSync, mkdirSync, writeFileSync, rmSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {spawnSync} from 'node:child_process';
@@ -76,6 +76,17 @@ for (const mode of ['restricted', 'unrestricted'] as const) {
     assert.equal(effect.path, undefined);
   });
 }
+
+test('unrestricted mode preserves ordinary absolute parent spellings while restricted mode refuses them', async t => {
+  for (const mode of ['restricted', 'unrestricted'] as const) {
+    const h = await fixture(t, mode);
+    mkdirSync(join(h.directory, 'sub'));
+    const result = await h.call({path: `${h.directory}/sub/../report.txt`});
+    assert.equal(result.isError, mode === 'restricted' ? true : undefined);
+    assert.equal(h.uploads.length, mode === 'restricted' ? 0 : 1);
+    if (mode === 'unrestricted') assert.equal(h.uploads[0].file.toString(), 'synthetic report');
+  }
+});
 
 test('path cardinality, metadata and empty-file failures have no Slack effect', async t => {
   const h = await fixture(t, 'restricted');

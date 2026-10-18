@@ -169,9 +169,11 @@ export class PathUploadReader {
 
   async read(absolutePath: string): Promise<Buffer> {
     if (this.closed) throw new Error('Path upload reader is closed');
-    if (typeof absolutePath !== 'string' || !isAbsolute(absolutePath) || absolutePath.includes('\0')
-        || absolutePath.split(sep).includes('..')) throw new Error('Upload path must be absolute without NUL or parent traversal');
+    if (typeof absolutePath !== 'string' || !isAbsolute(absolutePath) || absolutePath.includes('\0')) {
+      throw new Error('Upload path must be absolute without NUL');
+    }
     if (this.policy.mode === 'unrestricted') return this.readUnrestricted(absolutePath);
+    if (absolutePath.split(sep).includes('..')) throw new Error('Restricted upload paths cannot contain parent traversal');
     const normalized = resolve(absolutePath);
     const matches = this.roots.flatMap((root) => [...new Set([root.alias, root.canonical])].map((prefix) => ({ root, prefix, suffix: relative(prefix, normalized) })))
       .filter(({ suffix }) => suffix !== '' && suffix !== '..' && !suffix.startsWith(`..${sep}`) && !isAbsolute(suffix))
