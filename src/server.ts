@@ -835,7 +835,7 @@ export class SlackMcplServer {
 
   /** A string argument a tool requires, refused when it's missing or empty.
    *  The refusal opens with `notDone`; the reads pass their own lead, since
-   *  every failure of a read opens with it. */
+   *  every failure of a read opens with it once the read runs. */
   private requireString(
     args: Record<string, unknown>,
     key: keyof typeof ARGUMENT_SOURCES,

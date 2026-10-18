@@ -385,6 +385,13 @@ test('a rate limit says nothing was done and how long Slack asks to wait', async
     explainSlackError(await clientError(), { tool: 'send_message', args: { channelId: 'C15' } }),
     /asks to wait 1 second before trying again\.$/,
   );
+  // A count below 0 isn't a wait, so it's left out, as for a ratelimited
+  // refusal.
+  api.answer({ status: 429, headers: { 'retry-after': '-1' }, body: { ok: false, error: 'ratelimited' } });
+  assert.match(
+    explainSlackError(await clientError(), { tool: 'send_message', args: { channelId: 'C15' } }),
+    /\n\nNothing was posted: Slack is rate-limiting this kind of call for the workspace\. Try again shortly\.$/,
+  );
   // A listing a call pages through starts over from its first page, so calling again can stop at the same place.
   for (const [tool, lead] of [
     ['list_channels', 'Nothing was listed'],

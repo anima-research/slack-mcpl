@@ -57,7 +57,7 @@ test('MCPL feature denial still refuses bounded history before Slack calls', asy
   assert.deepEqual(h.reads, [], 'Slack was asked for nothing');
 });
 
-test('a read missing its channel or thread opens with what every failure of a read opens with', async t => {
+test("a read missing its channel or thread opens with what the read's other failures open with", async t => {
   const h = harness(); t.after(() => h.close());
   await initialize(h, false);
   assert.deepEqual(await tool(h, 'fetch_history', {}), {

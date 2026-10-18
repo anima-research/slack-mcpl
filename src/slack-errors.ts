@@ -190,8 +190,9 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
     );
   }
   if (e?.code === ErrorCode.RateLimitedError) {
-    // The client throws this only with Slack's Retry-After, in seconds.
-    return rateLimited(e.retryAfter);
+    // The client throws this only with Slack's Retry-After, in seconds, which
+    // are given as for a ratelimited refusal (retryAfterSeconds).
+    return rateLimited(retryAfterSeconds(err));
   }
   if (e?.code === ErrorCode.RequestError && connectionNeverMade(e.original?.code)) {
     return (

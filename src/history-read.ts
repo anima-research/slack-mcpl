@@ -31,10 +31,10 @@ export const READ_ARGUMENTS = {
   thread: ['channelId', 'threadTs', 'limit', 'oldest', 'latest', 'cursor', 'maxScanned', 'maxBytes'],
 } as const;
 
-/** How every failure of a read opens. A read can fail after its first pages,
- *  so it says what the caller didn't get. */
+/** How every failure of a read opens, once the read runs. A read can fail
+ *  after its first pages, so it says what the caller didn't get. */
 export const NOTHING_RETURNED = 'No messages were returned';
-/** One of the read's own failures, which opens as every failure of a read does. */
+/** One of the read's own failures, which opens as all of them do. */
 const refused = (text: string) => new Error(`${NOTHING_RETURNED}: ${text}`);
 /** What a Slack timestamp looks like, for a refusal of one. */
 export const TS_FORM = 'which looks like 1718000000.000100';

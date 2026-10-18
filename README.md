@@ -245,7 +245,9 @@ refuse; an unknown argument's refusal names the arguments the tool takes, and
 any it looks like a slip for. The default `maxBytes` of 64 KiB can end a default read before its
 match count, with `byte_limit` and a cursor. A failed read's explanation now
 leads with "No messages were returned", as do the read's own failures, and a
-failure the explanation doesn't cover is followed by it. Existing tool names, default match counts and
+failure the explanation doesn't cover is followed by it. The host's refusals
+every tool shares, such as a feature set it hasn't enabled, keep their own
+words, which say nothing ran. Existing tool names, default match counts and
 `list_channels.writable` remain stable. No new scopes, regex, bulk expansion,
 native search or interaction-token handling are included.
 
