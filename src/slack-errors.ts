@@ -33,6 +33,7 @@ import {
   UploadBytesFailed,
   UploadNotConfirmed,
   failedRequest,
+  slackRefusal,
 } from './slack-adapter.js';
 
 /** The call an error came from: a tool's name, or `channels/publish` for the
@@ -93,12 +94,6 @@ export function explainSlackError(err: unknown, call: SlackCall): string {
   const text = typeof carried === 'string' ? carried : String(err);
   const why = explanation(err, call);
   return why ? `${text}\n\n${why}` : text;
-}
-
-/** Slack's code, when Slack refused the call; undefined for any other error. */
-export function slackRefusal(err: unknown): string | undefined {
-  const e = err as { code?: unknown; data?: { error?: unknown } } | null;
-  return e?.code === ErrorCode.PlatformError && typeof e.data?.error === 'string' ? e.data.error : undefined;
 }
 
 function explanation(err: unknown, call: SlackCall): string | undefined {

@@ -63,10 +63,14 @@ test('a JSON null counts as an argument not given, and so does an empty string f
 
 test('upload handler requires a filename', async (t) => {
   const { asked, call } = await fixture(t);
-  for (const filename of [undefined, '', 123]) {
+  for (const [filename, passed] of [[undefined, 'left it out'], ['', 'passed an empty string'], [123, 'passed a number']]) {
     const result = await call({ filename, content: 'hello' });
     assert.equal(result.isError, true);
-    assert.match(result.content[0].text, /filename is required/);
+    assert.equal(
+      result.content[0].text,
+      `Nothing was done: filename must be a non-empty string, and this call ${passed}. Pass the name the file is ` +
+        'shown with in Slack, with its extension, such as positions.csv.',
+    );
   }
   assert.equal(asked.length, 0);
 });

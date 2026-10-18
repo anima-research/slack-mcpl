@@ -21,6 +21,37 @@ export interface FetchedAttachment {
   name: string;
 }
 
+const bytes = (n: number) => n.toLocaleString('en-US');
+
+/** Where fetch_attachment's url comes from, for each text that asks for it. */
+export const ATTACHMENT_URL_SOURCE =
+  'Pass the url exactly as the message gives it after "fetchable via fetch_attachment:"; it starts with ' +
+  'https://files.slack.com/.';
+
+/** A file over the limit: by its size when that's known, or else as a download that passed it. */
+function tooLarge(size?: number): Error {
+  const limit = `fetch_attachment's limit of ${MAX_ATTACHMENT_BYTES / (1024 * 1024)} MiB (${bytes(MAX_ATTACHMENT_BYTES)} bytes)`;
+  return new Error(
+    `Nothing was fetched: ${size === undefined ? `the download passed ${limit}` : `the file is ${bytes(size)} bytes, over ${limit}`}` +
+      ", so calling again gets the same answer; this server can't fetch a file that large.",
+  );
+}
+
+/** A download that failed on the way, before an answer or partway through one.
+ *  One whose `signal` ended it keeps the signal's reason, such as its
+ *  timeout's TimeoutError, which the explainer reads. Otherwise the reason is
+ *  the failure's cause: its message, or, for an AggregateError of every
+ *  address tried, each one's, or its code. */
+function inTransit(err: unknown, signal?: AbortSignal): Error {
+  if (signal?.aborted) return err as Error;
+  const e = err as { message?: unknown; cause?: { message?: unknown; errors?: unknown; code?: unknown } } | null;
+  const text = (value: unknown) => (typeof value === 'string' ? value : '');
+  const cause = e?.cause;
+  const each = Array.isArray(cause?.errors) ? cause.errors.map((x) => text((x as { message?: unknown } | null)?.message)).filter(Boolean) : [];
+  const why = text(cause?.message) || each.join('; ') || text(cause?.code) || String(e?.message ?? err);
+  return new Error(`Nothing was fetched: the download failed on the way (${why}). Try again shortly.`);
+}
+
 /**
  * Authenticated GET with an enforced size cap. Checks Content-Length when the
  * server provides one, and streams with a running byte budget as defense in
@@ -33,42 +64,50 @@ export async function fetchAttachmentBytes(
   fallbackName: string,
   opts: { headers?: Record<string, string>; signal?: AbortSignal } = {},
 ): Promise<FetchedAttachment> {
-  const resp = await fetch(url, { headers: opts.headers ?? {}, redirect: 'follow', signal: opts.signal });
-  if (!resp.ok) throw new Error(`fetch failed: ${resp.status} ${resp.statusText}`);
+  const resp = await fetch(url, { headers: opts.headers ?? {}, redirect: 'follow', signal: opts.signal }).catch((err: unknown) => {
+    throw inTransit(err, opts.signal);
+  });
+  if (!resp.ok) {
+    const answered = `HTTP ${resp.status} ${resp.statusText}`.trim();
+    // A timeout, a rate limit or a failing server says nothing about the url.
+    throw new Error(
+      resp.status === 408 || resp.status === 429 || resp.status >= 500
+        ? `Nothing was fetched: the file's url answered ${answered}, so the server was busy or failing. Try again shortly.`
+        : `Nothing was fetched: the file's url answered ${answered}. ${ATTACHMENT_URL_SOURCE} If it was exact, the ` +
+            'file may have been deleted, or this bot may not be allowed to read it; calling again gets the same ' +
+            'answer unless someone shares the file where this bot can read it, or, if the Slack app lacks ' +
+            "files:read (Slack's file links need it), whoever runs this host adds that scope to the app's bot " +
+            'token scopes and reinstalls the app.',
+    );
+  }
 
   // Pre-check Content-Length so an oversized declared body never starts buffering.
   const declared = resp.headers.get('content-length');
   if (declared !== null) {
     const n = Number(declared);
     if (Number.isFinite(n) && n > MAX_ATTACHMENT_BYTES) {
-      throw new Error(`attachment too large: ${n} bytes (max ${MAX_ATTACHMENT_BYTES})`);
+      throw tooLarge(n);
     }
   }
 
+  // A response with no body stream, such as a 204's, carries no bytes.
   const reader = resp.body?.getReader();
-  let buf: Buffer;
-  if (!reader) {
-    // No streaming body: fall back to arrayBuffer with a post-read check.
-    buf = Buffer.from(await resp.arrayBuffer());
-    if (buf.byteLength > MAX_ATTACHMENT_BYTES) {
-      throw new Error(`attachment too large: ${buf.byteLength} bytes (max ${MAX_ATTACHMENT_BYTES})`);
+  const chunks: Buffer[] = [];
+  let total = 0;
+  while (reader) {
+    const { value, done } = await reader.read().catch((err: unknown) => {
+      throw inTransit(err, opts.signal);
+    });
+    if (done) break;
+    if (!value) continue;
+    total += value.byteLength;
+    if (total > MAX_ATTACHMENT_BYTES) {
+      reader.cancel().catch(() => {});
+      throw tooLarge();
     }
-  } else {
-    const chunks: Buffer[] = [];
-    let total = 0;
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      if (!value) continue;
-      total += value.byteLength;
-      if (total > MAX_ATTACHMENT_BYTES) {
-        reader.cancel().catch(() => {});
-        throw new Error(`attachment too large: streamed past ${MAX_ATTACHMENT_BYTES} bytes`);
-      }
-      chunks.push(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
-    }
-    buf = Buffer.concat(chunks, total);
+    chunks.push(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
   }
+  const buf = Buffer.concat(chunks, total);
 
   const headerMime = resp.headers.get('content-type')?.split(';')[0].trim();
   const classified = classifyExtension(fallbackName);
@@ -116,14 +155,39 @@ export function toFetchResult({ buf, mimeType, name }: FetchedAttachment): Recor
  */
 export function parseSlackAttachmentUrl(rawUrl: string): URL {
   if (!rawUrl) throw new Error('url is required');
-  if (!rawUrl.startsWith('https://')) {
-    throw new Error('url must be a full https:// link');
+  const notALink = () => new Error(`Nothing was fetched: "${rawUrl}" isn't a full https:// link. ${ATTACHMENT_URL_SOURCE}`);
+  if (!rawUrl.startsWith('https://')) throw notALink();
+  let url: URL;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    throw notALink();
   }
-  const url = new URL(rawUrl);
   if (url.host !== 'files.slack.com') {
-    throw new Error(`refusing to fetch from host ${url.host}; Slack attachments are served from files.slack.com only`);
+    throw new Error(
+      `Nothing was fetched: ${url.host} isn't Slack's file server. fetch_attachment sends this bot's token with ` +
+        `the request, so it takes only links on files.slack.com. ${ATTACHMENT_URL_SOURCE}`,
+    );
+  }
+  // fetch() refuses such a url before connecting.
+  if (url.username || url.password) {
+    throw new Error(
+      `Nothing was fetched: fetch_attachment can't fetch a url that carries a user name or password, and Slack's ` +
+        `file links carry neither. ${ATTACHMENT_URL_SOURCE}`,
+    );
   }
   return url;
+}
+
+/** The file's name, from the url's last segment, decoded when it decodes: it's
+ *  only a label, so a segment with a malformed escape is kept as given. */
+export function attachmentName(url: URL): string {
+  const segment = url.pathname.split('/').pop() || 'attachment';
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
 }
 
 export interface AttachmentRef {

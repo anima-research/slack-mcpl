@@ -82,7 +82,11 @@ test('upload_file belongs to slack.messaging and cannot upload while that featur
   });
   const result = await call(h.host, 'upload_file', uploadArgs);
   assert.equal(result.isError, true);
-  assert.match(result.content[0].text, /slack\.messaging.*not enabled/);
+  assert.equal(
+    result.content[0].text,
+    "upload_file is turned off on this host: the host's policy hasn't enabled its feature set, slack.messaging, so " +
+      "nothing ran, and calling again won't change that until the host enables it.",
+  );
   assert.deepEqual(h.uploads, []);
 });
 
@@ -92,7 +96,11 @@ test('SLACK_DISABLE_DMS refuses an upload before Slack receives file bytes', asy
   await ready(h);
   const result = await call(h.host, 'upload_file', { ...uploadArgs, channelId: 'D1' });
   assert.equal(result.isError, true);
-  assert.match(result.content[0].text, /SLACK_DISABLE_DMS/);
+  assert.equal(
+    result.content[0].text,
+    'Nothing was uploaded: D1 is a direct message or group DM, and this bot works only in channels here, since ' +
+      'direct messages are turned off. list_channels shows the ones it can use.',
+  );
   assert.deepEqual(h.uploads, []);
 });
 
@@ -162,9 +170,18 @@ test('an upload marks its conversation as the one last posted in, so a message t
 
 test('file deletion retains the upload destination allow-list and DM guards', async () => {
   const restricted = fakeSlack({ sendChannels: ['C1'] });
-  await assert.rejects(restricted.slack.deleteFile('C9', 'F1'), /not allowed/);
+  await assert.rejects(restricted.slack.deleteFile('C9', 'F1'), {
+    message:
+      "Nothing was deleted: this bot may write only to C1, and C9 isn't one of them. list_channels marks the " +
+      "conversations it may write to with writable: true. Calling again won't change that; whoever runs this host " +
+      'decides where it may write.',
+  });
   assert.deepEqual(restricted.deletedFiles, []);
   const noDms = fakeSlack({ disableDms: true });
-  await assert.rejects(noDms.slack.deleteFile('D1', 'F1'), /SLACK_DISABLE_DMS/);
+  await assert.rejects(noDms.slack.deleteFile('D1', 'F1'), {
+    message:
+      'Nothing was deleted: D1 is a direct message or group DM, and this bot works only in channels here, since ' +
+      'direct messages are turned off. list_channels shows the ones it can use.',
+  });
   assert.deepEqual(noDms.deletedFiles, []);
 });
