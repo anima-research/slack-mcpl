@@ -42,7 +42,7 @@ test('parseSlackAttachmentUrl rejects a url that carries a user name or password
   // fetch() refuses one before connecting, which would read as a failure on the way.
   for (const url of ['https://bot:secret@files.slack.com/files-pri/T1-F1/a.png', 'https://bot@files.slack.com/x']) {
     assert.throws(() => parseSlackAttachmentUrl(url), {
-      message: `Nothing was fetched: fetch_attachment can't fetch a url that carries a user name or password. ${asGiven}`,
+      message: `Nothing was fetched: fetch_attachment can't fetch a url that carries a user name or password, and Slack's file links carry neither. ${asGiven}`,
     });
   }
 });

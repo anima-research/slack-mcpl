@@ -50,9 +50,9 @@ test('DM sends and DM history reads are refused before reaching Slack', async ()
   const { adapter, calls } = makeAdapter(true);
   await assert.rejects(adapter.sendDM('U1', 'hi'), {
     message:
-      "Nothing was sent: direct messages are turned off on this host, so send_dm can't reach anyone, and calling " +
-      "again won't change that. To reach people, post in a channel with send_message; list_channels marks where " +
-      'this bot may write with writable: true.',
+      "Nothing was sent: direct messages are turned off on this host, so send_dm can't reach anyone. Calling again " +
+      "won't change that; whoever runs this host decides whether this bot may send DMs. To reach people, post in a " +
+      'channel with send_message; list_channels marks where this bot may write with writable: true.',
   });
   await assert.rejects(adapter.fetchHistory('D1'), { message: `Nothing was read: D1 is a direct message or group DM, ${offHere}` });
   await assert.rejects(adapter.fetchThread('D1', '1.0'), { message: `Nothing was read: D1 is a direct message or group DM, ${offHere}` });
@@ -154,30 +154,30 @@ for (const [what, answer, next] of [
   [
     'Slack refuses the id',
     { body: { ok: false, error: 'channel_not_found' } },
-    `(An API error occurred: channel_not_found), ${confirms} list_channels shows the ones it can use.`,
+    `(Slack answered channel_not_found), ${confirms} list_channels shows the ones it can use.`,
   ],
   [
     'Slack refuses the id as malformed',
     { body: { ok: false, error: 'invalid_channel_id' } },
-    `(An API error occurred: invalid_channel_id), ${confirms} list_channels shows the ones it can use.`,
+    `(Slack answered invalid_channel_id), ${confirms} list_channels shows the ones it can use.`,
   ],
   [
     "the Slack app lacks the lookup's scope",
     { body: { ok: false, error: 'missing_scope', needed: 'channels:read', provided: 'chat:write' } },
-    `(An API error occurred: missing_scope), ${confirms} Calling again won't change that until whoever runs this ` +
+    `(Slack answered missing_scope), ${confirms} Calling again won't change that until whoever runs this ` +
       "server adds the scope it needs (Slack names channels:read) to the Slack app's bot token scopes and reinstalls " +
       'the app.',
   ],
   [
     "the Slack app lacks a scope Slack doesn't name",
     { body: { ok: false, error: 'missing_scope' } },
-    `(An API error occurred: missing_scope), ${confirms} Calling again won't change that until whoever runs this ` +
+    `(Slack answered missing_scope), ${confirms} Calling again won't change that until whoever runs this ` +
       "server adds the scope it needs to the Slack app's bot token scopes and reinstalls the app.",
   ],
   [
     "Slack doesn't accept the token",
     { body: { ok: false, error: 'invalid_auth' } },
-    `(An API error occurred: invalid_auth), ${confirms} Calling again won't change Slack's answer; only whoever ` +
+    `(Slack answered invalid_auth), ${confirms} Calling again won't change Slack's answer; only whoever ` +
       "runs this server, or the workspace's admins, can.",
   ],
   [

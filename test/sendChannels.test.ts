@@ -31,8 +31,8 @@ const refusal = (notDone: string) =>
 
 const noDm =
   "Nothing was sent: this bot may write only to CALLOWED, none of them a direct message, so send_dm can't reach " +
-  "anyone, and calling again won't change that. To reach people, post in a channel with send_message; " +
-  'list_channels marks where this bot may write with writable: true.';
+  "anyone. Calling again won't change that; whoever runs this host decides where it may write. To reach people, " +
+  'post in a channel with send_message; list_channels marks where this bot may write with writable: true.';
 
 test('writes outside the allow-list are refused before reaching Slack', async () => {
   const { adapter, calls } = makeAdapter(['CALLOWED']);
@@ -55,6 +55,16 @@ test('no allow-list means no restriction', async () => {
   await adapter.sendMessage('CANY', 'hi');
   await adapter.sendDM('U1', 'hi');
   assert.deepEqual(calls, ['post:CANY', 'post:D9']);
+});
+
+test("send_dm to a DM the allow-list doesn't name says nothing was sent", async () => {
+  // The list names a DM, D8, so the DM is opened; Slack opens D9.
+  const { adapter, calls } = makeAdapter(['D8']);
+  await assert.rejects(adapter.sendDM('U1', 'hi'), (err: Error) => {
+    assert.match(err.message, /^Nothing was sent: this bot may write only to D8, and D9 isn't one of them\./);
+    return true;
+  });
+  assert.deepEqual(calls, [], 'nothing is posted');
 });
 
 test('send_dm is refused before a conversation is opened when the list names no DM', async () => {

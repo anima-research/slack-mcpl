@@ -51,13 +51,16 @@ export function slackRefusal(err: unknown): string | undefined {
 }
 
 /** Slack's answers to conversations.info that it has no such conversation to
- *  show this bot. */
+ *  show this bot (channel_not_found), or that the id isn't one at all
+ *  (invalid_channel_id). */
 const NOT_SHOWN = new Set(['channel_not_found', 'invalid_channel_id']);
 
 /** What can change Slack's answer to a check of a conversation (with DMs off)
  *  that a later one wouldn't pass either: another conversation, or whoever
- *  runs this server. A check that can pass doesn't come here: assertNotDm
- *  leaves its error to the explainer. */
+ *  runs this server. A check waitToAskAgain says can pass doesn't come here:
+ *  assertNotDm leaves its error to the explainer. A rate limit's answer
+ *  without the Retry-After the client needs does come here, and is told to
+ *  try again shortly. */
 function afterFailedCheck(err: unknown): string {
   const e = err as { data?: { needed?: unknown } } | null;
   const code = slackRefusal(err);
@@ -704,13 +707,16 @@ export class SlackAdapter {
       // have landed: already_reacted says it's there; Slack's failure while
       // handling it leaves it unknown, as the explainer says (internal_error
       // and fatal_error can take effect in part); and so does an HTTP error or
-      // a request that failed after it may have reached Slack. Slack's
+      // a request that failed after it may have reached Slack. Slack's other
       // refusals, its rate limits (a 429, or ratelimited in a 200) and
       // request_timeout say it didn't act, a connection never made reached
       // nothing, and this server's own refusal, such as the write allow-list's,
-      // sent nothing. Slack answers a removal of one that isn't there with
-      // no_reaction.
+      // sent nothing. So did a failure of a request before the add, such as
+      // the DM check's conversations.info. Slack answers a removal of one that
+      // isn't there with no_reaction.
       (err: { code?: unknown; original?: { code?: unknown } } | null) => {
+        const failed = failedRequest(err);
+        if (failed !== undefined && failed !== 'reactions.add') return false;
         if (err?.code === ErrorCode.RequestError) return !connectionNeverMade(err.original?.code);
         if (err?.code === ErrorCode.HTTPError) return true;
         const answer = slackRefusal(err);
@@ -763,13 +769,16 @@ export class SlackAdapter {
     }
   }
 
+  /** `notDone` opens this server's own refusals: send_dm's reads "Nothing was
+   *  sent". */
   async sendMessage(
     channelId: string,
     text: string,
     opts: { threadTs?: string } = {},
+    notDone = 'Nothing was posted',
   ): Promise<{ messageId: string }> {
-    this.assertWritable(channelId, 'Nothing was posted');
-    await this.assertNotDm(channelId, 'Nothing was posted');
+    this.assertWritable(channelId, notDone);
+    await this.assertNotDm(channelId, notDone);
     const result = await this.web.chat.postMessage({
       channel: channelId,
       text,
@@ -802,9 +811,11 @@ export class SlackAdapter {
       // the conversation. Anything else, Slack's refusal included, leaves it
       // unconfirmed, and the write is refused.
       if (waitToAskAgain(err, 'conversations.info')) throw err;
+      const answer = slackRefusal(err);
+      const why = answer !== undefined ? `Slack answered ${answer}` : (err as Error).message;
       throw new Error(
-        `${notDone}: Slack couldn't confirm ${channelId} is a channel (${(err as Error).message}), and with direct ` +
-          `messages turned off, this bot works only in conversations Slack confirms are channels. ${afterFailedCheck(err)}`,
+        `${notDone}: Slack couldn't confirm ${channelId} is a channel (${why}), and with direct messages turned ` +
+          `off, this bot works only in conversations Slack confirms are channels. ${afterFailedCheck(err)}`,
       );
     }
     if (!this.channelIds.has(channelId)) throw refuse("isn't a channel");
@@ -816,8 +827,8 @@ export class SlackAdapter {
       'writable: true.';
     if (this.disableDms) {
       throw new Error(
-        "Nothing was sent: direct messages are turned off on this host, so send_dm can't reach anyone, and " +
-          `calling again won't change that. ${toChannels}`,
+        "Nothing was sent: direct messages are turned off on this host, so send_dm can't reach anyone. Calling " +
+          `again won't change that; whoever runs this host decides whether this bot may send DMs. ${toChannels}`,
       );
     }
     // A DM ID starts with D. If the allow-list names none, no DM can be written,
@@ -825,7 +836,8 @@ export class SlackAdapter {
     if (this.sendChannels?.length && !this.sendChannels.some((id) => id.startsWith('D'))) {
       throw new Error(
         `Nothing was sent: this bot may write only to ${this.sendChannels.join(', ')}, none of them a direct ` +
-          `message, so send_dm can't reach anyone, and calling again won't change that. ${toChannels}`,
+          "message, so send_dm can't reach anyone. Calling again won't change that; whoever runs this host decides " +
+          `where it may write. ${toChannels}`,
       );
     }
     const open = await this.web.conversations.open({ users: userId });
@@ -836,7 +848,7 @@ export class SlackAdapter {
           "each person's userId, and call again.",
       );
     }
-    const { messageId } = await this.sendMessage(channelId, text);
+    const { messageId } = await this.sendMessage(channelId, text, {}, 'Nothing was sent');
     return { messageId, channelId };
   }
 

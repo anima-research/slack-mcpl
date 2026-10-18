@@ -166,8 +166,9 @@ export class SlackMcplServer {
   private channelManager = new ChannelManager();
   /** A new registration supersedes work started under an earlier grant. */
   private registrationGeneration = 0;
-  /** The generation of the registration running now, if one is. A
-   *  refresh_channels then answers at once. */
+  /** The generation of the newest registration, from its start until it
+   *  ends; a registration it superseded may still be finishing after that. A
+   *  refresh_channels answers at once while it's set. */
   private registering: number | undefined;
   private stateTracker = new StateTracker();
   /** Serial delivery within a conversation; different conversations stay independent. */
@@ -1178,7 +1179,7 @@ export class SlackMcplServer {
           ? `Registered ${added.length} newly-visible conversation(s).`
           : unnamed.length > 0
             ? 'No conversation was registered.'
-            : 'No new conversations — the host already knows about every visible one.') + leftOut,
+            : 'No new conversations: the host already has every one this listing found.') + leftOut,
     };
   }
 
@@ -1231,7 +1232,7 @@ export class SlackMcplServer {
    *  conversations come to be registered with the host, or that they can't. */
   private howChannelsRegister(): string {
     return this.grant.has('channels.register')
-      ? 'refresh_channels registers the conversations this bot is in; open one by the id it announces.'
+      ? `refresh_channels registers the conversations this bot is in${this.slack.dmsDisabled ? ', channels only while direct messages are turned off' : ''}; open one by the id it announces.`
       : "This host hasn't granted this server channels.register, so this server can't register conversations with it.";
   }
 

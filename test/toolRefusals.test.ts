@@ -205,6 +205,21 @@ test('refresh_channels on a plain MCP connection is not offered, and a call is r
   assert.equal(listed, 0);
 });
 
+test('with direct messages off, channels/open says refresh_channels registers channels only', async (t) => {
+  const h = await serve(t, { conversations: { list: async () => ({ channels: [CHANNEL] }) } }, { grant: FULL_GRANT, disableDms: true });
+  await until(() => h.hostSaw.some((r) => r.method === method.CHANNELS_REGISTER), 'registration');
+  await new Promise((r) => setImmediate(r));
+  await assert.rejects(
+    h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'slack:D9', type: 'slack', address: {} }),
+    failsWith(
+      -32603,
+      "No matching channel found: slack:D9 isn't a channel this server has registered with this host, so nothing " +
+        'was opened. refresh_channels registers the conversations this bot is in, channels only while direct ' +
+        'messages are turned off; open one by the id it announces.',
+    ),
+  );
+});
+
 test('channels/open says why nothing opened: an unregistered id, an address it cannot read, or a type with none', async (t) => {
   const h = await serve(t, { conversations: { list: async () => ({ channels: [CHANNEL] }) } }, { grant: FULL_GRANT });
   await until(() => h.hostSaw.some((r) => r.method === method.CHANNELS_REGISTER), 'registration');

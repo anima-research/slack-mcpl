@@ -38,11 +38,17 @@ function tooLarge(size?: number): Error {
 }
 
 /** A download that failed on the way, before an answer or partway through one.
- *  One its timeout ended keeps its TimeoutError, which the explainer reads. */
-function inTransit(err: unknown): Error {
-  if ((err as { name?: unknown } | null)?.name === 'TimeoutError') return err as Error;
-  const e = err as { message?: unknown; cause?: { message?: unknown } } | null;
-  const why = typeof e?.cause?.message === 'string' && e.cause.message ? e.cause.message : String(e?.message ?? err);
+ *  One whose `signal` ended it keeps the signal's reason, such as its
+ *  timeout's TimeoutError, which the explainer reads. Otherwise the reason is
+ *  the failure's cause: its message, or, for an AggregateError of every
+ *  address tried, each one's, or its code. */
+function inTransit(err: unknown, signal?: AbortSignal): Error {
+  if (signal?.aborted) return err as Error;
+  const e = err as { message?: unknown; cause?: { message?: unknown; errors?: unknown; code?: unknown } } | null;
+  const text = (value: unknown) => (typeof value === 'string' ? value : '');
+  const cause = e?.cause;
+  const each = Array.isArray(cause?.errors) ? cause.errors.map((x) => text((x as { message?: unknown } | null)?.message)).filter(Boolean) : [];
+  const why = text(cause?.message) || each.join('; ') || text(cause?.code) || String(e?.message ?? err);
   return new Error(`Nothing was fetched: the download failed on the way (${why}). Try again shortly.`);
 }
 
@@ -59,7 +65,7 @@ export async function fetchAttachmentBytes(
   opts: { headers?: Record<string, string>; signal?: AbortSignal } = {},
 ): Promise<FetchedAttachment> {
   const resp = await fetch(url, { headers: opts.headers ?? {}, redirect: 'follow', signal: opts.signal }).catch((err: unknown) => {
-    throw inTransit(err);
+    throw inTransit(err, opts.signal);
   });
   if (!resp.ok) {
     const answered = `HTTP ${resp.status} ${resp.statusText}`.trim();
@@ -90,7 +96,7 @@ export async function fetchAttachmentBytes(
   let total = 0;
   while (reader) {
     const { value, done } = await reader.read().catch((err: unknown) => {
-      throw inTransit(err);
+      throw inTransit(err, opts.signal);
     });
     if (done) break;
     if (!value) continue;
@@ -166,8 +172,8 @@ export function parseSlackAttachmentUrl(rawUrl: string): URL {
   // fetch() refuses such a url before connecting.
   if (url.username || url.password) {
     throw new Error(
-      `Nothing was fetched: fetch_attachment can't fetch a url that carries a user name or password. ` +
-        ATTACHMENT_URL_SOURCE,
+      `Nothing was fetched: fetch_attachment can't fetch a url that carries a user name or password, and Slack's ` +
+        `file links carry neither. ${ATTACHMENT_URL_SOURCE}`,
     );
   }
   return url;

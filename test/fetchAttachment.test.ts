@@ -86,7 +86,7 @@ test('a download cut off partway says it failed on the way, and why', async (t) 
   });
 });
 
-test("a redirect to another host is followed, and the bot's token isn't sent there", async (t) => {
+test("a redirect to another origin is followed, and the bot's token isn't sent there", async (t) => {
   const seen: Array<string | undefined> = [];
   const there = await fileServer(t, (res, req) => {
     seen.push(req.headers.authorization);
