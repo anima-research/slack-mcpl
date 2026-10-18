@@ -975,7 +975,7 @@ test("refresh_channels leaves out a new DM whose user's name Slack didn't give, 
   assert.deepEqual(first.added, [{ id: 'slack:D1', label: 'DM: @ann (acme)' }]);
   assert.equal(
     first.note,
-    "Registered 1 newly-visible conversation(s). Left out 1 DM(s) whose user's name Slack didn't give just now, " +
+    "Registered 1 newly-visible conversation(s). Left out 1 DM(s) whose user's name this server couldn't get from Slack just now, " +
       'since the host keeps the label a conversation is first announced with: slack:D2 (user U2). Call ' +
       'refresh_channels again in about 7 seconds to announce them by name. This server still sends their messages ' +
       'to the host meanwhile.',

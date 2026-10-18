@@ -18,7 +18,8 @@
  * Event handling salvaged from zulip-mcp PR #8's SlackAdapter.
  */
 
-import { WebClient, ErrorCode, type WebClientOptions } from '@slack/web-api';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { WebClient, ErrorCode, type WebAPICallResult, type WebClientOptions } from '@slack/web-api';
 import { SocketModeClient } from '@slack/socket-mode';
 import {
   formatSlackText,
@@ -52,7 +53,8 @@ const FAILED_WAIT_SECONDS = 30;
 /** Why work no call waits on, such as channel registration, waits before
  *  asking Slack again after a request to `method`: Slack rate-limited it and
  *  asked for this many seconds (`limited`), or it failed in a way that can
- *  pass: in transit, with an HTTP error, or by Slack's own failure (`failed`). */
+ *  pass: in transit, with an HTTP error, by Slack's own failure, or by not
+ *  being sent because its call was out of time (`failed`). */
 export interface SlackWait {
   method: string;
   seconds: number;
@@ -61,12 +63,17 @@ export interface SlackWait {
 
 /** The wait before asking Slack again after `err` from a request to `method`,
  *  for work no call waits on; undefined when Slack's answer will be the same
- *  next time, or `err` isn't the client's. */
+ *  next time, or `err` isn't the client's. A request the host is waiting on
+ *  waits out only a `limited` one, within its budget (SlackWebClient). */
 export function waitToAskAgain(err: unknown, method: string): SlackWait | undefined {
   const e = err as { code?: unknown; retryAfter?: unknown; data?: { error?: unknown } } | null;
   if (e?.code === ErrorCode.RateLimitedError && typeof e.retryAfter === 'number') {
     return { method, seconds: e.retryAfter, why: 'limited' };
   }
+  // A request its call's time left no room for can go out in a later call.
+  // Only a request made for a call can get it, and work no call waits on
+  // never does, so its wait is left at none.
+  if (err instanceof OutOfCallTime) return { method, seconds: 0, why: 'failed' };
   const failedAtSlack = e?.code === ErrorCode.PlatformError && typeof e.data?.error === 'string' &&
     SLACK_FAILED.has(e.data.error);
   if (e?.code === ErrorCode.RequestError || e?.code === ErrorCode.HTTPError || failedAtSlack) {
@@ -203,12 +210,13 @@ export interface SlackAdapterConfig {
 /**
  * The Web API client's settings for every request after startup, so that each
  * one answers at once with what happened. A rate limit comes back with
- * Slack's Retry-After (rejectRateLimitedCalls). A failure in transit comes
+ * Slack's Retry-After (rejectRateLimitedCalls), and SlackWebClient waits out
+ * one a request from the host can afford. A failure in transit comes
  * back without the request being sent again (no retries), so this client never
  * sends a post that may have reached Slack a second time. A request fails once
  * Slack has gone 10 seconds without answering, or without sending more of its
- * answer, inside the host's own request timeout (30 s by mcpl-core's default,
- * 60 s by agent-framework's); an answer that keeps arriving a little at a time
+ * answer, and SlackWebClient sends a request only if those 10 seconds fit
+ * before its call's deadline; an answer that keeps arriving a little at a time
  * isn't cut off. With the client's defaults, a rate limit or a network failure
  * was retried inside the call for up to about 30 minutes, and every request
  * behind it waited, since requests are handled one at a time.
@@ -219,17 +227,123 @@ export const SLACK_CLIENT_OPTIONS = {
   timeout: 10_000,
 } satisfies WebClientOptions;
 
+/** How long, in seconds, this server gives a request from the host, counted
+ *  from when it reaches this server. */
+export const CALL_SECONDS = 25;
+
+/** How long, in seconds, the Slack requests made for one request from the
+ *  host may spend waiting out Slack's rate limits, in all. */
+export const WAIT_PER_CALL_SECONDS = 5;
+
+/** The time of the request from the host being handled: when it reached this
+ *  server, its deadline, and what is left of its waiting. serve() handles one
+ *  request at a time, so one store is live at once. */
+interface CallTime {
+  arrived: number;
+  deadline: number;
+  secondsLeft: number;
+}
+const callTime = new AsyncLocalStorage<CallTime>();
+
+/** Handle one request from the host, which reached this server at `arrived`
+ *  (ms since the epoch): its Slack requests are sent only while their timeout
+ *  fits before CALL_SECONDS after that, and share WAIT_PER_CALL_SECONDS of
+ *  waiting for rate limits (SlackWebClient). */
+export function withCallTime<T>(arrived: number, handle: () => Promise<T>): Promise<T> {
+  return callTime.run({ arrived, deadline: arrived + CALL_SECONDS * 1000, secondsLeft: WAIT_PER_CALL_SECONDS }, handle);
+}
+
+/** Start work that outlives the request from the host it began in, such as
+ *  registration or an acknowledgement's removal, outside that request's time:
+ *  its Slack requests have no deadline and answer a rate limit at once, as any
+ *  made outside a request do, and it waits in its own way, if at all. */
+export function outsideCallTime<T>(start: () => T): T {
+  return callTime.exit(start);
+}
+
+/** What SlackWebClient throws instead of sending a request whose timeout
+ *  wouldn't end before its call's deadline. The request wasn't sent. */
+export class OutOfCallTime extends Error {
+  readonly code = 'slack_mcpl_out_of_call_time';
+  constructor(readonly method: string, readonly usedSeconds: number) {
+    super(`${method} wasn't sent: this call had used ${usedSeconds} of its ${CALL_SECONDS} seconds`);
+    this.name = 'OutOfCallTime';
+  }
+}
+
+/**
+ * The adapter's Web API client, built with SLACK_CLIENT_OPTIONS, which keeps
+ * each request from the host to its time.
+ *
+ * A Slack request made for a request from the host is sent only if its whole
+ * timeout fits before that call's deadline, CALL_SECONDS after the call reached
+ * this server, whether the call waited behind earlier calls or spent the time
+ * on its own requests. So a request that times out does so before the
+ * deadline, and a write never runs into the deadline and comes back possibly
+ * done. Only an answer from Slack that keeps arriving a little at a time can
+ * outlast it, since the timeout then ends only a pause in the answer. A
+ * request that doesn't fit throws OutOfCallTime, unsent.
+ *
+ * When Slack answers one of these requests with a rate limit no longer than
+ * what is left of its call's WAIT_PER_CALL_SECONDS, and the request would still
+ * fit after the wait, the client waits that long and sends it once more. The
+ * second answer stands, rate limit included. Slack refused the first without
+ * acting on it, so sending it again can't post twice. A short limit, such as
+ * chat.postMessage's one message per second, then costs the agent a second
+ * inside the call instead of a turn of its own. A longer one, such as a method
+ * tier's minute window, comes back at once with Slack's seconds. Requests are
+ * handled one at a time, so every second a call waits, the requests queued
+ * behind it wait too, and a listing that pages through a large workspace can
+ * meet a limit on each page, which a budget for the whole call bounds where one
+ * per request wouldn't.
+ *
+ * A request made outside a request from the host has no deadline and answers a
+ * rate limit at once. The client binds each of its methods to apiCall as it's
+ * built (`dist/methods.js`, bindApiCall), so this override reaches every
+ * request.
+ */
+export class SlackWebClient extends WebClient {
+  /** Each request's timeout, in ms: the longest a request can take. */
+  private readonly requestMs: number;
+
+  constructor(token?: string, options: WebClientOptions = {}) {
+    super(token, options);
+    this.requestMs = options.timeout ?? 0;
+  }
+
+  override async apiCall(method: string, options?: Record<string, unknown>): Promise<WebAPICallResult> {
+    const call = callTime.getStore();
+    if (call && Date.now() + this.requestMs > call.deadline) {
+      throw new OutOfCallTime(method, Math.round((Date.now() - call.arrived) / 1000));
+    }
+    try {
+      return await super.apiCall(method, options);
+    } catch (err) {
+      const wait = waitToAskAgain(err, method);
+      if (
+        !call || wait?.why !== 'limited' || !(wait.seconds >= 0 && wait.seconds <= call.secondsLeft) ||
+        Date.now() + wait.seconds * 1000 + this.requestMs > call.deadline
+      ) {
+        throw err;
+      }
+      call.secondsLeft -= wait.seconds;
+      await new Promise((resolve) => setTimeout(resolve, wait.seconds * 1000));
+      return super.apiCall(method, options);
+    }
+  }
+}
+
 /**
  * The two Web API clients connectSlack builds. auth.test's keeps the client's
  * default patience: a Slack that can't be reached at launch is retried,
  * rather than ending the process, and each try has the same timeout as every
- * other call. Every request after startup goes through the adapter's, built
- * with SLACK_CLIENT_OPTIONS.
+ * other call. Every request after startup goes through the adapter's, a
+ * SlackWebClient built with SLACK_CLIENT_OPTIONS.
  */
 export function slackClients(token: string): { auth: WebClient; web: WebClient } {
   return {
     auth: new WebClient(token, { timeout: SLACK_CLIENT_OPTIONS.timeout }),
-    web: new WebClient(token, SLACK_CLIENT_OPTIONS),
+    web: new SlackWebClient(token, SLACK_CLIENT_OPTIONS),
   };
 }
 
@@ -362,11 +476,12 @@ export class SlackAdapter {
    *  NOT a member of (no events, no posting without joining) — those are
    *  excluded here; list_channels with includeNonMember surfaces them.
    *
-   *  A page Slack rate-limits, or that fails in a way that can pass, ends the
-   *  listing, unless `waitOut` is given, for a listing that runs in the
-   *  background. Then the page, or the name of a DM's user, is asked for again
-   *  once `waitOut` resolves (waitToAskAgain says how long). A DM whose name
-   *  is still missing carries `nameWait`. */
+   *  A page Slack rate-limits past what a call's client waits out, or that
+   *  its call's deadline leaves no time for (SlackWebClient), or that fails in
+   *  a way that can pass, ends the listing, unless `waitOut` is given, for a
+   *  listing that runs in the background. Then the page, or the name of a DM's
+   *  user, is asked for again once `waitOut` resolves (waitToAskAgain says how
+   *  long). A DM whose name is still missing carries `nameWait`. */
   async listConversations(includeNonMember = false, waitOut?: SlackWaitOut): Promise<SlackConversationInfo[]> {
     const out: SlackConversationInfo[] = [];
     let cursor: string | undefined;
@@ -564,7 +679,7 @@ export class SlackAdapter {
       text,
       ...(opts.threadTs ? { thread_ts: opts.threadTs } : {}),
     });
-    void this.clearAck(channelId);
+    void outsideCallTime(() => this.clearAck(channelId));
     return { messageId: result.ts ? String(result.ts) : '' };
   }
 

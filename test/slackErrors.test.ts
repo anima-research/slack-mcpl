@@ -11,7 +11,14 @@ import assert from 'node:assert/strict';
 import { WebClient } from '@slack/web-api';
 import { method } from '@animalabs/mcpl-core';
 import { explainSlackError } from '../src/slack-errors.js';
-import { SLACK_CLIENT_OPTIONS, SlackAdapter, type SlackSocketLike, type SlackWebLike } from '../src/slack-adapter.js';
+import {
+  CALL_SECONDS,
+  OutOfCallTime,
+  SLACK_CLIENT_OPTIONS,
+  SlackAdapter,
+  type SlackSocketLike,
+  type SlackWebLike,
+} from '../src/slack-adapter.js';
 import { SlackMcplServer } from '../src/server.js';
 import { toolDefinitions } from '../src/tools.js';
 import { connectHost, initialize, FULL_GRANT } from './harness.js';
@@ -498,6 +505,21 @@ test('other errors and other codes pass through unchanged', async () => {
 });
 
 const socket: SlackSocketLike = { on() {}, async start() {}, async disconnect() {} };
+
+test("a request its call's deadline left no time for says it wasn't sent, and that calling again is safe", () => {
+  const text = explainSlackError(new OutOfCallTime('chat.postMessage', 16), { tool: 'send_message', args: { channelId: 'C1', content: 'hi' } });
+  assert.ok(text.startsWith(`chat.postMessage wasn't sent: this call had used 16 of its ${CALL_SECONDS} seconds\n\n`), text);
+  assert.ok(
+    text.endsWith(
+      `\n\nNothing was posted: this server gives each call ${CALL_SECONDS} seconds from when it reaches this server, and ` +
+        'this one had used 16 of them, waiting behind earlier calls or on its own earlier requests, so too few were ' +
+        "left to send this request to Slack. It wasn't sent, so calling again is safe.",
+    ),
+    text,
+  );
+  const listing = explainSlackError(new OutOfCallTime('conversations.list', 20), { tool: 'list_channels', args: {} });
+  assert.match(listing, /calling again is safe\. A new call starts the listing over from the first page/);
+});
 
 test("a tool's refusal reaches the agent explained, still marked as an error", async () => {
   const slack = new SlackAdapter(client as unknown as SlackWebLike, socket, 'UBOT', 'acme');

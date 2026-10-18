@@ -16,13 +16,14 @@
  * (`slack_webapi_request_error`, or `slack_webapi_http_error` with the HTTP
  * status), which leaves a write's outcome unknown, unless the connection
  * couldn't be made at all, which Node's code on the request error's
- * `original` tells. Each refusal code here is one Slack's reference documents
- * for a method these tools call. Other errors, and codes not listed, pass
- * through unchanged.
+ * `original` tells. A fourth is this server's own: a request its call's
+ * deadline left no time to send (OutOfCallTime). Each refusal code here is one
+ * Slack's reference documents for a method these tools call. Other errors,
+ * and codes not listed, pass through unchanged.
  */
 import { ErrorCode } from '@slack/web-api';
 import { connectionNeverMade, reactionName } from './content.js';
-import { SLACK_CLIENT_OPTIONS } from './slack-adapter.js';
+import { CALL_SECONDS, OutOfCallTime, SLACK_CLIENT_OPTIONS } from './slack-adapter.js';
 
 /** The call an error came from: a tool's name, or `channels/publish` for the
  *  host's publish, and the arguments it names Slack's objects by. */
@@ -147,6 +148,14 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
     );
   };
 
+  if (err instanceof OutOfCallTime) {
+    // Not sent: SlackWebClient sends a request only if its timeout fits.
+    return (
+      `${lead}: this server gives each call ${CALL_SECONDS} seconds from when it reaches this server, and this one ` +
+      `had used ${err.usedSeconds} of them, waiting behind earlier calls or on its own earlier requests, so too ` +
+      `few were left to send this request to Slack. It wasn't sent, so calling again is safe.${startsOver}`
+    );
+  }
   if (e?.code === ErrorCode.RateLimitedError) {
     // The client throws this only with Slack's Retry-After, in seconds.
     const seconds = e.retryAfter;

@@ -1,26 +1,46 @@
 /**
- * The Web API client's settings (SLACK_CLIENT_OPTIONS): each call answers at
- * once with what happened, instead of the client waiting out rate limits and
- * retrying failures inside the call for up to about 30 minutes. Driven through
- * a real WebClient against a local endpoint that answers as Slack does.
+ * The adapter's Web API client (SlackWebClient, with SLACK_CLIENT_OPTIONS):
+ * each call answers with what happened, waiting out only a rate limit its
+ * request from the host can afford, instead of the client waiting out rate
+ * limits and retrying failures inside the call for up to about 30 minutes.
+ * Driven through the real client against a local endpoint that answers as
+ * Slack does.
  */
 
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { WebClient } from '@slack/web-api';
-import { GaveUp, SLACK_CLIENT_OPTIONS, SlackAdapter, slackClients, type SlackSocketLike, type SlackWebLike } from '../src/slack-adapter.js';
+import { method } from '@animalabs/mcpl-core';
+import {
+  CALL_SECONDS,
+  GaveUp,
+  OutOfCallTime,
+  SLACK_CLIENT_OPTIONS,
+  SlackAdapter,
+  SlackWebClient,
+  WAIT_PER_CALL_SECONDS,
+  outsideCallTime,
+  slackClients,
+  withCallTime,
+  type SlackSocketLike,
+  type SlackWebLike,
+} from '../src/slack-adapter.js';
 import { SlackMcplServer } from '../src/server.js';
 import { resolveSlackUserNames, type SlackUserInfoClient } from '../src/content.js';
-import { connectHost, initialize } from './harness.js';
-import { fakeSlackApi, silentSlackApi, unreachableSlackApiUrl, type FakeSlackApi } from './slackApi.js';
+import { FULL_GRANT, connectHost, initialize, until } from './harness.js';
+import { fakeSlackApi, silentSlackApi, unreachableSlackApiUrl, type FakeSlackApi, type SlackApiAnswer } from './slackApi.js';
 
 let api: FakeSlackApi;
 let client: WebClient;
 
 before(async () => {
   api = await fakeSlackApi();
-  client = new WebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: api.url });
+  client = new SlackWebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: api.url });
 });
+
+/** Slack's answer to a request it rate-limits, asking for `seconds`. */
+const limited = (seconds: number): SlackApiAnswer =>
+  ({ status: 429, headers: { 'retry-after': String(seconds) }, body: { ok: false, error: 'ratelimited' } });
 
 after(() => api.close());
 
@@ -86,6 +106,8 @@ test("connectSlack's clients: the adapter's is built with these options, and aut
   // here because connectSlack itself calls the real Slack.
   type Built = { rejectRateLimitedCalls: boolean; retryConfig: unknown; axios: { defaults: { timeout?: number } } };
   const { auth, web } = slackClients('xoxb-test');
+  assert.ok(web instanceof SlackWebClient, "the adapter's client waits out a rate limit a call can afford");
+  assert.ok(!(auth instanceof SlackWebClient));
   const adapter = web as unknown as Built;
   assert.equal(adapter.rejectRateLimitedCalls, true);
   assert.deepEqual(adapter.retryConfig, { retries: 0 });
@@ -99,9 +121,12 @@ test("connectSlack's clients: the adapter's is built with these options, and aut
 
 const socket: SlackSocketLike = { on() {}, async start() {}, async disconnect() {} };
 
-test("each write makes at most two Slack requests, which the client's timeout keeps inside the host's own", { timeout: 5000 }, async () => {
-  // mcpl-core's default request timeout is 30 s and agent-framework's 60 s.
-  assert.ok(SLACK_CLIENT_OPTIONS.timeout > 0 && SLACK_CLIENT_OPTIONS.timeout * 2 < 30_000);
+test("each write makes at most two Slack requests, which with the call's waiting fit in its time, inside the host's own", { timeout: 5000 }, async () => {
+  // A call's time is inside mcpl-core's default request timeout of 30 s and
+  // agent-framework's of 60 s. A write's two requests and the call's waiting
+  // fit in it, so the start rule cuts off neither while no call is ahead.
+  assert.ok(CALL_SECONDS * 1000 < 30_000);
+  assert.ok(SLACK_CLIENT_OPTIONS.timeout > 0 && SLACK_CLIENT_OPTIONS.timeout * 2 + WAIT_PER_CALL_SECONDS * 1000 <= CALL_SECONDS * 1000);
   // With DMs off, a write to a conversation the adapter hasn't seen asks Slack
   // what it is first, and send_dm opens the DM first.
   api.answer({ body: { ok: true, ts: '1.1', channel: { id: 'C7', is_im: false, is_mpim: false } } });
@@ -139,6 +164,212 @@ test("a rate-limited send answers the agent at once with Slack's seconds, and th
   };
   assert.notEqual(next.isError, true);
   await h.close();
+});
+
+/** send_message for `channelId`, with how long it took and the Slack methods it called. */
+async function sendMessage(h: ReturnType<typeof connectHost>, channelId: string) {
+  const before = api.calls.length;
+  const started = Date.now();
+  const result = (await h.host.sendRequest('tools/call', {
+    name: 'send_message',
+    arguments: { channelId, content: 'hi' },
+  })) as { isError?: boolean; content: { text: string }[] };
+  return { result, ms: Date.now() - started, called: api.calls.slice(before) };
+}
+
+test('a rate limit the call can afford is waited out inside it, the request is sent once more, and the second answer stands', { timeout: 10_000 }, async (t) => {
+  const h = connectHost(new SlackMcplServer(new SlackAdapter(client as unknown as SlackWebLike, socket, 'UBOT', 'acme')));
+  t.after(() => h.close());
+  await initialize(h, false);
+
+  api.answer(limited(1), { body: { ok: true, ts: '1.2' } });
+  const waited = await sendMessage(h, 'C1');
+  assert.notEqual(waited.result.isError, true, JSON.stringify(waited.result));
+  assert.deepEqual(waited.called, ['chat.postMessage', 'chat.postMessage']);
+  assert.ok(waited.ms >= 990, `it waited the second Slack asked for (${waited.ms} ms)`);
+
+  // Rate-limited again on the second try: that answer is the call's.
+  api.answer(limited(1));
+  const twice = await sendMessage(h, 'C1');
+  assert.equal(twice.result.isError, true);
+  assert.match(twice.result.content[0].text, /Nothing was posted: Slack is rate-limiting this kind of call for the workspace, and asks to wait 1 second /);
+  assert.deepEqual(twice.called, ['chat.postMessage', 'chat.postMessage']);
+
+  // Longer than the call can afford: answered at once, the request sent once.
+  api.answer(limited(WAIT_PER_CALL_SECONDS + 1));
+  const longer = await sendMessage(h, 'C1');
+  assert.equal(longer.result.isError, true);
+  assert.match(longer.result.content[0].text, new RegExp(`asks to wait ${WAIT_PER_CALL_SECONDS + 1} seconds`));
+  assert.deepEqual(longer.called, ['chat.postMessage']);
+  assert.ok(longer.ms < 900, `${longer.ms} ms`);
+
+  // A Retry-After that is no wait at all is answered at once too.
+  api.answer(limited(-1));
+  const malformed = await sendMessage(h, 'C1');
+  assert.equal(malformed.result.isError, true);
+  assert.deepEqual(malformed.called, ['chat.postMessage']);
+});
+
+test("a call's requests share its waiting: one wait can use all of what is left, and none goes past it", { timeout: 20_000 }, async (t) => {
+  // With DMs off, a write asks Slack what the conversation is first, so the
+  // call makes two requests.
+  const h = connectHost(new SlackMcplServer(new SlackAdapter(client as unknown as SlackWebLike, socket, 'UBOT', 'acme', undefined, undefined, true)));
+  t.after(() => {
+    api.answerFor('conversations.info');
+    return h.close();
+  });
+  await initialize(h, false);
+  const channel = { body: { ok: true, channel: { id: 'C7', is_im: false, is_mpim: false } } };
+  const first = WAIT_PER_CALL_SECONDS - 2;
+
+  api.answerFor('conversations.info', limited(first), channel);
+  api.answer(limited(2), { body: { ok: true, ts: '1.3' } });
+  const allOfIt = await sendMessage(h, 'C7');
+  assert.notEqual(allOfIt.result.isError, true, JSON.stringify(allOfIt.result));
+  assert.deepEqual(allOfIt.called, ['conversations.info', 'conversations.info', 'chat.postMessage', 'chat.postMessage']);
+  assert.ok(allOfIt.ms >= WAIT_PER_CALL_SECONDS * 1000 - 10, `${allOfIt.ms} ms`);
+
+  // A new adapter, so the conversation is asked about again.
+  const h2 = connectHost(new SlackMcplServer(new SlackAdapter(client as unknown as SlackWebLike, socket, 'UBOT', 'acme', undefined, undefined, true)));
+  t.after(() => h2.close());
+  await initialize(h2, false);
+  api.answerFor('conversations.info', limited(first), channel);
+  api.answer(limited(3));
+  const pastIt = await sendMessage(h2, 'C7');
+  assert.equal(pastIt.result.isError, true);
+  assert.match(pastIt.result.content[0].text, /asks to wait 3 seconds/);
+  assert.deepEqual(pastIt.called, ['conversations.info', 'conversations.info', 'chat.postMessage']);
+  assert.ok(pastIt.ms < first * 1000 + 900, `the second limit was answered at once (${pastIt.ms} ms)`);
+});
+
+test('a rate limit outside a request from the host comes back at once, including work a request starts in the background', { timeout: 5000 }, async () => {
+  api.answer(limited(1));
+  const alone = await failure(() => client.chat.postMessage({ channel: 'C1', text: 'hi' }));
+  assert.equal((alone.err as { retryAfter?: number }).retryAfter, 1);
+  assert.equal(alone.sent, 1);
+  const started = Date.now();
+  const background = await withCallTime(Date.now(), () => failure(() => outsideCallTime(() => client.chat.postMessage({ channel: 'C1', text: 'hi' }))));
+  assert.equal(background.sent, 1);
+  assert.ok(Date.now() - started < 900);
+});
+
+test("an acknowledgement's removal that a post starts keeps its own tries, outside the post's waiting", { timeout: 5000 }, async (t) => {
+  t.after(() => api.answerFor('reactions.remove'));
+  const slack = new SlackAdapter(client as unknown as SlackWebLike, socket, 'UBOT', 'acme', undefined, undefined, false, 'eyes');
+  api.answer({ body: { ok: true, ts: '1.4' } });
+  await slack.acknowledge('C1', '1.1');
+  api.answerFor('reactions.remove', limited(1));
+  const removals = () => api.calls.filter((c) => c === 'reactions.remove').length;
+  const before = removals();
+  await withCallTime(Date.now(), () => slack.sendMessage('C1', 'hi'));
+  await until(() => removals() > before, 'the removal');
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+  assert.equal(removals() - before, 1, "the rate-limited removal waits for its own next try, a minute on, not the post's second");
+});
+
+test('registration that a grant starts waits out its rate limits in its own way, and logs each wait', { timeout: 5000 }, async (t) => {
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+  api.answerFor('conversations.list', limited(1), { body: { ok: true, channels: [{ id: 'C9', name: 'general', is_member: true, is_im: false, is_mpim: false }] } });
+  const h = connectHost(new SlackMcplServer(new SlackAdapter(client as unknown as SlackWebLike, socket, 'UBOT', 'acme')));
+  t.after(() => {
+    api.answerFor('conversations.list');
+    return h.close();
+  });
+  await initialize(h, true);
+  const before = api.calls.filter((c) => c === 'conversations.list').length;
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await until(() => h.hostSaw.some((r) => r.method === method.CHANNELS_REGISTER), 'registration', 4000);
+  assert.equal(api.calls.filter((c) => c === 'conversations.list').length - before, 2);
+  assert.ok(
+    lines.some((l) => l.includes('Slack rate-limited conversations.list (try 1 of 10); registration asks again in 1 s')),
+    lines.join('\n'),
+  );
+});
+
+test("a request goes out only if its whole timeout fits before its call's deadline, and a wait only if the request still fits after it", { timeout: 5000 }, async () => {
+  const timeoutS = SLACK_CLIENT_OPTIONS.timeout / 1000;
+  /** A call that reached this server with `left` seconds of its time left now. */
+  const arrivedWith = (left: number) => Date.now() - (CALL_SECONDS - left) * 1000;
+  api.answer({ body: { ok: true, ts: '1.5' } });
+
+  const late = await withCallTime(arrivedWith(timeoutS - 0.5), () => failure(() => client.chat.postMessage({ channel: 'C1', text: 'hi' })));
+  assert.ok(late.err instanceof OutOfCallTime, String(late.err));
+  assert.equal((late.err as OutOfCallTime).method, 'chat.postMessage');
+  assert.equal(late.sent, 0, 'nothing was sent');
+
+  const before = api.calls.length;
+  await withCallTime(arrivedWith(timeoutS + 1), () => client.chat.postMessage({ channel: 'C1', text: 'hi' }));
+  assert.equal(api.calls.length - before, 1, 'with a whole timeout left, it goes out');
+
+  // Half a second over a timeout left: the request goes out, but after a 1 s
+  // wait it wouldn't fit, so the rate limit comes back at once.
+  api.answer(limited(1), { body: { ok: true, ts: '1.5' } });
+  const started = Date.now();
+  const limitedLate = await withCallTime(arrivedWith(timeoutS + 0.5), () => failure(() => client.chat.postMessage({ channel: 'C1', text: 'hi' })));
+  assert.equal((limitedLate.err as { code?: string }).code, 'slack_webapi_rate_limited_error');
+  assert.equal(limitedLate.sent, 1);
+  assert.ok(Date.now() - started < 900);
+});
+
+test("a write's second request isn't sent once its first has left too little of the call's time", { timeout: 5000 }, async (t) => {
+  t.after(() => api.answerFor('conversations.info'));
+  // With DMs off, the write asks Slack what the conversation is first.
+  const slack = new SlackAdapter(client as unknown as SlackWebLike, socket, 'UBOT', 'acme', undefined, undefined, true);
+  api.answerFor('conversations.info', { body: { ok: true, channel: { id: 'C8', is_im: false, is_mpim: false } }, delayMs: 2000 });
+  api.answer({ body: { ok: true, ts: '1.6' } });
+  const before = api.calls.length;
+  // 11.5 s are left as the call starts, and the DM check takes 2 of them.
+  const arrived = Date.now() - (CALL_SECONDS - SLACK_CLIENT_OPTIONS.timeout / 1000 - 1.5) * 1000;
+  await assert.rejects(
+    withCallTime(arrived, () => slack.sendMessage('C8', 'hi')),
+    (err) => err instanceof OutOfCallTime && err.method === 'chat.postMessage',
+  );
+  assert.deepEqual(api.calls.slice(before), ['conversations.info'], 'the post was not sent');
+});
+
+test("a DM whose name lookup its call has no time left for is marked to wait, not labelled for good", { timeout: 5000 }, async (t) => {
+  t.after(() => api.answerFor('conversations.list'));
+  const slack = new SlackAdapter(client as unknown as SlackWebLike, socket, 'UBOT', 'acme');
+  // 11.5 s are left as the listing starts, and its one page takes 2 of them,
+  // so the lookup of the DM's user can't go out.
+  api.answerFor('conversations.list', { body: { ok: true, channels: [{ id: 'D5', is_im: true, user: 'U5' }] }, delayMs: 2000 });
+  const before = api.calls.length;
+  const arrived = Date.now() - (CALL_SECONDS - SLACK_CLIENT_OPTIONS.timeout / 1000 - 1.5) * 1000;
+  const [dm] = await withCallTime(arrived, () => slack.listConversations());
+  assert.deepEqual(api.calls.slice(before), ['conversations.list'], 'users.info was not sent');
+  assert.equal(dm.name, 'U5');
+  // refresh_channels leaves out a new DM with a name wait, for a later refresh to announce by name.
+  assert.deepEqual(dm.nameWait, { method: 'users.info', seconds: 0, why: 'failed' });
+});
+
+test("a call's time counts from when it reaches the server, so one queued past its time answers at once, unsent", { timeout: 10_000 }, async (t) => {
+  // The first call's post goes to a Slack that never answers, and its 1 s
+  // timeout holds the server while the second call waits behind it.
+  const silent = await silentSlackApi();
+  t.after(() => silent.close());
+  const slow = new SlackWebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, timeout: 1000, slackApiUrl: silent.url });
+  const h = connectHost(new SlackMcplServer(new SlackAdapter(slow as unknown as SlackWebLike, socket, 'UBOT', 'acme')));
+  t.after(() => h.close());
+  await initialize(h, false);
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  type Result = { isError?: boolean; content: { text: string }[] };
+  const send = (content: string) =>
+    h.host.sendRequest('tools/call', { name: 'send_message', arguments: { channelId: 'C1', content } }) as Promise<Result>;
+  const first = send('first');
+  const second = send('second');
+  await until(() => silent.requests() === 1, "the first call's post");
+  // The second call has reached the server and waits. By the server's clock,
+  // all of its time passes meanwhile.
+  t.mock.timers.tick(CALL_SECONDS * 1000);
+  const [one, two] = await Promise.all([first, second]);
+  assert.match(one.content[0].text, /whether the message was posted is unknown/);
+  assert.equal(two.isError, true);
+  assert.match(
+    two.content[0].text,
+    new RegExp(`Nothing was posted: this server gives each call ${CALL_SECONDS} seconds from when it reaches this server, and this one had used ${CALL_SECONDS} of them`),
+  );
+  assert.equal(silent.requests(), 1, 'the second call sent nothing');
 });
 
 test('a user Slack refuses to look up is kept as the id, and a lookup that fails otherwise is asked again', { timeout: 5000 }, async () => {

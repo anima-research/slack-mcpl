@@ -10,6 +10,8 @@ export interface SlackApiAnswer {
   status?: number;
   headers?: Record<string, string>;
   body: Record<string, unknown>;
+  /** How long to take before answering, in ms. */
+  delayMs?: number;
 }
 
 export interface FakeSlackApi {
@@ -19,14 +21,20 @@ export interface FakeSlackApi {
   calls: string[];
   /** The parameters the client sent each of them, in the same order. */
   sent: URLSearchParams[];
-  /** What every method but conversations.list answers from now on.
-   *  conversations.list always lists no conversations. */
-  answer(answer: SlackApiAnswer): void;
+  /** What every method answerFor hasn't been given answers from now on: each
+   *  answer in turn, and the last to every request after it. */
+  answer(...answers: [SlackApiAnswer, ...SlackApiAnswer[]]): void;
+  /** What `method` alone answers from now on, in the same way. With no
+   *  answers, it answers as it did at the start again. conversations.list
+   *  starts out listing no conversations. */
+  answerFor(method: string, ...answers: SlackApiAnswer[]): void;
   close(): Promise<void>;
 }
 
 export async function fakeSlackApi(): Promise<FakeSlackApi> {
-  let next: SlackApiAnswer = { body: { ok: true } };
+  let answers: SlackApiAnswer[] = [{ body: { ok: true } }];
+  const atStart: Record<string, SlackApiAnswer[]> = { 'conversations.list': [{ body: { ok: true, channels: [] } }] };
+  const answersFor = new Map(Object.entries(atStart));
   const calls: string[] = [];
   const sent: URLSearchParams[] = [];
   const server = http.createServer((req, res) => {
@@ -37,10 +45,12 @@ export async function fakeSlackApi(): Promise<FakeSlackApi> {
       const called = (req.url ?? '').split('/').pop() ?? '';
       calls.push(called);
       sent.push(new URLSearchParams(received));
-      const { status = 200, headers = {}, body } =
-        called === 'conversations.list' ? { body: { ok: true, channels: [] } } : next;
-      res.writeHead(status, { 'content-type': 'application/json', ...headers });
-      res.end(JSON.stringify(body));
+      const queue = answersFor.get(called) ?? answers;
+      const { status = 200, headers = {}, body, delayMs = 0 } = queue.length > 1 ? queue.shift()! : queue[0];
+      setTimeout(() => {
+        res.writeHead(status, { 'content-type': 'application/json', ...headers });
+        res.end(JSON.stringify(body));
+      }, delayMs);
     });
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
@@ -49,8 +59,13 @@ export async function fakeSlackApi(): Promise<FakeSlackApi> {
     url: `http://127.0.0.1:${port}/api/`,
     calls,
     sent,
-    answer(answer) {
-      next = answer;
+    answer(...given) {
+      answers = given;
+    },
+    answerFor(method, ...given) {
+      const answers = given.length ? given : atStart[method];
+      if (answers) answersFor.set(method, [...answers]);
+      else answersFor.delete(method);
     },
     async close() {
       server.closeAllConnections();

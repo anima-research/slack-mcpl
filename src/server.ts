@@ -39,7 +39,14 @@ import type {
   ContentBlock,
 } from '@animalabs/mcpl-core';
 
-import { GaveUp, type SlackAdapter, type SlackMessageData, type SlackWait } from './slack-adapter.js';
+import {
+  GaveUp,
+  outsideCallTime,
+  withCallTime,
+  type SlackAdapter,
+  type SlackMessageData,
+  type SlackWait,
+} from './slack-adapter.js';
 import { toolDefinitions } from './tools.js';
 import { withToolClasses } from './tool-classes.js';
 import { buildFeatureSets, buildServerCapabilities, featureSetForTool, MESSAGING_FEATURE_SET } from './feature-sets.js';
@@ -242,12 +249,19 @@ export class SlackMcplServer {
     // still ends the process: mcpl-core-ts#11 is that fix.)
     conn.on('error', (err: unknown) => console.error('[slack-mcpl] Connection error:', err));
 
+    // A call's time counts from when it reaches this server, not from when
+    // this loop takes it up, so a call queued behind others answers in time
+    // too. The connection emits each request as it parses it, before
+    // queueing it for nextMessage() (mcpl-core's routeIncoming).
+    const arrivals = new WeakMap<JsonRpcRequest, number>();
+    conn.on('request', (req: JsonRpcRequest) => arrivals.set(req, Date.now()));
+
     try {
       await this.handleInitialize();
       while (!conn.isClosed) {
         const msg = await conn.nextMessage();
         if (msg.type === 'request') {
-          await this.handleRequest(msg.request);
+          await withCallTime(arrivals.get(msg.request) ?? Date.now(), () => this.handleRequest(msg.request));
         } else {
           this.handleNotification(msg.notification);
         }
@@ -373,7 +387,7 @@ export class SlackMcplServer {
           if (!couldRegister && this.grant.has('channels.register')) {
             // A registration that throws past its own catches is logged here,
             // so it doesn't end the process.
-            void this.registerSlackChannels()
+            void outsideCallTime(() => this.registerSlackChannels())
               .catch((err) => console.error('[slack-mcpl] Channel registration failed:', err));
           }
           break;
@@ -1036,8 +1050,9 @@ export class SlackMcplServer {
     const convs = await this.slack.listConversations();
     // The host keeps the label a conversation is first announced with, and a
     // refresh never announces a known one again, so a new DM whose user's name
-    // Slack didn't give just now waits for a later refresh rather than go out
-    // labelled with the user's id. One the host already knows stays as it is.
+    // this server couldn't get from Slack just now waits for a later refresh
+    // rather than go out labelled with the user's id. One the host already
+    // knows stays as it is.
     const unnamed = convs.filter((c) => c.nameWait && !this.channelManager.get(mcplChannelId(c.id)));
     const descriptors = convs
       .filter((c) => !c.nameWait)
@@ -1058,10 +1073,10 @@ export class SlackMcplServer {
     const wait = Math.max(1, ...unnamed.map((c) => c.nameWait?.seconds ?? 0));
     const unnamedIds = unnamed.map((c) => `${mcplChannelId(c.id)} (user ${c.userId})`).join(', ');
     const leftOut = notGranted || unnamed.length === 0 ? '' :
-      ` Left out ${unnamed.length} DM(s) whose user's name Slack didn't give just now, since the host keeps the ` +
-        `label a conversation is first announced with: ${unnamedIds}. Call refresh_channels again in about ` +
-        `${wait} second${wait === 1 ? '' : 's'} to announce them by name. This server still sends their messages ` +
-        'to the host meanwhile.';
+      ` Left out ${unnamed.length} DM(s) whose user's name this server couldn't get from Slack just now, since ` +
+        `the host keeps the label a conversation is first announced with: ${unnamedIds}. Call refresh_channels ` +
+        `again in about ${wait} second${wait === 1 ? '' : 's'} to announce them by name. This server still sends ` +
+        'their messages to the host meanwhile.';
     return {
       visible: convs.length,
       added: added.map((d) => ({ id: d.id, label: d.label })),
