@@ -655,6 +655,58 @@ for (const lookup of ['history', 'name', 'location'] as const) {
   });
 }
 
+test('a lookup Slack fails says so on stderr, and the message goes without it', async (t) => {
+  const errors = t.mock.method(console, 'error', () => {});
+  const limited = 'A rate-limit has been reached, you may retry this request in 30 seconds';
+  const f = fixture(
+    async () => { throw new Error(limited); },
+    async () => { throw new Error(limited); },
+  );
+  const peer = connect(f.server);
+  try {
+    await peer.ready();
+    f.emit('111.1');
+    await until(() => peer.deliveries().length === 1, 'the message, without its lookups');
+    const text = pushText(peer.deliveries()[0]);
+    assert.doesNotMatch(text, /<backscroll/);
+    assert.match(text, /\[C1 \(acme\) id=111\.1\] /);
+    assert.deepEqual(logLines(errors).filter((l) => l.includes("Couldn't get")), [
+      `[slack-mcpl] Couldn't get the backscroll for message 111.1 in C1 (${limited}); delivering without it`,
+      `[slack-mcpl] Couldn't get the name of conversation C1 (${limited}); delivering without it`,
+    ]);
+  } finally {
+    await peer.close();
+  }
+});
+
+test('a lookup that fails after its give-up is logged once, as given up', async (t) => {
+  const gate = deferred<void>();
+  const errors = t.mock.method(console, 'error', () => {});
+  const f = fixture(async () => {
+    await gate.promise;
+    throw new Error('A request error occurred: timeout of 10000ms exceeded');
+  });
+  const peer = connect(f.server);
+  try {
+    await peer.ready();
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    f.emit('111.1');
+    await settle();
+    t.mock.timers.tick(5000);
+    for (let i = 0; i < 50 && peer.deliveries().length < 1; i++) await settle();
+    assert.equal(peer.deliveries().length, 1);
+    gate.resolve();
+    for (let i = 0; i < 5; i++) await settle();
+    assert.deepEqual(logLines(errors).filter((l) => l.includes('backscroll')), [
+      '[slack-mcpl] Gave up on the backscroll for message 111.1 in C1 after 5 s; delivering without it',
+    ]);
+  } finally {
+    t.mock.timers.reset();
+    await peer.close();
+    gate.resolve();
+  }
+});
+
 test('a header prepared while another conversation awaits the host still names its conversation', async (t) => {
   const gate = deferred<boolean>();
   const f = fixture();

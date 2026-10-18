@@ -1,59 +1,53 @@
 /**
- * Slack's refusals, explained (src/slack-errors.ts). Each error here is the
- * one @slack/web-api throws for Slack's answer: a real WebClient calls a local
- * endpoint that answers as Slack's Web API does, so the explainer reads the
- * client's own shape (`code`, and Slack's answer in `data`).
+ * Slack's failed calls, explained (src/slack-errors.ts). Each error here is
+ * the one @slack/web-api throws, with this server's client settings, for what
+ * Slack answers: a real WebClient calls a local endpoint that answers as
+ * Slack's Web API does (test/slackApi.ts), so the explainer reads the client's
+ * own shape (`code`, Slack's answer in `data`, `retryAfter`, `statusCode`).
  */
 
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import http from 'node:http';
 import { WebClient } from '@slack/web-api';
 import { method } from '@animalabs/mcpl-core';
 import { explainSlackError } from '../src/slack-errors.js';
-import { SlackAdapter, type SlackSocketLike, type SlackWebLike } from '../src/slack-adapter.js';
+import {
+  CALL_SECONDS,
+  OutOfCallTime,
+  SLACK_CLIENT_OPTIONS,
+  SlackAdapter,
+  type SlackSocketLike,
+  type SlackWebLike,
+} from '../src/slack-adapter.js';
 import { SlackMcplServer } from '../src/server.js';
 import { toolDefinitions } from '../src/tools.js';
 import { connectHost, initialize, FULL_GRANT } from './harness.js';
+import { fakeSlackApi, silentSlackApi, unreachableSlackApiUrl, type FakeSlackApi } from './slackApi.js';
 
-/** What the endpoint answers every method but conversations.list. */
-let answer: Record<string, unknown> = { ok: true };
-/** The last method called, with the parameters the client sent it. */
-let lastCall: { method: string; params: URLSearchParams } | undefined;
-let endpoint: http.Server;
+let api: FakeSlackApi;
 let client: WebClient;
 
 before(async () => {
-  endpoint = http.createServer((req, res) => {
-    let body = '';
-    req.setEncoding('utf8');
-    req.on('data', (chunk: string) => { body += chunk; });
-    req.on('end', () => {
-      const called = (req.url ?? '').split('/').pop() ?? '';
-      lastCall = { method: called, params: new URLSearchParams(body) };
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify(called === 'conversations.list' ? { ok: true, channels: [] } : answer));
-    });
-  });
-  await new Promise<void>((resolve) => endpoint.listen(0, '127.0.0.1', () => resolve()));
-  const { port } = endpoint.address() as { port: number };
-  client = new WebClient('xoxb-test', { slackApiUrl: `http://127.0.0.1:${port}/api/` });
+  api = await fakeSlackApi();
+  client = new WebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: api.url });
 });
 
-after(async () => {
-  endpoint.closeAllConnections();
-  await new Promise<void>((resolve) => endpoint.close(() => resolve()));
-});
+after(() => api.close());
 
-/** The error the client throws when Slack refuses a call with `error`. */
-async function slackError(error: string, extra: Record<string, unknown> = {}): Promise<unknown> {
-  answer = { ok: false, error, ...extra };
+/** The error the client throws for an answer, or for Slack out of reach. */
+async function clientError(call: WebClient = client): Promise<unknown> {
   try {
-    await client.apiCall('chat.postMessage', { channel: 'C1', text: 'x' });
+    await call.apiCall('chat.postMessage', { channel: 'C1', text: 'x' });
   } catch (err) {
     return err;
   }
-  throw new Error(`the client did not throw for ${error}`);
+  throw new Error('the client did not throw');
+}
+
+/** The error the client throws when Slack refuses a call with `error`. */
+async function slackError(error: string, extra: Record<string, unknown> = {}): Promise<unknown> {
+  api.answer({ body: { ok: false, error, ...extra } });
+  return clientError();
 }
 
 async function explain(
@@ -83,8 +77,10 @@ test('a value is named exactly as the call was given it, whitespace included', a
 /** Every call whose Slack errors reach the explainer: what its refusal says
  *  didn't happen, and whether it writes, so that Slack's own failure leaves
  *  its outcome unknown. The tools that call no Slack Web API method are
- *  listed apart: fetch_attachment downloads with its own fetch, and the
- *  subscription tools keep local state. */
+ *  listed apart: fetch_attachment downloads with its own fetch, whose texts
+ *  for a download out of its call's time and one that times out are tested
+ *  in attachmentDownload.test.ts, and the subscription tools keep local
+ *  state. */
 const CALLS: Array<[tool: string, lead: string, writes: boolean]> = [
   ['send_message', 'Nothing was posted', true],
   ['reply_message', 'Nothing was posted', true],
@@ -365,11 +361,122 @@ test("Slack's own failure: a read is tried again, a write's outcome is unknown a
   );
   assert.match(
     await explain('internal_error', 'add_reaction', { channelId: 'C14', messageId: '1.2', emoji: 'eyes' }),
-    /whether the reaction was added is unknown .*Adding it again is safe: if it's there, Slack answers already_reacted\./s,
+    /whether the reaction was added is unknown .*Adding it again is safe: if it's there, add_reaction says so and changes nothing\./s,
   );
   const unavailable = await explain('service_unavailable', 'send_message', { channelId: 'C14' });
   assert.match(unavailable, /whether the message was posted is unknown\. Check fetch_history/);
   assert.doesNotMatch(unavailable, /part of a call/, 'only internal_error and fatal_error are documented as partial');
+});
+
+test('a rate limit says nothing was done and how long Slack asks to wait', async () => {
+  api.answer({ status: 429, headers: { 'retry-after': '7' }, body: { ok: false, error: 'ratelimited' } });
+  const err = await clientError();
+  assert.equal(
+    explainSlackError(err, { tool: 'send_message', args: { channelId: 'C15' } }),
+    'A rate-limit has been reached, you may retry this request in 7 seconds\n\nNothing was posted: Slack is ' +
+      'rate-limiting this kind of call for the workspace, and asks to wait 7 seconds before trying again.',
+  );
+  assert.match(
+    explainSlackError(err, { tool: 'fetch_history', args: { channelId: 'C15' } }),
+    /\n\nNothing was read: Slack is rate-limiting this kind of call for the workspace, and asks to wait 7 seconds/,
+  );
+  api.answer({ status: 429, headers: { 'retry-after': '1' }, body: { ok: false, error: 'ratelimited' } });
+  assert.match(
+    explainSlackError(await clientError(), { tool: 'send_message', args: { channelId: 'C15' } }),
+    /asks to wait 1 second before trying again\.$/,
+  );
+  // A listing a call pages through starts over from its first page, so calling again can stop at the same place.
+  for (const [tool, lead] of [
+    ['list_channels', 'Nothing was listed'],
+    ['find_user', 'No users were listed'],
+    ['refresh_channels', 'Nothing was announced to the host'],
+  ] as const) {
+    assert.match(
+      explainSlackError(err, { tool, args: {} }),
+      new RegExp(`\\n\\n${lead}: Slack is rate-limiting this kind of call for the workspace, and asks to wait 7 seconds ` +
+        'before trying again\\. A new call starts the listing over from the first page, so if the workspace is too large ' +
+        "to list within Slack's limit, calling again stops near the same place\\.$"),
+      tool,
+    );
+  }
+  api.answer({ body: { ok: false, error: 'ratelimited' } });
+  assert.match(
+    explainSlackError(await clientError(), { tool: 'list_channels', args: {} }),
+    /\n\nNothing was listed: Slack is rate-limiting this kind of call for the workspace\. Try again shortly\. A new call starts the listing over from the first page, so if the workspace is too large to list within Slack's limit, calling again stops near the same place\.$/,
+  );
+});
+
+test("a failure in transit leaves a write's outcome unknown, and a read is tried again", async () => {
+  // A request with no answer: the client's own timeout, shortened here.
+  const silent = await silentSlackApi();
+  const unanswered = await clientError(
+    new WebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, timeout: 300, slackApiUrl: silent.url }),
+  ).finally(() => silent.close());
+  assert.match(
+    explainSlackError(unanswered, { tool: 'send_message', args: { channelId: 'C16' } }),
+    /^A request error occurred: .*\n\nSlack went 10 seconds without answering, or the connection to it failed, so whether the message was posted is unknown\. Check fetch_history for conversation C16 before posting again, so it isn't posted twice\.$/s,
+  );
+  assert.match(
+    explainSlackError(unanswered, { tool: 'fetch_history', args: { channelId: 'C16' } }),
+    /\n\nNothing was read: Slack went 10 seconds without answering, or the connection to it failed\. Try again shortly\.$/,
+  );
+  api.answer({ status: 503, body: { ok: false } });
+  const unavailable = await clientError();
+  assert.match(
+    explainSlackError(unavailable, { tool: 'edit_message', args: { channelId: 'C16', messageId: '1.3' } }),
+    /^An HTTP protocol error occurred: statusCode = 503\n\nSlack answered with HTTP 503, so whether the edit took is unknown\. fetch_history shows message 1\.3 as it is now if it's in the channel itself, and fetch_thread does, with its thread's id, if it's a thread reply\.$/,
+  );
+  assert.match(
+    explainSlackError(unavailable, { tool: 'find_user', args: { query: 'ann' } }),
+    /\n\nNo users were listed: Slack answered with HTTP 503\. Try again shortly\.$/,
+  );
+});
+
+test("a connection that couldn't be made says nothing was done, even for a write", async () => {
+  const refused = await clientError(
+    new WebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: await unreachableSlackApiUrl() }),
+  );
+  assert.match(
+    explainSlackError(refused, { tool: 'send_message', args: { channelId: 'C17' } }),
+    /^A request error occurred: connect ECONNREFUSED .*\n\nNothing was posted: Slack couldn't be reached\. Try again shortly\. If it keeps failing, whoever runs this host has to check its connection to Slack\.$/s,
+  );
+  assert.match(
+    explainSlackError(refused, { tool: 'fetch_history', args: { channelId: 'C17' } }),
+    /\n\nNothing was read: Slack couldn't be reached\. Try again shortly\. If it keeps failing, whoever runs this host has to check its connection to Slack\.$/,
+  );
+  // The other codes Node gives for a connection never made can't be produced
+  // here, so each is put on the client's own error in place of ECONNREFUSED.
+  const withNodeCode = (code: string) => Object.assign(new Error((refused as Error).message), {
+    code: (refused as { code: unknown }).code,
+    original: Object.assign(new Error(`connect ${code}`), { code }),
+  });
+  for (const code of ['ENOTFOUND', 'EAI_AGAIN', 'EAI_FAIL', 'ENETUNREACH', 'EHOSTUNREACH']) {
+    assert.match(
+      explainSlackError(withNodeCode(code), { tool: 'send_message', args: { channelId: 'C17' } }),
+      /\n\nNothing was posted: Slack couldn't be reached\. Try again shortly\. If it keeps failing, whoever runs this host has to check its connection to Slack\.$/,
+      code,
+    );
+  }
+  // A connection that was made, then failed, leaves a write's outcome unknown.
+  assert.match(
+    explainSlackError(withNodeCode('ECONNRESET'), { tool: 'send_message', args: { channelId: 'C17' } }),
+    /so whether the message was posted is unknown/,
+  );
+});
+
+test('a request Slack received only in part, or rate-limited in its answer, says nothing was done', async () => {
+  assert.match(
+    await explain('request_timeout', 'send_message', { channelId: 'C18' }),
+    /\n\nNothing was posted: Slack didn't receive the whole request, so it didn't act on it\. Try again shortly\.$/,
+  );
+  assert.match(
+    await explain('request_timeout', 'fetch_history', { channelId: 'C18' }),
+    /\n\nNothing was read: Slack didn't receive the whole request, so it didn't act on it\. Try again shortly\.$/,
+  );
+  assert.match(
+    await explain('ratelimited', 'edit_message', { channelId: 'C18', messageId: '1.1' }),
+    /\n\nThe message wasn't changed: Slack is rate-limiting this kind of call for the workspace\. Try again shortly\.$/,
+  );
 });
 
 test('a user id Slack does not know or show points to find_user, or says nothing changes it', async () => {
@@ -401,11 +508,29 @@ test('other errors and other codes pass through unchanged', async () => {
 
 const socket: SlackSocketLike = { on() {}, async start() {}, async disconnect() {} };
 
+test("a request its call's deadline left no time for says it wasn't sent, and that calling again is safe", () => {
+  const text = explainSlackError(new OutOfCallTime('chat.postMessage', 16), { tool: 'send_message', args: { channelId: 'C1', content: 'hi' } });
+  assert.ok(text.startsWith("chat.postMessage: out of this call's time\n\n"), text);
+  assert.ok(
+    text.endsWith(
+      `\n\nNothing was posted: this server gives each call ${CALL_SECONDS} seconds from when it reaches this server, and ` +
+        'this one had used 16 of them, waiting behind earlier calls or on its own earlier requests, so too few were ' +
+        "left to send this request to Slack. It wasn't sent, so calling again is safe.",
+    ),
+    text,
+  );
+  const listing = explainSlackError(new OutOfCallTime('conversations.list', 20), { tool: 'list_channels', args: {} });
+  assert.match(
+    listing,
+    new RegExp(`calling again is safe\\. A new call starts the listing over from the first page, so if the workspace is too large to list within a call's ${CALL_SECONDS} seconds, calling again stops near the same place\\.$`),
+  );
+});
+
 test("a tool's refusal reaches the agent explained, still marked as an error", async () => {
   const slack = new SlackAdapter(client as unknown as SlackWebLike, socket, 'UBOT', 'acme');
   const h = connectHost(new SlackMcplServer(slack));
   await initialize(h, false);
-  answer = { ok: false, error: 'channel_not_found' };
+  api.answer({ body: { ok: false, error: 'channel_not_found' } });
   const result = (await h.host.sendRequest('tools/call', {
     name: 'send_message',
     arguments: { channelId: 'C0NOPE', content: 'hi' },
@@ -422,13 +547,13 @@ test('an emoji Slack refuses is named as add_reaction sent it', async () => {
   const slack = new SlackAdapter(client as unknown as SlackWebLike, socket, 'UBOT', 'acme');
   const h = connectHost(new SlackMcplServer(slack));
   await initialize(h, false);
-  answer = { ok: false, error: 'invalid_name' };
+  api.answer({ body: { ok: false, error: 'invalid_name' } });
   const result = (await h.host.sendRequest('tools/call', {
     name: 'add_reaction',
     arguments: { channelId: 'C9', messageId: '1.1', emoji: 'thumbsup::skin-tone-2' },
   })) as { isError?: boolean; content: { text: string }[] };
-  assert.equal(lastCall?.method, 'reactions.add');
-  assert.equal(lastCall?.params.get('name'), 'thumbsupskin-tone-2');
+  assert.equal(api.calls.at(-1), 'reactions.add');
+  assert.equal(api.sent.at(-1)?.get('name'), 'thumbsupskin-tone-2');
   assert.match(result.content[0].text, /no emoji named "thumbsupskin-tone-2", the name this server sent for "thumbsup::skin-tone-2"/);
   await h.close();
 });
@@ -437,9 +562,9 @@ test("the host's channels/publish gets the same explanation in its error", async
   const slack = new SlackAdapter(client as unknown as SlackWebLike, socket, 'UBOT', 'acme');
   const h = connectHost(new SlackMcplServer(slack));
   await initialize(h, true);
-  answer = { ok: true };
+  api.answer({ body: { ok: true } });
   await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
-  answer = { ok: false, error: 'not_in_channel' };
+  api.answer({ body: { ok: false, error: 'not_in_channel' } });
   await assert.rejects(
     h.host.sendRequest(method.CHANNELS_PUBLISH, {
       conversationId: 'conv-1',
@@ -448,5 +573,26 @@ test("the host's channels/publish gets the same explanation in its error", async
     }),
     /An API error occurred: not_in_channel\n\nNothing was posted: this bot isn't a member of conversation C0OUT, so Slack didn't let it post there/,
   );
+  await h.close();
+});
+
+test('a reaction already there answers as a success that says nothing changed', async () => {
+  const slack = new SlackAdapter(client as unknown as SlackWebLike, socket, 'UBOT', 'acme');
+  const h = connectHost(new SlackMcplServer(slack));
+  await initialize(h, false);
+  api.answer({ body: { ok: false, error: 'already_reacted' } });
+  const result = (await h.host.sendRequest('tools/call', {
+    name: 'add_reaction',
+    arguments: { channelId: 'C1', messageId: '1718000000.000100', emoji: 'eyes' },
+  })) as { isError?: boolean; content: { text: string }[] };
+  assert.notEqual(result.isError, true);
+  assert.equal(result.content[0].text, "Nothing changed: message 1718000000.000100 already has this bot's eyes reaction.");
+  // Any other refusal stays an error.
+  api.answer({ body: { ok: false, error: 'invalid_name' } });
+  const refused = (await h.host.sendRequest('tools/call', {
+    name: 'add_reaction',
+    arguments: { channelId: 'C1', messageId: '1718000000.000100', emoji: 'nope' },
+  })) as { isError?: boolean };
+  assert.equal(refused.isError, true);
   await h.close();
 });
