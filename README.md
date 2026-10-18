@@ -152,32 +152,21 @@ not search ordinary thread replies; an incidental broadcast reply does not make
 it a complete thread search. Use `fetch_thread(channelId, threadTs)` for one
 known root. No automatic thread expansion or workspace search occurs.
 
-Both tools retain `messages`, `id`, `author`, `timestamp`, `content`, optional
-`threadTs` and attachment hints. They add:
+Both tools return `messages`, each with `id`, `author`, `timestamp`, `content`,
+optional `threadTs` and attachment hints, as before, and add:
 
 - `authorId` when Slack supplies a user ID, and `authorBotId` when supplied.
-  Display names use the existing name cache, falling back to the stable ID;
-  these bounded reads do not make additional user-name requests.
-- `rootTs` and `rootSource` (`reported` by Slack, or the message's own ID).
-  Parent `thread_ts === ts` is retained as root identity, while `threadTs`
+  Authors' and mentioned users' names are looked up as before, and an author
+  whose name can't be had is shown by their ID.
+- `rootTs`, the thread a message belongs to: its parent's ts, as Slack reports
+  it on a reply or a broadcast reply, or the message's own. `threadTs`
   continues to identify a reply's parent. `replyCount` is included only when
   Slack supplies a valid nonnegative integer; missing means unknown, not zero.
-- One `channel` object: `writeAllowedByPolicy` has the existing
-  `list_channels.writable` meaning. `channel.slack` separately reports observed
-  flags/restrictions and nullable `channelPostAllowedByMetadata` /
-  `threadReplyAllowedByMetadata`. `false` means metadata establishes a block;
-  `true` requires explicit clear flags and an explicitly empty applicable
-  restriction. Otherwise it is `null` (unknown), including role restrictions
-  whose applicability is unknown. None of these fields grants a Slack scope or
-  guarantees a later write. For example, a thread-only channel can block root
-  posts independently of replies. No test post is used.
+- `channel`: the conversation's `id`, and `writable`, with
+  `list_channels.writable`'s meaning.
 
-Reads request fresh `conversations.info` metadata once per call. If its scope
-is missing but history is permitted, metadata is unknown and the read proceeds;
-no new OAuth scope is required. An explicit loss of channel membership refuses
-the read. `SLACK_DISABLE_DMS` still requires Slack to confirm a non-DM channel.
-Every continuation performs fresh Slack requests; a cursor never grants access
-or serves cached message content. Slack's own read refusal is propagated.
+`SLACK_DISABLE_DMS` checks a read's conversation as every read is checked, and
+Slack's own refusal of a read is passed on as the other tools' are.
 
 `fetch_history` also accepts `textContains`, `caseSensitive` (default `false`)
 and `authorIds`. The literal substring is matched against **raw Slack text**,
@@ -187,35 +176,35 @@ Slack user IDs, ORed within the list and ANDed with the substring. Missing
 authors do not match an author filter. Regex is not supported. Filtering reduces
 returned context; it still retrieves candidate messages from Slack.
 
-All numeric inputs are bounded integers, independently applied **per call**:
+All numeric inputs are bounded integers, applied **per call**:
 
 | Input | Default | Inclusive range | Meaning |
 |---|---:|---:|---|
 | `limit` | 50 history / 100 thread | 1–1,000 | Returned matches/messages; thread parent counts when present |
 | `maxScanned` | 1,000 | 1–10,000 | Candidate messages examined |
-| `maxPages` | 10 | 1–50 | History/replies requests, plus at most one metadata request |
-| `maxMs` | 10,000 | 100–30,000 | Deadline including metadata; aborts in-flight tool-read HTTP work |
 | `maxBytes` | 65,536 | 2,048–1,048,576 | UTF-8 bytes of the complete result JSON, before MCP text-block wrapping |
 
-Tool reads do not retry or sleep through rate limits. The legacy messaging,
-backscroll and unread clients retain their existing behavior. The deadline/byte
-limits bound tool work/output, not the Slack service's response size or timing
-of remote processing after cancellation.
+Each page is one Slack request, made like every other request this server
+makes: it goes out only if its 10-second timeout fits in what is left of the
+call's 25 seconds, and a rate limit that fits the call's 5-second budget for
+waiting is waited out. A page that doesn't fit, or a longer rate limit, ends the
+read with what it found and a cursor. A read that has scanned nothing yet fails
+instead, saying why, as any call does.
 
 `pagination` reports `scanned`, `matched`, `returned`, `pages`, `scanComplete`,
 `stopReason`, `scope` and `threadRepliesSearched`. `matched` counts examined
 matches, including a match held back by the byte budget. Stop reasons are
-`exhausted`, `match_limit`, `scan_limit`, `page_limit`, `time_limit`, `byte_limit`,
-`rate_limited` and `pagination_stalled`. A rate limit may include
-`retryAfterSeconds`; the caller chooses whether/when to resume. A stalled
-pagination response is incomplete, never silently exhausted.
+`exhausted`, `match_limit`, `scan_limit`, `byte_limit`, `time_limit`,
+`rate_limited` and `pagination_stalled`. A rate limit includes
+`retryAfterSeconds` when Slack gave one; the caller chooses whether and when to
+resume. A stalled pagination response is incomplete, never silently exhausted.
 
 **Zero matches in an incomplete scan does not mean no matching message exists.**
 `scanComplete` describes only the selected channel-message range or single
 thread, never all channel threads. A default upper timestamp is fixed when the
 initial read starts. `oldest` and `latest` are exclusive bounds on both tools.
-Slack history remains live: edits, deletions and cursor invalidation can affect
-later pages; this is not an immutable export.
+Slack history remains live: edits and deletions can affect later pages; this is
+not an immutable export.
 
 For incomplete reads, pass `pagination.nextCursor` as `cursor` and repeat the
 original channel, thread, time bounds and filters. Budget values may change
@@ -226,16 +215,16 @@ chronological list. When `byte_limit` returns no messages, increase `maxBytes`
 to fit the held match; it is not silently skipped. A match larger than the hard
 maximum cannot be returned whole by this tool.
 
-Handles retain only query hashes and positions, expire after 15 minutes, belong
-to one adapter instance and are capped at 128 live entries (oldest evicted).
-Tampering, filter/channel/thread mismatch, eviction or restart refuses before
-reading. Restart the query after expiry/eviction; no signing credential, durable
-cursor store, raw message cache or new access route is introduced.
+A cursor carries the position to continue from and a hash of its query. The
+server keeps nothing for it, so it doesn't expire and survives a restart. A
+cursor used with another channel, thread, time bounds or filters, or one this
+server didn't give, is refused before Slack is asked. Every continuation reads
+Slack again; a cursor never grants access or holds message content.
 
 Compatibility: the former truncation `note` is replaced by structured
 `pagination`; clients must check it and resume rather than assuming a complete
-range. Previously unbounded/invalid numeric limits and unknown arguments now
-refuse. Existing tool names, default match counts and list `writable` semantics
+range. Previously unbounded or invalid numeric limits and unknown arguments now
+refuse. Existing tool names, default match counts and `list_channels.writable`
 remain stable. No new scopes, regex, bulk expansion, native search or
 interaction-token handling are included.
 

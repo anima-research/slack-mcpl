@@ -21,7 +21,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { WebClient, ErrorCode, type WebAPICallResult, type WebClientOptions } from '@slack/web-api';
 import { SocketModeClient } from '@slack/socket-mode';
-import {BoundedHistoryReader, type SlackReadCall} from './history-read.js';
+import { SLACK_TS, readBounded, readOptions, type HistoryReadResult, type ReadStop } from './history-read.js';
 import {
   formatSlackText,
   extractSlackUserIds,
@@ -86,6 +86,16 @@ export function waitToAskAgain(err: unknown, method: string): SlackWait | undefi
     return { method, seconds: FAILED_WAIT_SECONDS, why: 'failed' };
   }
   return undefined;
+}
+
+/** Why a read tool's page failing stops the read with what it has, rather
+ *  than failing it: the call's time had no room for the page, or Slack
+ *  rate-limited it for longer than the call could wait. */
+function readStop(err: unknown): ReadStop | undefined {
+  if (err instanceof OutOfCallTime) return { reason: 'time_limit' };
+  const e = err as { code?: unknown; retryAfter?: unknown } | null;
+  if (e?.code !== ErrorCode.RateLimitedError) return undefined;
+  return { reason: 'rate_limited', ...(typeof e.retryAfter === 'number' && e.retryAfter >= 0 ? { retryAfter: e.retryAfter } : {}) };
 }
 
 /** Called by a listing no call waits on before it asks Slack again: with the
@@ -185,9 +195,16 @@ export interface SlackMessageData {
 export interface HistoryMessage {
   id: string;
   authorId?: string;
+  /** The bot that posted it, when Slack names one. */
+  authorBotId?: string;
   authorName: string;
   content: string;
+  /** A reply's parent. */
   threadTs?: string;
+  /** The thread it belongs to: its parent's ts, or its own. */
+  rootTs: string;
+  /** Its replies, when Slack gives a count; missing means unknown. */
+  replyCount?: number;
   timestamp: Date;
   attachments: Array<{ name: string; mimeType?: string; url?: string }>;
 }
@@ -413,13 +430,6 @@ export async function connectSlack(config: SlackAdapterConfig): Promise<SlackAda
     config.sendChannels,
     config.disableDms,
     config.ackReaction,
-    // Isolate tool-read deadlines/retries from the legacy messaging client.
-    // AbortSignal reaches Axios through the SDK's supported interceptor.
-    async (method, args, signal) => await new WebClient(config.botToken, {
-      retryConfig: {retries: 0}, rejectRateLimitedCalls: true,
-      attachOriginalToWebAPIRequestError: false,
-      requestInterceptor: request => { request.signal = signal; return request; },
-    }).apiCall(method, args) as unknown as Record<string, unknown>,
   );
 }
 
@@ -429,8 +439,8 @@ export interface SlackWebLike {
     list(args: Record<string, unknown>): Promise<{ channels?: unknown[]; response_metadata?: { next_cursor?: string } }>;
     info(args: { channel: string }): Promise<{ channel?: unknown }>;
     open(args: { users: string }): Promise<{ channel?: { id?: string } }>;
-    history(args: Record<string, unknown>): Promise<{ messages?: unknown[]; response_metadata?: { next_cursor?: string } }>;
-    replies(args: Record<string, unknown>): Promise<{ messages?: unknown[]; response_metadata?: { next_cursor?: string } }>;
+    history(args: Record<string, unknown>): Promise<{ messages?: unknown[]; has_more?: boolean; response_metadata?: { next_cursor?: string } }>;
+    replies(args: Record<string, unknown>): Promise<{ messages?: unknown[]; has_more?: boolean; response_metadata?: { next_cursor?: string } }>;
   };
   chat: {
     postMessage(args: Record<string, unknown>): Promise<{ ts?: string }>;
@@ -454,7 +464,6 @@ export interface SlackSocketLike {
 }
 
 export class SlackAdapter {
-  private historyReader: BoundedHistoryReader;
   private userNameCache = new Map<string, string>();
   private messageHandlers: Array<(msg: SlackMessageData) => void> = [];
   private socketStarted = false;
@@ -483,12 +492,7 @@ export class SlackAdapter {
     private sendChannels?: string[],
     private disableDms = false,
     private ackReaction?: string,
-    readCall?: SlackReadCall,
   ) {
-    this.historyReader = new BoundedHistoryReader(readCall ?? (async (method, args) => {
-      const operation = method.slice('conversations.'.length) as 'info' | 'history' | 'replies';
-      return this.web.conversations[operation](args as {channel: string}) as Promise<Record<string, unknown>>;
-    }), id => this.canWrite(id), this.userNameCache, this.disableDms);
     // Register the handler at construction so start() ordering can't race
     // an early event past an unregistered listener.
     this.socket.on('message', ({ event, ack }) => {
@@ -815,13 +819,39 @@ export class SlackAdapter {
 
   // ── History ──
 
-  /** The bounded public tool contract; backscroll/unread keep fetchHistory. */
-  readHistory(channelId: string, args: Record<string, unknown>) {
-    return this.historyReader.read('history', channelId, args);
+  /** fetch_history's read: bounded and filtered, saying whether it covered
+   *  its range, with a cursor to continue (history-read.ts). Its pages go
+   *  through this adapter's client, after the same DM check as every read.
+   *  Backscroll keeps fetchHistory, its own pager, and both shape messages
+   *  with shapeHistory. */
+  async readHistory(channelId: string, args: Record<string, unknown>): Promise<HistoryReadResult> {
+    const opts = readOptions(args, 'history', channelId);
+    await this.assertNotDm(channelId);
+    return readBounded(opts, {
+      page: (at, limit) => this.web.conversations.history({
+        channel: channelId, limit, inclusive: false,
+        ...(at ? { latest: at } : {}), ...(opts.oldest ? { oldest: opts.oldest } : {}),
+      }),
+      shape: (messages) => this.shapeHistory(messages),
+      writable: this.canWrite(channelId),
+      stopped: readStop,
+    });
   }
 
-  readThread(channelId: string, threadTs: string, args: Record<string, unknown>) {
-    return this.historyReader.read('thread', channelId, args, threadTs);
+  /** fetch_thread's read, as readHistory's, paging forward through one
+   *  thread from its parent. */
+  async readThread(channelId: string, threadTs: string, args: Record<string, unknown>): Promise<HistoryReadResult> {
+    const opts = readOptions(args, 'thread', channelId, threadTs);
+    await this.assertNotDm(channelId);
+    return readBounded(opts, {
+      page: (at, limit) => this.web.conversations.replies({
+        channel: channelId, ts: threadTs, limit, inclusive: false,
+        ...(at ? { oldest: at } : {}), ...(opts.latest ? { latest: opts.latest } : {}),
+      }),
+      shape: (messages) => this.shapeHistory(messages),
+      writable: this.canWrite(channelId),
+      stopped: readStop,
+    });
   }
 
   /** Channel-level history, oldest-first. Thread replies are NOT included
@@ -877,19 +907,30 @@ export class SlackAdapter {
     }
     await this.resolveUserNames(Array.from(ids));
 
-    return messages.map((msg) => ({
-      id: String(msg.ts ?? ''),
+    return messages.map((msg) => {
+      const id = String(msg.ts ?? '');
+      // The thread a message belongs to: the one its parent's ts names, as
+      // Slack reports it, or the message's own.
+      const reported = [msg.thread_ts, msg.root?.thread_ts, msg.root?.ts].find((ts) => typeof ts === 'string' && SLACK_TS.test(ts));
+      const count = msg.reply_count;
+      return {
+      id,
       authorId: msg.user,
+      ...(msg.bot_id ? { authorBotId: msg.bot_id } : {}),
       authorName: msg.user ? (this.userNameCache.get(msg.user) ?? msg.user) : (msg.username ?? 'bot'),
       content: formatSlackText(msg.text ?? '', this.userNameCache),
       threadTs: msg.thread_ts && msg.thread_ts !== msg.ts ? msg.thread_ts : undefined,
+      rootTs: reported ?? id,
+      // Missing means unknown, not none.
+      ...(typeof count === 'number' && Number.isSafeInteger(count) && count >= 0 ? { replyCount: count } : {}),
       timestamp: new Date(parseFloat(msg.ts ?? '0') * 1000),
       attachments: (msg.files ?? []).map((f) => ({
         name: f.name ?? 'attachment',
         mimeType: f.mimetype,
         url: f.url_private,
       })),
-    }));
+      };
+    });
   }
 
   // ── Users ──

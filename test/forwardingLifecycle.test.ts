@@ -17,7 +17,7 @@ function deferred<T>() {
 }
 
 const historyMessage: HistoryMessage = {
-  id: '100.0', authorId: 'U2', authorName: 'Ann', content: 'older context',
+  id: '100.0', authorId: 'U2', authorName: 'Ann', content: 'older context', rootTs: '100.0',
   timestamp: new Date(100000), attachments: [],
 };
 

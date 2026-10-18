@@ -6,12 +6,10 @@ import {READ_LIMITS} from './history-read.js';
 
 const readProperties = {
   maxScanned: {type: 'integer', ...READ_LIMITS.maxScanned, description: 'Candidate messages scanned per call, independently of returned matches'},
-  maxPages: {type: 'integer', ...READ_LIMITS.maxPages, description: 'History/replies API pages per call; one metadata request is additional'},
-  maxMs: {type: 'integer', ...READ_LIMITS.maxMs, description: 'Deadline in milliseconds for metadata and message requests'},
   maxBytes: {type: 'integer', ...READ_LIMITS.maxBytes, description: 'Maximum UTF-8 bytes of the complete result JSON'},
   oldest: {type: 'string', description: 'Exclusive lower Slack timestamp bound'},
   latest: {type: 'string', description: 'Exclusive upper Slack timestamp bound; defaults to the start of this read'},
-  cursor: {type: 'string', description: 'Opaque nextCursor; repeat the original channel, thread, time bounds and filters. Expires after 15 minutes or server restart/eviction.'},
+  cursor: {type: 'string', description: 'pagination.nextCursor from an earlier call, with the same channel, thread, time bounds and filters'},
 };
 
 export interface ToolDefinition {
@@ -143,7 +141,8 @@ export const toolDefinitions: ToolDefinition[] = [
       'messages only — replies inside threads are not returned (use fetch_thread for those), ' +
       'so an active thread can look quiet here. Use `oldest`/`latest` (message IDs / ts values) ' +
       'to bound the range. Substring and exact author-ID predicates are ANDed. Check pagination.scanComplete ' +
-      'and stopReason: zero bounded matches does not prove absence. Resume nextCursor for older messages.',
+      'and stopReason: zero bounded matches does not prove absence. To go on to older messages, call again with ' +
+      'the same arguments and cursor set to pagination.nextCursor.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -162,7 +161,8 @@ export const toolDefinitions: ToolDefinition[] = [
     name: 'fetch_thread',
     description:
       'Fetch a bounded part of one Slack thread, oldest-first (parent first on the initial unbounded-range call). ' +
-      'Use the parent ID. Check pagination.scanComplete and stopReason; resume nextCursor for newer replies.',
+      'Use the parent ID. Check pagination.scanComplete and stopReason. To go on to newer replies, call again with ' +
+      'the same arguments and cursor set to pagination.nextCursor.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,

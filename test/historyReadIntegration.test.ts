@@ -18,11 +18,11 @@ test('history and thread tools expose bounded schemas and structured channel/com
   assert.equal(history.inputSchema.properties.limit.type, 'integer');
   assert.equal(history.inputSchema.properties.maxScanned.maximum, 10000);
   assert.ok(history.inputSchema.properties.textContains);
+  assert.equal(history.inputSchema.properties.maxPages, undefined);
+  assert.equal(history.inputSchema.properties.maxMs, undefined);
   const out = await tool(h, 'fetch_history', {channelId: 'C1'});
   assert.notEqual(out.error, true);
-  assert.equal(out.value.channel.id, 'C1');
-  assert.equal(out.value.channel.writeAllowedByPolicy, true);
-  assert.equal(out.value.channel.slack.channelPostAllowedByMetadata, null);
+  assert.deepEqual(out.value.channel, {id: 'C1', writable: true});
   assert.equal(out.value.pagination.scanComplete, true);
   assert.equal(out.value.pagination.threadRepliesSearched, false);
   const thread = await tool(h, 'fetch_thread', {channelId: 'C1', threadTs: '1.0'});
@@ -33,13 +33,13 @@ test('history and thread tools expose bounded schemas and structured channel/com
 test('tool dispatcher refuses invalid limits/unknown filters and preserves existing list writable meaning', async t => {
   const h = harness({sendChannels: ['C9']}); t.after(() => h.close());
   await initialize(h, false);
-  for (const args of [{limit: -1}, {limit: '50'}, {maxPages: 51}, {regex: '.*'}]) {
+  for (const args of [{limit: -1}, {limit: '50'}, {maxScanned: 10001}, {regex: '.*'}]) {
     assert.equal((await tool(h, 'fetch_history', {channelId: 'C1', ...args})).error, true);
   }
   const listed = await tool(h, 'list_channels', {});
   assert.equal(listed.value[0].writable, false);
   const history = await tool(h, 'fetch_history', {channelId: 'C1'});
-  assert.equal(history.value.channel.writeAllowedByPolicy, false);
+  assert.equal(history.value.channel.writable, false);
   assert.equal(h.posts.length, 0);
 });
 
