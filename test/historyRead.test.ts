@@ -27,6 +27,16 @@ function fixture(rows: SlackHistoryMessage[] = [], pageSize = 2) {
 }
 const rows = Array.from({length: 8}, (_, i) => ({ts: `${i + 1}.0`, user: i % 2 ? 'U2' : 'U1', text: i === 0 || i === 6 ? 'TARGET' : 'noise'}));
 
+test('one returned match can scan a full candidate page without 200 one-message requests', async () => {
+  const many = Array.from({length: 200}, (_, i) => ({ts: `${i + 1}.0`, text: i === 0 ? 'target' : 'noise'}));
+  const h = fixture(many, 200);
+  const out = await h.reader.read('history', 'C1', {limit: 1, maxPages: 1, textContains: 'target'});
+  assert.deepEqual(out.messages.map(m => m.id), ['1.0']);
+  assert.equal(out.pagination.scanned, 200);
+  assert.equal(out.pagination.pages, 1);
+  assert.equal(out.pagination.scanComplete, true);
+});
+
 test('sparse matches traverse empty filtered pages; exact authors AND Unicode-lowercase substring', async () => {
   const h = fixture(rows);
   const out = await h.reader.read('history', 'C1', {textContains: 'target', authorIds: ['U1']});

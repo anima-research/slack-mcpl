@@ -154,7 +154,7 @@ export class BoundedHistoryReader {
         pages++;
         const page = await request(kind === 'history' ? 'conversations.history' : 'conversations.replies',
           {channel: channelId, ...(threadTs ? {ts: threadTs} : {}), ...position,
-            limit: Math.min(200, opts.maxScanned - scanned, opts.limit - messages.length), inclusive: false});
+            limit: Math.min(200, opts.maxScanned - scanned), inclusive: false});
         if (!Array.isArray(page.messages)) throw new Error('Slack returned invalid history messages');
         const rows = page.messages as SlackHistoryMessage[];
         let consumed: string | undefined;
