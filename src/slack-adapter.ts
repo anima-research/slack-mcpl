@@ -869,8 +869,8 @@ export class SlackAdapter {
     const target = await this.web.files.getUploadURLExternal({ filename: file.filename, length: file.data.byteLength });
     const url = target.upload_url;
     const fileId = target.file_id;
-    if (typeof url !== 'string' || !url || typeof fileId !== 'string' || !fileId) {
-      throw new Error("files.getUploadURLExternal: Slack's answer gave no upload URL or file ID, so nothing was uploaded");
+    if (typeof fileId !== 'string' || !fileId) {
+      throw new Error("files.getUploadURLExternal: Slack's answer gave no file ID, so nothing was uploaded");
     }
     // Slack gave the file its ID at the first step, so whatever fails from
     // here leaves that file for a rollback to delete. Only the last step's
@@ -879,6 +879,9 @@ export class SlackAdapter {
       if (err !== null && typeof err === 'object') filesLeft.set(err, { fileId, mayHaveShared });
       return err;
     };
+    if (typeof url !== 'string' || !url) {
+      throw left(new Error("files.getUploadURLExternal: Slack's answer gave no upload URL, so nothing was uploaded"), false);
+    }
     try {
       await this.postFileBytes(url, file.data);
     } catch (err) {

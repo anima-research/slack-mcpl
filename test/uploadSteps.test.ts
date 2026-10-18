@@ -4,6 +4,7 @@
  * the agent, which uploads a rollback deletes, and the message that shared the
  * file, which holds its comment.
  */
+import http from 'node:http';
 import test, { after, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { method } from '@animalabs/mcpl-core';
@@ -12,6 +13,7 @@ import {
   SLACK_CLIENT_OPTIONS,
   SlackAdapter,
   SlackWebClient,
+  UploadBytesFailed,
   fileLeftByUpload,
   withCallTime,
   type SlackSocketLike,
@@ -114,14 +116,19 @@ test("a failure of the first step uploads nothing, says so, and isn't kept for r
   }
 });
 
-test("a first answer with no upload URL or file ID uploads nothing", { timeout: 5000 }, async (t) => {
-  for (const body of [{ ok: true, file_id: 'F1' }, { ok: true, upload_url: `${api.url}file-upload` }]) {
+test("a first answer with no file ID uploads nothing, and one with no upload URL leaves its file for rollback", { timeout: 5000 }, async (t) => {
+  for (const [body, says, left] of [
+    [{ ok: true, upload_url: `${api.url}file-upload` }, 'no file ID', undefined],
+    [{ ok: true, file_id: 'F1' }, 'no upload URL', { fileId: 'F1', mayHaveShared: false }],
+    [{ ok: true, file_id: 'F1', upload_url: '' }, 'no upload URL', { fileId: 'F1', mayHaveShared: false }],
+  ] as const) {
     await steps(t, { first: { body } });
     const from = api.calls.length;
     const err = await adapter().uploadFile('C1', { filename: 'a.txt', data: Buffer.from('a') }).then(() => null, (e: unknown) => e);
     assert.equal(explainSlackError(err, { tool: 'upload_file', args: { channelId: 'C1' } }),
-      "files.getUploadURLExternal: Slack's answer gave no upload URL or file ID, so nothing was uploaded");
+      `files.getUploadURLExternal: Slack's answer gave ${says}, so nothing was uploaded`);
     assert.deepEqual(called(from), ['files.getUploadURLExternal']);
+    assert.deepEqual(fileLeftByUpload(err), left, JSON.stringify(body));
   }
 });
 
@@ -176,6 +183,23 @@ test("bytes the upload server doesn't take and answer within the client's timeou
       'slow to take this file within 10 seconds: a smaller file may go through, and whoever runs this host can look ' +
       'into the connection.');
   assert.equal(silent.requests(), 1);
+  assert.deepEqual(fileLeftByUpload(err), { fileId: 'F1', mayHaveShared: false });
+});
+
+test("an answer to the bytes whose body stalls times out, as the whole post is under the timeout", { timeout: 5000 }, async (t) => {
+  // Headers at once, then a body that never ends.
+  const stalled = http.createServer((req, res) => { req.resume(); res.writeHead(200); res.write('{'); });
+  await new Promise<void>((resolve) => stalled.listen(0, '127.0.0.1', () => resolve()));
+  t.after(() => { stalled.closeAllConnections(); stalled.close(); });
+  const { port } = stalled.address() as { port: number };
+  await steps(t, { url: `http://127.0.0.1:${port}/file-upload` });
+  // The post's own timeout, the client's 10 s, held to 50 ms here.
+  const real = AbortSignal.timeout.bind(AbortSignal);
+  t.mock.method(AbortSignal, 'timeout', () => real(50));
+  const from = api.calls.length;
+  const err = await adapter().uploadFile('C1', { filename: 'a.txt', data: Buffer.from('a') }).then(() => null, (e: unknown) => e);
+  assert.ok(err instanceof UploadBytesFailed && err.why === 'TimeoutError', String(err));
+  assert.deepEqual(called(from), ['files.getUploadURLExternal'], 'the last step was never sent');
   assert.deepEqual(fileLeftByUpload(err), { fileId: 'F1', mayHaveShared: false });
 });
 
