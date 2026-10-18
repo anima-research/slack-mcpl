@@ -1,5 +1,5 @@
 /**
- * What Slack's refusal means for the call that got it.
+ * What a failed Slack call means for the call that got it.
  *
  * @slack/web-api reports a refusal from Slack's Web API as "An API error
  * occurred: <code>", which names Slack's code and nothing more: not whether
@@ -9,13 +9,22 @@
  * given, and points to the tool that shows real values, or says that only
  * whoever runs this host, or the workspace's admins, can change the answer.
  *
- * Only Slack's refusals are read: the client's `slack_webapi_platform_error`,
- * whose `data` is Slack's answer, with the code in `data.error`. Each code
- * here is one Slack's reference documents for a method these tools call.
- * Other errors, and codes not listed, pass through unchanged.
+ * Three kinds of error are read, each by the client's own code: Slack's
+ * refusals (`slack_webapi_platform_error`, whose `data` is Slack's answer,
+ * with the code in `data.error`), a rate limit (`slack_webapi_rate_limited_error`,
+ * with Slack's Retry-After as `retryAfter`), and a failure in transit
+ * (`slack_webapi_request_error`, or `slack_webapi_http_error` with the HTTP
+ * status), which leaves a write's outcome unknown, unless the connection
+ * couldn't be made at all, which Node's code on the request error's
+ * `original` tells. Two more are this server's own: a request its call's
+ * deadline left no time to send (OutOfCallTime), and fetch_attachment's
+ * download running past its timeout. Each refusal code here is one Slack's
+ * reference documents for a method these tools call. Other errors, and codes
+ * not listed, pass through unchanged.
  */
 import { ErrorCode } from '@slack/web-api';
-import { reactionName } from './content.js';
+import { connectionNeverMade, reactionName } from './content.js';
+import { CALL_SECONDS, OutOfCallTime, SLACK_CLIENT_OPTIONS, failedRequest } from './slack-adapter.js';
 
 /** The call an error came from: a tool's name, or `channels/publish` for the
  *  host's publish, and the arguments it names Slack's objects by. */
@@ -36,13 +45,25 @@ const NOT_DONE: Record<string, string> = {
   add_reaction: 'No reaction was added',
   fetch_history: 'Nothing was read',
   fetch_thread: 'Nothing was read',
+  fetch_attachment: 'Nothing was fetched',
   list_channels: 'Nothing was listed',
   find_user: 'No users were listed',
   refresh_channels: 'Nothing was announced to the host',
 };
 
 const POSTS = new Set(['send_message', 'reply_message', 'channels/publish', 'send_dm', 'upload_file']);
+/** The requests a write tool makes before its write: the conversation check
+ *  under SLACK_DISABLE_DMS and send_dm's opening of the DM. A failure of one of
+ *  these wrote nothing. Any other request a write tool makes reads as its own
+ *  write, so a method missing here costs only a check before trying again,
+ *  where one missing from a list of writes would say nothing was written when
+ *  something may have been. */
+const BEFORE_WRITE = new Set(['conversations.info', 'conversations.open']);
 const WRITES = new Set([...POSTS, 'edit_message', 'delete_message', 'add_reaction']);
+/** Tools whose listing pages through Slack inside the call, from the first
+ *  page each time, so in a workspace too large to list within Slack's rate
+ *  limit, calling again stops near the same page. */
+const LISTINGS = new Set(['list_channels', 'find_user', 'refresh_channels']);
 
 const RECALLED = 'The id may be mistyped or remembered rather than copied';
 const MESSAGE_IDS =
@@ -63,10 +84,20 @@ export function explainSlackError(err: unknown, call: SlackCall): string {
   return why ? `${text}\n\n${why}` : text;
 }
 
+/** Slack's code, when Slack refused the call; undefined for any other error. */
+export function slackRefusal(err: unknown): string | undefined {
+  const e = err as { code?: unknown; data?: { error?: unknown } } | null;
+  return e?.code === ErrorCode.PlatformError && typeof e.data?.error === 'string' ? e.data.error : undefined;
+}
+
 function explanation(err: unknown, call: SlackCall): string | undefined {
-  const e = err as { code?: unknown; data?: { error?: unknown; needed?: unknown } } | null;
-  if (e?.code !== ErrorCode.PlatformError || typeof e.data?.error !== 'string') return undefined;
-  const code = e.data.error;
+  const e = err as {
+    code?: unknown;
+    retryAfter?: number;
+    statusCode?: unknown;
+    original?: { code?: unknown };
+    data?: { needed?: unknown };
+  } | null;
   // A value is named exactly as the call was given it, untrimmed. A blank one
   // counts as none given: the text falls back to general wording, and a blank
   // message or thread id passes through as one from a call that named none.
@@ -87,9 +118,101 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
   const userId = given('userId');
   const theUser = userId ? `user ${userId}` : 'the user given';
   const isWrite = WRITES.has(call.tool);
+  // A write's outcome is unknown unless the request that failed is one known
+  // to come before the write. An error no request of the client's threw keeps
+  // the tool's reading, since then which request failed can't be told.
+  const failed = failedRequest(err);
+  const mayHaveWritten = isWrite && (failed === undefined || !BEFORE_WRITE.has(failed));
+  /** For a listing tool: a new call starts over, so a listing too large for
+   *  `limit` stops near the same place each time. */
+  const startsOver = (limit: string) => LISTINGS.has(call.tool)
+    ? ` A new call starts the listing over from the first page, so if the workspace is too large to list within ${limit}, ` +
+      'calling again stops near the same place.'
+    : '';
   const invite =
     "Someone in that conversation has to invite the bot (in Slack, /invite and the bot's name); until then, " +
     "calling again gets the same answer. list_channels shows the conversations it's in.";
+  /** A write whose outcome is unknown, and how to check it before trying again. */
+  const unknown = (cause: string, note = ''): string => {
+    if (POSTS.has(call.tool)) {
+      // fetch_history leaves out a reply that wasn't also sent to the
+      // channel, so a reply is looked for in its thread.
+      const where = !channel
+        ? "the DM's history (list_channels shows its id, and fetch_history its messages)"
+        : thread
+          ? `fetch_thread for the thread under message ${thread} in ${conversation}`
+          : `fetch_history for ${conversation}`;
+      if (call.tool === 'upload_file') {
+        return (
+          `${cause}, so whether the file was uploaded is unknown${note}. Check ${where} before uploading again, so ` +
+          "it isn't uploaded twice."
+        );
+      }
+      return (
+        `${cause}, so whether the message was posted is unknown${note}. Check ${where} before posting again, so ` +
+        "it isn't posted twice."
+      );
+    }
+    // fetch_history leaves out a reply that wasn't also sent to the channel,
+    // and only the agent knows whether the message it names is a thread reply.
+    const where = "if it's in the channel itself, and fetch_thread does, with its thread's id, if it's a thread reply";
+    if (call.tool === 'edit_message') {
+      return `${cause}, so whether the edit took is unknown${note}. fetch_history shows ${theMessage} as it is now ${where}.`;
+    }
+    if (call.tool === 'delete_message') {
+      return (
+        `${cause}, so whether ${theMessage} was deleted is unknown${note}. fetch_history shows whether it's still ` +
+        `there ${where}. Deleting it again is safe: once it's gone, Slack answers message_not_found.`
+      );
+    }
+    return (
+      `${cause}, so whether the reaction was added is unknown${note}. Adding it again is safe: if it's there, ` +
+      'add_reaction says so and changes nothing.'
+    );
+  };
+
+  if (err instanceof OutOfCallTime) {
+    // Not sent: a call's request goes out only if its timeout fits
+    // (assertRequestFits).
+    return (
+      `${lead}: this server gives each call ${CALL_SECONDS} seconds from when it reaches this server, and this one ` +
+      `had used ${err.usedSeconds} of them, waiting behind earlier calls or on its own earlier requests, so too ` +
+      `few were left to send this request to Slack. It wasn't sent, so calling again is safe.` +
+      startsOver(`a call's ${CALL_SECONDS} seconds`)
+    );
+  }
+  if (call.tool === 'fetch_attachment' && (err as { name?: unknown } | null)?.name === 'TimeoutError') {
+    // The download's own timeout, the client's, set where fetch_attachment
+    // starts it: AbortSignal.timeout rejects with a TimeoutError.
+    const seconds = SLACK_CLIENT_OPTIONS.timeout / 1000;
+    return (
+      `${lead}: Slack's file host didn't finish sending the file within ${seconds} seconds. Fetching changes ` +
+      `nothing, so calling again is safe. If it keeps timing out, Slack's file host or this server's ` +
+      `connection to it is too slow to send this file within ${seconds} seconds.`
+    );
+  }
+  if (e?.code === ErrorCode.RateLimitedError) {
+    // The client throws this only with Slack's Retry-After, in seconds.
+    const seconds = e.retryAfter;
+    return (
+      `${lead}: Slack is rate-limiting this kind of call for the workspace, and asks to wait ${seconds} ` +
+      `second${seconds === 1 ? '' : 's'} before trying again.${startsOver("Slack's limit")}`
+    );
+  }
+  if (e?.code === ErrorCode.RequestError && connectionNeverMade(e.original?.code)) {
+    return (
+      `${lead}: Slack couldn't be reached. Try again shortly. If it keeps failing, whoever runs this host has ` +
+      'to check its connection to Slack.'
+    );
+  }
+  if (e?.code === ErrorCode.RequestError || e?.code === ErrorCode.HTTPError) {
+    const cause = e.code === ErrorCode.HTTPError
+      ? `Slack answered with HTTP ${e.statusCode}`
+      : `Slack went ${SLACK_CLIENT_OPTIONS.timeout / 1000} seconds without answering, or the connection to it failed`;
+    return mayHaveWritten ? unknown(cause) : `${lead}: ${cause}. Try again shortly.`;
+  }
+  const code = slackRefusal(err);
+  if (code === undefined) return undefined;
   const messageIds = call.tool === 'reply_message' || call.tool === 'fetch_thread' ? PARENT_IDS : MESSAGE_IDS;
 
   // channels/publish names no message or thread itself: this server replies in
@@ -225,7 +348,7 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
       );
     }
     case 'missing_scope': {
-      const needed = typeof e.data.needed === 'string' && e.data.needed ? e.data.needed : undefined;
+      const needed = typeof e?.data?.needed === 'string' && e.data.needed ? e.data.needed : undefined;
       return (
         `${lead}: this bot's Slack app hasn't been granted the scope this call needs` +
         `${needed ? ` (Slack names ${needed})` : ''}, so Slack refused it. Calling again won't change that: ` +
@@ -243,50 +366,20 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
         "fails the same way until whoever runs this host fixes the token or the app's installation; calling " +
         "again won't help."
       );
+    case 'request_timeout':
+      // Slack: the POST data was either missing or truncated.
+      return `${lead}: Slack didn't receive the whole request, so it didn't act on it. Try again shortly.`;
+    case 'ratelimited':
+      // A rate limit in the body of a 200, without Retry-After.
+      return `${lead}: Slack is rate-limiting this kind of call for the workspace. Try again shortly.${startsOver("Slack's limit")}`;
     case 'internal_error':
     case 'fatal_error':
-    case 'service_unavailable': {
-      if (!isWrite) return `${lead}: Slack failed while handling the call. Try again shortly.`;
-      const partly = code === 'service_unavailable'
-        ? ''
-        : ' (Slack says part of a call can take effect before this error)';
-      const failed = 'Slack failed while handling the call, so whether';
-      if (POSTS.has(call.tool)) {
-        // fetch_history leaves out a reply that wasn't also sent to the
-        // channel, so a reply is looked for in its thread.
-        const where = !channel
-          ? "the DM's history (list_channels shows its id, and fetch_history its messages)"
-          : thread
-            ? `fetch_thread for the thread under message ${thread} in ${conversation}`
-            : `fetch_history for ${conversation}`;
-        if (call.tool === 'upload_file') {
-          return (
-            `${failed} the file was uploaded is unknown${partly}. Check ${where} before uploading again, so it ` +
-            "isn't uploaded twice."
-          );
-        }
-        return (
-          `${failed} the message was posted is unknown${partly}. Check ${where} before posting again, so it ` +
-          "isn't posted twice."
-        );
-      }
-      // fetch_history leaves out a reply that wasn't also sent to the channel,
-      // and only the agent knows whether the message it names is a thread reply.
-      const where = "if it's in the channel itself, and fetch_thread does, with its thread's id, if it's a thread reply";
-      if (call.tool === 'edit_message') {
-        return `${failed} the edit took is unknown${partly}. fetch_history shows ${theMessage} as it is now ${where}.`;
-      }
-      if (call.tool === 'delete_message') {
-        return (
-          `${failed} ${theMessage} was deleted is unknown${partly}. fetch_history shows whether it's still there ` +
-          `${where}. Deleting it again is safe: once it's gone, Slack answers message_not_found.`
-        );
-      }
-      return (
-        `${failed} the reaction was added is unknown${partly}. Adding it again is safe: if it's there, Slack ` +
-        'answers already_reacted.'
+    case 'service_unavailable':
+      if (!mayHaveWritten) return `${lead}: Slack failed while handling the call. Try again shortly.`;
+      return unknown(
+        'Slack failed while handling the call',
+        code === 'service_unavailable' ? '' : ' (Slack says part of a call can take effect before this error)',
       );
-    }
     case 'user_not_found':
       return (
         `${lead}: Slack has no user ${userId ?? 'by the id given'}. ${RECALLED}. find_user returns each ` +

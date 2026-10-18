@@ -10,7 +10,7 @@ const call = (host: ReturnType<typeof connectHost>['host'], name: string, args: 
   host.sendRequest('tools/call', { name, arguments: args }) as Promise<ToolResult>;
 const uploadArgs = { channelId: 'C1', filename: 'hello.txt', content: 'hello' };
 
-async function ready(h: ReturnType<typeof connectHost>) {
+async function ready(h: Pick<ReturnType<typeof connectHost>, 'host' | 'hostSaw'>) {
   await initialize(h, true);
   await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
   await until(() => h.hostSaw.some((r) => r.method === method.CHANNELS_REGISTER), 'registration');

@@ -39,7 +39,16 @@ import type {
   ContentBlock,
 } from '@animalabs/mcpl-core';
 
-import type { SlackAdapter, SlackMessageData } from './slack-adapter.js';
+import {
+  GaveUp,
+  SLACK_CLIENT_OPTIONS,
+  assertRequestFits,
+  outsideCallTime,
+  withCallTime,
+  type SlackAdapter,
+  type SlackMessageData,
+  type SlackWait,
+} from './slack-adapter.js';
 import { toolDefinitions } from './tools.js';
 import { withToolClasses } from './tool-classes.js';
 import { buildFeatureSets, buildServerCapabilities, featureSetForTool, MESSAGING_FEATURE_SET } from './feature-sets.js';
@@ -47,7 +56,7 @@ import { ChannelManager, mcplChannelId, parseMcplChannelId, toDescriptor } from 
 import { StateTracker } from './state.js';
 import { CapabilityGrant } from './grant.js';
 import { McplRpcError, capabilityDenied } from './errors.js';
-import { explainSlackError } from './slack-errors.js';
+import { explainSlackError, slackRefusal } from './slack-errors.js';
 import {
   fetchAttachmentBytes,
   MAX_ATTACHMENT_BYTES,
@@ -65,6 +74,14 @@ const require = createRequire(import.meta.url);
 const { version: serverVersion } = require(
   existsSync(new URL('../package.json', import.meta.url)) ? '../package.json' : '../../package.json',
 ) as { version: string };
+
+/** Registration gives up on a request to Slack, a page of the conversation
+ *  list or the name of a DM's user, once this many tries of it in a row have
+ *  been rate-limited or failed, with a wait before each try after the first,
+ *  so a limit something else keeps using, or a failure that doesn't pass,
+ *  holds each request for nine waits at most: each as long as Slack asks
+ *  after a rate limit, or 30 s after a failure. */
+const REGISTRATION_TRIES = 10;
 
 // Diagnostic file logger — bypasses the host's stderr capture. Set
 // SLACK_MCPL_DEBUG_LOG in the spawn env to a writable absolute path to
@@ -132,8 +149,9 @@ export class SlackMcplServer {
   private channelManager = new ChannelManager();
   /** A new registration supersedes work started under an earlier grant. */
   private registrationGeneration = 0;
-  /** The latest registration, which refresh_channels waits for. */
-  private registration: Promise<void> = Promise.resolve();
+  /** The latest registration while it runs, and whether it is still the
+   *  current one. A refresh_channels then answers at once. */
+  private registering: { isCurrent: () => boolean } | undefined;
   private stateTracker = new StateTracker();
   /** Serial delivery within a conversation; different conversations stay independent. */
   private forwarding = new Map<string, Promise<void>>();
@@ -234,12 +252,19 @@ export class SlackMcplServer {
     // still ends the process: mcpl-core-ts#11 is that fix.)
     conn.on('error', (err: unknown) => console.error('[slack-mcpl] Connection error:', err));
 
+    // A call's time counts from when it reaches this server, not from when
+    // this loop takes it up, so a call queued behind others answers in time
+    // too. The connection emits each request as it parses it, before
+    // queueing it for nextMessage() (mcpl-core's routeIncoming).
+    const arrivals = new WeakMap<JsonRpcRequest, number>();
+    conn.on('request', (req: JsonRpcRequest) => arrivals.set(req, Date.now()));
+
     try {
       await this.handleInitialize();
       while (!conn.isClosed) {
         const msg = await conn.nextMessage();
         if (msg.type === 'request') {
-          await this.handleRequest(msg.request);
+          await withCallTime(arrivals.get(msg.request) ?? Date.now(), () => this.handleRequest(msg.request));
         } else {
           this.handleNotification(msg.notification);
         }
@@ -363,10 +388,9 @@ export class SlackMcplServer {
           // when the grant first allows it, and again if a later policy turns
           // it from denied to granted. The receipt above is sent first.
           if (!couldRegister && this.grant.has('channels.register')) {
-            // Kept for refresh_channels to wait on. A registration that throws
-            // past its own catches is logged here, so it neither ends the
-            // process nor fails every later refresh with its old error.
-            this.registration = this.registerSlackChannels()
+            // A registration that throws past its own catches is logged here,
+            // so it doesn't end the process.
+            void outsideCallTime(() => this.registerSlackChannels())
               .catch((err) => console.error('[slack-mcpl] Channel registration failed:', err));
           }
           break;
@@ -633,13 +657,21 @@ export class SlackMcplServer {
         return { messageId: result.messageId, channelId: result.channelId };
       }
 
-      case 'add_reaction':
-        await this.slack.addReaction(
-          this.requireString(args, 'channelId'),
-          this.requireString(args, 'messageId'),
-          this.requireString(args, 'emoji'),
-        );
+      case 'add_reaction': {
+        const channelId = this.requireString(args, 'channelId');
+        const messageId = this.requireString(args, 'messageId');
+        const emoji = this.requireString(args, 'emoji');
+        try {
+          await this.slack.addReaction(channelId, messageId, emoji);
+        } catch (err) {
+          // The reaction the call asks for is there, which is its intent.
+          if (slackRefusal(err) === 'already_reacted') {
+            return `Nothing changed: message ${messageId} already has this bot's ${emoji} reaction.`;
+          }
+          throw err;
+        }
         return 'Reaction added';
+      }
 
       case 'edit_message':
         await this.slack.editMessage(
@@ -722,7 +754,15 @@ export class SlackMcplServer {
           ? { Authorization: `Bearer ${botToken}` }
           : {};
         const fileName = decodeURIComponent(url.pathname.split('/').pop() || 'attachment');
-        return toFetchResult(await fetchAttachmentBytes(url.toString(), fileName, { headers }));
+        // The download is a request this call makes, so it keeps the start rule
+        // the client's requests keep, with the client's timeout as its whole
+        // time: a stalled file host costs that timeout, not what's left of the
+        // call.
+        assertRequestFits('The download from files.slack.com', SLACK_CLIENT_OPTIONS.timeout);
+        return toFetchResult(await fetchAttachmentBytes(url.toString(), fileName, {
+          headers,
+          signal: AbortSignal.timeout(SLACK_CLIENT_OPTIONS.timeout),
+        }));
       }
 
       case 'subscribe_channel': {
@@ -891,13 +931,35 @@ export class SlackMcplServer {
     const generation = ++this.registrationGeneration;
     const isCurrent = () => this.conn === conn && !conn.isClosed &&
       this.registrationGeneration === generation && this.grant.has('channels.register');
+    // Until it ends, however it ends, a refresh_channels answers at once
+    // while this registration is current.
+    const running = { isCurrent };
+    this.registering = running;
+    try {
+      await this.listAndRegister(conn, isCurrent);
+    } finally {
+      if (this.registering === running) this.registering = undefined;
+    }
+  }
 
+  private async listAndRegister(conn: McplConnection, isCurrent: () => boolean): Promise<void> {
     let descriptors: ChannelDescriptor[] = [];
     try {
-      const convs = await this.slack.listConversations();
+      // This listing runs in the background (a refresh_channels meanwhile
+      // answers at once), so a request Slack rate-limits is waited out, as
+      // Slack asks, and one that fails in a way that can pass is asked again
+      // after a wait, and the listing goes on from there.
+      const convs = await this.slack.listConversations(false, (wait, inARow) =>
+        this.waitToAskAgain(wait, inARow, isCurrent));
       descriptors = convs.map((c) => toDescriptor(c, this.slack.teamName, this.slack.canWrite(c.id)));
     } catch (err) {
-      console.error('[slack-mcpl] Failed to enumerate conversations:', (err as Error).message);
+      // One superseded meanwhile stops without a word; the newer one reports.
+      if (isCurrent()) {
+        const why = err instanceof GaveUp
+          ? `${err.message}, so registration stopped; refresh_channels can announce the conversations later`
+          : (err as Error).message;
+        console.error('[slack-mcpl] Failed to enumerate conversations:', why);
+      }
       return;
     }
     dbg('registerSlackChannels', { count: descriptors.length });
@@ -915,6 +977,27 @@ export class SlackMcplServer {
     }
     if (!isCurrent()) return;
     this.applyRegistrationAnswer(descriptors, answer);
+  }
+
+  /** Registration's wait before asking Slack again for a request it was
+   *  rate-limited on, or that failed in a way that can pass, after which the
+   *  listing asks again. Each wait is logged. It gives up instead once the
+   *  request has been tried REGISTRATION_TRIES times in a row. A registration
+   *  that is no longer current stops listing, rather than wait or give up, or
+   *  once its wait ends. */
+  private async waitToAskAgain(wait: SlackWait, inARow: number, isCurrent: () => boolean): Promise<void> {
+    const superseded = () => new Error('A newer registration superseded this one');
+    // One superseded during its listing would otherwise wait for nothing.
+    // Checked before the give-up, which a DM's name survives: a superseded
+    // listing that gave up on a name would go on listing.
+    if (!isCurrent()) throw superseded();
+    if (inARow >= REGISTRATION_TRIES) {
+      throw new GaveUp(`Slack rate-limited or failed the same request ${inARow} times in a row`);
+    }
+    const what = wait.why === 'limited' ? `Slack rate-limited ${wait.method}` : `${wait.method} failed`;
+    console.error(`[slack-mcpl] ${what} (try ${inARow} of ${REGISTRATION_TRIES}); registration asks again in ${wait.seconds} s`);
+    await new Promise<void>((resolve) => { setTimeout(resolve, wait.seconds * 1000).unref(); });
+    if (!isCurrent()) throw superseded();
   }
 
   /**
@@ -990,44 +1073,66 @@ export class SlackMcplServer {
     note: string;
   }> {
     const conn = this.conn;
-    // The latest registration finishes first, so its host answer, if it still
-    // applies, lands before this listing instead of racing it. A channel that
-    // answer refuses is unknown again, so this refresh announces it, as any
-    // refresh after a refusal does. Requests are handled one at a time, so no
-    // newer registration starts during the wait.
-    await this.registration;
-    const gone = () => this.conn !== conn || !!conn?.isClosed;
-    // A host that left during the wait gets nothing, so nothing is listed for it.
-    if (gone()) {
-      return {
-        visible: 0,
-        added: [],
-        note: "The host's connection closed before the refresh could list conversations; nothing was announced.",
-      };
+    // A refresh doesn't list while the latest registration is running and can
+    // still register, so that registration's host answer, if it still applies,
+    // is applied before this listing instead of racing it; a channel that
+    // answer refuses is unknown again, so a refresh after it announces it.
+    // Waiting for registration can take longer than the host waits for this
+    // call, so a refresh meanwhile answers at once. A registration that is no
+    // longer current, after a revoke or a re-grant, on an earlier connection,
+    // or on a connection the host hasn't granted channels.register, plain MCP
+    // ones included, applies no answer from the host, so it holds no refresh
+    // back.
+    if (this.registering?.isCurrent()) {
+      throw new Error(
+        "Nothing was announced to the host: this server is still registering the workspace's conversations. " +
+          'Registration announces what it finds, unless it stops early. Once it has ended, refresh_channels lists ' +
+          "again and announces anything registration didn't, such as a conversation created since it began; until " +
+          'then it answers like this.',
+      );
     }
+    const gone = () => this.conn !== conn || !!conn?.isClosed;
     const convs = await this.slack.listConversations();
-    const descriptors = convs.map((c) => toDescriptor(c, this.slack.teamName, this.slack.canWrite(c.id)));
+    // The host keeps the label a conversation is first announced with, and a
+    // refresh never announces a known one again, so a new DM whose user's name
+    // this server couldn't get from Slack just now waits for a later refresh
+    // rather than go out labelled with the user's id. One the host already
+    // knows stays as it is.
+    const unnamed = convs.filter((c) => c.nameWait && !this.channelManager.get(mcplChannelId(c.id)));
+    const descriptors = convs
+      .filter((c) => !c.nameWait)
+      .map((c) => toDescriptor(c, this.slack.teamName, this.slack.canWrite(c.id)));
     // As registration does after its listing: a listing begun for a peer that
     // has since gone neither writes the registry nor announces. The grant is
     // checked next, in registerAndNotifyNew (serve() handles one request at a
     // time, so no featureSets/update lands during the listing).
     if (gone()) {
       return {
-        visible: descriptors.length,
+        visible: convs.length,
         added: [],
         note: "The host's connection closed while Slack was listing conversations; nothing was announced.",
       };
     }
     const added = this.registerAndNotifyNew(descriptors);
+    const notGranted = this.mcplEnabled && !this.grant.has('channels.register');
+    const wait = Math.max(1, ...unnamed.map((c) => c.nameWait?.seconds ?? 0));
+    const unnamedIds = unnamed.map((c) => `${mcplChannelId(c.id)} (user ${c.userId})`).join(', ');
+    const leftOut = notGranted || unnamed.length === 0 ? '' :
+      ` Left out ${unnamed.length} DM(s) whose user's name this server couldn't get from Slack just now, since ` +
+        `the host keeps the label a conversation is first announced with: ${unnamedIds}. Call refresh_channels ` +
+        `again in about ${wait} second${wait === 1 ? '' : 's'} to announce them by name. This server still sends ` +
+        'their messages to the host meanwhile.';
     return {
-      visible: descriptors.length,
+      visible: convs.length,
       added: added.map((d) => ({ id: d.id, label: d.label })),
       note:
-        added.length > 0
+        (added.length > 0
           ? `Registered ${added.length} newly-visible conversation(s).`
-          : this.mcplEnabled && !this.grant.has('channels.register')
+          : notGranted
             ? 'The host has not granted channels.register; nothing was announced.'
-            : 'No new conversations — the host already knows about every visible one.',
+            : unnamed.length > 0
+              ? 'No conversation was registered.'
+              : 'No new conversations — the host already knows about every visible one.') + leftOut,
     };
   }
 
@@ -1136,8 +1241,15 @@ export class SlackMcplServer {
         if (msg.kind === 'file') await this.slack.deleteUploadedFile(msg.channelId, msg.fileId);
         else await this.slack.deleteMessage(msg.channelId, msg.messageId);
         deleted++;
-      } catch {
-        // Best-effort — an item may have been deleted by someone else
+      } catch (err) {
+        // Best-effort: someone else may have deleted the item already, or the
+        // delete was rate-limited, out of this call's time, or failed on the
+        // way. The tracker has dropped it with the branch, so no later
+        // rollback tries it again, and an operator finds it here.
+        const item = msg.kind === 'file' ? `file ${msg.fileId}` : `message ${msg.messageId}`;
+        console.error(
+          `[slack-mcpl] Rollback couldn't delete ${item} in ${msg.channelId}: ${(err as Error)?.message ?? String(err)}`,
+        );
       }
     }
 
@@ -1186,14 +1298,20 @@ export class SlackMcplServer {
 
   /** Optional delivery context must not hold a conversation behind a stalled
    *  Slack call. A late result is ignored; the client may still finish its call.
-   *  A give-up is logged, since the message goes without what it looked up. */
+   *  A give-up or a failure is logged, since the message goes without what it
+   *  looked up. */
   private async deliveryLookup<T>(lookup: Promise<T>, what: string): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let gaveUp = false;
     try {
       return await Promise.race([
-        lookup,
+        lookup.catch((err: unknown) => {
+          if (!gaveUp) console.error(`[slack-mcpl] Couldn't get ${what} (${(err as Error).message}); delivering without it`);
+          throw err;
+        }),
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => {
+            gaveUp = true;
             console.error(`[slack-mcpl] Gave up on ${what} after 5 s; delivering without it`);
             reject(new Error(`Gave up on ${what} after 5 s`));
           }, 5000);

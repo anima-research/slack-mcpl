@@ -6,7 +6,8 @@ import {
   type ChannelsRegisterParams, type ChannelsListResult,
 } from '@animalabs/mcpl-core';
 import { SlackMcplServer } from '../src/server.js';
-import type { SlackAdapter, SlackConversationInfo } from '../src/slack-adapter.js';
+import { GaveUp } from '../src/slack-adapter.js';
+import type { SlackAdapter, SlackConversationInfo, SlackWait, SlackWaitOut } from '../src/slack-adapter.js';
 import { FULL_GRANT, until } from './harness.js';
 
 function deferred<T>() {
@@ -74,6 +75,10 @@ function connect(
     async refresh() {
       return host.sendRequest('tools/call', { name: 'refresh_channels', arguments: {} });
     },
+    /** Until the server's latest registration has ended, however it ended. */
+    async ended() {
+      await until(() => (server as unknown as { registering?: unknown }).registering === undefined, 'registration to end');
+    },
     async close() {
       toServer.end();
       await served;
@@ -83,6 +88,24 @@ function connect(
 }
 
 const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+// Registration's wait doesn't hold the event loop open, so a test that waits
+// for one to end polls with until(), whose timer does. Node 22.12.0's test
+// runner cancels a test whose event loop empties while it waits, and every
+// test after it in the file. A test that checks a wait's length, or needs a
+// registration to still be waiting when a refresh lands, holds time with mock
+// timers instead, so the wait lasts until the test moves time past it,
+// however slowly the machine runs; it polls with settled(), since until()'s
+// timer is held too.
+
+/** Polls with setImmediate until `predicate` holds, for a test whose timers are mocked. */
+async function settled(predicate: () => boolean, what: string): Promise<void> {
+  for (let i = 0; i < 100; i++) {
+    if (predicate()) return;
+    await settle();
+  }
+  throw new Error(`never saw ${what}`);
+}
 
 /** The server's log lines (console.error) while the test runs. */
 function serverLog(t: { after(fn: () => void): void }): string[] {
@@ -115,6 +138,13 @@ function registrationTimeouts(conn: McplConnection): (line: string) => boolean {
 }
 
 const ids = (listed: ChannelsListResult) => listed.channels.map((d) => d.id);
+
+/** refresh_channels' answer while registration runs. */
+const stillRegistering = () =>
+  "Nothing was announced to the host: this server is still registering the workspace's conversations. " +
+  'Registration announces what it finds, unless it stops early. Once it has ended, refresh_channels lists again and ' +
+  "announces anything registration didn't, such as a conversation created since it began; until then it answers " +
+  'like this.';
 
 test('a rejected registration is recoverable by refresh under the same grant', async (t) => {
   const log = serverLog(t);
@@ -158,7 +188,9 @@ test('only individually accepted descriptors become known after a pending batch'
 });
 
 for (const accepted of [false, true]) {
-  test(`refresh_channels waits for a pending registration's ${accepted ? 'acceptance' : 'refusal'}, which applies first`, async (t) => {
+  // A refresh held back by the pending answer would wait for nothing here,
+  // so a timeout fails the test instead of hanging the run.
+  test(`a pending registration's ${accepted ? 'acceptance' : 'refusal'} applies before a refresh lists, and a refresh meanwhile answers at once`, { timeout: 5000 }, async (t) => {
     let calls = 0;
     const { slack } = fakeSlack(async () => [conversation('C1', ++calls === 1 ? 'stale' : 'fresh')]);
     const h = connect(new SlackMcplServer(slack), () => {});
@@ -167,12 +199,13 @@ for (const accepted of [false, true]) {
     await h.grant();
     await until(() => h.requests.length === 1, 'pending registration');
 
-    const refreshed = h.refresh();
-    await settle();
-    await settle();
-    assert.equal(calls, 1, 'refresh lists only once the pending answer is in');
+    const meanwhile = (await h.refresh()) as ToolResult;
+    assert.equal(meanwhile.isError, true);
+    assert.equal(meanwhile.content[0].text, stillRegistering());
+    assert.equal(calls, 1, 'a refresh lists nothing while the answer is pending');
     h.host.sendResponse(h.requests[0].id, { results: [{ id: 'slack:C1', accepted }] });
-    await refreshed;
+    await h.ended();
+    await h.refresh();
     assert.equal(calls, 2);
     const announced = h.notifications.filter((n) => n.method === method.CHANNELS_CHANGED)
       .flatMap((n) => (n.params as { added: { id: string }[] }).added.map((d) => d.id));
@@ -185,7 +218,7 @@ for (const accepted of [false, true]) {
   });
 }
 
-test("a pending refusal of a known, open channel applies before the refresh waiting on it, which announces the channel again", async (t) => {
+test("a pending refusal of a known, open channel applies before a refresh lists, which announces the channel again", { timeout: 5000 }, async (t) => {
   let answer: (sent: string[]) => unknown = (sent) => ({ results: sent.map((id) => ({ id, accepted: true })) });
   const h = connect(new SlackMcplServer(fakeSlack().slack), (req, host) => {
     const result = answer((req.params as ChannelsRegisterParams).channels.map((c) => c.id));
@@ -202,11 +235,10 @@ test("a pending refusal of a known, open channel applies before the refresh wait
   await h.grant(['tools']);
   await h.grant();
   await until(() => h.requests.length === 2, "the re-grant's registration");
-  const refreshed = h.refresh();
-  await settle();
-  await settle();
+  assert.equal(((await h.refresh()) as ToolResult).isError, true, 'a refresh meanwhile answers at once');
   h.host.sendResponse(h.requests[1].id, { results: [{ id: 'slack:C1', accepted: false }] });
-  await refreshed;
+  await h.ended();
+  await h.refresh();
   const announced = h.notifications.filter((n) => n.method === method.CHANNELS_CHANGED)
     .flatMap((n) => (n.params as { added: { id: string }[] }).added.map((d) => d.id));
   assert.deepEqual(announced, ['slack:C1'], 'the refusal forgot C1 before the refresh listed it');
@@ -214,39 +246,40 @@ test("a pending refusal of a known, open channel applies before the refresh wait
   assert.equal(closing.closed, false, 'the refusal closed C1');
 });
 
-test("a refresh waiting on an unanswered registration lists once that request times out", async (t) => {
+test('a refresh during an unanswered registration answers at once, and lists once that request times out', async (t) => {
   const log = serverLog(t);
   const { slack } = fakeSlack();
   const h = connect(new SlackMcplServer(slack), () => {});
   const registrationTimedOut = registrationTimeouts(h.serverConn);
-  h.serverConn.requestTimeout = 200;
+  h.serverConn.requestTimeout = 1000;
   t.after(() => h.close());
   await h.initialize();
+  // The request's timer is held, so the registration still waits for its
+  // answer when the refresh lands, however slowly the machine runs.
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   await h.grant();
-  await until(() => h.requests.length === 1, 'registration');
+  await settled(() => h.requests.length === 1, 'registration');
+  assert.equal(((await h.refresh()) as ToolResult).isError, true, 'answered at once, while registration waits for its answer');
+  t.mock.timers.tick(1000);
+  await settled(() => log.some(registrationTimedOut), 'the timeout');
   await h.refresh();
-  assert.ok(log.some(registrationTimedOut), 'the refresh waited for the timeout');
-  assert.equal(h.notifications.filter((n) => n.method === method.CHANNELS_CHANGED).length, 1, 'then it listed and announced');
+  assert.equal(h.notifications.filter((n) => n.method === method.CHANNELS_CHANGED).length, 1, 'then a refresh lists and announces');
 });
 
-test("a refresh whose listing fails leaves a pending registration's accepted channels known", async (t) => {
+test("a refresh whose listing fails leaves registration's accepted channels known", async (t) => {
   let calls = 0;
   const { slack } = fakeSlack(async () => {
     if (++calls === 2) throw new Error('the Slack listing failed');
     return [conversation('C1')];
   });
-  const h = connect(new SlackMcplServer(slack), () => {});
+  const h = connect(new SlackMcplServer(slack));
   t.after(() => h.close());
   serverLog(t);
   await h.initialize();
   await h.grant();
-  await until(() => h.requests.length === 1, 'pending registration');
-
-  const refreshed = h.refresh() as Promise<{ isError?: boolean; content: { text: string }[] }>;
-  await settle();
-  await settle();
-  h.host.sendResponse(h.requests[0].id, { results: [{ id: 'slack:C1', accepted: true }] });
-  const result = await refreshed;
+  await until(() => h.requests.length === 1, 'registration');
+  await h.ended();
+  const result = (await h.refresh()) as ToolResult;
   assert.equal(result.isError, true);
   assert.match(result.content[0].text, /the Slack listing failed/);
   assert.deepEqual(ids(await h.listed()), ['slack:C1'], 'the accepted answer stands');
@@ -269,26 +302,7 @@ test('a registration that throws is logged, and refresh_channels still works', a
   assert.deepEqual(changed.added.map((d) => d.id), ['slack:C1']);
 });
 
-test('a refresh whose host leaves while it waits for a registration lists nothing more', async () => {
-  const listing = deferred<SlackConversationInfo[]>();
-  let calls = 0;
-  const { slack } = fakeSlack(() => { calls++; return listing.promise; });
-  const h = connect(new SlackMcplServer(slack));
-  await h.initialize();
-  await h.grant();
-  await until(() => calls === 1, "the registration's listing");
-  const refreshed = h.refresh().catch(() => undefined); // its answer can't arrive: the host leaves
-  await settle();
-  const leaving = h.close();
-  await until(() => h.serverConn.isClosed, 'the host leaving');
-  listing.resolve([conversation('C1')]);
-  await leaving;
-  await refreshed;
-  assert.equal(calls, 1, 'nothing is listed for a host that has gone');
-  assert.equal(h.requests.length, 0, 'nor registered');
-});
-
-test('a registration still listing when refresh starts sends its whole batch first', async (t) => {
+test('a registration still listing when refresh starts sends its whole batch first', { timeout: 5000 }, async (t) => {
   const listing = deferred<SlackConversationInfo[]>();
   let calls = 0;
   const { slack } = fakeSlack(() => ++calls === 2 ? listing.promise : Promise.resolve([conversation('C1')]));
@@ -303,13 +317,13 @@ test('a registration still listing when refresh starts sends its whole batch fir
   await h.grant();
   await until(() => calls === 2, "the re-grant's listing");
 
-  const refreshed = h.refresh();
-  await settle();
-  await settle();
-  assert.equal(calls, 2, 'refresh waits for the registration in flight');
+  const meanwhile = (await h.refresh()) as ToolResult;
+  assert.equal(meanwhile.isError, true, 'a refresh answers at once while the re-grant lists');
+  assert.equal(calls, 2, 'and lists nothing itself');
   listing.resolve([conversation('C1'), conversation('C2')]);
-  await refreshed;
-  assert.equal(h.requests.length, 2, 'the re-grant registers');
+  await until(() => h.requests.length === 2, 'the re-grant registers');
+  await h.ended();
+  await h.refresh();
   assert.deepEqual(
     (h.requests[1].params as ChannelsRegisterParams).channels.map((d) => d.id),
     ['slack:C1', 'slack:C2'],
@@ -513,6 +527,35 @@ test('a later policy dropping slack.messaging refuses rollback and preserves its
   assert.deepEqual(deleted, ['2']);
 });
 
+test("a rollback counts the deletes Slack confirmed, and logs each message it couldn't delete", async (t) => {
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+  const { slack, deleted } = fakeSlack();
+  (slack as unknown as { deleteMessage(channel: string, id: string): Promise<void> }).deleteMessage = async (_channel, id) => {
+    if (id === '2') throw new Error("chat.delete: out of this call's time");
+    deleted.push(id);
+  };
+  const h = connect(new SlackMcplServer(slack));
+  t.after(() => h.close());
+  await h.initialize();
+  await h.grant();
+  const sent = await h.host.sendRequest('tools/call', {
+    name: 'send_message', arguments: { channelId: 'C1', content: 'first' },
+  }) as { state: { checkpoint: string } };
+  for (const content of ['second', 'third']) {
+    await h.host.sendRequest('tools/call', { name: 'send_message', arguments: { channelId: 'C1', content } });
+  }
+  const rolledBack = await h.host.sendRequest(method.STATE_ROLLBACK, {
+    featureSet: 'slack.messaging', checkpoint: sent.state.checkpoint,
+  }) as { checkpoint: string; success: boolean; reason?: string };
+  assert.deepEqual(rolledBack, { checkpoint: sent.state.checkpoint, success: true, reason: 'Rolled back (1/2 messages deleted)' });
+  assert.deepEqual(deleted, ['3']);
+  assert.deepEqual(
+    lines.filter((line) => line.includes('Rollback')),
+    ["[slack-mcpl] Rollback couldn't delete message 2 in C1: chat.delete: out of this call's time"],
+  );
+});
+
 test('a refresh whose host leaves during its listing writes nothing for the next host', async (t) => {
   const listing = deferred<SlackConversationInfo[]>();
   let calls = 0;
@@ -626,4 +669,350 @@ test('a reused server refuses rollback until slack.messaging is active for the n
   await next.grant();
   assert.equal((await rollBack()).success, true);
   assert.deepEqual(deleted, ['2']);
+});
+
+/** The wait the adapter asks for after Slack rate-limits a request, or after one fails. */
+const limited = (seconds: number): SlackWait => ({ method: 'conversations.list', seconds, why: 'limited' });
+const failed = (seconds: number): SlackWait => ({ method: 'conversations.list', seconds, why: 'failed' });
+type ToolResult = { isError?: boolean; content: { text: string }[] };
+
+test('registration waits out a rate-limited page for as long as Slack asks, then registers', async (t) => {
+  let lists = 0;
+  const { slack } = fakeSlack(async (_all?: boolean, waitOut?: SlackWaitOut) => {
+    lists++;
+    await waitOut!(limited(1), 1);
+    return [conversation()];
+  });
+  const h = connect(new SlackMcplServer(slack));
+  t.after(() => h.close());
+  await h.initialize();
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  await h.grant();
+  await settled(() => lists === 1, 'the listing');
+  t.mock.timers.tick(999);
+  for (let i = 0; i < 20; i++) await settle();
+  assert.equal(h.requests.length, 0, 'still waiting just short of the second Slack asked for');
+  t.mock.timers.tick(1);
+  await settled(() => h.requests.length === 1, 'registration after the wait');
+  t.mock.timers.reset();
+  assert.deepEqual(ids(await h.listed()), ['slack:C1']);
+});
+
+test('registration gives up on a request tried ten times in a row, after nine waits, and says so', async (t) => {
+  const log = serverLog(t);
+  let waited = 0;
+  const { slack } = fakeSlack(async (_all?: boolean, waitOut?: SlackWaitOut) => {
+    for (let inARow = 1; ; inARow++) {
+      await waitOut!(limited(0), inARow);
+      waited = inARow;
+    }
+  });
+  const h = connect(new SlackMcplServer(slack));
+  t.after(() => h.close());
+  await h.initialize();
+  await h.grant();
+  await until(() => log.some((l) => l.includes('Failed to enumerate conversations')), 'the give-up');
+  assert.equal(waited, 9);
+  assert.deepEqual(log.filter((l) => l.includes('conversations.list') || l.includes('Failed to enumerate conversations')), [
+    ...Array.from({ length: 9 }, (_, i) =>
+      `[slack-mcpl] Slack rate-limited conversations.list (try ${i + 1} of 10); registration asks again in 0 s`),
+    '[slack-mcpl] Failed to enumerate conversations: Slack rate-limited or failed the same request 10 times in a ' +
+      'row, so registration stopped; refresh_channels can announce the conversations later',
+  ], 'each wait is logged, and the give-up ends the series');
+  assert.equal(h.requests.length, 0);
+});
+
+test('refresh_channels answers at once while registration runs, whether it lists or waits', { timeout: 5000 }, async (t) => {
+  const listing = deferred<void>();
+  const resumed = deferred<void>();
+  let waiting = false;
+  let lists = 0;
+  const { slack } = fakeSlack(async (_all?: boolean, waitOut?: SlackWaitOut) => {
+    // Registration's listing: pages before a rate limit, its wait, and pages
+    // after it. The refresh's own listing, later, doesn't wait.
+    if (lists++ === 0) {
+      await listing.promise;
+      waiting = true;
+      await waitOut!(limited(1), 1);
+      waiting = false;
+      await resumed.promise;
+    }
+    return [conversation()];
+  });
+  const h = connect(new SlackMcplServer(slack));
+  t.after(() => h.close());
+  await h.initialize();
+  await h.grant();
+  const answer = async () => {
+    const result = (await h.refresh()) as ToolResult;
+    assert.equal(result.isError, true);
+    return result.content[0].text;
+  };
+  assert.equal(await answer(), stillRegistering(), 'while it lists, before any wait');
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  listing.resolve();
+  await settled(() => waiting, 'the wait');
+  assert.equal(await answer(), stillRegistering(), 'while it waits');
+  t.mock.timers.tick(1000);
+  await settled(() => !waiting, 'the end of the wait');
+  t.mock.timers.reset();
+  assert.equal(await answer(), stillRegistering(), 'listing again after its wait');
+  assert.equal(h.requests.length, 0, 'answered before registration finished');
+  resumed.resolve();
+  await until(() => h.requests.length === 1, 'registration');
+  await h.ended();
+  const again = (await h.refresh()) as ToolResult;
+  assert.notEqual(again.isError, true, 'once registration has ended, a refresh lists again');
+});
+
+test('a registration superseded during its wait logs that wait, then stops without another line', async (t) => {
+  const log = serverLog(t);
+  let waited: 'went on' | 'stopped' | undefined;
+  const { slack } = fakeSlack(async (_all?: boolean, waitOut?: SlackWaitOut) => {
+    try {
+      await waitOut!(limited(1), 1);
+    } catch (err) {
+      waited = 'stopped';
+      throw err;
+    }
+    waited = 'went on';
+    return [conversation()];
+  });
+  const h = connect(new SlackMcplServer(slack));
+  t.after(() => h.close());
+  await h.initialize();
+  await h.grant();
+  // Revoking channels.register during the wait supersedes the registration.
+  await h.grant(['tools']);
+  await until(() => waited !== undefined, 'the end of the wait', 3000);
+  assert.equal(waited, 'stopped');
+  await settle();
+  // Every line but the connection's own.
+  assert.deepEqual(log.filter((l) => !l.startsWith('[slack-mcpl] Client ')), [
+    '[slack-mcpl] Slack rate-limited conversations.list (try 1 of 10); registration asks again in 1 s',
+  ], 'its wait, logged while it was current, and nothing once it stops');
+  assert.equal(h.requests.length, 0);
+});
+
+test('a registration superseded before the tenth try of a request stops, rather than give up on that request', async (t) => {
+  // A DM's listing goes on past a give-up on its user's name, so a superseded
+  // registration that gave up would go on listing.
+  const revoked = deferred<void>();
+  const tenth = deferred<'waited' | 'gave up' | 'stopped'>();
+  const { slack } = fakeSlack(async (_all?: boolean, waitOut?: SlackWaitOut) => {
+    await revoked.promise;
+    try {
+      await waitOut!(limited(0), 10);
+      tenth.resolve('waited');
+    } catch (err) {
+      tenth.resolve(err instanceof GaveUp ? 'gave up' : 'stopped');
+      throw err;
+    }
+    return [conversation()];
+  });
+  const h = connect(new SlackMcplServer(slack));
+  t.after(() => h.close());
+  await h.initialize();
+  await h.grant();
+  await h.grant(['tools']);
+  revoked.resolve();
+  assert.equal(await tenth.promise, 'stopped');
+  assert.equal(h.requests.length, 0);
+});
+
+test("a refresh after a re-grant isn't held by the wait of the registration it superseded", { timeout: 5000 }, async (t) => {
+  const newer = deferred<void>();
+  let lists = 0;
+  const { slack } = fakeSlack(async (_all?: boolean, waitOut?: SlackWaitOut) => {
+    // The first registration's listing waits out a rate limit; the newer one
+    // is still listing when a refresh comes; the refresh's own doesn't wait.
+    lists++;
+    if (lists === 1) await waitOut!(limited(2), 1);
+    if (lists === 2) await newer.promise;
+    return [conversation()];
+  });
+  const h = connect(new SlackMcplServer(slack));
+  t.after(() => h.close());
+  await h.initialize();
+  await h.grant();
+  await until(() => lists === 1, 'the first listing');
+  // Revoking channels.register and granting it again starts a newer registration.
+  await h.grant(['tools']);
+  await h.grant();
+  await until(() => lists === 2, 'the newer listing');
+  const meanwhile = (await h.refresh()) as ToolResult;
+  assert.equal(meanwhile.content[0].text, stillRegistering(), 'it answers for the newer registration, still listing');
+  newer.resolve();
+  await until(() => h.requests.length === 1, 'the newer registration');
+  await h.ended();
+  const answer = (await h.refresh()) as ToolResult;
+  assert.notEqual(answer.isError, true, answer.content[0].text);
+});
+
+test('a registration superseded while listing stops at its next rate limit, rather than wait or log it', async (t) => {
+  const log = serverLog(t);
+  const gate = deferred<void>();
+  let olderEnded = false;
+  let lists = 0;
+  const { slack } = fakeSlack(async (_all?: boolean, waitOut?: SlackWaitOut) => {
+    // The first registration is still listing when a re-grant supersedes it,
+    // and Slack then rate-limits its next page. The newer one waits out a
+    // rate limit of its own.
+    const older = lists++ === 0;
+    if (older) await gate.promise;
+    try {
+      await waitOut!(limited(3), 1);
+    } finally {
+      if (older) olderEnded = true;
+    }
+    return [conversation()];
+  });
+  const h = connect(new SlackMcplServer(slack));
+  t.after(() => h.close());
+  await h.initialize();
+  await h.grant();
+  await until(() => lists === 1, 'the first listing');
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  await h.grant(['tools']);
+  await h.grant();
+  await settled(() => lists === 2, 'the newer listing');
+  gate.resolve();
+  // Time is held, so it ends only by not waiting.
+  await settled(() => olderEnded, 'the superseded registration to stop');
+  assert.deepEqual(log.filter((l) => l.includes('registration asks again')), [
+    '[slack-mcpl] Slack rate-limited conversations.list (try 1 of 10); registration asks again in 3 s',
+  ], "only the newer registration's wait is logged");
+  // The newer registration is still running.
+  const answer = (await h.refresh()) as ToolResult;
+  assert.equal(answer.isError, true);
+  assert.equal(answer.content[0].text, stillRegistering());
+});
+
+test('a request that failed is asked again after its wait, which is logged', async (t) => {
+  const log = serverLog(t);
+  let lists = 0;
+  const { slack } = fakeSlack(async (_all?: boolean, waitOut?: SlackWaitOut) => {
+    if (lists++ === 0) await waitOut!(failed(1), 1);
+    return [conversation()];
+  });
+  const h = connect(new SlackMcplServer(slack));
+  t.after(() => h.close());
+  await h.initialize();
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  await h.grant();
+  await settled(() => lists === 1, 'the listing');
+  assert.deepEqual(log.filter((l) => l.includes('registration asks again')), [
+    '[slack-mcpl] conversations.list failed (try 1 of 10); registration asks again in 1 s',
+  ]);
+  for (let i = 0; i < 20; i++) await settle();
+  assert.equal(h.requests.length, 0, 'nothing registered before the wait ends');
+  t.mock.timers.tick(1000);
+  await settled(() => h.requests.length === 1, 'registration after its wait');
+});
+
+test("a wait for a DM's name is logged with the method it waits on", async (t) => {
+  const log = serverLog(t);
+  let lists = 0;
+  const { slack } = fakeSlack(async (_all?: boolean, waitOut?: SlackWaitOut) => {
+    if (lists++ === 0) await waitOut!({ method: 'users.info', seconds: 30, why: 'failed' }, 3);
+    return [conversation()];
+  });
+  const h = connect(new SlackMcplServer(slack));
+  t.after(() => h.close());
+  await h.initialize();
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  await h.grant();
+  await settled(() => lists === 1, 'the listing');
+  assert.deepEqual(log.filter((l) => l.includes('registration asks again')), [
+    '[slack-mcpl] users.info failed (try 3 of 10); registration asks again in 30 s',
+  ]);
+  t.mock.timers.tick(30_000);
+  await settled(() => h.requests.length === 1, 'registration after its wait');
+});
+
+// The registration below waits 30 s, past each test's 5 s timeout, so a
+// refresh held by that wait fails the test.
+test("after a revoke, a refresh isn't held by the wait of the registration the revoke ended", { timeout: 5000 }, async (t) => {
+  let lists = 0;
+  const { slack } = fakeSlack(async (_all?: boolean, waitOut?: SlackWaitOut) => {
+    if (lists++ === 0) await waitOut!(limited(30), 1);
+    return [conversation()];
+  });
+  const h = connect(new SlackMcplServer(slack));
+  t.after(() => h.close());
+  await h.initialize();
+  await h.grant();
+  await until(() => lists === 1, 'the listing');
+  // Revoking channels.register with no grant after it starts no newer registration.
+  await h.grant(['tools']);
+  const answer = (await h.refresh()) as ToolResult;
+  assert.notEqual(answer.isError, true, answer.content[0].text);
+  assert.equal(h.requests.length, 0, 'nothing was registered');
+});
+
+test("on a connection the host hasn't granted yet, or a plain MCP one, a refresh isn't held by an earlier connection's registration", { timeout: 5000 }, async (t) => {
+  let lists = 0;
+  const { slack } = fakeSlack(async (_all?: boolean, waitOut?: SlackWaitOut) => {
+    if (lists++ === 0) await waitOut!(limited(30), 1);
+    return [conversation()];
+  });
+  const server = new SlackMcplServer(slack);
+  const first = connect(server);
+  await first.initialize();
+  await first.grant();
+  await until(() => lists === 1, 'the listing');
+  await first.close();
+
+  // Granted tools, so it can call refresh_channels, but not channels.register.
+  const ungranted = connect(server);
+  await ungranted.initialize();
+  await ungranted.grant(['tools']);
+  const ungrantedAnswer = (await ungranted.refresh()) as ToolResult;
+  assert.notEqual(ungrantedAnswer.isError, true, ungrantedAnswer.content[0].text);
+  assert.equal(ungranted.requests.length, 0);
+  await ungranted.close();
+
+  const plain = connect(server);
+  t.after(() => plain.close());
+  await plain.host.sendRequest(method.INITIALIZE, { capabilities: {} });
+  plain.host.sendNotification('notifications/initialized');
+  const plainAnswer = (await plain.refresh()) as ToolResult;
+  assert.notEqual(plainAnswer.isError, true, plainAnswer.content[0].text);
+  assert.equal(plain.requests.length, 0);
+});
+
+test("refresh_channels leaves out a new DM whose user's name Slack didn't give, says when to call again, and keeps a known DM's label", { timeout: 5000 }, async (t) => {
+  const dm = (id: string, user: string, nameWait?: SlackWait): SlackConversationInfo =>
+    ({ id, name: user, kind: 'dm', userId: user, isMember: true, ...(nameWait ? { nameWait } : {}) });
+  const listings = [
+    [conversation()], // registration's
+    [conversation(), dm('D1', 'ann'), dm('D2', 'U2', limited(7))],
+    [conversation(), dm('D1', 'U1', failed(30)), dm('D2', 'bob')],
+  ];
+  const { slack } = fakeSlack(async () => listings.shift()!);
+  const h = connect(new SlackMcplServer(slack));
+  t.after(() => h.close());
+  await h.initialize();
+  await h.grant();
+  await until(() => h.requests.length === 1, 'registration');
+  await h.ended();
+  const refresh = async () => JSON.parse(((await h.refresh()) as ToolResult).content[0].text) as {
+    visible: number; added: Array<{ id: string; label: string }>; note: string;
+  };
+  const first = await refresh();
+  assert.equal(first.visible, 3);
+  assert.deepEqual(first.added, [{ id: 'slack:D1', label: 'DM: @ann (acme)' }]);
+  assert.equal(
+    first.note,
+    "Registered 1 newly-visible conversation(s). Left out 1 DM(s) whose user's name this server couldn't get from Slack just now, " +
+      'since the host keeps the label a conversation is first announced with: slack:D2 (user U2). Call ' +
+      'refresh_channels again in about 7 seconds to announce them by name. This server still sends their messages ' +
+      'to the host meanwhile.',
+  );
+  // The name came; and a DM the host knows keeps its label while its user's name is missing.
+  const second = await refresh();
+  assert.deepEqual(second.added, [{ id: 'slack:D2', label: 'DM: @bob (acme)' }]);
+  assert.equal(second.note, 'Registered 1 newly-visible conversation(s).');
+  const labels = (await h.listed()).channels.map((d) => [d.id, d.label]);
+  assert.deepEqual(labels, [['slack:C1', '#general (acme)'], ['slack:D1', 'DM: @ann (acme)'], ['slack:D2', 'DM: @bob (acme)']]);
 });
