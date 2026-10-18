@@ -54,4 +54,20 @@ test('MCPL feature denial still refuses bounded history before Slack calls', asy
     "fetch_history is turned off on this host: the host's policy hasn't enabled its feature set, slack.history, so " +
       "nothing ran, and calling again won't change that until the host enables it.",
   );
+  assert.deepEqual(h.reads, [], 'Slack was asked for nothing');
+});
+
+test('a read missing its channel or thread opens with what every failure of a read opens with', async t => {
+  const h = harness(); t.after(() => h.close());
+  await initialize(h, false);
+  assert.deepEqual(await tool(h, 'fetch_history', {}), {
+    error: true,
+    value: "No messages were returned: channelId must be a non-empty string, and this call left it out. list_channels shows each conversation's id.",
+  });
+  assert.deepEqual(await tool(h, 'fetch_thread', {channelId: 'C1', threadTs: ''}), {
+    error: true,
+    value: 'No messages were returned: threadTs must be a non-empty string, and this call passed an empty string. ' +
+      "Pass the thread's parent id: a reply's thread=, or the id of the message the replies are under, which fetch_history shows.",
+  });
+  assert.deepEqual(h.reads, []);
 });

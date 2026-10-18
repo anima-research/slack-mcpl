@@ -21,7 +21,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { WebClient, ErrorCode, LogLevel, type Logger, type WebAPICallResult, type WebClientOptions } from '@slack/web-api';
 import { SocketModeClient } from '@slack/socket-mode';
-import { SLACK_TS, readBounded, readOptions, type HistoryReadResult, type ReadStop } from './history-read.js';
+import { NOTHING_RETURNED, SLACK_TS, readBounded, readOptions, type HistoryReadResult, type ReadStop } from './history-read.js';
 import {
   formatSlackText,
   extractSlackUserIds,
@@ -124,12 +124,20 @@ export function waitToAskAgain(err: unknown, method: string): SlackWait | undefi
 
 /** Why a read tool's page failing stops the read with what it has, rather
  *  than failing it: the call's time had no room for the page, or Slack
- *  rate-limited it for longer than the call could wait. */
+ *  rate-limited it, with an HTTP 429 longer than the call could wait or with
+ *  a ratelimited refusal in an HTTP 200, which the client never waits out.
+ *  Slack's seconds come from the 429's Retry-After, or from one that came with
+ *  the refusal, which the client puts in its response_metadata. They're kept
+ *  only as a safe integer, at most 16 digits of JSON, which bounds the
+ *  result's own bytes (history-read.ts). */
 function readStop(err: unknown): ReadStop | undefined {
   if (err instanceof OutOfCallTime) return { reason: 'time_limit' };
-  const e = err as { code?: unknown; retryAfter?: unknown } | null;
-  if (e?.code !== ErrorCode.RateLimitedError) return undefined;
-  return { reason: 'rate_limited', ...(typeof e.retryAfter === 'number' && e.retryAfter >= 0 ? { retryAfter: e.retryAfter } : {}) };
+  const e = err as { code?: unknown; retryAfter?: unknown; data?: { response_metadata?: { retryAfter?: unknown } } } | null;
+  let seconds: unknown;
+  if (e?.code === ErrorCode.RateLimitedError) seconds = e.retryAfter;
+  else if (slackRefusal(err) === 'ratelimited') seconds = e?.data?.response_metadata?.retryAfter;
+  else return undefined;
+  return { reason: 'rate_limited', ...(Number.isSafeInteger(seconds) && (seconds as number) >= 0 ? { retryAfter: seconds as number } : {}) };
 }
 
 /** Called by a listing no call waits on before it asks Slack again: with the
@@ -929,7 +937,7 @@ export class SlackAdapter {
    *  with shapeHistory. */
   async readHistory(channelId: string, args: Record<string, unknown>): Promise<HistoryReadResult> {
     const opts = readOptions(args, 'history', channelId);
-    await this.assertNotDm(channelId, 'No messages were returned');
+    await this.assertNotDm(channelId, NOTHING_RETURNED);
     return readBounded(opts, {
       page: (at, limit) => this.web.conversations.history({
         channel: channelId, limit, inclusive: false,
@@ -945,7 +953,7 @@ export class SlackAdapter {
    *  thread from its parent. */
   async readThread(channelId: string, threadTs: string, args: Record<string, unknown>): Promise<HistoryReadResult> {
     const opts = readOptions(args, 'thread', channelId, threadTs);
-    await this.assertNotDm(channelId, 'No messages were returned');
+    await this.assertNotDm(channelId, NOTHING_RETURNED);
     return readBounded(opts, {
       page: (at, limit) => this.web.conversations.replies({
         channel: channelId, ts: threadTs, limit, inclusive: false,

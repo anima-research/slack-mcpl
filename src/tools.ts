@@ -46,12 +46,12 @@ export const toolDefinitions: ToolDefinition[] = [
       'Reply in a thread of a Slack conversation. Incoming messages show `thread=` when they ' +
       'are already in a thread and `id=` always. Pass the `thread=` value if the message you ' +
       'answer shows one; otherwise pass its `id=`, which starts a thread under it. In ' +
-      'fetch_history and fetch_thread results the same values are `threadTs` and `id`.',
+      'fetch_history and fetch_thread results, pass its `rootTs`, which names the thread it\'s in, or the message itself.',
     inputSchema: {
       type: 'object',
       properties: {
         channelId: { type: 'string', description: 'Slack conversation ID' },
-        messageId: { type: 'string', description: 'Thread ID (ts): the message\'s `thread=` (or `threadTs`) if it has one, else its `id=`' },
+        messageId: { type: 'string', description: 'Thread ID (ts): the message\'s `thread=` if it has one, else its `id=`; in fetch_history and fetch_thread results, its `rootTs`' },
         content: { type: 'string', description: 'Reply text (Slack mrkdwn)' },
       },
       required: ['channelId', 'messageId', 'content'],

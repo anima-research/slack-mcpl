@@ -1,10 +1,10 @@
 /**
  * fetch_history's and fetch_thread's bounded reads, through the adapter's own
- * client against a local endpoint that answers as Slack does: filters,
+ * client against a local endpoint that stands in for Slack's Web API: filters,
  * completeness, the cursor, the limits, and how the call's time and Slack's
  * rate limits stop a read.
  */
-import test, { after, before } from 'node:test';
+import test, { after, before, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   CALL_SECONDS,
@@ -16,7 +16,10 @@ import {
   type SlackSocketLike,
   type SlackWebLike,
 } from '../src/slack-adapter.js';
+import { READ_ARGUMENTS, readOptions } from '../src/history-read.js';
+import { toolDefinitions } from '../src/tools.js';
 import { fakeSlackApi, type FakeSlackApi, type SlackApiAnswer } from './slackApi.js';
+import { until } from './harness.js';
 
 let api: FakeSlackApi;
 let client: SlackWebClient;
@@ -115,12 +118,17 @@ test("a cursor from another query, or one this server didn't give, is refused be
   const first = await reader.readHistory('C1', { channelId: 'C1', limit: 1, textContains: 'target' });
   const from = api.calls.length;
   await assert.rejects(reader.readHistory('C1', { channelId: 'C1', limit: 1, textContains: 'other', cursor: first.pagination.nextCursor }),
-    /^Error: cursor belongs to another query: pass it with the same channel, thread, oldest, latest and filters/);
+    /^Error: No messages were returned: cursor belongs to another query\. Pass it with the same channel, thread, oldest, latest and filters as the call that gave it\.$/);
   await assert.rejects(reader.readHistory('C2', { channelId: 'C2', limit: 1, textContains: 'target', cursor: first.pagination.nextCursor }),
     /cursor belongs to another query/);
-  for (const cursor of ['not-a-cursor', Buffer.from(JSON.stringify({ q: 'x', at: 'nope' })).toString('base64url'), 'x'.repeat(300)]) {
+  // One of this server's own cursors, made longer than any it gives, is
+  // refused by its length alone.
+  const decoded = JSON.parse(Buffer.from(first.pagination.nextCursor!, 'base64url').toString());
+  const padded = Buffer.from(JSON.stringify({ ...decoded, pad: 'x'.repeat(200) })).toString('base64url');
+  assert.ok(padded.length > 256, String(padded.length));
+  for (const cursor of ['not-a-cursor', Buffer.from(JSON.stringify({ q: 'x', at: 'nope' })).toString('base64url'), padded]) {
     await assert.rejects(reader.readHistory('C1', { channelId: 'C1', limit: 1, textContains: 'target', cursor }),
-      /cursor is not a nextCursor this server gave/);
+      /^Error: No messages were returned: cursor isn't a nextCursor this server gave\. Pass it exactly as pagination\.nextCursor gave it\.$/);
   }
   assert.equal(api.calls.length, from, 'nothing was asked');
   // Budgets aren't part of the query, so a cursor carries over a new limit.
@@ -167,8 +175,16 @@ test("a call that can't return its first message for maxBytes fails, naming the 
 
 test("a thread whose parent doesn't fit maxBytes fails the same way, with oldest as the way past it", { timeout: 5000 }, async (t) => {
   answers(t, { 'conversations.replies': [page([row('1.0', 'U1', 'x'.repeat(4000), { thread_ts: '1.0' }), row('2.0', 'U2', 'one', { thread_ts: '1.0' })], false)] });
-  await assert.rejects(adapter().readThread('C1', '1.0', { channelId: 'C1', threadTs: '1.0', maxBytes: 2048 }),
-    /^Error: No messages were returned: the next message, 1\.0, takes .*to read past it, call again with the same arguments, but without cursor and with oldest set to 1\.0\.$/);
+  const reader = adapter();
+  const err = await reader.readThread('C1', '1.0', { channelId: 'C1', threadTs: '1.0', maxBytes: 2048 }).then(() => null, (e: unknown) => e);
+  const said = String((err as Error | null)?.message);
+  assert.match(said, /^No messages were returned: the next message, 1\.0, takes .*to read past it, call again with the same arguments, but without cursor and with oldest set to 1\.0\.$/);
+  // The size it names fits, called again with the same arguments.
+  const [, needed] = said.match(/call again with maxBytes of at least ([\d,]+)/) ?? [];
+  assert.ok(needed, said);
+  const out = await reader.readThread('C1', '1.0', { channelId: 'C1', threadTs: '1.0', maxBytes: Number(needed!.replace(/,/g, '')) });
+  assert.deepEqual(out.messages.map((m) => m.id), ['1.0']);
+  assert.equal(out.pagination.stopReason, 'byte_limit');
 });
 
 test('many small matches stay within maxBytes, each counted with its comma', { timeout: 5000 }, async (t) => {
@@ -190,15 +206,32 @@ test('maxScanned bounds the page asked for and stops the read there', { timeout:
   assert.ok(out.pagination.nextCursor);
 });
 
-test("a page the call's time has no room for ends the read with what it has and a cursor, once something was scanned", { timeout: 10_000 }, async (t) => {
-  // 12 s are left: the first page fits if it starts within 2 s, and takes
-  // 3 s, after which the second's 10 s don't.
-  answers(t, {
-    'conversations.history': [{ ...page([row('9.0', 'U1', 'a')], true), delayMs: 3000 }, page([row('8.0', 'U1', 'b')], false)],
-  });
+/** A read in a call whose clock is the test's: `left` seconds of the call
+ *  remain when it starts, and the clock moves `moves` seconds while Slack
+ *  holds its answer to the read's first page. */
+async function readWhileTimePasses<T>(
+  t: TestContext, method: string, first: SlackApiAnswer, rest: SlackApiAnswer[], left: number, moves: number,
+  read: () => Promise<T>,
+): Promise<T> {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  answers(t, { [method]: [{ ...first, after: held }, ...rest] });
   const from = api.calls.length;
-  const arrived = Date.now() - (CALL_SECONDS - SLACK_CLIENT_OPTIONS.timeout / 1000 - 2) * 1000;
-  const out = await withCallTime(arrived, () => adapter().readHistory('C1', { channelId: 'C1', latest: '10.0' }));
+  const done = withCallTime(Date.now() - (CALL_SECONDS - left) * 1000, read);
+  await until(() => sentTo(method, from).length === 1, "the first page's request");
+  t.mock.timers.tick(moves * 1000);
+  release();
+  return done;
+}
+
+test("a page the call's time has no room for ends the read with what it has and a cursor, once something was scanned", { timeout: 5000 }, async (t) => {
+  // 11 s are left, so the first page's 10 s fit; 2 s pass while Slack holds
+  // its answer, and the second's 10 s don't fit.
+  const from = api.calls.length;
+  const out = await readWhileTimePasses(t, 'conversations.history', page([row('9.0', 'U1', 'a')], true),
+    [page([row('8.0', 'U1', 'b')], false)], SLACK_CLIENT_OPTIONS.timeout / 1000 + 1, 2,
+    () => adapter().readHistory('C1', { channelId: 'C1', latest: '10.0' }));
   assert.deepEqual(out.messages.map((m) => m.id), ['9.0']);
   assert.equal(out.pagination.stopReason, 'time_limit');
   assert.ok(out.pagination.nextCursor);
@@ -356,11 +389,12 @@ test("a page Slack answers without a list of messages, or with a message without
     ],
   });
   const reader = adapter();
+  const unreadable = "Calling again may work; if it fails the same way, this server can't read Slack's answer for this range.";
   await assert.rejects(reader.readHistory('C1', { channelId: 'C1' }),
-    /^Error: No messages were returned: Slack's answer for a page of messages held no list of them$/);
+    { message: `No messages were returned: Slack's answer for a page of messages held no list of them. ${unreadable}` });
   for (const what of ['a message without a ts', 'an entry that is no message']) {
     await assert.rejects(reader.readHistory('C1', { channelId: 'C1' }),
-      /^Error: No messages were returned: Slack gave a message without a valid ts, so this read can't place it$/, what);
+      { message: `No messages were returned: Slack gave a message without a valid timestamp, so this read can't place it. ${unreadable}` }, what);
   }
 });
 
@@ -432,27 +466,49 @@ test('a later page with more to come but nothing in it stops the read as stalled
 test('arguments are checked before Slack is asked: unknown names, bounds, timestamps, filters and ids', { timeout: 5000 }, async () => {
   const reader = adapter();
   const from = api.calls.length;
+  const historyTakes = 'It takes channelId, limit, oldest, latest, cursor, maxScanned, maxBytes, textContains, caseSensitive, authorIds.';
+  const bound = "which looks like 1718000000.000100. Take one from fetch_history's ids, or from a message's id=.";
+  const authors = "authorIds must contain 1 to 50 Slack user or bot IDs, as a message's authorId or authorBotId gives them, or " +
+    "find_user's userId.";
   for (const [args, said] of [
-    [{ regex: '.*' }, /^Error: Unknown argument: regex$/],
-    [{ maxPages: 3, maxMs: 100 }, /^Error: Unknown arguments: maxPages, maxMs$/],
-    [{ threadTs: '1.0' }, /Unknown argument: threadTs/],
-    [{ limit: 0 }, /limit must be an integer from 1 to 1000/],
-    [{ limit: 1.5 }, /limit must be an integer/],
-    [{ limit: '50' }, /limit must be an integer/],
-    [{ maxScanned: 10001 }, /maxScanned must be an integer from 1 to 10000/],
-    [{ maxBytes: 1000 }, /maxBytes must be an integer from 2048 to 1048576/],
-    [{ oldest: 'yesterday' }, /oldest must be a Slack timestamp/],
-    [{ oldest: '2.0', latest: '1.0' }, /oldest must precede latest/],
-    [{ textContains: '' }, /textContains must contain 1 to 256 characters/],
-    [{ caseSensitive: 'yes' }, /caseSensitive must be a boolean/],
-    [{ authorIds: ['not-a-user'] }, /authorIds must contain 1 to 50 Slack user or bot IDs/],
+    [{ regex: '.*' }, `fetch_history takes no argument named regex. ${historyTakes}`],
+    [{ maxPages: 3, maxMs: 100 }, `fetch_history takes no arguments named maxPages, maxMs. ${historyTakes}`],
+    [{ threadTs: '1.0' }, `fetch_history takes no argument named threadTs. ${historyTakes}`],
+    // A slip for an argument names it: by case, by edits, or as part of it.
+    [{ textcontains: 'x' }, `fetch_history takes no argument named textcontains (did you mean textContains?). ${historyTakes}`],
+    [{ lmit: 5 }, `fetch_history takes no argument named lmit (did you mean limit?). ${historyTakes}`],
+    [{ max: 5, author: 'U1' }, 'fetch_history takes no arguments named max (did you mean maxScanned or maxBytes?), author (did you ' +
+      `mean authorIds?). ${historyTakes}`],
+    [{ limit: 0 }, 'limit must be an integer from 1 to 1000.'],
+    [{ limit: 1.5 }, 'limit must be an integer from 1 to 1000.'],
+    [{ limit: '50' }, 'limit must be an integer from 1 to 1000.'],
+    [{ maxScanned: 10001 }, 'maxScanned must be an integer from 1 to 10000.'],
+    [{ maxBytes: 1000 }, 'maxBytes must be an integer from 2048 to 1048576.'],
+    [{ oldest: 'yesterday' }, `oldest must be a Slack timestamp, ${bound}`],
+    [{ latest: 5 }, `latest must be a Slack timestamp, ${bound}`],
+    [{ oldest: '2.0', latest: '1.0' }, 'oldest must precede latest.'],
+    [{ textContains: '' }, 'textContains must contain 1 to 256 characters.'],
+    [{ caseSensitive: 'yes' }, 'caseSensitive must be a boolean.'],
+    [{ authorIds: ['not-a-user'] }, authors],
+    [{ authorIds: [] }, authors],
+    [{ authorIds: Array.from({ length: 51 }, (_, i) => `U${i}`) }, authors],
+    [{ authorIds: 'U1' }, authors],
   ] as const) {
-    await assert.rejects(reader.readHistory('C1', { channelId: 'C1', ...args }), said, JSON.stringify(args));
+    await assert.rejects(reader.readHistory('C1', { channelId: 'C1', ...args }), { message: `No messages were returned: ${said}` },
+      JSON.stringify(args));
   }
-  await assert.rejects(reader.readHistory('U1', { channelId: 'U1' }), /channelId must be a Slack conversation ID/);
-  await assert.rejects(reader.readThread('C1', 'nope', { channelId: 'C1', threadTs: 'nope' }), /threadTs must be a Slack timestamp/);
-  await assert.rejects(reader.readThread('C1', '1.0', { channelId: 'C1', threadTs: '1.0', textContains: 'x' }),
-    /Unknown argument: textContains/);
+  await assert.rejects(reader.readHistory('U1', { channelId: 'U1' }), {
+    message: "No messages were returned: channelId must be a Slack conversation id, such as C0123456789. list_channels shows each " +
+      "conversation's id.",
+  });
+  await assert.rejects(reader.readThread('C1', 'nope', { channelId: 'C1', threadTs: 'nope' }), {
+    message: 'No messages were returned: threadTs must be a Slack timestamp, which looks like 1718000000.000100. Pass the ' +
+      "thread's parent id: a reply's thread=, or the id of the message the replies are under, which fetch_history shows.",
+  });
+  await assert.rejects(reader.readThread('C1', '1.0', { channelId: 'C1', threadTs: '1.0', textContains: 'x' }), {
+    message: 'No messages were returned: fetch_thread takes no argument named textContains. It takes channelId, threadTs, ' +
+      'limit, oldest, latest, cursor, maxScanned, maxBytes.',
+  });
   assert.equal(api.calls.length, from);
 });
 
@@ -470,25 +526,274 @@ test('with DMs off, a read of a DM or its thread is refused by the adapter\'s DM
 });
 
 test("channel.writable is the write allow-list's answer, as list_channels gives it", { timeout: 5000 }, async (t) => {
-  answers(t, { 'conversations.history': [page([], false)] });
-  const out = await adapter({ sendChannels: ['C9'] }).readHistory('C1', { channelId: 'C1' });
-  assert.deepEqual(out.channel, { id: 'C1', writable: false });
+  answers(t, { 'conversations.history': [page([], false)], 'conversations.replies': [page([], false)] });
+  const reader = adapter({ sendChannels: ['C9'] });
+  assert.deepEqual((await reader.readHistory('C1', { channelId: 'C1' })).channel, { id: 'C1', writable: false });
+  assert.deepEqual((await reader.readThread('C1', '1.0', { channelId: 'C1', threadTs: '1.0' })).channel, { id: 'C1', writable: false });
+  assert.deepEqual((await reader.readThread('C9', '1.0', { channelId: 'C9', threadTs: '1.0' })).channel, { id: 'C9', writable: true });
 });
 
 test('the thread fields: a root from the parent, a broadcast reply and an ordinary message; a reply count only when Slack gives a valid one; the posting bot', { timeout: 5000 }, async (t) => {
   answers(t, {
     'conversations.history': [page([
+      row('9.0', 'U1', 'thread_ts ahead of the root', { thread_ts: '1.0', root: { ts: '3.0', thread_ts: '3.0' } }),
+      row('8.0', 'U1', 'an invalid thread_ts, then the root', { thread_ts: 'nope', root: { thread_ts: 'nope', ts: '3.0' } }),
+      row('7.0', 'U1', "the root's thread_ts alone", { subtype: 'thread_broadcast', root: { thread_ts: '3.0' } }),
+      row('6.0', 'U1', "the root's ts alone", { subtype: 'thread_broadcast', root: { ts: '3.0' } }),
       row('5.0', 'U1', 'broadcast', { subtype: 'thread_broadcast', root: { ts: '3.0', thread_ts: '3.0' } }),
       row('4.0', 'U1', 'plain', { reply_count: -1 }),
       row('3.0', 'U1', 'parent', { thread_ts: '3.0', reply_count: 2 }),
       { ts: '2.0', bot_id: 'B1', username: 'deploybot', text: 'from a bot', reply_count: 1.5 },
+      row('1.0', 'U1', 'a parent whose replies are gone', { thread_ts: '1.0', reply_count: 0 }),
     ], false)],
   });
   const out = await adapter().readHistory('C1', { channelId: 'C1' });
   assert.deepEqual(out.messages.map((m) => [m.id, m.rootTs, m.replyCount, m.authorBotId, m.author]), [
+    ['1.0', '1.0', 0, undefined, 'U1'],
     ['2.0', '2.0', undefined, 'B1', 'deploybot'],
     ['3.0', '3.0', 2, undefined, 'U1'],
     ['4.0', '4.0', undefined, undefined, 'U1'],
     ['5.0', '3.0', undefined, undefined, 'U1'],
+    ['6.0', '3.0', undefined, undefined, 'U1'],
+    ['7.0', '3.0', undefined, undefined, 'U1'],
+    ['8.0', '3.0', undefined, undefined, 'U1'],
+    ['9.0', '1.0', undefined, undefined, 'U1'],
   ]);
+});
+test('a history read passes oldest on to Slack as the bound of every page', { timeout: 5000 }, async (t) => {
+  answers(t, { 'conversations.history': [page([row('9.0', 'U1', 'a')], true), page([row('8.0', 'U1', 'b')], false)] });
+  const from = api.calls.length;
+  await adapter().readHistory('C1', { channelId: 'C1', oldest: '2.0', latest: '10.0' });
+  assert.deepEqual(sentTo('conversations.history', from).map((p) => [p.latest, p.oldest]), [['10.0', '2.0'], ['9.0', '2.0']]);
+});
+
+test('a read without limit asks Slack for its default match count: 50 history messages, 100 of a thread', { timeout: 5000 }, async (t) => {
+  answers(t, { 'conversations.history': [page([], false)], 'conversations.replies': [page([], false)] });
+  const reader = adapter();
+  const from = api.calls.length;
+  await reader.readHistory('C1', { channelId: 'C1' });
+  await reader.readThread('C1', '1.0', { channelId: 'C1', threadTs: '1.0' });
+  assert.equal(sentTo('conversations.history', from)[0]!.limit, '50');
+  assert.equal(sentTo('conversations.replies', from)[0]!.limit, '100');
+});
+
+test("a thread read stopped by a long rate limit, or by the call's time, returns what it read and a cursor toward newer replies", { timeout: 5000 }, async (t) => {
+  const first = page([row('1.0', 'U1', 'parent', { thread_ts: '1.0' }), row('2.0', 'U2', 'one', { thread_ts: '1.0' })], true);
+  const reader = adapter();
+  answers(t, { 'conversations.replies': [first, { status: 429, headers: { 'retry-after': '30' }, body: { ok: false, error: 'ratelimited' } }] });
+  const limited = await withCallTime(Date.now(), () => reader.readThread('C1', '1.0', { channelId: 'C1', threadTs: '1.0' }));
+  assert.deepEqual([limited.messages.map((m) => m.id), limited.pagination.stopReason, limited.pagination.retryAfterSeconds],
+    [['1.0', '2.0'], 'rate_limited', 30]);
+  const timed = await readWhileTimePasses(t, 'conversations.replies', first, [page([row('3.0', 'U2', 'two', { thread_ts: '1.0' })], false)],
+    SLACK_CLIENT_OPTIONS.timeout / 1000 + 1, 2, () => reader.readThread('C1', '1.0', { channelId: 'C1', threadTs: '1.0' }));
+  assert.deepEqual([timed.messages.map((m) => m.id), timed.pagination.stopReason], [['1.0', '2.0'], 'time_limit']);
+  for (const cursor of [limited.pagination.nextCursor, timed.pagination.nextCursor]) {
+    const from = api.calls.length;
+    await reader.readThread('C1', '1.0', { channelId: 'C1', threadTs: '1.0', cursor });
+    assert.equal(sentTo('conversations.replies', from)[0]!.oldest, '2.0', 'it continues after the last reply it read');
+  }
+});
+
+test("Slack's ratelimited refusal after the first pages stops the read as a rate limit, with Slack's seconds when they came with it", { timeout: 5000 }, async (t) => {
+  for (const [headers, seconds] of [[{ 'retry-after': '30' }, 30], [{}, undefined]] as const) {
+    answers(t, { 'conversations.history': [page([row('9.0', 'U1', 'a')], true), { headers, body: { ok: false, error: 'ratelimited' } }] });
+    const out = await withCallTime(Date.now(), () => adapter().readHistory('C1', { channelId: 'C1', latest: '10.0' }));
+    assert.deepEqual(out.messages.map((m) => m.id), ['9.0']);
+    assert.equal(out.pagination.stopReason, 'rate_limited');
+    assert.equal(out.pagination.retryAfterSeconds, seconds);
+    assert.ok(out.pagination.nextCursor);
+  }
+});
+
+test('any other failure after the first pages fails the call, since a read is safe to repeat', { timeout: 5000 }, async (t) => {
+  for (const [failure, code] of [
+    [{ status: 503, body: { ok: false } }, 'slack_webapi_http_error'],
+    [{ body: { ok: false, error: 'internal_error' } }, 'slack_webapi_platform_error'],
+  ] as const) {
+    answers(t, { 'conversations.history': [page([row('9.0', 'U1', 'a')], true), failure] });
+    const err = await withCallTime(Date.now(), () => adapter().readHistory('C1', { channelId: 'C1', latest: '10.0' }))
+      .then(() => null, (e: unknown) => e);
+    assert.equal((err as { code?: string } | null)?.code, code, JSON.stringify(failure));
+  }
+});
+
+test('a filtered read that scanned only messages it leaves out, then met a long rate limit, returns no matches with its counts and a cursor', { timeout: 5000 }, async (t) => {
+  answers(t, {
+    'conversations.history': [
+      page([row('9.0', 'U1', 'noise'), row('8.0', 'U1', 'noise')], true),
+      { status: 429, headers: { 'retry-after': '30' }, body: { ok: false, error: 'ratelimited' } },
+    ],
+  });
+  const out = await withCallTime(Date.now(), () => adapter().readHistory('C1', { channelId: 'C1', textContains: 'target', latest: '10.0' }));
+  assert.deepEqual(out.messages, []);
+  assert.deepEqual([out.pagination.scanned, out.pagination.matched, out.pagination.stopReason], [2, 0, 'rate_limited']);
+  assert.ok(out.pagination.nextCursor);
+});
+
+test("a later page with more to come that holds only a message read before, or a thread's parent again, stops as stalled", { timeout: 5000 }, async (t) => {
+  answers(t, {
+    'conversations.history': [page([row('9.0', 'U1', 'a'), row('8.0', 'U1', 'b')], true), page([row('8.0', 'U1', 'b')], true)],
+    'conversations.replies': [
+      page([row('1.0', 'U1', 'parent', { thread_ts: '1.0' }), row('2.0', 'U2', 'one', { thread_ts: '1.0' })], true),
+      page([row('1.0', 'U1', 'parent', { thread_ts: '1.0' })], true),
+    ],
+  });
+  const reader = adapter();
+  const history = await reader.readHistory('C1', { channelId: 'C1', latest: '10.0' });
+  const thread = await reader.readThread('C1', '1.0', { channelId: 'C1', threadTs: '1.0' });
+  for (const [out, ids] of [[history, ['8.0', '9.0']], [thread, ['1.0', '2.0']]] as const) {
+    assert.deepEqual(out.messages.map((m) => m.id), ids);
+    assert.deepEqual([out.pagination.stopReason, out.pagination.scanComplete], ['pagination_stalled', false]);
+    assert.ok(out.pagination.nextCursor);
+  }
+});
+
+test('a filtered read looks up the names of its matches, not of the messages it leaves out', { timeout: 5000 }, async (t) => {
+  answers(t, { 'conversations.history': [page([row('9.0', 'U1', 'mine'), row('8.0', 'U2', 'theirs, for <@U3>')], false)] });
+  const from = api.calls.length;
+  await adapter().readHistory('C1', { channelId: 'C1', authorIds: ['U1'] });
+  assert.deepEqual(sentTo('users.info', from).map((p) => p.user), ['U1']);
+});
+
+test('a record gives its time in ISO form, and each attachment with how to fetch it', { timeout: 5000 }, async (t) => {
+  answers(t, {
+    'conversations.history': [page([row('1718000000.000100', 'U1', 'see the file', {
+      files: [{ name: 'plan.pdf', mimetype: 'application/pdf', url_private: 'https://files.slack.com/files-pri/T1-F1/plan.pdf' }, { name: 'raw' }],
+    })], false)],
+  });
+  const [record] = (await adapter().readHistory('C1', { channelId: 'C1' })).messages;
+  assert.equal(record!.timestamp, '2024-06-10T06:13:20.000Z');
+  assert.deepEqual(record!.attachments, [
+    'plan.pdf (application/pdf) — fetchable via fetch_attachment: https://files.slack.com/files-pri/T1-F1/plan.pdf',
+    'raw',
+  ]);
+});
+
+test('maxBytes counts UTF-8 bytes, so a message whose characters would fit but whose bytes do not is held back', { timeout: 5000 }, async (t) => {
+  answers(t, { 'conversations.history': [page([row('9.0', 'U1', 'small'), row('8.0', 'U1', '\u{1F600}'.repeat(400))], true)] });
+  const out = await adapter().readHistory('C1', { channelId: 'C1', maxBytes: 2048, latest: '10.0' });
+  assert.deepEqual(out.messages.map((m) => m.id), ['9.0']);
+  assert.equal(out.pagination.stopReason, 'byte_limit');
+  assert.ok(Buffer.byteLength(JSON.stringify(out)) <= 2048, String(Buffer.byteLength(JSON.stringify(out))));
+});
+
+test('timestamps within one second are read in the order of their fractions, and a read continues from one', { timeout: 5000 }, async (t) => {
+  answers(t, {
+    'conversations.history': [
+      page([row('1718000000.000100', 'U1', 'a'), row('1718000000.000300', 'U1', 'c'), row('1718000000.000200', 'U1', 'b')], true),
+      page([row('1718000000.000100', 'U1', 'a')], false),
+    ],
+  });
+  const reader = adapter();
+  const from = api.calls.length;
+  const first = await reader.readHistory('C1', { channelId: 'C1', limit: 2, latest: '1718000001' });
+  assert.deepEqual(first.messages.map((m) => m.id), ['1718000000.000200', '1718000000.000300']);
+  const next = await reader.readHistory('C1', { channelId: 'C1', limit: 2, latest: '1718000001', cursor: first.pagination.nextCursor });
+  assert.equal(sentTo('conversations.history', from)[1]!.latest, '1718000000.000200');
+  assert.deepEqual(next.messages.map((m) => m.id), ['1718000000.000100']);
+});
+
+test('authorIds matches a message by any of the ids it lists', { timeout: 5000 }, async (t) => {
+  answers(t, { 'conversations.history': [page([row('3.0', 'U1', 'a'), row('2.0', 'U2', 'b'), row('1.0', 'U3', 'c')], false)] });
+  const out = await adapter().readHistory('C1', { channelId: 'C1', authorIds: ['U3', 'U1'] });
+  assert.deepEqual(out.messages.map((m) => m.id), ['1.0', '3.0']);
+});
+
+test('a cursor belongs to its whole query: another thread, bound or filter refuses it, and the same authors in another order take it', { timeout: 5000 }, async (t) => {
+  answers(t, {
+    'conversations.history': [page([row('9.0', 'U1', 'target'), row('8.0', 'U2', 'target')], true)],
+    'conversations.replies': [page([row('1.0', 'U1', 'parent', { thread_ts: '1.0' }), row('2.0', 'U2', 'one', { thread_ts: '1.0' })], true)],
+  });
+  const reader = adapter();
+  const query = { channelId: 'C1', limit: 1, textContains: 'target', authorIds: ['U1', 'U2'], oldest: '1.0', latest: '10.0' };
+  const history = (await reader.readHistory('C1', query)).pagination.nextCursor;
+  const thread = (await reader.readThread('C1', '1.0', { channelId: 'C1', threadTs: '1.0', limit: 1 })).pagination.nextCursor;
+  const from = api.calls.length;
+  for (const changed of [{ oldest: '2.0' }, { latest: '11.0' }, { caseSensitive: true }, { authorIds: ['U1'] }]) {
+    await assert.rejects(reader.readHistory('C1', { ...query, ...changed, cursor: history }), /cursor belongs to another query/,
+      JSON.stringify(changed));
+  }
+  await assert.rejects(reader.readThread('C1', '3.0', { channelId: 'C1', threadTs: '3.0', limit: 1, cursor: thread }),
+    /cursor belongs to another query/);
+  assert.equal(api.calls.length, from, 'nothing was asked');
+  await reader.readHistory('C1', { ...query, authorIds: ['U2', 'U1', 'U2'], cursor: history });
+  assert.equal(sentTo('conversations.history', from)[0]!.latest, '9.0', 'the same authors, reordered and repeated, continue the read');
+});
+
+test("each read tool's schema takes what its read takes: the same arguments, each bound at its edge, and the defaults", () => {
+  type Property = { type: string; minimum?: number; maximum?: number; default?: unknown; minItems?: number; maxItems?: number;
+    minLength?: number; maxLength?: number; items?: { pattern: string } };
+  for (const kind of ['history', 'thread'] as const) {
+    const tool = kind === 'history' ? 'fetch_history' : 'fetch_thread';
+    const schema = toolDefinitions.find((d) => d.name === tool)!.inputSchema;
+    const properties = schema.properties as Record<string, Property>;
+    const given: Record<string, unknown> = kind === 'history' ? { channelId: 'C1' } : { channelId: 'C1', threadTs: '1.0' };
+    const read = (args: Record<string, unknown>) => readOptions({ ...given, ...args }, kind, 'C1', kind === 'thread' ? '1.0' : undefined);
+    assert.deepEqual(Object.keys(properties).sort(), [...READ_ARGUMENTS[kind]].sort(), tool);
+    assert.equal(schema.additionalProperties, false, tool);
+    assert.deepEqual([...(schema.required ?? [])].sort(), Object.keys(given).sort(), tool);
+    assert.throws(() => read({ notAnArgument: 1 }), /takes no argument named notAnArgument\./, tool);
+    const defaults: Record<string, unknown> = read({});
+    for (const [name, p] of Object.entries(properties)) {
+      const at = (value: unknown) => read({ [name]: value });
+      const refuses = (value: unknown) => assert.throws(() => at(value), new RegExp(name + ' must'), tool + ' ' + name + ' ' + JSON.stringify(value));
+      if (p.type === 'integer') {
+        assert.ok(Number.isInteger(p.minimum) && Number.isInteger(p.maximum), tool + ' ' + name + ' is bounded');
+        assert.equal(defaults[name], p.default, tool + ' ' + name + "'s default");
+        at(p.minimum); at(p.maximum);
+        refuses(p.minimum! - 1); refuses(p.maximum! + 1);
+      } else if (p.type === 'array') {
+        const ids = (n: number) => Array.from({ length: n }, (_, i) => 'U' + i);
+        at(ids(p.minItems!)); at(ids(p.maxItems!));
+        refuses(ids(p.minItems! - 1)); refuses(ids(p.maxItems! + 1));
+        for (const id of ['U1', 'W1', 'B1', 'u1', 'C1', 'U-1']) {
+          if (new RegExp(p.items!.pattern).test(id)) at([id]);
+          else refuses([id]);
+        }
+      } else if (p.type === 'boolean') {
+        at(true);
+        refuses('true');
+      } else if (p.maxLength !== undefined) {
+        // Characters as the schema counts them: code points.
+        at('\u{1F600}'.repeat(p.minLength!)); at('\u{1F600}'.repeat(p.maxLength));
+        refuses('\u{1F600}'.repeat(p.minLength! - 1)); refuses('\u{1F600}'.repeat(p.maxLength + 1));
+      }
+    }
+  }
+});
+
+test("a rate limit's seconds past Number.MAX_SAFE_INTEGER are left out", { timeout: 5000 }, async (t) => {
+  answers(t, {
+    'conversations.history': [
+      page([row('9.0', 'U1', 'a')], true),
+      { status: 429, headers: { 'retry-after': '100000000000000000000' }, body: { ok: false, error: 'ratelimited' } },
+    ],
+  });
+  const out = await adapter().readHistory('C1', { channelId: 'C1', latest: '10.0' });
+  assert.equal(out.pagination.stopReason, 'rate_limited');
+  assert.equal(out.pagination.retryAfterSeconds, undefined);
+});
+
+test('a read stopped by a rate limit stays within maxBytes with the longest seconds it can carry, at the largest message that fits', { timeout: 10_000 }, async (t) => {
+  // Every other field of the result as long as its bound: the counts as wide
+  // as their limits, and the longest timestamp a cursor can hold.
+  const ts = '8639999999999.999999';
+  const read = (size: number) => {
+    api.answerFor('conversations.history', page([row(ts, 'U1', 'x'.repeat(size))], true),
+      { status: 429, headers: { 'retry-after': String(Number.MAX_SAFE_INTEGER) }, body: { ok: false, error: 'ratelimited' } });
+    return adapter().readHistory('C1', { channelId: 'C1', limit: 2, maxScanned: 2, maxBytes: 2048 }).catch(() => undefined);
+  };
+  t.after(() => api.answerFor('conversations.history'));
+  // The largest message that fits beside the result's own fields, by halves:
+  // a larger one fails the read at its start.
+  let fits = 0, fails = 2048;
+  while (fails - fits > 1) {
+    const size = Math.floor((fits + fails) / 2);
+    if (await read(size)) fits = size;
+    else fails = size;
+  }
+  const out = (await read(fits))!;
+  assert.equal(out.pagination.stopReason, 'rate_limited');
+  assert.equal(out.pagination.retryAfterSeconds, Number.MAX_SAFE_INTEGER);
+  assert.ok(Buffer.byteLength(JSON.stringify(out)) <= 2048, String(Buffer.byteLength(JSON.stringify(out))));
 });

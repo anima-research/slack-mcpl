@@ -58,6 +58,7 @@ import { StateTracker } from './state.js';
 import { CapabilityGrant } from './grant.js';
 import { McplRpcError, capabilityDenied } from './errors.js';
 import { explainSlackError } from './slack-errors.js';
+import { NOTHING_RETURNED } from './history-read.js';
 import {
   fetchAttachmentBytes,
   parseSlackAttachmentUrl,
@@ -710,13 +711,13 @@ export class SlackMcplServer {
         return await this.refreshChannels();
 
       case 'fetch_history': {
-        const channelId = this.requireString(args, 'channelId');
+        const channelId = this.requireString(args, 'channelId', NOTHING_RETURNED);
         return await this.slack.readHistory(channelId, args);
       }
 
       case 'fetch_thread': {
-        const channelId = this.requireString(args, 'channelId');
-        const threadTs = this.requireString(args, 'threadTs');
+        const channelId = this.requireString(args, 'channelId', NOTHING_RETURNED);
+        const threadTs = this.requireString(args, 'threadTs', NOTHING_RETURNED);
         return await this.slack.readThread(channelId, threadTs, args);
       }
 
@@ -829,7 +830,14 @@ export class SlackMcplServer {
     }
   }
 
-  private requireString(args: Record<string, unknown>, key: keyof typeof ARGUMENT_SOURCES): string {
+  /** A string argument a tool requires, refused when it's missing or empty.
+   *  The refusal opens with `notDone`; the reads pass their own lead, since
+   *  every failure of a read opens with it. */
+  private requireString(
+    args: Record<string, unknown>,
+    key: keyof typeof ARGUMENT_SOURCES,
+    notDone = 'Nothing was done',
+  ): string {
     const v = args[key];
     if (typeof v !== 'string' || v.length === 0) {
       const passed =
@@ -839,7 +847,7 @@ export class SlackMcplServer {
         : Array.isArray(v) ? 'passed an array'
         : typeof v === 'object' ? 'passed an object'
         : `passed a ${typeof v}`;
-      throw new Error(`Nothing was done: ${key} must be a non-empty string, and this call ${passed}. ${ARGUMENT_SOURCES[key]}`);
+      throw new Error(`${notDone}: ${key} must be a non-empty string, and this call ${passed}. ${ARGUMENT_SOURCES[key]}`);
     }
     return v;
   }

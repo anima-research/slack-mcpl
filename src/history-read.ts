@@ -6,6 +6,7 @@
  */
 import { createHash } from 'node:crypto';
 import { formatSlackText, type SlackHistoryMessage } from './content.js';
+import { isNearMiss } from './near-miss.js';
 import type { HistoryMessage } from './slack-adapter.js';
 
 type Kind = 'history' | 'thread';
@@ -18,24 +19,42 @@ export const READ_LIMITS = {
   maxBytes: { minimum: 2048, maximum: 1048576, default: 65536 },
 } as const;
 
-/** The most messages Slack returns in one page of either method. */
+/** The most messages this server asks for in one page of either method,
+ *  the most Slack recommends. Slack may give fewer, such as at most 15 to an
+ *  app distributed commercially outside the Slack Marketplace and installed
+ *  since May 29, 2025, and a read follows has_more either way. */
 const PAGE_SIZE = 200;
+
+/** The arguments each read tool takes, as its schema in tools.ts lists them. */
+export const READ_ARGUMENTS = {
+  history: ['channelId', 'limit', 'oldest', 'latest', 'cursor', 'maxScanned', 'maxBytes', 'textContains', 'caseSensitive', 'authorIds'],
+  thread: ['channelId', 'threadTs', 'limit', 'oldest', 'latest', 'cursor', 'maxScanned', 'maxBytes'],
+} as const;
+
+/** How every failure of a read opens. A read can fail after its first pages,
+ *  so it says what the caller didn't get. */
+export const NOTHING_RETURNED = 'No messages were returned';
+/** One of the read's own failures, which opens as every failure of a read does. */
+const refused = (text: string) => new Error(`${NOTHING_RETURNED}: ${text}`);
+/** What a Slack timestamp looks like, for a refusal of one. */
+const TS_FORM = 'which looks like 1718000000.000100';
+/** What an answer this server can't read means for calling again. */
+const UNREADABLE = "Calling again may work; if it fails the same way, this server can't read Slack's answer for this range.";
 
 /** A Slack timestamp, a message's ts. */
 export const SLACK_TS = /^\d{1,16}(?:\.\d{1,6})?$/;
 const isTimestamp = (value: unknown): value is string =>
   typeof value === 'string' && SLACK_TS.test(value) && Number.isFinite(new Date(Number(value) * 1000).getTime());
-function timestamp(value: unknown, name: string): string {
-  if (!isTimestamp(value)) throw new Error(`${name} must be a Slack timestamp`);
+/** A timestamp argument, refused with where a right one comes from. */
+function timestamp(value: unknown, name: string, source: string): string {
+  if (!isTimestamp(value)) throw refused(`${name} must be a Slack timestamp, ${TS_FORM}. ${source}`);
   return value;
 }
 /** A message's ts, as Slack gave it: a read can't place a message without
  *  one, or an entry that isn't a message at all. */
 function messageTs(m: SlackHistoryMessage | null | undefined): string {
   const ts = m?.ts;
-  if (!isTimestamp(ts)) {
-    throw new Error('No messages were returned: Slack gave a message without a valid ts, so this read can\'t place it');
-  }
+  if (!isTimestamp(ts)) throw refused(`Slack gave a message without a valid timestamp, so this read can't place it. ${UNREADABLE}`);
   return ts;
 }
 function compareTs(a: string, b: string): number {
@@ -65,34 +84,51 @@ const BY_ID = new (class extends Map<string, string> {
  *  doesn't take is refused, so a misspelled filter can't read as no filter. */
 export type ReadOptions = ReturnType<typeof readOptions>;
 export function readOptions(args: Record<string, unknown>, kind: Kind, channelId: string, threadTs?: string) {
-  const allowed = new Set(['channelId', 'limit', 'oldest', 'latest', 'cursor', ...Object.keys(READ_LIMITS),
-    ...(kind === 'history' ? ['textContains', 'caseSensitive', 'authorIds'] : ['threadTs'])]);
-  const unknown = Object.keys(args).filter((key) => !allowed.has(key));
-  if (unknown.length) throw new Error(`Unknown argument${unknown.length === 1 ? '' : 's'}: ${unknown.join(', ')}`);
-  if (!/^[CGD][A-Z0-9]+$/.test(channelId)) throw new Error('channelId must be a Slack conversation ID');
-  if (kind === 'thread') timestamp(threadTs, 'threadTs');
+  const takes: readonly string[] = READ_ARGUMENTS[kind];
+  const unknown = Object.keys(args).filter((key) => !takes.includes(key));
+  if (unknown.length) {
+    const named = unknown.map((key) => {
+      const meant = takes.filter((name) => isNearMiss(key, name));
+      return meant.length ? `${key} (did you mean ${meant.join(' or ')}?)` : key;
+    });
+    throw refused(
+      `${kind === 'history' ? 'fetch_history' : 'fetch_thread'} takes no argument${unknown.length === 1 ? '' : 's'} named ` +
+        `${named.join(', ')}. It takes ${takes.join(', ')}.`,
+    );
+  }
+  if (!/^[CGD][A-Z0-9]+$/.test(channelId)) {
+    throw refused("channelId must be a Slack conversation id, such as C0123456789. list_channels shows each conversation's id.");
+  }
+  if (kind === 'thread') {
+    timestamp(threadTs, 'threadTs',
+      "Pass the thread's parent id: a reply's thread=, or the id of the message the replies are under, which fetch_history shows.");
+  }
   const limits = {} as Record<keyof typeof READ_LIMITS, number>;
   for (const [name, bounds] of Object.entries(READ_LIMITS)) {
     const value = args[name] === undefined
       ? (name === 'limit' ? (kind === 'history' ? 50 : 100) : ('default' in bounds ? bounds.default : undefined))
       : args[name];
     if (typeof value !== 'number' || !Number.isInteger(value) || value < bounds.minimum || value > bounds.maximum) {
-      throw new Error(`${name} must be an integer from ${bounds.minimum} to ${bounds.maximum}`);
+      throw refused(`${name} must be an integer from ${bounds.minimum} to ${bounds.maximum}.`);
     }
     limits[name as keyof typeof READ_LIMITS] = value;
   }
-  const oldest = args.oldest === undefined ? undefined : timestamp(args.oldest, 'oldest');
-  const latest = args.latest === undefined ? undefined : timestamp(args.latest, 'latest');
-  if (oldest && latest && compareTs(oldest, latest) >= 0) throw new Error('oldest must precede latest');
+  const bound = "Take one from fetch_history's ids, or from a message's id=.";
+  const oldest = args.oldest === undefined ? undefined : timestamp(args.oldest, 'oldest', bound);
+  const latest = args.latest === undefined ? undefined : timestamp(args.latest, 'latest', bound);
+  if (oldest && latest && compareTs(oldest, latest) >= 0) throw refused('oldest must precede latest.');
   // Characters as the schema's maxLength counts them: code points.
   if (args.textContains !== undefined &&
     (typeof args.textContains !== 'string' || [...args.textContains].length < 1 || [...args.textContains].length > 256)) {
-    throw new Error('textContains must contain 1 to 256 characters');
+    throw refused('textContains must contain 1 to 256 characters.');
   }
-  if (args.caseSensitive !== undefined && typeof args.caseSensitive !== 'boolean') throw new Error('caseSensitive must be a boolean');
+  if (args.caseSensitive !== undefined && typeof args.caseSensitive !== 'boolean') throw refused('caseSensitive must be a boolean.');
   if (args.authorIds !== undefined && (!Array.isArray(args.authorIds) || args.authorIds.length < 1 || args.authorIds.length > 50 ||
     !args.authorIds.every((id) => typeof id === 'string' && AUTHOR_ID.test(id)))) {
-    throw new Error('authorIds must contain 1 to 50 Slack user or bot IDs');
+    throw refused(
+      "authorIds must contain 1 to 50 Slack user or bot IDs, as a message's authorId or authorBotId gives them, or find_user's " +
+        'userId.',
+    );
   }
   const query = {
     kind, channelId, threadTs, oldest, latest,
@@ -119,12 +155,12 @@ function cursorPosition(cursor: unknown, queryHash: string): string {
     decoded = undefined;
   }
   if (!decoded || typeof decoded.at !== 'string' || !SLACK_TS.test(decoded.at) || typeof decoded.q !== 'string') {
-    throw new Error('cursor is not a nextCursor this server gave: pass it exactly as pagination.nextCursor gave it');
+    throw refused("cursor isn't a nextCursor this server gave. Pass it exactly as pagination.nextCursor gave it.");
   }
   if (decoded.q !== queryHash) {
-    throw new Error(
-      "cursor belongs to another query: pass it with the same channel, thread, oldest, latest and filters as the " +
-        'call that gave it',
+    throw refused(
+      'cursor belongs to another query. Pass it with the same channel, thread, oldest, latest and filters as the call ' +
+        'that gave it.',
     );
   }
   return decoded.at;
@@ -217,7 +253,8 @@ export async function readBounded(opts: ReadOptions, source: ReadSource): Promis
     messages: [],
     pagination: {
       ...result().pagination, scanned: opts.maxScanned, matched: opts.limit, returned: opts.limit, pages: opts.maxScanned,
-      stopReason: 'pagination_stalled', nextCursor: encodeCursor(opts.queryHash, '9999999999999999.999999'), retryAfterSeconds: 99999,
+      stopReason: 'pagination_stalled', nextCursor: encodeCursor(opts.queryHash, '9999999999999999.999999'),
+      retryAfterSeconds: Number.MAX_SAFE_INTEGER,
     },
   }));
   let recordBytes = 0;
@@ -233,9 +270,7 @@ export async function readBounded(opts: ReadOptions, source: ReadSource): Promis
       const size = Math.min(PAGE_SIZE, wanted + (kind === 'thread' && at !== undefined ? 1 : 0));
       const page = await source.page(at, size);
       pages++;
-      if (!Array.isArray(page.messages)) {
-        throw new Error("No messages were returned: Slack's answer for a page of messages held no list of them");
-      }
+      if (!Array.isArray(page.messages)) throw refused(`Slack's answer for a page of messages held no list of them. ${UNREADABLE}`);
       // The page's messages in reading order, each strictly past the one
       // before it, starting from the position: one Slack gives again, such as
       // a thread's parent, or twice in one page, is taken once and never
@@ -301,12 +336,12 @@ function stoppedAtStart(opts: ReadOptions, stopReason: StopReason, held: { ts: s
       `set to ${held.ts}`;
     const needed = skeleton + held.bytes;
     const most = READ_LIMITS.maxBytes.maximum;
-    return `No messages were returned: the next message, ${held.ts}, takes ${n(held.bytes)} bytes in this tool's result, ` +
+    return `${NOTHING_RETURNED}: the next message, ${held.ts}, takes ${n(held.bytes)} bytes in this tool's result, ` +
       `which with up to ${n(skeleton)} bytes of the result's own fields is more than maxBytes, ${n(opts.maxBytes)}. ` +
       (needed <= most
         ? `To read it, call again with maxBytes of at least ${n(needed)}; to read past it, ${past}.`
         : `maxBytes goes up to ${n(most)}, so this tool can't return it whole; to read past it, ${past}.`);
   }
-  return "No messages were returned: Slack's page held no message past where this read started, though it said more " +
+  return `${NOTHING_RETURNED}: Slack's page held no message past where this read started, though it said more ` +
     "remain. Calling again may get them; if it stops the same way, Slack isn't giving the rest of this range just now.";
 }

@@ -119,7 +119,9 @@ for (const [tool, args, text] of [
     const h = await serve(t, {});
     const called = await h.call(tool, args);
     assert.equal(called.isError, true);
-    assert.equal(called.content[0].text, `Nothing was done: ${text}`);
+    // A read's refusal opens as every failure of a read does.
+    const lead = tool === 'fetch_thread' ? 'No messages were returned' : 'Nothing was done';
+    assert.equal(called.content[0].text, `${lead}: ${text}`);
   });
 }
 

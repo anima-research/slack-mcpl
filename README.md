@@ -70,7 +70,7 @@ does not declare `channels.streaming`.
 When answering a particular message, use `reply_message` to select its thread explicitly. Automatic prose delivery through `channels/publish` carries no thread or triggering message ID. The server uses the thread of the last message it passed to the host from that Slack conversation instead, whether or not the host accepted it, so another message can redirect the reply to a different thread, or to the channel's top level ([#6](https://github.com/anima-research/slack-mcpl/issues/6)). The server keeps that in memory only: after a restart, a publish goes to the top level until the server passes on a message from the conversation.
 
 1. Select the Slack conversation ID, such as `C123`, rather than its MCPL ID, `slack:C123`.
-2. For `messageId`, use the target message's displayed `thread=` value. If it has no `thread=`, use its `id=`: the reply goes into that message's own thread, which starts one if it has none. History results call these fields `threadTs` and `id`.
+2. For `messageId`, use the target message's displayed `thread=` value. If it has no `thread=`, use its `id=`: the reply goes into that message's own thread, which starts one if it has none. In `fetch_history` and `fetch_thread` results, use the message's `rootTs`, which names the thread it's in, or the message itself.
 3. Send the reply through `reply_message`.
 
 For example, to answer `[thread=1718000000.000100 id=1718000000.000200] Ann: Can you check this?` in conversation `C123`, call `reply_message` with:
@@ -192,8 +192,8 @@ All numeric inputs are bounded integers, applied **per call**:
 Each page is a Slack request, made like every other request this server
 makes: it goes out only if its 10-second timeout fits in what is left of the
 call's 25 seconds, and a rate limit that fits the call's 5-second budget for
-waiting is waited out and the request sent once more. A page that doesn't fit, or a longer rate limit, ends the
-read with what it found and a cursor.
+waiting is waited out and the request sent once more. A page that doesn't fit, a longer rate limit, or Slack's
+`ratelimited` refusal in an HTTP 200, which isn't waited out, ends the read with what it found and a cursor.
 
 Every call either covers its range, moves past where it started, or fails,
 saying why. A call that
@@ -240,7 +240,8 @@ reads Slack again; a cursor never grants access or holds message content.
 Compatibility: the former truncation `note` is replaced by structured
 `pagination`; clients must check it and resume rather than assuming a complete
 range. Previously unbounded or invalid numeric limits and unknown arguments now
-refuse. The default `maxBytes` of 64 KiB can end a default read before its
+refuse; an unknown argument's refusal names the arguments the tool takes, and
+any it looks like a slip for. The default `maxBytes` of 64 KiB can end a default read before its
 match count, with `byte_limit` and a cursor. A failed read's explanation now
 leads with "No messages were returned", as do the read's own failures. Existing tool names, default match counts and
 `list_channels.writable` remain stable. No new scopes, regex, bulk expansion,
