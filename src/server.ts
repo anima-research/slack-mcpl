@@ -646,12 +646,21 @@ export class SlackMcplServer {
         );
         return 'Message edited';
 
-      case 'delete_message':
-        await this.slack.deleteMessage(
-          this.requireString(args, 'channelId'),
-          this.requireString(args, 'messageId'),
-        );
+      case 'delete_message': {
+        const channelId = this.requireString(args, 'channelId');
+        const messageId = this.requireString(args, 'messageId');
+        // Gone from Slack, deleted now or already, so no rollback tries to
+        // delete it again. Any other failure keeps it recorded, for a
+        // rollback to try.
+        try {
+          await this.slack.deleteMessage(channelId, messageId);
+        } catch (err) {
+          if (slackRefusal(err) === 'message_not_found') this.stateTracker.forgetSent(channelId, messageId);
+          throw err;
+        }
+        this.stateTracker.forgetSent(channelId, messageId);
         return 'Message deleted';
+      }
 
       case 'list_channels': {
         const convs = await this.slack.listConversations(args.includeNonMember === true);
@@ -1206,10 +1215,16 @@ export class SlackMcplServer {
         await this.slack.deleteMessage(msg.channelId, msg.messageId);
         deleted++;
       } catch (err) {
-        // Best-effort: someone else may have deleted the message already, or
-        // the delete was rate-limited, out of this call's time, or failed on
-        // the way. The tracker has dropped it with the branch, so no later
-        // rollback tries it again, and an operator finds it here.
+        // A message Slack says is gone, deleted by someone else or by a
+        // delete whose answer was lost, is as the rollback wants it.
+        if (slackRefusal(err) === 'message_not_found') {
+          deleted++;
+          continue;
+        }
+        // Best-effort otherwise: the delete was rate-limited, out of this
+        // call's time, or failed on the way. The tracker has dropped it with
+        // the branch, so no later rollback tries it again, and an operator
+        // finds it here.
         console.error(
           `[slack-mcpl] Rollback couldn't delete message ${msg.messageId} in ${msg.channelId}: ${(err as Error)?.message ?? String(err)}`,
         );
