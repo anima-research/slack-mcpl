@@ -1,8 +1,15 @@
 /**
  * Checkpoint tracking for slack.messaging rollback.
  *
- * Tracks messages and files sent by the bot. On rollback, attempts to
- * delete items sent after the target checkpoint (best-effort).
+ * Tracks the messages and files sent by the bot. On rollback, attempts to
+ * delete the ones the target checkpoint's state doesn't hold (best-effort).
+ *
+ * Checkpoints form a tree: each one's parent is the checkpoint current when it
+ * was made, so a rollback starts a new branch from its target. An item
+ * belongs to the first checkpoint made after it was sent, whose state is the
+ * first to hold it. A checkpoint's state then holds the items that belong to
+ * it or to a checkpoint before it on its branch, so a rollback can find them
+ * whatever branch it comes from.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -14,6 +21,8 @@ export interface SentMessage {
   channelId: string;
   content: string;
   timestamp: string;
+  /** The first checkpoint made after it was sent; undefined until one is. */
+  checkpoint?: string;
 }
 
 export interface UploadedFile {
@@ -27,6 +36,8 @@ export interface UploadedFile {
    *  and Slack may have shared the file. */
   comment: boolean;
   timestamp: string;
+  /** The first checkpoint made after it was uploaded; undefined until one is. */
+  checkpoint?: string;
 }
 
 type SentItem = SentMessage | UploadedFile;
@@ -34,8 +45,6 @@ type SentItem = SentMessage | UploadedFile;
 export interface Checkpoint {
   id: string;
   parent: string | null;
-  /** Index into the sent items array — everything at this index and after was sent post-checkpoint. */
-  sentCount: number;
 }
 
 export class StateTracker {
@@ -67,14 +76,25 @@ export class StateTracker {
     });
   }
 
-  /** Create a new checkpoint. Returns the checkpoint ID. */
+  /** Forget a message deleted outside rollback, so no rollback deletes it
+   *  again. */
+  forgetSent(channelId: string, messageId: string): void {
+    this.sentItems = this.sentItems.filter((m) => m.kind !== 'message' || m.channelId !== channelId || m.messageId !== messageId);
+  }
+
+  /** Create a new checkpoint. Returns the checkpoint ID: a whole UUID, so no
+   *  two checkpoints share one, which would close a loop in the tree, and one
+   *  from an earlier process isn't taken for a checkpoint of this one. */
   createCheckpoint(): string {
-    const id = `chk_${randomUUID().slice(0, 8)}`;
-    this.checkpoints.set(id, {
-      id,
-      parent: this.currentCheckpoint,
-      sentCount: this.sentItems.length,
-    });
+    const id = `chk_${randomUUID()}`;
+    this.checkpoints.set(id, { id, parent: this.currentCheckpoint });
+    // The items no checkpoint covers yet are always the last ones recorded:
+    // recordSent and recordUploaded append, a rollback keeps only covered
+    // ones, and forgetSent keeps the order. So the walk stops at the first
+    // covered one.
+    for (let i = this.sentItems.length - 1; i >= 0 && this.sentItems[i].checkpoint === undefined; i--) {
+      this.sentItems[i].checkpoint = id;
+    }
     this.currentCheckpoint = id;
     return id;
   }
@@ -85,18 +105,19 @@ export class StateTracker {
   }
 
   /**
-   * Roll back to a checkpoint. Returns items that should be deleted
-   * (sent after the checkpoint).
+   * Roll back to a checkpoint. Returns the items that should be deleted:
+   * those its state doesn't hold, whichever branch they were sent on. Its
+   * branch's own items that an earlier rollback deleted don't come back.
    */
   rollback(checkpointId: string): SentItem[] | null {
-    const checkpoint = this.checkpoints.get(checkpointId);
-    if (!checkpoint) return null;
+    if (!this.checkpoints.has(checkpointId)) return null;
 
-    // Get items sent after this checkpoint
-    const toDelete = this.sentItems.slice(checkpoint.sentCount);
+    const lineage = new Set<string>();
+    for (let at: string | null = checkpointId; at !== null; at = this.checkpoints.get(at)!.parent) lineage.add(at);
+    const held = (m: SentItem) => m.checkpoint !== undefined && lineage.has(m.checkpoint);
 
-    // Create a new branch — don't delete old checkpoints, just branch from here
-    this.sentItems = this.sentItems.slice(0, checkpoint.sentCount);
+    const toDelete = this.sentItems.filter((m) => !held(m));
+    this.sentItems = this.sentItems.filter(held);
     this.currentCheckpoint = checkpointId;
 
     return toDelete;

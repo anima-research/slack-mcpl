@@ -723,12 +723,21 @@ export class SlackMcplServer {
         );
         return 'Message edited';
 
-      case 'delete_message':
-        await this.slack.deleteMessage(
-          this.requireString(args, 'channelId'),
-          this.requireString(args, 'messageId'),
-        );
+      case 'delete_message': {
+        const channelId = this.requireString(args, 'channelId');
+        const messageId = this.requireString(args, 'messageId');
+        // Gone from Slack, deleted now or already, so no rollback tries to
+        // delete it again. Any other failure keeps it recorded, for a
+        // rollback to try.
+        try {
+          await this.slack.deleteMessage(channelId, messageId);
+        } catch (err) {
+          if (slackRefusal(err) === 'message_not_found') this.stateTracker.forgetSent(channelId, messageId);
+          throw err;
+        }
+        this.stateTracker.forgetSent(channelId, messageId);
         return 'Message deleted';
+      }
 
       case 'list_channels': {
         const convs = await this.slack.listConversations(args.includeNonMember === true);
@@ -1293,10 +1302,10 @@ export class SlackMcplServer {
           deleted[kind]++;
           return;
         }
-        // Best-effort: someone else may have deleted the item already, or the
-        // delete was rate-limited, out of this call's time, or failed on the
-        // way. The tracker has dropped it with the branch, so no later
-        // rollback tries it again, and an operator finds it here.
+        // Best-effort otherwise: the delete was refused, rate-limited, out of
+        // this call's time, or failed on the way. The tracker has dropped it
+        // with the branch, so no later rollback tries it again, and an
+        // operator finds it here.
         console.error(`[slack-mcpl] Rollback couldn't delete ${what} in ${channelId}: ${(err as Error)?.message ?? String(err)}`);
       }
     };
@@ -1310,7 +1319,7 @@ export class SlackMcplServer {
             () => this.slack.deleteMessage(item.channelId, shareTs));
         }
       } else {
-        await attempt('message', `message ${item.messageId}`, item.channelId, [],
+        await attempt('message', `message ${item.messageId}`, item.channelId, ['message_not_found'],
           () => this.slack.deleteMessage(item.channelId, item.messageId));
       }
     }

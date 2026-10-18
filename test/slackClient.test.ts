@@ -9,7 +9,9 @@
 
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { WebClient } from '@slack/web-api';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { WebClient, type Logger } from '@slack/web-api';
 import { method } from '@animalabs/mcpl-core';
 import {
   CALL_SECONDS,
@@ -21,6 +23,7 @@ import {
   WAIT_PER_CALL_SECONDS,
   outsideCallTime,
   slackClients,
+  stderrLogger,
   withCallTime,
   type SlackSocketLike,
   type SlackWebLike,
@@ -106,7 +109,7 @@ test("connectSlack's clients: the adapter's is built with these options, and aut
   // The settings each client was built with are its own private fields, read
   // here because connectSlack itself calls the real Slack.
   type Built = { rejectRateLimitedCalls: boolean; retryConfig: unknown; axios: { defaults: { timeout?: number } } };
-  const { auth, web } = slackClients('xoxb-test');
+  const { auth, web } = slackClients('xoxb-test', 'xapp-test');
   assert.ok(web instanceof SlackWebClient, "the adapter's client waits out a rate limit a call can afford");
   assert.ok(!(auth instanceof SlackWebClient));
   const adapter = web as unknown as Built;
@@ -118,6 +121,84 @@ test("connectSlack's clients: the adapter's is built with these options, and aut
   assert.equal(startup.rejectRateLimitedCalls, false);
   assert.equal(startup.retryConfig, defaults.retryConfig, 'a launch while Slack is unreachable still waits');
   assert.equal(startup.axios.defaults.timeout, 10_000);
+});
+
+test("every client connectSlack builds logs to stderr, so a rate limit at launch writes nothing to stdout, which carries the protocol", { timeout: 60_000 }, async (t) => {
+  // connectSlack's auth.test, then Socket Mode's apps.connections.open when
+  // the adapter starts, are each rate-limited once with a Retry-After of 0 s,
+  // so each client logs, at info, that it will try again, and does. Slack
+  // then refuses the connection, which ends Socket Mode's start. They run in
+  // a process of their own, whose stdout is read here, and which ends with
+  // the test, however it ends.
+  api.answerFor('auth.test', limited(0), { body: { ok: true, user_id: 'UBOT', team: 'acme' } });
+  api.answerFor('apps.connections.open', limited(0), { body: { ok: false, error: 'invalid_auth' } });
+  t.after(() => {
+    api.answerFor('auth.test');
+    api.answerFor('apps.connections.open');
+  });
+  const from = api.calls.length;
+  const child = spawn(process.execPath, ['--import', 'tsx', fileURLToPath(new URL('./slackClientsChild.ts', import.meta.url)), api.url], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    signal: t.signal,
+  });
+  t.after(() => child.kill('SIGKILL'));
+  let stdout = '';
+  let stderr = '';
+  // A test that ends early aborts its signal, which kills the child and
+  // reports the abort here.
+  child.on('error', (err) => { stderr += `\n${String(err)}`; });
+  child.stdout.setEncoding('utf8').on('data', (chunk: string) => { stdout += chunk; });
+  child.stderr.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk; });
+  const code = await new Promise((resolve) => child.on('close', resolve));
+  assert.equal(code, 0, stderr);
+  assert.deepEqual(
+    api.calls.slice(from).filter((m) => m === 'auth.test' || m === 'apps.connections.open'),
+    ['auth.test', 'auth.test', 'apps.connections.open', 'apps.connections.open'],
+  );
+  assert.equal(stdout, '');
+  for (const client of ['auth.test', 'Socket Mode']) {
+    assert.ok(stderr.includes(`[slack-mcpl] ${client} (info): API Call failed due to rate limiting. Will retry in 0 seconds.`), stderr);
+  }
+  // Debug lines are left out, as the clients' own logger leaves them out at
+  // its default level.
+  assert.doesNotMatch(stderr, /\(debug\)/);
+});
+
+test("the adapter's client logs to stderr too, and is built against the Slack API URL given", () => {
+  // Of its lines at info, the one this server's requests could reach is the
+  // rate limit's "Will retry", which rejectRateLimitedCalls skips. Its logger
+  // and URL are private fields, read here. The body runs at once, so no
+  // other test's line reaches the capture.
+  const { web } = slackClients('xoxb-test', 'xapp-test', api.url);
+  assert.equal((web as unknown as { slackApiUrl: string }).slackApiUrl, api.url);
+  const lines: string[] = [];
+  const write = console.error;
+  console.error = (...args: unknown[]) => { lines.push(args.join(' ')); };
+  try {
+    (web as unknown as { logger: Logger }).logger.info('a line');
+  } finally {
+    console.error = write;
+  }
+  assert.deepEqual(lines, ['[slack-mcpl] Web API (info): a line']);
+});
+
+test('stderrLogger writes info, warn and error to stderr with their level, and debug nowhere', () => {
+  const logger = stderrLogger('test');
+  const lines: string[] = [];
+  const out: string[] = [];
+  const kept = { error: console.error, log: console.log, info: console.info, warn: console.warn, debug: console.debug };
+  console.error = (...args: unknown[]) => { lines.push(args.join(' ')); };
+  for (const name of ['log', 'info', 'warn', 'debug'] as const) console[name] = (...args: unknown[]) => { out.push(args.join(' ')); };
+  try {
+    logger.debug('d');
+    logger.info('i');
+    logger.warn('w');
+    logger.error('e');
+  } finally {
+    Object.assign(console, kept);
+  }
+  assert.deepEqual(lines, ['[slack-mcpl] test (info): i', '[slack-mcpl] test (warn): w', '[slack-mcpl] test (error): e']);
+  assert.deepEqual(out, [], 'nothing else is written');
 });
 
 const socket: SlackSocketLike = { on() {}, async start() {}, async disconnect() {} };

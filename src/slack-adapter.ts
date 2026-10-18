@@ -19,7 +19,7 @@
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { WebClient, ErrorCode, type WebAPICallResult, type WebClientOptions } from '@slack/web-api';
+import { WebClient, ErrorCode, LogLevel, type Logger, type WebAPICallResult, type WebClientOptions } from '@slack/web-api';
 import { SocketModeClient } from '@slack/socket-mode';
 import {
   formatSlackText,
@@ -431,16 +431,48 @@ export class SlackWebClient extends WebClient {
 }
 
 /**
- * The two Web API clients connectSlack builds. auth.test's keeps the client's
- * default patience: a Slack that can't be reached at launch is retried,
- * rather than ending the process, and each try has the same timeout as every
- * other call. Every request after startup goes through the adapter's, a
- * SlackWebClient built with SLACK_CLIENT_OPTIONS.
+ * A logger for a Slack client that writes each line to stderr, labelled with
+ * `client`, at info and above, as the client's own logger writes at its
+ * default level. Over stdio, stdout carries the protocol, and the client's own
+ * logger writes its info and debug lines there, with console.info and
+ * console.debug. setLevel and setName, which the Logger interface asks for,
+ * do nothing: the Web API and Socket Mode clients use a logger they're given
+ * as it is, without calling either.
  */
-export function slackClients(token: string): { auth: WebClient; web: WebClient } {
+export function stderrLogger(client: string): Logger {
+  const write = (level: string) => (...msg: unknown[]) => console.error(`[slack-mcpl] ${client} (${level}):`, ...msg);
   return {
-    auth: new WebClient(token, { timeout: SLACK_CLIENT_OPTIONS.timeout }),
-    web: new SlackWebClient(token, SLACK_CLIENT_OPTIONS),
+    debug() {},
+    info: write('info'),
+    warn: write('warn'),
+    error: write('error'),
+    getLevel: () => LogLevel.INFO,
+    setLevel() {},
+    setName() {},
+  };
+}
+
+/**
+ * The Slack clients connectSlack builds, each logging to stderr
+ * (stderrLogger). auth.test's keeps the Web API client's default patience: a
+ * Slack that can't be reached at launch is retried, rather than ending the
+ * process, and each try has the same timeout as every other call. Every
+ * request after startup goes through the adapter's, a SlackWebClient built
+ * with SLACK_CLIENT_OPTIONS. Socket Mode's client builds a Web API client of
+ * its own, for apps.connections.open, and gives it the same logger.
+ * `slackApiUrl` is Slack's own unless given, as a test gives its local
+ * endpoint.
+ */
+export function slackClients(
+  botToken: string,
+  appToken: string,
+  slackApiUrl?: string,
+): { auth: WebClient; web: WebClient; socket: SocketModeClient } {
+  const api = slackApiUrl ? { slackApiUrl } : {};
+  return {
+    auth: new WebClient(botToken, { timeout: SLACK_CLIENT_OPTIONS.timeout, logger: stderrLogger('auth.test'), ...api }),
+    web: new SlackWebClient(botToken, { ...SLACK_CLIENT_OPTIONS, logger: stderrLogger('Web API'), ...api }),
+    socket: new SocketModeClient({ appToken, logger: stderrLogger('Socket Mode'), clientOptions: { ...api } }),
   };
 }
 
@@ -448,18 +480,18 @@ export function slackClients(token: string): { auth: WebClient; web: WebClient }
  * Connect to Slack and build an adapter: auth.test resolves the bot's own
  * user ID (for self-filtering and mention detection) and the team name
  * (for channel labels), then Socket Mode is wired but not yet started —
- * call start() after registering the message handler.
+ * call start() after registering the message handler. `slackApiUrl` is
+ * Slack's own unless given, as slackClients' is.
  */
-export async function connectSlack(config: SlackAdapterConfig): Promise<SlackAdapter> {
-  const clients = slackClients(config.botToken);
+export async function connectSlack(config: SlackAdapterConfig, slackApiUrl?: string): Promise<SlackAdapter> {
+  const clients = slackClients(config.botToken, config.appToken, slackApiUrl);
   const auth = await clients.auth.auth.test();
-  const socket = new SocketModeClient({ appToken: config.appToken });
   return new SlackAdapter(
     // WebClient satisfies SlackWebLike at runtime; the cast bridges the
     // parameter-width gap (SlackWebLike takes loose records so tests can
     // inject fakes, WebClient's methods want their exact argument types).
     clients.web as unknown as SlackWebLike,
-    socket,
+    clients.socket,
     (auth.user_id as string | undefined) ?? null,
     (auth.team as string | undefined) ?? '',
     config.dmUsers,
