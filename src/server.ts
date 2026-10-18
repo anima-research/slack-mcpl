@@ -664,9 +664,11 @@ export class SlackMcplServer {
           ...(c.kind === 'channel' || c.kind === 'private_channel' ? { isMember: c.isMember } : {}),
           writable: this.slack.canWrite(c.id),
         }));
-        // A listing that left types out says which beside the list, so an
-        // agent asked about its DMs can tell "none" from "can't see them";
-        // one that left none out answers with the list alone.
+        // A listing that left out types the token can't read says which
+        // beside the list, so an agent asked about its DMs can tell "none"
+        // from "the token can't read them"; one that left none out answers
+        // with the list alone. Types the host has turned off aren't listed
+        // or noted, as the tool's description says.
         if (leftOut.length === 0) return listed;
         return { _content: [textContent(JSON.stringify(listed)), textContent(leftOutNote(leftOut))] };
       }

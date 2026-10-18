@@ -98,7 +98,7 @@ export function leftOutNote(leftOut: string[]): string {
  *  holds those read scopes. */
 export class NoReadableConversations extends Error {
   constructor(readonly needed: string[]) {
-    super(`conversations.list: the token has none of the read scopes ${needed.join(', ')}`);
+    super(`This bot's token has none of the read scopes ${andList(needed)}`);
     this.name = 'NoReadableConversations';
   }
 }
@@ -530,8 +530,8 @@ export class SlackAdapter {
 
   private stopping = false;
 
-  /** The bot token's scopes, as Slack last reported them; undefined while
-   *  Slack hasn't. */
+  /** The bot token's scopes, as Slack has reported them, each answer's
+   *  added to those before; undefined while Slack hasn't. */
   private scopes: string[] | undefined;
 
   constructor(
@@ -616,24 +616,27 @@ export class SlackAdapter {
       : '[slack-mcpl] Conversation listing now asks for every type it lists: the token has each one\'s read scope.');
   }
 
-  /** Takes the scopes a Slack answer reports, if it reports any, and says on
-   *  stderr which types listings leave out whenever that changes. */
+  /** Adds the scopes a Slack answer reports, if it reports any, to those
+   *  known, and says on stderr which types listings leave out whenever that
+   *  changes. Slack never narrows a token's scopes, so an answer naming fewer,
+   *  such as one sent before a grant that lands after it, takes none away. */
   private takeScopes(reported: string[] | undefined): void {
     if (!reported) return;
     const before = this.leftOutTypes().join(',');
-    this.scopes = reported;
+    this.scopes = [...new Set([...(this.scopes ?? []), ...reported])];
     const omitted = this.leftOutTypes();
     if (omitted.join(',') !== before) this.logLeftOut(omitted, 'now ');
   }
 
   /** Enumerate conversations the bot can act in: member channels, DMs, and
-   *  group DMs, of the types whose read scopes Slack last reported the token
+   *  group DMs, of the types whose read scopes Slack has reported the token
    *  has (every enabled type while it hasn't reported any). Slack reports the
    *  scopes with each answer, a refusal's included. A listing whose types they
-   *  change starts over once with the new types, so its answer reflects the
-   *  scopes Slack last reported, and `leftOut` names the enabled types it
-   *  didn't ask for. With no type to ask for, auth.test is asked once for the
-   *  scopes, and if they read no type either, NoReadableConversations says so.
+   *  change, at any answer, its own or another listing's before its own,
+   *  starts over with the new types, so its answer reflects the scopes known
+   *  at its last answer, and `leftOut` names the enabled types it didn't ask
+   *  for. With no type to ask for, auth.test is asked for the scopes, and if
+   *  they read no type either, NoReadableConversations says so.
    *  conversations.list also returns public channels the bot is NOT a member
    *  of (no events, no posting without joining) — those are excluded here;
    *  list_channels with includeNonMember surfaces them.
@@ -646,29 +649,19 @@ export class SlackAdapter {
    *  long). A DM whose name is still missing carries `nameWait`. */
   async listConversations(includeNonMember = false, waitOut?: SlackWaitOut): Promise<SlackListing> {
     const noneReadable = () => new NoReadableConversations(this.conversationTypes().map((type) => TYPE_SCOPE[type]));
-    // Slack refuses the whole call when one type lacks its read scope, and an
-    // empty types value has undocumented behavior, so a listing never sends
-    // one: with no type to ask for, the scopes held may be older than the
-    // token's.
     let types = this.readableTypes();
-    if (types.length === 0) {
-      this.takeScopes(reportedScopes((await this.web.auth.test()).response_metadata));
-      types = this.readableTypes();
-      if (types.length === 0) throw noneReadable();
-    }
     let out: SlackConversationInfo[] = [];
     let cursor: string | undefined;
     let limited = 0;
-    let startedOver = false;
     const names = { waitOut };
-    // A listing keeps its types while it pages, so a cursor keeps its meaning.
-    // An answer that changes which types the token can read starts it over,
-    // once, so a second change waits for the next listing.
+    // A listing keeps its types while it pages, so a cursor keeps its meaning,
+    // and starts over whenever the types the token can read change. Once
+    // Slack has reported the scopes, they only grow, so a listing starts over
+    // at most once more than there are types.
     const startOver = (): boolean => {
       const now = this.readableTypes();
-      if (startedOver || now.join(',') === types.join(',')) return false;
+      if (now.join(',') === types.join(',')) return false;
       if (now.length === 0) throw noneReadable();
-      startedOver = true;
       types = now;
       out = [];
       cursor = undefined;
@@ -678,6 +671,18 @@ export class SlackAdapter {
     for (;;) {
       let result: Awaited<ReturnType<SlackWebLike['conversations']['list']>>;
       try {
+        // Slack refuses the whole call when one type lacks its read scope, and
+        // an empty types value has undocumented behavior, so a listing never
+        // sends one: with no type to ask for, the scopes held may be older
+        // than the token's, and auth.test reports them. In the background it's
+        // waited out and asked again like a page.
+        if (types.length === 0) {
+          this.takeScopes(reportedScopes((await this.web.auth.test()).response_metadata));
+          limited = 0;
+          types = this.readableTypes();
+          if (types.length === 0) throw noneReadable();
+          continue;
+        }
         result = await this.web.conversations.list({
           types: types.join(','),
           exclude_archived: true,
@@ -687,7 +692,7 @@ export class SlackAdapter {
       } catch (err) {
         this.takeScopes(reportedScopes((err as { data?: { response_metadata?: unknown } } | null)?.data?.response_metadata));
         if (startOver()) continue;
-        const wait = waitOut && waitToAskAgain(err, 'conversations.list');
+        const wait = waitOut && waitToAskAgain(err, types.length > 0 ? 'conversations.list' : 'auth.test');
         if (!wait) throw err;
         await waitOut!(wait, ++limited);
         continue;

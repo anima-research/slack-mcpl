@@ -1,22 +1,24 @@
 /**
  * conversations.list asks only for the types the token's scopes can read, as
- * Slack last reported them. Driven through a fake client for the requests the
+ * Slack has reported them. Driven through a fake client for the requests the
  * adapter builds, and through the real client against a local endpoint that
  * answers as Slack does, with the x-oauth-scopes header Slack sends with each
  * answer, a refusal's included.
  */
 import test, { after, before } from 'node:test';
 import assert from 'node:assert/strict';
+import { method } from '@animalabs/mcpl-core';
 import {
   NoReadableConversations,
   SLACK_CLIENT_OPTIONS,
   SlackAdapter,
   SlackWebClient,
+  leftOutNote,
   type SlackSocketLike,
   type SlackWebLike,
 } from '../src/slack-adapter.js';
 import { SlackMcplServer } from '../src/server.js';
-import { connectHost, initialize } from './harness.js';
+import { FULL_GRANT, connectHost, initialize, until } from './harness.js';
 import { fakeSlackApi, type FakeSlackApi, type SlackApiAnswer } from './slackApi.js';
 
 const ALL = ['channels:read', 'groups:read', 'im:read', 'mpim:read'];
@@ -105,6 +107,8 @@ test("the stderr line names only the enabled types the token can't read, and say
   const { adapter } = fixture(['channels:read', 'groups:read', 'im:read'], false, [
     { channels: [], response_metadata: { scopes: ALL } },
     { channels: [], response_metadata: { scopes: ALL } },
+    // An answer naming fewer scopes than known, such as one sent before a
+    // grant, takes none away: Slack never narrows a token's scopes.
     { channels: [], response_metadata: { scopes: ['channels:read', 'groups:read'] } },
   ]);
   await adapter.listConversations();
@@ -112,8 +116,14 @@ test("the stderr line names only the enabled types the token can't read, and say
   assert.deepEqual(lines, [
     '[slack-mcpl] Conversation listing omits types without a granted read scope: mpim (requires mpim:read).',
     "[slack-mcpl] Conversation listing now asks for every type it lists: the token has each one's read scope.",
-    '[slack-mcpl] Conversation listing now omits types without a granted read scope: im (requires im:read), mpim (requires mpim:read).',
   ]);
+});
+
+test("the note names three or more kinds as a list, each with its read scope", () => {
+  assert.equal(leftOutNote(['private_channel', 'im', 'mpim']),
+    "This listing leaves out private channels, DMs and group DMs: this bot's token doesn't have groups:read, " +
+      "im:read and mpim:read, the read scopes Slack needs to list those. Whoever runs this host can add them to the " +
+      "app's bot token scopes and reinstall the app to the workspace.");
 });
 
 // Through the real client: Slack's answer names the token's scopes in its
@@ -163,22 +173,55 @@ test('a refusal whose scopes leave out a type the listing asked for starts it ov
   ]);
 });
 
-test('a listing starts over once: a second change of scopes stands for this listing and applies to the next', { timeout: 5000 }, async (t) => {
+test('a listing starts over each time the types the token can read change, so a second grant is listed by the same call', { timeout: 5000 }, async (t) => {
   t.after(() => api.answerFor('conversations.list'));
   const from = api.calls.length;
   api.answerFor('conversations.list',
-    refused('channels:read,groups:read,im:read', 'mpim:read'),
-    refused('channels:read,groups:read', 'im:read'),
-    page('channels:read,groups:read'));
-  const slack = realAdapter();
-  const err = (await slack.listConversations().then(() => null, (e: unknown) => e)) as { data?: { error?: string } } | null;
-  assert.equal(err?.data?.error, 'missing_scope');
-  await slack.listConversations();
+    page('channels:read,groups:read,im:read', [channel('C1')]),
+    page('channels:read,groups:read,im:read,mpim:read', [channel('C1')]),
+    page('channels:read,groups:read,im:read,mpim:read', [channel('C1')]));
+  const listed = await realAdapter(['channels:read', 'groups:read']).listConversations();
+  assert.deepEqual(listed.leftOut, []);
+  assert.deepEqual(listed.conversations.map((c) => c.id), ['C1']);
   assert.deepEqual(asked(from), [
-    ['public_channel,private_channel,im,mpim', undefined],
-    ['public_channel,private_channel,im', undefined],
     ['public_channel,private_channel', undefined],
+    ['public_channel,private_channel,im', undefined],
+    ['public_channel,private_channel,im,mpim', undefined],
   ]);
+});
+
+test("an answer naming fewer scopes than known takes none away, so the listing keeps its types", { timeout: 5000 }, async (t) => {
+  t.after(() => api.answerFor('conversations.list'));
+  const from = api.calls.length;
+  api.answerFor('conversations.list', page('channels:read,groups:read', [channel('C1')]));
+  const listed = await realAdapter(['channels:read', 'groups:read', 'im:read']).listConversations();
+  assert.deepEqual(listed.leftOut, ['mpim']);
+  assert.deepEqual(asked(from), [['public_channel,private_channel,im', undefined]]);
+});
+
+test("a grant another listing reports while this one waits on a page starts this one over at that page's answer", { timeout: 5000 }, async (t) => {
+  t.after(() => api.answerFor('conversations.list'));
+  const from = api.calls.length;
+  let other: Promise<unknown> | undefined;
+  api.answerFor('conversations.list',
+    // This listing's only page, slowed so the other listing's answer lands first.
+    { ...page('channels:read,groups:read,im:read', [channel('C1')]), delayMs: 200 },
+    page('channels:read,groups:read,im:read,mpim:read'),
+    page('channels:read,groups:read,im:read,mpim:read', [channel('C1')]));
+  const slack = realAdapter(['channels:read', 'groups:read', 'im:read']);
+  const mine = slack.listConversations();
+  await until(() => api.calls.length > from, 'the first listing asked');
+  other = slack.listConversations();
+  const listed = await mine;
+  await other;
+  assert.deepEqual(listed.leftOut, []);
+  assert.deepEqual(listed.conversations.map((c) => c.id), ['C1']);
+  assert.deepEqual(asked(from).map(([types]) => types), [
+    'public_channel,private_channel,im',
+    'public_channel,private_channel,im',
+    'public_channel,private_channel,im,mpim',
+    'public_channel,private_channel,im,mpim',
+  ], "the other listing starts over at its own answer, and this one at its page's");
 });
 
 test("a refusal whose scopes read no type ends the listing unsent, rather than ask with no types", { timeout: 5000 }, async (t) => {
@@ -211,6 +254,27 @@ test('a page whose scopes add a type starts the listing over from the first page
   ]);
 });
 
+test('with no readable type, a background listing waits out a rate-limited auth.test and asks it again', { timeout: 5000 }, async (t) => {
+  t.after(() => api.answerFor('auth.test'));
+  t.after(() => api.answerFor('conversations.list'));
+  const from = api.calls.length;
+  api.answerFor('auth.test',
+    { status: 429, headers: { 'retry-after': '1' }, body: { ok: false, error: 'ratelimited' } },
+    { headers: { 'x-oauth-scopes': 'chat:write,channels:read' }, body: { ok: true, user_id: 'UBOT' } });
+  api.answerFor('conversations.list',
+    { status: 429, headers: { 'retry-after': '1' }, body: { ok: false, error: 'ratelimited' } },
+    page('chat:write,channels:read', [channel('C1')]));
+  const waits: [string, number][] = [];
+  const listed = await realAdapter(['chat:write']).listConversations(false, async (wait, n) => { waits.push([wait.method, n]); });
+  assert.deepEqual(waits, [['auth.test', 1], ['conversations.list', 1]], "each request's waits are counted on their own");
+  assert.deepEqual(listed.conversations.map((c) => c.id), ['C1']);
+  assert.deepEqual(api.calls.slice(from), ['auth.test', 'auth.test', 'conversations.list', 'conversations.list']);
+  // In a call, with no wait to give, the rate limit is the listing's answer.
+  api.answerFor('auth.test', { status: 429, headers: { 'retry-after': '1' }, body: { ok: false, error: 'ratelimited' } });
+  const err = await realAdapter(['chat:write']).listConversations().then(() => null, (e: unknown) => e);
+  assert.equal((err as { code?: string } | null)?.code, 'slack_webapi_rate_limited_error');
+});
+
 test("a listing in the background that starts over counts its waits afresh, since it's a new request", { timeout: 5000 }, async (t) => {
   t.after(() => api.answerFor('conversations.list'));
   const limited: SlackApiAnswer = { status: 429, headers: { 'retry-after': '1' }, body: { ok: false, error: 'ratelimited' } };
@@ -225,7 +289,7 @@ test("a listing in the background that starts over counts its waits afresh, sinc
   assert.deepEqual(inARow, [1, 1]);
 });
 
-test('a blank x-oauth-scopes header, which the client reads as [""], keeps the scopes last reported', { timeout: 5000 }, async (t) => {
+test('a blank x-oauth-scopes header, which the client reads as [""], keeps the scopes reported before', { timeout: 5000 }, async (t) => {
   t.after(() => api.answerFor('conversations.list'));
   api.answerFor('conversations.list', page(''));
   const direct = await client.conversations.list({ types: 'public_channel' });
@@ -288,9 +352,31 @@ test('list_channels with no readable type says so, names the read scopes, and se
   };
   assert.equal(listed.isError, true);
   assert.equal(listed.content[0].text,
-    'conversations.list: the token has none of the read scopes channels:read, groups:read, im:read, mpim:read\n\n' +
+    "This bot's token has none of the read scopes channels:read, groups:read, im:read and mpim:read\n\n" +
       "Nothing was listed: Slack lists each kind of conversation only for a token with that kind's read scope. " +
       "Calling again won't change that: whoever runs this host has to add one of those scopes to the app's bot " +
       'token scopes and reinstall the app to the workspace.');
   assert.deepEqual(api.calls.slice(from), ['auth.test']);
+});
+
+test('with no readable type, registration logs why and registers nothing, and refresh_channels says so', { timeout: 5000 }, async (t) => {
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => lines.push(args.join(' ')));
+  const from = api.calls.length;
+  const h = connectHost(new SlackMcplServer(realAdapter(['chat:write'])));
+  t.after(() => h.close());
+  await initialize(h, true);
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  const failed = "[slack-mcpl] Failed to enumerate conversations: This bot's token has none of the read scopes " +
+    'channels:read, groups:read, im:read and mpim:read';
+  await until(() => lines.includes(failed), 'registration logged its failure');
+  assert.equal(h.hostSaw.filter((req) => req.method === method.CHANNELS_REGISTER).length, 0, 'nothing was registered');
+  const refreshed = (await h.host.sendRequest('tools/call', { name: 'refresh_channels', arguments: {} })) as {
+    isError?: boolean;
+    content: { text: string }[];
+  };
+  assert.equal(refreshed.isError, true);
+  assert.match(refreshed.content[0].text,
+    /^This bot's token has none of the read scopes channels:read, groups:read, im:read and mpim:read\n\nNothing was announced to the host: /);
+  assert.deepEqual([...new Set(api.calls.slice(from))], ['auth.test'], 'no listing was sent');
 });
