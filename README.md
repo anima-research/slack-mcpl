@@ -171,8 +171,9 @@ Slack's own refusal of a read is passed on as the other tools' are.
 `fetch_history` also accepts `textContains`, `caseSensitive` (default `false`)
 and `authorIds`. The literal substring is matched against each message's
 `content` as the tools return it, Slack's escapes decoded and links shown by
-their labels, except that a mentioned user appears by their user ID
-(`uid:U…`), since names aren't looked up for matching. Case-insensitive
+their labels, except that a mentioned user appears only by their user ID, as
+`@U… (uid:U…)`: neither a name nor a label Slack sent with the mention is
+matched, so a match never depends on a lookup. Case-insensitive
 matching uses JavaScript Unicode `toLowerCase`, without locale rules or
 normalization. Author IDs are exact: a user's ID, matched against `authorId`,
 or a bot's, matched against `authorBotId`. They're ORed within the list and
@@ -205,7 +206,7 @@ and calling again is safe.
 `stopReason`, `scope` and `threadRepliesSearched`. `scanned` and `matched`
 count the messages the cursor moved past, so a chain of calls counts each
 message once; a match held back by the byte budget is counted by the call that
-returns it. Stop reasons are
+returns it. `pages` counts the requests for pages this call made. Stop reasons are
 `exhausted`, `match_limit`, `scan_limit`, `byte_limit`, `time_limit`,
 `rate_limited` and `pagination_stalled`. A rate limit includes
 `retryAfterSeconds` when Slack gave one; the caller chooses whether and when to

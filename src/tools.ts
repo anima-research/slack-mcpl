@@ -150,7 +150,7 @@ export const toolDefinitions: ToolDefinition[] = [
         ...readProperties,
         channelId: { type: 'string', description: 'Slack conversation ID' },
         limit: { type: 'integer', ...READ_LIMITS.limit, default: 50, description: 'Maximum matching messages returned per call' },
-        textContains: {type: 'string', minLength: 1, maxLength: 256, description: "Literal substring of a message's content as returned, except that a mentioned user appears by their user ID (uid:U…), since names aren't looked up for matching; case-insensitive by default; no regex"},
+        textContains: {type: 'string', minLength: 1, maxLength: 256, description: "Literal substring of a message's content as returned, except that a mentioned user appears only by their user ID, as @U… (uid:U…), not by name; case-insensitive by default; no regex"},
         caseSensitive: {type: 'boolean', default: false, description: 'Use exact case for textContains; otherwise JavaScript Unicode toLowerCase, without normalization'},
         authorIds: {type: 'array', minItems: 1, maxItems: 50, items: {type: 'string', pattern: AUTHOR_ID.source}, description: "Match any exact author ID, a message's authorId or authorBotId, AND textContains; missing authors do not match"},
       },

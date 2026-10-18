@@ -23,11 +23,18 @@ const PAGE_SIZE = 200;
 
 /** A Slack timestamp, a message's ts. */
 export const SLACK_TS = /^\d{1,16}(?:\.\d{1,6})?$/;
+const isTimestamp = (value: unknown): value is string =>
+  typeof value === 'string' && SLACK_TS.test(value) && Number.isFinite(new Date(Number(value) * 1000).getTime());
 function timestamp(value: unknown, name: string): string {
-  if (typeof value !== 'string' || !SLACK_TS.test(value) || !Number.isFinite(new Date(Number(value) * 1000).getTime())) {
-    throw new Error(`${name} must be a Slack timestamp`);
-  }
+  if (!isTimestamp(value)) throw new Error(`${name} must be a Slack timestamp`);
   return value;
+}
+/** A message's ts, as Slack gave it: a read can't place a message without one. */
+function messageTs(m: SlackHistoryMessage): string {
+  if (!isTimestamp(m.ts)) {
+    throw new Error('No messages were returned: Slack gave a message without a valid ts, so this read can\'t place it');
+  }
+  return m.ts;
 }
 function compareTs(a: string, b: string): number {
   const micros = (s: string) => {
@@ -42,9 +49,15 @@ function compareTs(a: string, b: string): number {
  *  and authorBotId give them. */
 export const AUTHOR_ID = /^[UWB][A-Z0-9]+$/;
 
-/** No names: a filter matches a message as its content shows it, with a
- *  mentioned user as their id, so a match never depends on a lookup. */
-const NO_NAMES = new Map<string, string>();
+/** The names a filter matches mentions by: each user's own ID. A filter
+ *  matches a message's text formatted as its content is, except that a
+ *  mentioned user reads @U… (uid:U…), with or without a label Slack sent, so a
+ *  match never depends on a lookup or on what the name cache holds. */
+const BY_ID = new (class extends Map<string, string> {
+  override get(id: string): string {
+    return id;
+  }
+})();
 
 /** A read's arguments, checked before Slack is asked: an argument this tool
  *  doesn't take is refused, so a misspelled filter can't read as no filter. */
@@ -212,26 +225,33 @@ export async function readBounded(opts: ReadOptions, source: ReadSource): Promis
       if (records.length >= opts.limit) { stopReason = 'match_limit'; break; }
       // A filtered read scans as far as it may; an unfiltered one asks for
       // the matches it still needs. Past a thread's start, Slack may give the
-      // parent again within the page's size, so such a page asks for one more.
+      // parent again within the page's size, so such a page asks for one
+      // more, up to Slack's page size.
       const wanted = Math.min(opts.maxScanned - scanned, filtering ? PAGE_SIZE : opts.limit - records.length);
       const size = Math.min(PAGE_SIZE, wanted + (kind === 'thread' && at !== undefined ? 1 : 0));
       const page = await source.page(at, size);
       pages++;
-      if (!Array.isArray(page.messages)) throw new Error('Slack returned invalid history messages');
-      // Only a message past the position counts, so one Slack returns again,
-      // such as a thread's parent, is neither returned twice nor moves the
-      // position back; and the rest are taken in reading order, so the
-      // position only moves forward, whatever order the page came in.
-      const from = at;
-      const rows = (page.messages as SlackHistoryMessage[])
-        .map((m) => ({ m, ts: timestamp(m.ts, 'Slack message ts') }))
-        .filter(({ ts }) => from === undefined || (kind === 'history' ? compareTs(ts, from) < 0 : compareTs(ts, from) > 0))
-        .sort((a, b) => (kind === 'history' ? compareTs(b.ts, a.ts) : compareTs(a.ts, b.ts)));
+      if (!Array.isArray(page.messages)) {
+        throw new Error("No messages were returned: Slack's answer for a page of messages held no list of them");
+      }
+      // The page's messages in reading order, each strictly past the one
+      // before it, starting from the position: one Slack gives again, such as
+      // a thread's parent, or twice in one page, is taken once and never
+      // moves the position back, whatever order the page came in.
+      const beyond = (ts: string, from: string | undefined) =>
+        from === undefined || (kind === 'history' ? compareTs(ts, from) < 0 : compareTs(ts, from) > 0);
+      const rows: { m: SlackHistoryMessage; ts: string }[] = [];
+      for (const row of (page.messages as SlackHistoryMessage[])
+        .map((m) => ({ m, ts: messageTs(m) }))
+        .sort((a, b) => (kind === 'history' ? compareTs(b.ts, a.ts) : compareTs(a.ts, b.ts)))) {
+        if (beyond(row.ts, rows.at(-1)?.ts ?? at)) rows.push(row);
+      }
       const isMatch = (m: SlackHistoryMessage) =>
-        (needle === undefined || fold(formatSlackText(m.text ?? '', NO_NAMES)).includes(needle)) &&
+        (needle === undefined || fold(formatSlackText(m.text ?? '', BY_ID)).includes(needle)) &&
         (!opts.authorIds.length || [m.user, m.bot_id].some((id) => id !== undefined && opts.authorIds.includes(id)));
-      // Only the matches the read can still return are shaped, so names are
-      // looked up for them alone.
+      // Only the matches the limit can still take are shaped, so names are
+      // looked up for them, not for every message scanned. Some may then not
+      // fit maxBytes; their names stay cached for the call that continues.
       const matches = rows.filter(({ m }) => isMatch(m)).slice(0, opts.limit - records.length).map(({ m }) => m);
       const shaped = new Map((await source.shape(matches)).map((m, i) => [matches[i]!, m]));
       for (const [i, { m, ts }] of rows.entries()) {
@@ -286,5 +306,5 @@ function stoppedAtStart(opts: ReadOptions, stopReason: StopReason, held: { ts: s
         : `maxBytes goes up to ${n(most)}, so this tool can't return it whole; to read past it, ${past}.`);
   }
   return "No messages were returned: Slack's page held no message past where this read started, though it said more " +
-    'remain. Calling again may get them.';
+    "remain. Calling again may get them; if it stops the same way, Slack isn't giving the rest of this range just now.";
 }

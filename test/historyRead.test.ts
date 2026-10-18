@@ -144,9 +144,9 @@ test("a call that can't return its first message for maxBytes fails, naming the 
   assert.ok(needed, said);
   assert.match(said, /^No messages were returned: the next message, 8\.0, takes [\d,]+ bytes in this tool's result, which with up to [\d,]+ bytes of the result's own fields is more than maxBytes, 2,048\. /);
   assert.match(said, /to read past it, call again with the same arguments, but without cursor and with latest set to 8\.0\.$/);
-  // The size it names fits.
-  const out = await reader.readHistory('C1', { channelId: 'C1', maxBytes: Number(needed!.replace(/,/g, '')), latest: '9.0', limit: 1 });
-  assert.deepEqual(out.messages.map((m) => m.id), ['8.0']);
+  // The size it names fits, called again with the same arguments.
+  const out = await reader.readHistory('C1', { channelId: 'C1', maxBytes: Number(needed!.replace(/,/g, '')), latest: '9.0' });
+  assert.equal(out.messages[0]?.id, '8.0');
 });
 
 test("a thread whose parent doesn't fit maxBytes fails the same way, with oldest as the way past it", { timeout: 5000 }, async (t) => {
@@ -325,10 +325,54 @@ test('textContains is counted in characters, as the schema counts them', { timeo
     /textContains must contain 1 to 256 characters/);
 });
 
+test("a message too big for even maxBytes' most fails with how to read past it", { timeout: 10_000 }, async (t) => {
+  answers(t, { 'conversations.history': [page([row('8.0', 'U1', 'x'.repeat(1_100_000)), row('7.0', 'U1', 'small')], true)] });
+  await assert.rejects(adapter().readHistory('C1', { channelId: 'C1', latest: '9.0' }),
+    /maxBytes goes up to 1,048,576, so this tool can't return it whole; to read past it, call again with the same arguments, but without cursor and with latest set to 8\.0\.$/);
+});
+
+test("a page Slack answers without a list of messages, or with a message without a ts, fails the read with what wasn't returned", { timeout: 5000 }, async (t) => {
+  answers(t, { 'conversations.history': [{ body: { ok: true, has_more: false } }, page([row('nope', 'U1', 'a')], false)] });
+  const reader = adapter();
+  await assert.rejects(reader.readHistory('C1', { channelId: 'C1' }),
+    /^Error: No messages were returned: Slack's answer for a page of messages held no list of them$/);
+  await assert.rejects(reader.readHistory('C1', { channelId: 'C1' }),
+    /^Error: No messages were returned: Slack gave a message without a valid ts, so this read can't place it$/);
+});
+
+test('a message Slack lists twice in one page is taken once', { timeout: 5000 }, async (t) => {
+  answers(t, { 'conversations.history': [page([row('9.0', 'U1', 'a'), row('8.0', 'U1', 'b'), row('9.0', 'U1', 'a')], false)] });
+  const out = await adapter().readHistory('C1', { channelId: 'C1', latest: '10.0' });
+  assert.deepEqual(out.messages.map((m) => m.id), ['8.0', '9.0']);
+  assert.equal(out.pagination.scanned, 2);
+});
+
+test("a mention matches by its user ID only, whatever name the content shows or label Slack sent", { timeout: 5000 }, async (t) => {
+  answers(t, {
+    'conversations.history': [page([row('2.0', 'U1', 'ask <@U77>'), row('1.0', 'U1', 'ask <@U78|bob>')], false)],
+    'users.info': [{ body: { ok: true, user: { profile: { display_name: 'Ann' } } } }],
+  });
+  const reader = adapter();
+  // A read without a filter looks the names up, so the content shows them.
+  const shown = await reader.readHistory('C1', { channelId: 'C1' });
+  assert.deepEqual(shown.messages.map((m) => m.content), ['ask @Ann (uid:U78)', 'ask @Ann (uid:U77)']);
+  for (const [needle, ids] of [['Ann', []], ['bob', []], ['uid:U77', ['2.0']], ['@U78', ['1.0']]] as const) {
+    const out = await reader.readHistory('C1', { channelId: 'C1', textContains: needle });
+    assert.deepEqual(out.messages.map((m) => m.id), ids, needle);
+  }
+});
+
+test('fetch_thread passes latest on to Slack as the bound of every page', { timeout: 5000 }, async (t) => {
+  answers(t, { 'conversations.replies': [page([row('1.0', 'U1', 'parent', { thread_ts: '1.0' })], false)] });
+  const from = api.calls.length;
+  await adapter().readThread('C1', '1.0', { channelId: 'C1', threadTs: '1.0', latest: '9.0' });
+  assert.equal(sentTo('conversations.replies', from)[0]!.latest, '9.0');
+});
+
 test("a first page with more to come but nothing in it fails the call, since the read can't move", { timeout: 5000 }, async (t) => {
   answers(t, { 'conversations.history': [page([], true)] });
   await assert.rejects(adapter().readHistory('C1', { channelId: 'C1' }),
-    /^Error: No messages were returned: Slack's page held no message past where this read started, though it said more remain\. Calling again may get them\.$/);
+    /^Error: No messages were returned: Slack's page held no message past where this read started, though it said more remain\. Calling again may get them; if it stops the same way, Slack isn't giving the rest of this range just now\.$/);
 });
 
 test('a later page with more to come but nothing in it stops the read as stalled, not covered', { timeout: 5000 }, async (t) => {
