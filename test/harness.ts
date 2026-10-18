@@ -178,6 +178,8 @@ export function connectHost(server: SlackMcplServer, opts: HarnessOptions = {}) 
   const served = server.serve(serverConn);
   return {
     host,
+    /** The server's end, for a test to hear what reaches it. */
+    serverConn,
     hostSaw,
     served,
     async close() {

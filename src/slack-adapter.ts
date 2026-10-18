@@ -20,7 +20,8 @@
  * Event handling salvaged from zulip-mcp PR #8's SlackAdapter.
  */
 
-import { WebClient } from '@slack/web-api';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { WebClient, ErrorCode, LogLevel, type Logger, type WebAPICallResult, type WebClientOptions } from '@slack/web-api';
 import { SocketModeClient } from '@slack/socket-mode';
 import {
   formatSlackText,
@@ -28,22 +29,118 @@ import {
   resolveSlackUserNames,
   fetchSlackHistory,
   classifyExtension,
+  reactionName,
+  SLACK_FAILED,
+  connectionNeverMade,
   type AttachmentRef,
   type SlackHistoryMessage,
 } from './content.js';
 
 /** An acknowledgement reaction is removed after this, replied to or not. */
 const ACK_TTL_MS = 10 * 60 * 1000;
-/** A removal that failed without an answer from Slack is tried again after
- *  this, at most ACK_MAX_TRIES times in all. */
+/** A removal that failed in a way that can pass is tried again after this,
+ *  up to ACK_MAX_TRIES tries in all. */
 const ACK_RETRY_MS = 60 * 1000;
 const ACK_MAX_TRIES = 5;
+/** Slack's answers to an acknowledgement's add after which it may be there:
+ *  already_reacted, and the failures the explainer calls an unknown outcome. */
+const MAY_HAVE_LANDED = new Set(['already_reacted', 'internal_error', 'fatal_error', 'service_unavailable']);
 /** The host refreshes typing every few seconds; Slack keeps a thread status
  *  for 2 minutes, so it is set again only after this. */
 const STATUS_REFRESH_MS = 60 * 1000;
 const STATUS_TEXT = 'is thinking…';
 
-type AckEntry = { timer: ReturnType<typeof setTimeout>; added: Promise<boolean>; tries: number };
+/** Slack's code, when Slack refused the call; undefined for any other error. */
+export function slackRefusal(err: unknown): string | undefined {
+  const e = err as { code?: unknown; data?: { error?: unknown } } | null;
+  return e?.code === ErrorCode.PlatformError && typeof e.data?.error === 'string' ? e.data.error : undefined;
+}
+
+/** Slack's answers to conversations.info that it has no such conversation to
+ *  show this bot (channel_not_found), or that the id isn't one at all
+ *  (invalid_channel_id). */
+const NOT_SHOWN = new Set(['channel_not_found', 'invalid_channel_id']);
+
+/** What can change Slack's answer to a check of a conversation (with DMs off)
+ *  that a later one wouldn't pass either: another conversation, or whoever
+ *  runs this host. A check waitToAskAgain says can pass doesn't come here:
+ *  assertNotDm leaves its error to the explainer. A rate limit's answer
+ *  without the Retry-After the client needs does come here, and is told to
+ *  try again shortly. */
+function afterFailedCheck(err: unknown): string {
+  const e = err as { data?: { needed?: unknown } } | null;
+  const code = slackRefusal(err);
+  // Not Slack's refusal, nor a failure waitToAskAgain names, such as a rate
+  // limit's answer without the Retry-After the client needs.
+  if (code === undefined) return 'Try again shortly.';
+  if (NOT_SHOWN.has(code)) return 'list_channels shows the ones it can use.';
+  if (code === 'missing_scope') {
+    const needed = typeof e?.data?.needed === 'string' && e.data.needed ? ` (Slack names ${e.data.needed})` : '';
+    return (
+      `Calling again won't change that until whoever runs this host adds the scope it needs${needed} to the ` +
+      "Slack app's bot token scopes and reinstalls the app."
+    );
+  }
+  return "Calling again won't change Slack's answer; only whoever runs this host, or the workspace's admins, can.";
+}
+
+type AckEntry = {
+  timer: ReturnType<typeof setTimeout>;
+  added: Promise<boolean>;
+  tries: number;
+  removing?: Promise<void>;
+};
+
+/** How long work no call waits on waits before asking Slack again after a
+ *  failure that gives no Retry-After. */
+const FAILED_WAIT_SECONDS = 30;
+
+/** Why work no call waits on, such as channel registration, waits before
+ *  asking Slack again after a request to `method`: Slack rate-limited it and
+ *  asked for this many seconds (`limited`), or it failed in a way that can
+ *  pass: in transit, with an HTTP error, by Slack's own failure, or by not
+ *  being sent because its call was out of time (`failed`). */
+export interface SlackWait {
+  method: string;
+  seconds: number;
+  why: 'limited' | 'failed';
+}
+
+/** The wait before asking Slack again after `err` from a request to `method`,
+ *  for work no call waits on; undefined when Slack's answer will be the same
+ *  next time, or `err` isn't the client's. A request the host is waiting on
+ *  waits out only a `limited` one, within its budget (SlackWebClient). */
+export function waitToAskAgain(err: unknown, method: string): SlackWait | undefined {
+  const e = err as { code?: unknown; retryAfter?: unknown } | null;
+  if (e?.code === ErrorCode.RateLimitedError && typeof e.retryAfter === 'number') {
+    return { method, seconds: e.retryAfter, why: 'limited' };
+  }
+  // A request its call's time left no room for can go out in a later call.
+  // Only a request made for a call can get it, and work no call waits on
+  // never does, so its wait is left at none.
+  if (err instanceof OutOfCallTime) return { method, seconds: 0, why: 'failed' };
+  const refused = slackRefusal(err);
+  const failedAtSlack = refused !== undefined && SLACK_FAILED.has(refused);
+  if (e?.code === ErrorCode.RequestError || e?.code === ErrorCode.HTTPError || failedAtSlack) {
+    return { method, seconds: FAILED_WAIT_SECONDS, why: 'failed' };
+  }
+  return undefined;
+}
+
+/** Called by a listing no call waits on before it asks Slack again: with the
+ *  wait, and how many times in a row this request has needed one. Rejecting
+ *  ends the listing with that error, unless it's GaveUp on a DM's name. */
+export type SlackWaitOut = (wait: SlackWait, inARow: number) => Promise<void>;
+
+/** What a SlackWaitOut rejects with when it gives up on a request rather than
+ *  on the whole listing. A page given up ends the listing; a DM whose user's
+ *  name is given up is labelled with the user's id, as a refused lookup is. */
+export class GaveUp extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'GaveUp';
+  }
+}
 
 /** Message subtypes that represent real user content. Everything else
  * (message_changed, message_deleted, channel_join, bot_message, …) is noise
@@ -95,6 +192,10 @@ export interface SlackConversationInfo {
   topic?: string;
   isMember: boolean;
   numMembers?: number;
+  /** A DM whose user's name Slack didn't give, in a way that can pass: the
+   *  wait before asking again, as waitToAskAgain gives it. Its name is the
+   *  user's id until a lookup succeeds. */
+  nameWait?: SlackWait;
 }
 
 export interface SlackMessageData {
@@ -152,21 +253,231 @@ export interface SlackAdapterConfig {
 }
 
 /**
+ * The Web API client's settings for every request after startup, so that each
+ * one answers at once with what happened. A rate limit comes back with
+ * Slack's Retry-After (rejectRateLimitedCalls), and SlackWebClient waits out
+ * one a request from the host can afford. A failure in transit comes
+ * back without the request being sent again (no retries), so this client never
+ * sends a post that may have reached Slack a second time. A request fails once
+ * Slack has gone 10 seconds without answering, or without sending more of its
+ * answer, and SlackWebClient sends a request only if those 10 seconds fit
+ * before its call's deadline; an answer that keeps arriving a little at a time
+ * isn't cut off. With the client's defaults, a rate limit or a network failure
+ * was retried inside the call for up to about 30 minutes, and every request
+ * behind it waited, since requests are handled one at a time.
+ */
+export const SLACK_CLIENT_OPTIONS = {
+  rejectRateLimitedCalls: true,
+  retryConfig: { retries: 0 },
+  timeout: 10_000,
+} satisfies WebClientOptions;
+
+/** How long, in seconds, this server gives a request from the host, counted
+ *  from when it reaches this server. */
+export const CALL_SECONDS = 25;
+
+/** How long, in seconds, the Slack requests made for one request from the
+ *  host may spend waiting out Slack's rate limits, in all. */
+export const WAIT_PER_CALL_SECONDS = 5;
+
+/** The time of the request from the host being handled: when it reached this
+ *  server, its deadline, and what is left of its waiting. serve() handles one
+ *  request at a time, so one store is live at once. */
+interface CallTime {
+  arrived: number;
+  deadline: number;
+  secondsLeft: number;
+}
+const callTime = new AsyncLocalStorage<CallTime>();
+
+/** Handle one request from the host, which reached this server at `arrived`
+ *  (ms since the epoch): its Slack requests are sent only while their timeout
+ *  fits before CALL_SECONDS after that, and share WAIT_PER_CALL_SECONDS of
+ *  waiting for rate limits (SlackWebClient). */
+export function withCallTime<T>(arrived: number, handle: () => Promise<T>): Promise<T> {
+  return callTime.run({ arrived, deadline: arrived + CALL_SECONDS * 1000, secondsLeft: WAIT_PER_CALL_SECONDS }, handle);
+}
+
+/** Start work that outlives the request from the host it began in, such as
+ *  registration or an acknowledgement's removal, outside that request's time:
+ *  its Slack requests have no deadline and answer a rate limit at once, as any
+ *  made outside a request do, and it waits in its own way, if at all. */
+export function outsideCallTime<T>(start: () => T): T {
+  return callTime.exit(start);
+}
+
+/** What assertRequestFits throws instead of letting a request go out whose
+ *  timeout wouldn't end before its call's deadline. The request wasn't sent.
+ *  `method` names it: a Web API method, or what else it was, such as
+ *  fetch_attachment's download. */
+export class OutOfCallTime extends Error {
+  readonly code = 'slack_mcpl_out_of_call_time';
+  /** `usedSeconds`: whole seconds, rounded up, so a refusal never reads as
+   *  leaving room for the request; at most CALL_SECONDS. */
+  constructor(readonly method: string, readonly usedSeconds: number) {
+    super(`${method}: out of this call's time`);
+    this.name = 'OutOfCallTime';
+  }
+}
+
+/** The Web API method of the request each error SlackWebClient passes on came
+ *  from, so the explainer can tell a write's own request from one made before
+ *  it. */
+const failedRequests = new WeakMap<object, string>();
+
+/** The Web API method of the request `err` came from: OutOfCallTime's own, or
+ *  the one SlackWebClient marked it with; undefined for an error no request of
+ *  SlackWebClient's threw. */
+export function failedRequest(err: unknown): string | undefined {
+  if (err instanceof OutOfCallTime) return err.method;
+  return err !== null && typeof err === 'object' ? failedRequests.get(err) : undefined;
+}
+
+/** The start rule for every request a request from the host makes, made
+ *  through SlackWebClient or not: one that can take up to `requestMs` goes out
+ *  only if it would end before the call's deadline, and otherwise this throws
+ *  OutOfCallTime and nothing is sent. Outside a request from the host there is
+ *  no deadline. */
+export function assertRequestFits(method: string, requestMs: number): void {
+  const call = callTime.getStore();
+  if (call && Date.now() + requestMs > call.deadline) {
+    throw new OutOfCallTime(method, Math.min(CALL_SECONDS, Math.ceil((Date.now() - call.arrived) / 1000)));
+  }
+}
+
+/**
+ * The adapter's Web API client, built with SLACK_CLIENT_OPTIONS, which keeps
+ * each request from the host to its time.
+ *
+ * A Slack request made for a request from the host is sent only if its whole
+ * timeout fits before that call's deadline, CALL_SECONDS after the call reached
+ * this server, whether the call waited behind earlier calls or spent the time
+ * on its own requests. So a request that times out does so before the
+ * deadline, and a write never runs into the deadline and comes back possibly
+ * done. Only an answer from Slack that keeps arriving a little at a time can
+ * outlast it, since the timeout then ends only a pause in the answer. A
+ * request that doesn't fit throws OutOfCallTime, unsent.
+ *
+ * When Slack answers one of these requests with a rate limit no longer than
+ * what is left of its call's WAIT_PER_CALL_SECONDS, and the request would still
+ * fit after the wait, the client waits that long and sends it once more. The
+ * second answer stands, rate limit included. Slack refused the first without
+ * acting on it, so sending it again can't post twice. A short limit, such as
+ * chat.postMessage's one message per second, then costs the agent a second
+ * inside the call instead of a turn of its own. A longer one, such as a method
+ * tier's minute window, comes back at once with Slack's seconds. Requests are
+ * handled one at a time, so every second a call waits, the requests queued
+ * behind it wait too, and a listing that pages through a large workspace can
+ * meet a limit on each page, which a budget for the whole call bounds where one
+ * per request wouldn't.
+ *
+ * A request made outside a request from the host has no deadline and answers a
+ * rate limit at once. The client binds each of its methods to apiCall as it's
+ * built (`dist/methods.js`, bindApiCall), so this override reaches every Web
+ * API method call. filesUploadV2's upload of a file's bytes is the one request
+ * the client makes without it (`makeRequest`, `dist/WebClient.js`).
+ */
+export class SlackWebClient extends WebClient {
+  /** Each request's timeout, in ms: the longest a request can take. */
+  private readonly requestMs: number;
+
+  /** `options.timeout` is required: the start rule needs each request's whole
+   *  time. */
+  constructor(token: string | undefined, options: WebClientOptions & { timeout: number }) {
+    super(token, options);
+    this.requestMs = options.timeout;
+  }
+
+  override apiCall(method: string, options?: Record<string, unknown>): Promise<WebAPICallResult> {
+    return this.send(method, options, true);
+  }
+
+  /** One send of a request, which keeps the start rule as it goes out. After a
+   *  rate limit the call can wait out, the request goes through here once more,
+   *  so a wait whose timer fires late can't send it past the deadline. */
+  private async send(method: string, options: Record<string, unknown> | undefined, mayWait: boolean): Promise<WebAPICallResult> {
+    assertRequestFits(method, this.requestMs);
+    const call = callTime.getStore();
+    try {
+      return await super.apiCall(method, options);
+    } catch (err) {
+      if (err !== null && typeof err === 'object') failedRequests.set(err, method);
+      const wait = waitToAskAgain(err, method);
+      if (
+        !mayWait || !call || wait?.why !== 'limited' || !(wait.seconds >= 0 && wait.seconds <= call.secondsLeft) ||
+        Date.now() + wait.seconds * 1000 + this.requestMs > call.deadline
+      ) {
+        throw err;
+      }
+      call.secondsLeft -= wait.seconds;
+      await new Promise((resolve) => setTimeout(resolve, wait.seconds * 1000));
+      return this.send(method, options, false);
+    }
+  }
+}
+
+/**
+ * A logger for a Slack client that writes each line to stderr, labelled with
+ * `client`, at info and above, as the client's own logger writes at its
+ * default level. Over stdio, stdout carries the protocol, and the client's own
+ * logger writes its info and debug lines there, with console.info and
+ * console.debug. setLevel and setName, which the Logger interface asks for,
+ * do nothing: the Web API and Socket Mode clients use a logger they're given
+ * as it is, without calling either.
+ */
+export function stderrLogger(client: string): Logger {
+  const write = (level: string) => (...msg: unknown[]) => console.error(`[slack-mcpl] ${client} (${level}):`, ...msg);
+  return {
+    debug() {},
+    info: write('info'),
+    warn: write('warn'),
+    error: write('error'),
+    getLevel: () => LogLevel.INFO,
+    setLevel() {},
+    setName() {},
+  };
+}
+
+/**
+ * The Slack clients connectSlack builds, each logging to stderr
+ * (stderrLogger). auth.test's keeps the Web API client's default patience: a
+ * Slack that can't be reached at launch is retried, rather than ending the
+ * process, and each try has the same timeout as every other call. Every
+ * request after startup goes through the adapter's, a SlackWebClient built
+ * with SLACK_CLIENT_OPTIONS. Socket Mode's client builds a Web API client of
+ * its own, for apps.connections.open, and gives it the same logger.
+ * `slackApiUrl` is Slack's own unless given, as a test gives its local
+ * endpoint.
+ */
+export function slackClients(
+  botToken: string,
+  appToken: string,
+  slackApiUrl?: string,
+): { auth: WebClient; web: WebClient; socket: SocketModeClient } {
+  const api = slackApiUrl ? { slackApiUrl } : {};
+  return {
+    auth: new WebClient(botToken, { timeout: SLACK_CLIENT_OPTIONS.timeout, logger: stderrLogger('auth.test'), ...api }),
+    web: new SlackWebClient(botToken, { ...SLACK_CLIENT_OPTIONS, logger: stderrLogger('Web API'), ...api }),
+    socket: new SocketModeClient({ appToken, logger: stderrLogger('Socket Mode'), clientOptions: { ...api } }),
+  };
+}
+
+/**
  * Connect to Slack and build an adapter: auth.test resolves the bot's own
  * user ID (for self-filtering and mention detection) and the team name
  * (for channel labels), then Socket Mode is wired but not yet started —
- * call start() after registering the message handler.
+ * call start() after registering the message handler. `slackApiUrl` is
+ * Slack's own unless given, as slackClients' is.
  */
-export async function connectSlack(config: SlackAdapterConfig): Promise<SlackAdapter> {
-  const web = new WebClient(config.botToken);
-  const auth = await web.auth.test();
-  const socket = new SocketModeClient({ appToken: config.appToken });
+export async function connectSlack(config: SlackAdapterConfig, slackApiUrl?: string): Promise<SlackAdapter> {
+  const clients = slackClients(config.botToken, config.appToken, slackApiUrl);
+  const auth = await clients.auth.auth.test();
   return new SlackAdapter(
     // WebClient satisfies SlackWebLike at runtime; the cast bridges the
     // parameter-width gap (SlackWebLike takes loose records so tests can
     // inject fakes, WebClient's methods want their exact argument types).
-    web as unknown as SlackWebLike,
-    socket,
+    clients.web as unknown as SlackWebLike,
+    clients.socket,
     (auth.user_id as string | undefined) ?? null,
     (auth.team as string | undefined) ?? '',
     config.dmUsers,
@@ -271,6 +582,11 @@ export class SlackAdapter {
     // cannot, and leaves them on Slack. No new ones while that runs.
     this.stopping = true;
     await Promise.all([...this.ackPending.keys()].map((c) => this.clearAck(c)));
+    // A removal that failed just before stop() began has armed its retry, and
+    // the clear above only joined it. Nothing is tried again after a stop.
+    for (const [channelId, pending] of [...this.ackPending]) {
+      for (const [ts, entry] of [...pending]) this.dropAck(channelId, ts, entry);
+    }
     if (this.socketStarted) {
       await this.socket.disconnect().catch(() => {});
       this.socketStarted = false;
@@ -282,26 +598,44 @@ export class SlackAdapter {
   /** Enumerate conversations the bot can act in: member channels, DMs, and
    *  group DMs. conversations.list also returns public channels the bot is
    *  NOT a member of (no events, no posting without joining) — those are
-   *  excluded here; list_channels with includeNonMember surfaces them. */
-  async listConversations(includeNonMember = false): Promise<SlackConversationInfo[]> {
+   *  excluded here; list_channels with includeNonMember surfaces them.
+   *
+   *  A page Slack rate-limits past what a call's client waits out, or that
+   *  its call's deadline leaves no time for (SlackWebClient), or that fails in
+   *  a way that can pass, ends the listing, unless `waitOut` is given, for a
+   *  listing that runs in the background. Then the page, or the name of a DM's
+   *  user, is asked for again once `waitOut` resolves (waitToAskAgain says how
+   *  long). A DM whose name is still missing carries `nameWait`. */
+  async listConversations(includeNonMember = false, waitOut?: SlackWaitOut): Promise<SlackConversationInfo[]> {
     const out: SlackConversationInfo[] = [];
     let cursor: string | undefined;
-    do {
-      const result = await this.web.conversations.list({
-        types: this.disableDms ? 'public_channel,private_channel' : 'public_channel,private_channel,im,mpim',
-        exclude_archived: true,
-        limit: 200,
-        cursor,
-      });
+    let limited = 0;
+    const names = { waitOut };
+    for (;;) {
+      let result: Awaited<ReturnType<SlackWebLike['conversations']['list']>>;
+      try {
+        result = await this.web.conversations.list({
+          types: this.disableDms ? 'public_channel,private_channel' : 'public_channel,private_channel,im,mpim',
+          exclude_archived: true,
+          limit: 200,
+          cursor,
+        });
+      } catch (err) {
+        const wait = waitOut && waitToAskAgain(err, 'conversations.list');
+        if (!wait) throw err;
+        await waitOut!(wait, ++limited);
+        continue;
+      }
+      limited = 0;
       for (const raw of (result.channels ?? []) as SlackApiConversation[]) {
-        const info = await this.describeConversation(raw);
+        const info = await this.describeConversation(raw, names);
         if (!info) continue;
         if (!includeNonMember && info.kind === 'channel' && !info.isMember) continue;
         out.push(info);
       }
       cursor = result.response_metadata?.next_cursor || undefined;
-    } while (cursor);
-    return out;
+      if (!cursor) return out;
+    }
   }
 
   async getConversationMeta(channelId: string): Promise<SlackConversationInfo | null> {
@@ -309,14 +643,41 @@ export class SlackAdapter {
     return this.describeConversation((info.channel ?? {}) as SlackApiConversation);
   }
 
-  private async describeConversation(conv: SlackApiConversation): Promise<SlackConversationInfo | null> {
+  /** `names.waitOut`, in a listing that runs in the background, waits out a
+   *  DM's name lookup that can pass; describeConversation clears it once it
+   *  gives up on a name. */
+  private async describeConversation(
+    conv: SlackApiConversation,
+    names?: { waitOut?: SlackWaitOut },
+  ): Promise<SlackConversationInfo | null> {
     if (!conv.id) return null;
     if (conv.is_im) {
       // DM: label with the human's name so the host can scope/whitelist it.
-      await this.resolveUserNames([conv.user]);
+      // The host keeps a registered DM's label, so a listing in the background
+      // waits out a lookup that can pass, as it does a page. When the wait gives
+      // up on a name, the DM is labelled with the user's id, as a refused
+      // lookup's is, and the listing goes on; later DMs in it are looked up
+      // once, without waiting, so a lookup that keeps failing holds it once.
+      let nameWait: SlackWait | undefined;
+      for (let inARow = 0; conv.user;) {
+        const failed = (await this.resolveUserNames([conv.user])).get(conv.user);
+        nameWait = waitToAskAgain(failed, 'users.info');
+        if (!nameWait || !names?.waitOut) break;
+        try {
+          await names.waitOut(nameWait, ++inARow);
+        } catch (err) {
+          if (!(err instanceof GaveUp)) throw err;
+          console.error(
+            `[slack-mcpl] Gave up on the name of user ${conv.user}: ${err.message}. DM ${conv.id} is labelled with ` +
+              "the user's id, and the listing's later DMs are looked up without waiting.",
+          );
+          names.waitOut = undefined;
+          break;
+        }
+      }
       const userName = (conv.user ? this.userNameCache.get(conv.user) : undefined) ?? conv.user ?? conv.id;
       this.dmIds.add(conv.id);
-      return { id: conv.id, kind: 'dm', name: userName, userId: conv.user, isMember: true };
+      return { id: conv.id, kind: 'dm', name: userName, userId: conv.user, isMember: true, ...(nameWait ? { nameWait } : {}) };
     }
     if (conv.is_mpim) {
       this.dmIds.add(conv.id);
@@ -342,10 +703,13 @@ export class SlackAdapter {
     return !this.sendChannels?.length || this.sendChannels.includes(channelId);
   }
 
-  private assertWritable(channelId: string): void {
+  /** `notDone` opens the refusal: what the call would have done, as not done. */
+  private assertWritable(channelId: string, notDone: string): void {
     if (!this.canWrite(channelId)) {
       throw new Error(
-        `Writing to ${channelId} is not allowed: this bot may only write to ${this.sendChannels?.join(', ')} (SLACK_SEND_CHANNELS)`,
+        `${notDone}: this bot may write only to ${this.sendChannels?.join(', ')}, and ${channelId} isn't one of ` +
+          'them. list_channels marks the conversations it may write to with writable: true. Calling again ' +
+          "won't change that; whoever runs this host decides where it may write.",
       );
     }
   }
@@ -355,7 +719,9 @@ export class SlackAdapter {
   // reaction on the message that addressed the bot, removed when the bot next
   // posts in that conversation or after ACK_TTL_MS, whichever comes first.
 
-  /** `added` settles once reactions.add has, so a removal never overtakes it. */
+  /** `added` settles once reactions.add is answered or its request fails, so a
+   *  removal never overtakes an add Slack has answered. An add whose request
+   *  timed out can still reach Slack after the removal. */
   private ackPending = new Map<string, Map<string, AckEntry>>();
 
   private armAck(channelId: string, ts: string, ms: number): ReturnType<typeof setTimeout> {
@@ -411,52 +777,90 @@ export class SlackAdapter {
   async acknowledge(channelId: string, ts: string): Promise<void> {
     if (!this.ackReaction || this.stopping) return;
     if (this.ackPending.get(channelId)?.has(ts)) return; // Slack delivered the event twice
-    const added = this.addReaction(channelId, ts, this.ackReaction).then(() => true, () => false);
+    const added = this.addReaction(channelId, ts, this.ackReaction).then(
+      () => true,
+      // The add counts as there, and is removed like an added one, when it may
+      // have landed: already_reacted says it's there; Slack's failure while
+      // handling it leaves it unknown, as the explainer says (internal_error
+      // and fatal_error can take effect in part); and so does an HTTP error or
+      // a request that failed after it may have reached Slack. Slack's other
+      // refusals, its rate limits (a 429, or ratelimited in a 200) and
+      // request_timeout say it didn't act, a connection never made reached
+      // nothing, and this server's own refusal, such as the write allow-list's,
+      // sent nothing. So did a failure of a request before the add, such as
+      // the DM check's conversations.info. Slack answers a removal of one that
+      // isn't there with no_reaction.
+      (err: { code?: unknown; original?: { code?: unknown } } | null) => {
+        const failed = failedRequest(err);
+        if (failed !== undefined && failed !== 'reactions.add') return false;
+        if (err?.code === ErrorCode.RequestError) return !connectionNeverMade(err.original?.code);
+        if (err?.code === ErrorCode.HTTPError) return true;
+        const answer = slackRefusal(err);
+        return answer !== undefined && MAY_HAVE_LANDED.has(answer);
+      },
+    );
     // Recorded before the add resolves, so a reply that lands first still removes it.
     let pending = this.ackPending.get(channelId);
     if (!pending) this.ackPending.set(channelId, (pending = new Map()));
     const entry: AckEntry = { timer: this.armAck(channelId, ts, ACK_TTL_MS), added, tries: 0 };
     pending.set(ts, entry);
-    if (!(await added)) this.dropAck(channelId, ts, entry); // not writable here, or Slack refused
+    if (!(await added)) this.dropAck(channelId, ts, entry); // not there, so nothing to remove
   }
 
   /** Remove the reaction from one message, or from every pending message in the
-   *  conversation. A removal that failed without an answer from Slack (rate
-   *  limit, HTTP or network error) is tried again; one Slack refused is not. */
+   *  conversation. A removal that failed in a way that can pass (a rate
+   *  limit, an HTTP error, a network failure or Slack's own failure) is tried
+   *  again; one Slack refused is not. */
   async clearAck(channelId: string, ts?: string): Promise<void> {
     const pending = this.ackPending.get(channelId);
     if (!pending || !this.ackReaction) return;
     const targets = ts === undefined ? [...pending.keys()] : pending.has(ts) ? [ts] : [];
-    await Promise.all(targets.map(async (t) => {
+    await Promise.all(targets.map((t) => {
       const entry = pending.get(t);
       if (!entry) return;
-      clearTimeout(entry.timer);
-      if (!(await entry.added)) return this.dropAck(channelId, t, entry);
-      try {
-        await this.web.reactions.remove({ channel: channelId, timestamp: t, name: this.ackReaction! });
-        this.dropAck(channelId, t, entry);
-      } catch (err) {
-        // Slack's own answer (data.error) will be the same next time.
-        const answered = !!(err as { data?: { error?: string } }).data?.error;
-        if (answered || ++entry.tries >= ACK_MAX_TRIES) this.dropAck(channelId, t, entry);
-        else entry.timer = this.armAck(channelId, t, ACK_RETRY_MS);
-      }
+      // Posts, expiry, and shutdown share one removal, including the wait
+      // for reactions.add. Reserve it before any asynchronous work settles.
+      entry.removing ??= this.removeAck(channelId, t, entry).finally(() => {
+        entry.removing = undefined;
+      });
+      return entry.removing;
     }));
   }
 
+  private async removeAck(channelId: string, ts: string, entry: AckEntry): Promise<void> {
+    clearTimeout(entry.timer);
+    if (!(await entry.added)) return this.dropAck(channelId, ts, entry);
+    entry.tries++;
+    try {
+      await this.web.reactions.remove({ channel: channelId, timestamp: ts, name: this.ackReaction! });
+      this.dropAck(channelId, ts, entry);
+    } catch (err) {
+      // Slack's refusal will be the same next time. A rate limit, an HTTP
+      // error, a failure in transit or Slack's own failure can pass. The fifth
+      // failure drops the entry, so no sixth attempt can start.
+      const code = slackRefusal(err);
+      const lasting = code !== undefined && !SLACK_FAILED.has(code);
+      if (lasting || this.stopping || entry.tries >= ACK_MAX_TRIES) this.dropAck(channelId, ts, entry);
+      else entry.timer = this.armAck(channelId, ts, ACK_RETRY_MS);
+    }
+  }
+
+  /** `notDone` opens this server's own refusals: send_dm's reads "Nothing was
+   *  sent". */
   async sendMessage(
     channelId: string,
     text: string,
     opts: { threadTs?: string } = {},
+    notDone = 'Nothing was posted',
   ): Promise<{ messageId: string }> {
-    this.assertWritable(channelId);
-    await this.assertNotDm(channelId);
+    this.assertWritable(channelId, notDone);
+    await this.assertNotDm(channelId, notDone);
     const result = await this.web.chat.postMessage({
       channel: channelId,
       text,
       ...(opts.threadTs ? { thread_ts: opts.threadTs } : {}),
     });
-    void this.clearAck(channelId);
+    void outsideCallTime(() => this.clearAck(channelId));
     // Slack clears a thread's status when the bot posts in that thread.
     if (opts.threadTs && this.statusOn.get(channelId)?.ts === opts.threadTs) this.statusOn.delete(channelId);
     return { messageId: result.ts ? String(result.ts) : '' };
@@ -467,50 +871,81 @@ export class SlackAdapter {
    *  reads call this. An ID is not enough: a group DM ID looks like a channel
    *  ID, and a user ID (U…) posts into that user's DM. An unknown ID is asked
    *  about until Slack confirms it; if Slack cannot say, it is refused. */
-  private async assertNotDm(channelId: string): Promise<void> {
+  private async assertNotDm(channelId: string, notDone: string): Promise<void> {
     if (!this.disableDms || this.channelIds.has(channelId)) return;
     const refuse = (why: string) =>
-      new Error(`Conversation ${channelId} ${why}; direct messages are disabled for this bot (SLACK_DISABLE_DMS)`);
-    if (this.dmIds.has(channelId) || channelId.startsWith('D')) throw refuse('is a DM');
+      new Error(
+        `${notDone}: ${channelId} ${why}, and this bot works only in channels here, since direct messages are ` +
+          'turned off. list_channels shows the ones it can use.',
+      );
+    if (this.dmIds.has(channelId) || channelId.startsWith('D')) throw refuse('is a direct message or group DM');
     try {
       await this.getConversationMeta(channelId); // fills channelIds for this very ID, or not
     } catch (err) {
-      throw refuse(`could not be confirmed as a channel (${(err as Error).message})`);
+      // A check that couldn't be made and can pass (rate-limited, out of its
+      // call's time, failed on the way or by Slack's own failure) keeps its
+      // error for the explainer, which reads it as this request's, made
+      // before the write: nothing was written, and calling again can confirm
+      // the conversation. Anything else, Slack's refusal included, leaves it
+      // unconfirmed, and the write is refused.
+      if (waitToAskAgain(err, 'conversations.info')) throw err;
+      const answer = slackRefusal(err);
+      const why = answer !== undefined ? `Slack answered ${answer}` : (err as Error).message;
+      throw new Error(
+        `${notDone}: Slack couldn't confirm ${channelId} is a channel (${why}), and with direct messages turned ` +
+          `off, this bot works only in conversations Slack confirms are channels. ${afterFailedCheck(err)}`,
+      );
     }
-    if (!this.channelIds.has(channelId)) throw refuse('is not a channel');
+    if (!this.channelIds.has(channelId)) throw refuse("isn't a channel");
   }
 
   async sendDM(userId: string, text: string): Promise<{ messageId: string; channelId: string }> {
-    if (this.disableDms) throw new Error('Direct messages are disabled for this bot (SLACK_DISABLE_DMS)');
+    const toChannels =
+      'To reach people, post in a channel with send_message; list_channels marks where this bot may write with ' +
+      'writable: true.';
+    if (this.disableDms) {
+      throw new Error(
+        "Nothing was sent: direct messages are turned off on this host, so send_dm can't reach anyone. Calling " +
+          `again won't change that; whoever runs this host decides whether this bot may send DMs. ${toChannels}`,
+      );
+    }
     // A DM ID starts with D. If the allow-list names none, no DM can be written,
     // so don't open one just to find that out.
     if (this.sendChannels?.length && !this.sendChannels.some((id) => id.startsWith('D'))) {
-      throw new Error('Writing to a direct message is not allowed: SLACK_SEND_CHANNELS lists no DM conversation');
+      throw new Error(
+        `Nothing was sent: this bot may write only to ${this.sendChannels.join(', ')}, none of them a direct ` +
+          "message, so send_dm can't reach anyone. Calling again won't change that; whoever runs this host decides " +
+          `where it may write. ${toChannels}`,
+      );
     }
     const open = await this.web.conversations.open({ users: userId });
     const channelId = open.channel?.id;
-    if (!channelId) throw new Error(`Could not open a DM with user ${userId}`);
-    const { messageId } = await this.sendMessage(channelId, text);
+    if (!channelId) {
+      throw new Error(
+        `Nothing was sent: Slack opened no DM with user ${userId}. Check the id with find_user, which returns ` +
+          "each person's userId, and call again.",
+      );
+    }
+    const { messageId } = await this.sendMessage(channelId, text, {}, 'Nothing was sent');
     return { messageId, channelId };
   }
 
   async editMessage(channelId: string, ts: string, text: string): Promise<void> {
-    this.assertWritable(channelId);
-    await this.assertNotDm(channelId);
+    this.assertWritable(channelId, "The message wasn't changed");
+    await this.assertNotDm(channelId, "The message wasn't changed");
     await this.web.chat.update({ channel: channelId, ts, text });
   }
 
   async deleteMessage(channelId: string, ts: string): Promise<void> {
-    this.assertWritable(channelId);
-    await this.assertNotDm(channelId);
+    this.assertWritable(channelId, 'Nothing was deleted');
+    await this.assertNotDm(channelId, 'Nothing was deleted');
     await this.web.chat.delete({ channel: channelId, ts });
   }
 
   async addReaction(channelId: string, ts: string, emoji: string): Promise<void> {
-    this.assertWritable(channelId);
-    await this.assertNotDm(channelId);
-    // Slack wants the bare emoji name; accept :name: and strip the colons.
-    await this.web.reactions.add({ channel: channelId, timestamp: ts, name: emoji.replace(/:/g, '') });
+    this.assertWritable(channelId, 'No reaction was added');
+    await this.assertNotDm(channelId, 'No reaction was added');
+    await this.web.reactions.add({ channel: channelId, timestamp: ts, name: reactionName(emoji) });
   }
 
   // ── History ──
@@ -521,7 +956,7 @@ export class SlackAdapter {
     channelId: string,
     opts: { limit?: number; oldest?: string; latest?: string } = {},
   ): Promise<{ messages: HistoryMessage[]; truncated: boolean }> {
-    await this.assertNotDm(channelId);
+    await this.assertNotDm(channelId, 'Nothing was read');
     const { messages, truncated } = await fetchSlackHistory(this.web, {
       channel: channelId,
       ...(opts.oldest !== undefined ? { oldest: opts.oldest } : {}),
@@ -537,7 +972,7 @@ export class SlackAdapter {
     threadTs: string,
     limit = 100,
   ): Promise<{ messages: HistoryMessage[]; truncated: boolean }> {
-    await this.assertNotDm(channelId);
+    await this.assertNotDm(channelId, 'Nothing was read');
     const collected: SlackHistoryMessage[] = [];
     let cursor: string | undefined;
     let truncated = false;
@@ -678,9 +1113,10 @@ export class SlackAdapter {
     for (const handler of this.messageHandlers) handler(msg);
   }
 
-  /** Resolve user IDs into this adapter's cache (shared logic in content.ts). */
-  private async resolveUserNames(userIds: Array<string | undefined>): Promise<void> {
-    await resolveSlackUserNames(
+  /** Resolve user IDs into this adapter's cache (shared logic in content.ts).
+   *  Returns the error of each lookup left uncached. */
+  private async resolveUserNames(userIds: Array<string | undefined>): Promise<Map<string, unknown>> {
+    return resolveSlackUserNames(
       this.web,
       this.userNameCache,
       userIds.filter((id): id is string => !!id),

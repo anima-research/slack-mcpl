@@ -5,6 +5,7 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { McplConnection, method, type JsonRpcRequest } from '@animalabs/mcpl-core';
+import { ErrorCode } from '@slack/web-api';
 import { SlackMcplServer } from '../src/server.js';
 import type { SlackAdapter, SlackMessageData, HistoryMessage } from '../src/slack-adapter.js';
 import { FULL_GRANT, until } from './harness.js';
@@ -654,6 +655,58 @@ for (const lookup of ['history', 'name', 'location'] as const) {
   });
 }
 
+test('a lookup Slack fails says so on stderr, and the message goes without it', async (t) => {
+  const errors = t.mock.method(console, 'error', () => {});
+  const limited = 'A rate-limit has been reached, you may retry this request in 30 seconds';
+  const f = fixture(
+    async () => { throw new Error(limited); },
+    async () => { throw new Error(limited); },
+  );
+  const peer = connect(f.server);
+  try {
+    await peer.ready();
+    f.emit('111.1');
+    await until(() => peer.deliveries().length === 1, 'the message, without its lookups');
+    const text = pushText(peer.deliveries()[0]);
+    assert.doesNotMatch(text, /<backscroll/);
+    assert.match(text, /\[C1 \(acme\) id=111\.1\] /);
+    assert.deepEqual(logLines(errors).filter((l) => l.includes("Couldn't get")), [
+      `[slack-mcpl] Couldn't get the backscroll for message 111.1 in C1 (${limited}); delivering without it`,
+      `[slack-mcpl] Couldn't get the name of conversation C1 (${limited}); delivering without it`,
+    ]);
+  } finally {
+    await peer.close();
+  }
+});
+
+test('a lookup that fails after its give-up is logged once, as given up', async (t) => {
+  const gate = deferred<void>();
+  const errors = t.mock.method(console, 'error', () => {});
+  const f = fixture(async () => {
+    await gate.promise;
+    throw new Error('A request error occurred: timeout of 10000ms exceeded');
+  });
+  const peer = connect(f.server);
+  try {
+    await peer.ready();
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    f.emit('111.1');
+    await settle();
+    t.mock.timers.tick(5000);
+    for (let i = 0; i < 50 && peer.deliveries().length < 1; i++) await settle();
+    assert.equal(peer.deliveries().length, 1);
+    gate.resolve();
+    for (let i = 0; i < 5; i++) await settle();
+    assert.deepEqual(logLines(errors).filter((l) => l.includes('backscroll')), [
+      '[slack-mcpl] Gave up on the backscroll for message 111.1 in C1 after 5 s; delivering without it',
+    ]);
+  } finally {
+    t.mock.timers.reset();
+    await peer.close();
+    gate.resolve();
+  }
+});
+
 test('a header prepared while another conversation awaits the host still names its conversation', async (t) => {
   const gate = deferred<boolean>();
   const f = fixture();
@@ -947,4 +1000,75 @@ test('a first mention in an already-subscribed conversation brings no auto-subsc
   await until(() => peer.deliveries().length === 1, 'mention');
   assert.match(pushText(peer.deliveries()[0]), /<backscroll/);
   assert.doesNotMatch(pushText(peer.deliveries()[0]), /Auto-subscribed/);
+});
+
+test('a top-level publish Slack fails is explained for the conversation it named', async (t) => {
+  const f = fixture();
+  const peer = connect(f.server);
+  t.after(() => peer.close());
+  await peer.ready();
+  const slack = f.slack as unknown as { sendMessage: unknown };
+  slack.sendMessage = async (channel: string, _text: string, opts: { threadTs?: string } = {}) => {
+    f.posts.push({ channel, ...opts });
+    throw Object.assign(new Error('An API error occurred: internal_error'), {
+      code: ErrorCode.PlatformError,
+      data: { ok: false, error: 'internal_error' },
+    });
+  };
+  await assert.rejects(peer.publish(), /Check fetch_history for conversation C1 before posting again/);
+  assert.deepEqual(f.posts, [{ channel: 'C1' }]);
+});
+
+test("a publish Slack fails is explained for the thread it posted into, though a delivery moved the thread meanwhile", async (t) => {
+  const f = fixture();
+  const peer = connect(f.server);
+  t.after(() => peer.close());
+  await peer.ready();
+  f.emit('111.1', 'C1', { threadTs: '110.0' });
+  await until(() => peer.deliveries().length === 1, 'the first delivery');
+  await settle();
+  await settle();
+  // Slack's failure arrives after a second delivery, in another thread, is taken.
+  const slack = f.slack as unknown as { sendMessage: unknown };
+  slack.sendMessage = async (channel: string, _text: string, opts: { threadTs?: string } = {}) => {
+    f.posts.push({ channel, ...opts });
+    f.emit('113.1', 'C1', { threadTs: '112.0' });
+    await until(() => peer.deliveries().length === 2, 'the second delivery');
+    await settle();
+    await settle();
+    // The client's shape for Slack's refusal, as test/slackErrors.test.ts gets it from a real WebClient.
+    throw Object.assign(new Error('An API error occurred: internal_error'), {
+      code: ErrorCode.PlatformError,
+      data: { ok: false, error: 'internal_error' },
+    });
+  };
+  await assert.rejects(
+    peer.publish(),
+    /Check fetch_thread for the thread under message 110\.0 in conversation C1 before posting again/,
+  );
+  assert.deepEqual(f.posts, [{ channel: 'C1', threadTs: '110.0' }]);
+});
+
+test('a publish Slack refuses leaves the thread where it was, so the next publish to that conversation goes there too', async (t) => {
+  const f = fixture();
+  const peer = connect(f.server);
+  t.after(() => peer.close());
+  await peer.ready();
+  f.emit('111.1', 'C1', { threadTs: '110.0' });
+  await until(() => peer.deliveries().length === 1, 'the delivery');
+  await settle();
+  await settle();
+  const slack = f.slack as unknown as { sendMessage: unknown };
+  slack.sendMessage = async (channel: string, _text: string, opts: { threadTs?: string } = {}) => {
+    f.posts.push({ channel, ...opts });
+    throw Object.assign(new Error('An API error occurred: thread_not_found'), {
+      code: ErrorCode.PlatformError,
+      data: { ok: false, error: 'thread_not_found' },
+    });
+  };
+  const refused =
+    /Here that was the thread under message 110\.0 in conversation C1, and Slack refused it\. Another publish to conversation C1 now would go to the same thread\./;
+  await assert.rejects(peer.publish(), refused);
+  await assert.rejects(peer.publish(), refused);
+  assert.deepEqual(f.posts, [{ channel: 'C1', threadTs: '110.0' }, { channel: 'C1', threadTs: '110.0' }]);
 });
