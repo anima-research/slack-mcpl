@@ -548,7 +548,9 @@ test("a rollback counts the deletes Slack confirmed, and logs each message it co
   const rolledBack = await h.host.sendRequest(method.STATE_ROLLBACK, {
     featureSet: 'slack.messaging', checkpoint: sent.state.checkpoint,
   }) as { checkpoint: string; success: boolean; reason?: string };
-  assert.deepEqual(rolledBack, { checkpoint: sent.state.checkpoint, success: true, reason: 'Rolled back (1/2 messages deleted)' });
+  assert.deepEqual(rolledBack, {
+    checkpoint: sent.state.checkpoint, success: true, reason: 'Rolled back (1/2 messages deleted). Not deleted: message 2 in C1',
+  });
   assert.deepEqual(deleted, ['3']);
   assert.deepEqual(
     lines.filter((line) => line.includes('Rollback')),

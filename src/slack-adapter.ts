@@ -45,10 +45,17 @@ const ACK_MAX_TRIES = 5;
  *  explainer calls an unknown outcome. */
 const MAY_HAVE_LANDED = new Set(['already_reacted', 'internal_error', 'fatal_error', 'service_unavailable', 'file_update_failed']);
 
-/** Slack's code, when Slack refused the call; undefined for any other error. */
+/** The form of Slack's error codes. web-api 7.19.0 reads an answer whose body
+ *  isn't JSON as a refusal whose code is the body itself (buildResult, in
+ *  dist/WebClient.js), which shows nothing about what Slack did. */
+const SLACK_CODE = /^[a-z0-9_]+$/;
+
+/** Slack's code, when Slack refused the call; undefined for any other error,
+ *  an answer with no code in Slack's form included. */
 export function slackRefusal(err: unknown): string | undefined {
   const e = err as { code?: unknown; data?: { error?: unknown } } | null;
-  return e?.code === ErrorCode.PlatformError && typeof e.data?.error === 'string' ? e.data.error : undefined;
+  const code = e?.code === ErrorCode.PlatformError ? e.data?.error : undefined;
+  return typeof code === 'string' && SLACK_CODE.test(code) ? code : undefined;
 }
 
 /** Slack's answers to conversations.info that it has no such conversation to
@@ -347,14 +354,15 @@ export function fileLeftByUpload(err: unknown): FileLeft | undefined {
 /** Whether a request's failure leaves it undone: the call's time left no room
  *  to send it, the connection to Slack was never made, or Slack refused it or
  *  rate-limited it. A failure Slack says may have taken effect
- *  (MAY_HAVE_LANDED), an HTTP error, a timeout or a connection that failed
- *  once made doesn't say. */
+ *  (MAY_HAVE_LANDED), an answer not in Slack's form, an HTTP error, a timeout
+ *  or a connection that failed once made doesn't say. */
 function cannotHaveLanded(err: unknown): boolean {
   if (err instanceof OutOfCallTime) return true;
-  const e = err as { code?: unknown; original?: { code?: unknown }; data?: { error?: unknown } } | null;
+  const e = err as { code?: unknown; original?: { code?: unknown } } | null;
   if (e?.code === ErrorCode.RequestError) return connectionNeverMade(e.original?.code);
   if (e?.code === ErrorCode.RateLimitedError) return true;
-  return e?.code === ErrorCode.PlatformError && typeof e.data?.error === 'string' && !MAY_HAVE_LANDED.has(e.data.error);
+  const refused = slackRefusal(err);
+  return refused !== undefined && !MAY_HAVE_LANDED.has(refused);
 }
 
 /** An upload's last step answered without the file: whether Slack shared it
@@ -944,7 +952,11 @@ export class SlackAdapter {
     } catch (err) {
       throw left(err, !cannotHaveLanded(err));
     }
-    const shared = answer.files?.find((f) => f.id === fileId);
+    // An answer whose files aren't a list of files names none.
+    const files: unknown = answer.files;
+    const shared = Array.isArray(files)
+      ? (files as Array<SlackUploadedFile | null>).find((f) => f !== null && typeof f === 'object' && f.id === fileId)
+      : undefined;
     if (!shared) throw left(new UploadNotConfirmed(fileId), true);
     // The working reaction comes off whatever time the call has left, as a
     // sent message's does.
@@ -954,8 +966,10 @@ export class SlackAdapter {
 
   /** Posts a file's bytes to the upload URL Slack gave, as Slack's
    *  working-with-files page does: the bytes as the body. Like every request a
-   *  call makes, it keeps the start rule and the client's timeout, which
-   *  covers the whole post. The URL needs no token. */
+   *  call makes, it keeps the start rule for the client's timeout, and
+   *  AbortSignal.timeout ends the whole post at that length: the bytes, the
+   *  answer and its body. The client's own timeout ends only a pause in an
+   *  answer (SlackWebClient). The URL needs no token. */
   private async postFileBytes(url: string, data: Buffer): Promise<void> {
     assertRequestFits("The upload of the file's bytes", SLACK_CLIENT_OPTIONS.timeout);
     try {

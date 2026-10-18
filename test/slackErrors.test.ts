@@ -6,6 +6,7 @@
  * own shape (`code`, Slack's answer in `data`, `retryAfter`, `statusCode`).
  */
 
+import http from 'node:http';
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { WebClient } from '@slack/web-api';
@@ -510,6 +511,26 @@ test('other errors and other codes pass through unchanged', async () => {
   const lookalike = Object.assign(new Error('An API error occurred: channel_not_found'), { data: { error: 'channel_not_found' } });
   assert.equal(explainSlackError(lookalike, { tool: 'send_message', args: { channelId: 'C1' } }), lookalike.message);
   assert.equal(explainSlackError('a string', { tool: 'send_message', args: {} }), 'a string');
+});
+
+test("an answer that isn't in Slack's form leaves a write's outcome unknown, and another call says to try again", async (t) => {
+  // A body that isn't JSON, such as a proxy's page, which the client reads as
+  // a refusal whose code is the body itself.
+  const page = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<html>Bad gateway</html>'); });
+  });
+  await new Promise<void>((resolve) => page.listen(0, '127.0.0.1', () => resolve()));
+  t.after(() => { page.closeAllConnections(); page.close(); });
+  const err = await clientError(new WebClient('xoxb-test', {
+    ...SLACK_CLIENT_OPTIONS, slackApiUrl: `http://127.0.0.1:${(page.address() as { port: number }).port}/api/`,
+  }));
+  const posted = explainSlackError(err, { tool: 'send_message', args: { channelId: 'C1', content: 'hi' } });
+  assert.ok(posted.endsWith(
+    "\n\nSlack answered in a form this server can't read, so whether the message was posted is unknown. Check " +
+      "fetch_history for conversation C1 before posting again, so it isn't posted twice."), posted);
+  const listed = explainSlackError(err, { tool: 'list_channels', args: {} });
+  assert.ok(listed.endsWith("\n\nNothing was listed: Slack answered in a form this server can't read. Try again shortly."), listed);
 });
 
 const socket: SlackSocketLike = { on() {}, async start() {}, async disconnect() {} };

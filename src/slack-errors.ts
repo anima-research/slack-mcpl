@@ -21,8 +21,10 @@
  * running past its timeout, a failed post of an upload's bytes to Slack's
  * upload server (UploadBytesFailed), and an upload whose last step named no file
  * (UploadNotConfirmed). Each refusal code here is one Slack's
- * reference documents for a method these tools call. Other errors, and codes
- * not listed, pass through unchanged.
+ * reference documents for a method these tools call. A refusal whose code
+ * isn't in Slack's form, as the client reads a body that isn't JSON, is read
+ * as an answer that shows nothing about what Slack did. Other errors, and
+ * codes not listed, pass through unchanged.
  */
 import { ErrorCode } from '@slack/web-api';
 import { connectionNeverMade, reactionName } from './content.js';
@@ -191,10 +193,12 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
     const unshared = "Slack shares a file only at the upload's last step, which wasn't sent";
     if (err.why === 'TimeoutError') {
       // The timeout covers the whole post: the bytes, the answer and its body.
+      // The bytes may have reached the server, so this says only that the
+      // post didn't finish.
       return (
-        `${lead}: Slack's upload server didn't take the file's bytes and answer within ${seconds} seconds. ` +
+        `${lead}: the post of the file's bytes to Slack's upload server didn't finish within ${seconds} seconds. ` +
         `${unshared}, so calling again is safe. If it keeps timing out, Slack's upload server or this server's ` +
-        `connection to it is too slow to take this file within ${seconds} seconds: a smaller file may go through, ` +
+        `connection to it is too slow for this file within ${seconds} seconds: a smaller file may go through, ` +
         'and whoever runs this host can look into the connection.'
       );
     }
@@ -247,6 +251,12 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
     return mayHaveWritten ? unknown(cause) : `${lead}: ${cause}. Try again shortly.`;
   }
   const code = slackRefusal(err);
+  // An answer the client reads as a refusal but whose code isn't in Slack's
+  // form, such as a body that isn't JSON, shows nothing about what Slack did.
+  if (code === undefined && e?.code === ErrorCode.PlatformError) {
+    const cause = "Slack answered in a form this server can't read";
+    return mayHaveWritten ? unknown(cause) : `${lead}: ${cause}. Try again shortly.`;
+  }
   if (code === undefined) return undefined;
   const messageIds = call.tool === 'reply_message' || call.tool === 'fetch_thread' || call.tool === 'upload_file' ? PARENT_IDS : MESSAGE_IDS;
 
@@ -421,6 +431,12 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
         'Slack failed while handling the call',
         code === 'internal_error' || code === 'fatal_error' ? ' (Slack says part of a call can take effect before this error)' : '',
       );
+    case 'file_not_found':
+      // files.completeUploadExternal's: "Could not find the file from the
+      // upload ticket."
+      return call.tool === 'upload_file'
+        ? `${lead}: Slack couldn't find the file this upload's first step set up. Calling again starts a new upload.`
+        : undefined;
     case 'user_not_found':
       return (
         `${lead}: Slack has no user ${userId ?? 'by the id given'}. ${RECALLED}. find_user returns each ` +
