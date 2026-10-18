@@ -171,7 +171,7 @@ test("fetch_attachment with a bot token a request header can't carry says so, wi
   assert.equal(
     fetched.content[0].text,
     "Nothing was fetched: this server's bot token holds a character a request header can't carry, such as a line " +
-      "break, so fetch_attachment can't send it. Calling again won't change that until whoever runs this server " +
+      "break, so fetch_attachment can't send it. Calling again won't change that until whoever runs this host " +
       'fixes the token.',
   );
   assert.ok(!fetched.content[0].text.includes('secret'), 'the token stays out of the text');

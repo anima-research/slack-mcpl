@@ -779,7 +779,7 @@ export class SlackMcplServer {
           throw new Error(
             "Nothing was fetched: this server's bot token holds a character a request header can't carry, such as a " +
               "line break, so fetch_attachment can't send it. Calling again won't change that until whoever runs " +
-              'this server fixes the token.',
+              'this host fixes the token.',
           );
         }
         const fileName = attachmentName(url);

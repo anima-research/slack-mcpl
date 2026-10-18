@@ -57,7 +57,7 @@ const NOT_SHOWN = new Set(['channel_not_found', 'invalid_channel_id']);
 
 /** What can change Slack's answer to a check of a conversation (with DMs off)
  *  that a later one wouldn't pass either: another conversation, or whoever
- *  runs this server. A check waitToAskAgain says can pass doesn't come here:
+ *  runs this host. A check waitToAskAgain says can pass doesn't come here:
  *  assertNotDm leaves its error to the explainer. A rate limit's answer
  *  without the Retry-After the client needs does come here, and is told to
  *  try again shortly. */
@@ -71,11 +71,11 @@ function afterFailedCheck(err: unknown): string {
   if (code === 'missing_scope') {
     const needed = typeof e?.data?.needed === 'string' && e.data.needed ? ` (Slack names ${e.data.needed})` : '';
     return (
-      `Calling again won't change that until whoever runs this server adds the scope it needs${needed} to the ` +
+      `Calling again won't change that until whoever runs this host adds the scope it needs${needed} to the ` +
       "Slack app's bot token scopes and reinstalls the app."
     );
   }
-  return "Calling again won't change Slack's answer; only whoever runs this server, or the workspace's admins, can.";
+  return "Calling again won't change Slack's answer; only whoever runs this host, or the workspace's admins, can.";
 }
 
 type AckEntry = {

@@ -139,7 +139,7 @@ test('only Slack\'s explicit "not a DM" for the very ID asked about lets a write
 });
 
 // What can change Slack's answer: another conversation, or whoever runs this
-// server. Each answer comes from a real client against a local endpoint that
+// host. Each answer comes from a real client against a local endpoint that
 // answers as Slack does.
 const confirms = 'and with direct messages turned off, this bot works only in conversations Slack confirms are channels.';
 
@@ -165,20 +165,20 @@ for (const [what, answer, next] of [
     "the Slack app lacks the lookup's scope",
     { body: { ok: false, error: 'missing_scope', needed: 'channels:read', provided: 'chat:write' } },
     `(Slack answered missing_scope), ${confirms} Calling again won't change that until whoever runs this ` +
-      "server adds the scope it needs (Slack names channels:read) to the Slack app's bot token scopes and reinstalls " +
+      "host adds the scope it needs (Slack names channels:read) to the Slack app's bot token scopes and reinstalls " +
       'the app.',
   ],
   [
     "the Slack app lacks a scope Slack doesn't name",
     { body: { ok: false, error: 'missing_scope' } },
     `(Slack answered missing_scope), ${confirms} Calling again won't change that until whoever runs this ` +
-      "server adds the scope it needs to the Slack app's bot token scopes and reinstalls the app.",
+      "host adds the scope it needs to the Slack app's bot token scopes and reinstalls the app.",
   ],
   [
     "Slack doesn't accept the token",
     { body: { ok: false, error: 'invalid_auth' } },
     `(Slack answered invalid_auth), ${confirms} Calling again won't change Slack's answer; only whoever ` +
-      "runs this server, or the workspace's admins, can.",
+      "runs this host, or the workspace's admins, can.",
   ],
   [
     "Slack rate-limits the lookup without the Retry-After the client needs",

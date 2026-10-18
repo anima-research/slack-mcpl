@@ -76,7 +76,7 @@ export async function fetchAttachmentBytes(
         : `Nothing was fetched: the file's url answered ${answered}. ${ATTACHMENT_URL_SOURCE} If it was exact, the ` +
             'file may have been deleted, or this bot may not be allowed to read it; calling again gets the same ' +
             'answer unless someone shares the file where this bot can read it, or, if the Slack app lacks ' +
-            "files:read (Slack's file links need it), whoever runs this server adds that scope to the app's bot " +
+            "files:read (Slack's file links need it), whoever runs this host adds that scope to the app's bot " +
             'token scopes and reinstalls the app.',
     );
   }
