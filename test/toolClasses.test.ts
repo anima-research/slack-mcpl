@@ -18,7 +18,8 @@ const RFC_008_VOCABULARY = ['comms', 'memory', 'notes', 'files', 'shell', 'web',
 type ListedTool = ToolDefinition & { _meta?: Record<string, unknown> };
 
 // `toolDefinitions` is every tool the server can list; tools/list only ever
-// filters it (send_dm when DMs are not writable).
+// filters it (send_dm when DMs are not writable, and refresh_channels on a
+// plain MCP connection).
 const ALL_TOOLS = toolDefinitions.map((t) => t.name);
 
 test('every tool the server can list is in TOOL_CLASSES or UNCLASSED', () => {
@@ -47,7 +48,8 @@ test('tools/list carries each tool\'s class and leaves the model-facing definiti
     const h = harness();
     await initialize(h, mcpl);
     const { tools } = (await h.host.sendRequest('tools/list')) as { tools: ListedTool[] };
-    assert.deepEqual(tools.map((t) => t.name), ALL_TOOLS, 'send_dm is listed when DMs are writable');
+    const offered = mcpl ? ALL_TOOLS : ALL_TOOLS.filter((name) => name !== 'refresh_channels');
+    assert.deepEqual(tools.map((t) => t.name), offered, 'send_dm is listed when DMs are writable, and refresh_channels with MCPL');
     for (const tool of tools) {
       assert.deepEqual(tool._meta?.['mcpl/class'], TOOL_CLASSES[tool.name], tool.name);
       const { _meta, ...rest } = tool;
