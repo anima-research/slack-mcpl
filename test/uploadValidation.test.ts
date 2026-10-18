@@ -52,11 +52,13 @@ test('upload handler requires exactly one content argument', async (t) => {
   assert.equal(asked.length, 0);
 });
 
-test('a JSON null counts as an argument not given', async (t) => {
+test('a JSON null counts as an argument not given, and so does an empty string for an optional one', async (t) => {
   const { shared, bytes, call } = await fixture(t);
   assert.notEqual((await call({ content: 'hello', contentBase64: null, title: null, comment: null, messageId: null })).isError, true);
   assert.deepEqual(bytes(1), Buffer.from('hello'));
   assert.deepEqual(shared[0], { files: [{ id: 'FV1', title: 'data.bin' }], channel_id: 'C1' });
+  assert.notEqual((await call({ content: 'hello', title: '', comment: '', messageId: '' })).isError, true);
+  assert.deepEqual(shared[1], { files: [{ id: 'FV2', title: 'data.bin' }], channel_id: 'C1' });
 });
 
 test('upload handler requires a filename', async (t) => {
@@ -71,11 +73,10 @@ test('upload handler requires a filename', async (t) => {
 
 test('upload handler refuses empty content with an explicit empty-content error', async (t) => {
   const { asked, call } = await fixture(t);
-  for (const args of [{ content: '' }, { contentBase64: '' }]) {
-    const result = await call(args);
+  for (const key of ['content', 'contentBase64']) {
+    const result = await call({ [key]: '' });
     assert.equal(result.isError, true);
-    assert.match(result.content[0].text, /content.*empty/i);
-    assert.doesNotMatch(result.content[0].text, /exactly one/);
+    assert.match(result.content[0].text, new RegExp(`^${key} is empty: give the file's content, at least one byte`));
   }
   assert.equal(asked.length, 0);
 });

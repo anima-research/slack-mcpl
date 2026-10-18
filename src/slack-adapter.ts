@@ -40,9 +40,10 @@ const ACK_TTL_MS = 10 * 60 * 1000;
  *  this, at most ACK_MAX_TRIES times in all. */
 const ACK_RETRY_MS = 60 * 1000;
 const ACK_MAX_TRIES = 5;
-/** Slack's answers to an acknowledgement's add after which it may be there:
- *  already_reacted, and the failures the explainer calls an unknown outcome. */
-const MAY_HAVE_LANDED = new Set(['already_reacted', 'internal_error', 'fatal_error', 'service_unavailable']);
+/** Slack's answers to a write after which it may have taken effect:
+ *  already_reacted, to an acknowledgement's add, and the failures the
+ *  explainer calls an unknown outcome. */
+const MAY_HAVE_LANDED = new Set(['already_reacted', 'internal_error', 'fatal_error', 'service_unavailable', 'file_update_failed']);
 
 type AckEntry = {
   timer: ReturnType<typeof setTimeout>;
@@ -294,25 +295,30 @@ export function failedRequest(err: unknown): string | undefined {
   return err !== null && typeof err === 'object' ? failedRequests.get(err) : undefined;
 }
 
-/** The file an upload left when its last step failed or named no file, and
- *  whether Slack may have shared it. */
+/** The file an upload left when it failed after its first step, and whether
+ *  Slack may have shared it. */
 export interface FileLeft {
   fileId: string;
   mayHaveShared: boolean;
 }
 const filesLeft = new WeakMap<object, FileLeft>();
 
-/** The file an upload's failed last step left, which a rollback deletes too,
- *  and whether Slack may have shared it; undefined for any other error. */
+/** The file an upload left when it failed after its first step, which a
+ *  rollback deletes too, and whether Slack may have shared it; undefined for
+ *  any other error. */
 export function fileLeftByUpload(err: unknown): FileLeft | undefined {
   return err !== null && typeof err === 'object' ? filesLeft.get(err) : undefined;
 }
 
-/** Whether Slack refused a request or rate-limited it, either of which leaves
- *  it undone. A failure Slack says may have taken effect (MAY_HAVE_LANDED), an
- *  HTTP error, a timeout or a dropped connection doesn't say. */
-function refusedOutright(err: unknown): boolean {
-  const e = err as { code?: unknown; data?: { error?: unknown } } | null;
+/** Whether a request's failure leaves it undone: the call's time left no room
+ *  to send it, the connection to Slack was never made, or Slack refused it or
+ *  rate-limited it. A failure Slack says may have taken effect
+ *  (MAY_HAVE_LANDED), an HTTP error, a timeout or a connection that failed
+ *  once made doesn't say. */
+function cannotHaveLanded(err: unknown): boolean {
+  if (err instanceof OutOfCallTime) return true;
+  const e = err as { code?: unknown; original?: { code?: unknown }; data?: { error?: unknown } } | null;
+  if (e?.code === ErrorCode.RequestError) return connectionNeverMade(e.original?.code);
   if (e?.code === ErrorCode.RateLimitedError) return true;
   return e?.code === ErrorCode.PlatformError && typeof e.data?.error === 'string' && !MAY_HAVE_LANDED.has(e.data.error);
 }
@@ -326,14 +332,14 @@ export class UploadNotConfirmed extends Error {
   }
 }
 
-/** A file's bytes that didn't reach Slack's upload server: its timeout ran out
- *  (`TimeoutError`), the connection failed (`transit`), or the server answered
- *  with this HTTP status. Slack shares a file only at the upload's last step,
- *  so nothing was shared. */
-export class UploadBytesNotSent extends Error {
+/** A post of a file's bytes to Slack's upload server that failed: its timeout
+ *  ran out (`TimeoutError`), the connection failed (`transit`), or the server
+ *  answered with this HTTP status. The bytes may have reached the server, but
+ *  Slack shares a file only at the upload's last step, so nothing was shared. */
+export class UploadBytesFailed extends Error {
   constructor(readonly why: 'TimeoutError' | 'transit' | number) {
     super(`The upload of the file's bytes: ${why === 'TimeoutError' ? 'timed out' : why === 'transit' ? 'the connection failed' : `HTTP ${why}`}`);
-    this.name = 'UploadBytesNotSent';
+    this.name = 'UploadBytesFailed';
   }
 }
 
@@ -847,12 +853,13 @@ export class SlackAdapter {
    *  sendMessage. Needs the files:write scope.
    *
    *  A file is shared only at the last step, so a failure before it shared
-   *  nothing. When the last step fails, its file rides on the error
-   *  (fileLeftByUpload) for rollback, with whether Slack may have shared it:
-   *  not when Slack refused or rate-limited the step. An answer that names no
-   *  file throws UploadNotConfirmed, whose file rides on it the same way.
-   *  `shareTs` is the message that shared the file, when the answer names it:
-   *  it holds the comment, which rollback deletes after the file. */
+   *  nothing. Once the first step has given the file its ID, a failure leaves
+   *  that file on its error (fileLeftByUpload) for rollback, with whether
+   *  Slack may have shared it: only if the last step's own request may have
+   *  taken effect. An answer that names no file throws UploadNotConfirmed,
+   *  whose file rides on it the same way, possibly shared. `shareTs` is the
+   *  message that shared the file, when the answer names it: it holds the
+   *  comment, which rollback deletes after the file. */
   async uploadFile(
     channelId: string,
     file: { filename: string; data: Buffer; title?: string; comment?: string; threadTs?: string },
@@ -865,7 +872,18 @@ export class SlackAdapter {
     if (typeof url !== 'string' || !url || typeof fileId !== 'string' || !fileId) {
       throw new Error("files.getUploadURLExternal: Slack's answer gave no upload URL or file ID, so nothing was uploaded");
     }
-    await this.postFileBytes(url, file.data);
+    // Slack gave the file its ID at the first step, so whatever fails from
+    // here leaves that file for a rollback to delete. Only the last step's
+    // own request can have shared it.
+    const left = (err: unknown, mayHaveShared: boolean): unknown => {
+      if (err !== null && typeof err === 'object') filesLeft.set(err, { fileId, mayHaveShared });
+      return err;
+    };
+    try {
+      await this.postFileBytes(url, file.data);
+    } catch (err) {
+      throw left(err, false);
+    }
     let answer: Awaited<ReturnType<SlackWebLike['files']['completeUploadExternal']>>;
     try {
       answer = await this.web.files.completeUploadExternal({
@@ -875,20 +893,10 @@ export class SlackAdapter {
         ...(file.threadTs ? { thread_ts: file.threadTs } : {}),
       });
     } catch (err) {
-      // A request the call's time left no room for wasn't sent. Anything else
-      // leaves the file for a rollback to remove, at no cost to the agent, a
-      // refusal's private one included.
-      if (!(err instanceof OutOfCallTime) && err !== null && typeof err === 'object') {
-        filesLeft.set(err, { fileId, mayHaveShared: !refusedOutright(err) });
-      }
-      throw err;
+      throw left(err, !cannotHaveLanded(err));
     }
     const shared = answer.files?.find((f) => f.id === fileId);
-    if (!shared) {
-      const err = new UploadNotConfirmed(fileId);
-      filesLeft.set(err, { fileId, mayHaveShared: true });
-      throw err;
-    }
+    if (!shared) throw left(new UploadNotConfirmed(fileId), true);
     // The working reaction comes off whatever time the call has left, as a
     // sent message's does.
     void outsideCallTime(() => this.clearAck(channelId));
@@ -909,10 +917,10 @@ export class SlackAdapter {
         signal: AbortSignal.timeout(SLACK_CLIENT_OPTIONS.timeout),
       });
       await answer.arrayBuffer();
-      if (!answer.ok) throw new UploadBytesNotSent(answer.status);
+      if (!answer.ok) throw new UploadBytesFailed(answer.status);
     } catch (err) {
-      if (err instanceof UploadBytesNotSent) throw err;
-      throw new UploadBytesNotSent((err as { name?: unknown } | null)?.name === 'TimeoutError' ? 'TimeoutError' : 'transit');
+      if (err instanceof UploadBytesFailed) throw err;
+      throw new UploadBytesFailed((err as { name?: unknown } | null)?.name === 'TimeoutError' ? 'TimeoutError' : 'transit');
     }
   }
 

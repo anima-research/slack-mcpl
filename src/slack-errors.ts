@@ -18,8 +18,8 @@
  * couldn't be made at all, which Node's code on the request error's
  * `original` tells. Four more are this server's own: a request its call's
  * deadline left no time to send (OutOfCallTime), fetch_attachment's download
- * running past its timeout, an upload's bytes that didn't reach Slack
- * (UploadBytesNotSent), and an upload whose last step named no file
+ * running past its timeout, a failed post of an upload's bytes to Slack's
+ * upload server (UploadBytesFailed), and an upload whose last step named no file
  * (UploadNotConfirmed). Each refusal code here is one Slack's
  * reference documents for a method these tools call. Other errors, and codes
  * not listed, pass through unchanged.
@@ -30,7 +30,7 @@ import {
   CALL_SECONDS,
   OutOfCallTime,
   SLACK_CLIENT_OPTIONS,
-  UploadBytesNotSent,
+  UploadBytesFailed,
   UploadNotConfirmed,
   failedRequest,
 } from './slack-adapter.js';
@@ -120,7 +120,7 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
   // of the bytes before it, which may have reached Slack's upload server,
   // leads with what is true of the file by then.
   const sharing = call.tool === 'upload_file' &&
-    (failedRequest(err) === 'files.completeUploadExternal' || err instanceof UploadBytesNotSent);
+    (failedRequest(err) === 'files.completeUploadExternal' || err instanceof UploadBytesFailed);
   const lead = sharing ? 'Nothing was shared' : NOT_DONE[call.tool] ?? 'Nothing was done';
   const channel = given('channelId');
   const conversation = channel ? `conversation ${channel}` : 'the conversation';
@@ -191,18 +191,25 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
     // Its ID came from the first step, so a rollback deletes it either way.
     return unknown("Slack's answer to the upload's last step named no file");
   }
-  if (err instanceof UploadBytesNotSent) {
+  if (err instanceof UploadBytesFailed) {
     const seconds = SLACK_CLIENT_OPTIONS.timeout / 1000;
     const unshared = "Slack shares a file only at the upload's last step, which wasn't sent";
     if (err.why === 'TimeoutError') {
+      // The timeout covers the whole post: the bytes, the answer and its body.
       return (
-        `${lead}: Slack's upload server didn't take the file's bytes within ${seconds} seconds. ${unshared}, so ` +
-        'calling again is safe. If it keeps timing out, calling again won\'t help: this server\'s connection to ' +
-        `Slack is too slow to send this file within ${seconds} seconds, which whoever runs this host can look into.`
+        `${lead}: Slack's upload server didn't take the file's bytes and answer within ${seconds} seconds. ` +
+        `${unshared}, so calling again is safe. If it keeps timing out, Slack's upload server or this server's ` +
+        `connection to it is too slow to take this file within ${seconds} seconds: a smaller file may go through, ` +
+        'and whoever runs this host can look into the connection.'
       );
     }
-    const cause = err.why === 'transit' ? "the connection to Slack's upload server failed" : `Slack's upload server answered HTTP ${err.why}`;
-    return `${lead}: ${cause} while it took the file's bytes. ${unshared}. Try again shortly.`;
+    if (err.why === 'transit') {
+      return (
+        `${lead}: the connection to Slack's upload server failed. ${unshared}. Try again shortly. If it keeps ` +
+        "failing, whoever runs this host has to check its connection to Slack's upload server."
+      );
+    }
+    return `${lead}: Slack's upload server answered the file's bytes with HTTP ${err.why}. ${unshared}. Try again shortly.`;
   }
   if (err instanceof OutOfCallTime) {
     // Not sent: a call's request goes out only if its timeout fits
@@ -411,10 +418,13 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
     case 'internal_error':
     case 'fatal_error':
     case 'service_unavailable':
+    // files.completeUploadExternal's: "Failure occurred when attempting to
+    // update the file."
+    case 'file_update_failed':
       if (!mayHaveWritten) return `${lead}: Slack failed while handling the call. Try again shortly.`;
       return unknown(
         'Slack failed while handling the call',
-        code === 'service_unavailable' ? '' : ' (Slack says part of a call can take effect before this error)',
+        code === 'internal_error' || code === 'fatal_error' ? ' (Slack says part of a call can take effect before this error)' : '',
       );
     case 'user_not_found':
       return (

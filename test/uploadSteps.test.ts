@@ -1,7 +1,7 @@
 /**
  * upload_file in Slack's three steps, through the real client against a local
- * endpoint that answers as Slack does: what each step's failure tells the
- * agent, which uploads a rollback deletes, and the message that shared the
+ * endpoint that stands in for Slack's Web API: what each step's failure tells
+ * the agent, which uploads a rollback deletes, and the message that shared the
  * file, which holds its comment.
  */
 import test, { after, before } from 'node:test';
@@ -73,6 +73,13 @@ async function server(t: { after(fn: () => Promise<void>): void }) {
   return { h, call, rollback };
 }
 
+/** A rollback's note for file F1's comment, uploaded to C1, whose sharing
+ *  message this server doesn't know. */
+const commentMayRemain =
+  "The comment of uploaded file F1 may remain in conversation C1: this server doesn't know the message that shared " +
+  "the file, so no rollback can delete it. delete_message may, by that message's id, which fetch_history shows, or " +
+  'fetch_thread if the file went into a thread';
+
 /** Methods called from `from` on, the upload's own bytes request included,
  *  less the listing a grant starts in the background. */
 const called = (from: number) => api.calls.slice(from).filter((m) => m !== 'conversations.list');
@@ -118,7 +125,7 @@ test("a first answer with no upload URL or file ID uploads nothing", { timeout: 
   }
 });
 
-test("bytes the call's time leaves no room for aren't sent, and nothing is uploaded", { timeout: 10_000 }, async (t) => {
+test("bytes the call's time leaves no room for aren't sent, nothing is uploaded, and the file's ID is left for rollback", { timeout: 10_000 }, async (t) => {
   // 12.5 s are left, and the first step takes 3 s of them.
   await steps(t, { first: { ...target(`${api.url}file-upload`, 'F1'), delayMs: 3000 } });
   const from = api.calls.length;
@@ -128,29 +135,31 @@ test("bytes the call's time leaves no room for aren't sent, and nothing is uploa
   assert.match(explainSlackError(err, { tool: 'upload_file', args: { channelId: 'C1' } }),
     /^The upload of the file's bytes: out of this call's time\n\nNothing was uploaded: this server gives each call 25 seconds/);
   assert.deepEqual(called(from), ['files.getUploadURLExternal']);
+  assert.deepEqual(fileLeftByUpload(err), { fileId: 'F1', mayHaveShared: false });
 });
 
-test("bytes whose connection fails share nothing, and say so", { timeout: 5000 }, async (t) => {
+test("bytes whose connection fails share nothing, say so, and leave the file for rollback", { timeout: 5000 }, async (t) => {
   await steps(t, { url: `${await unreachableSlackApiUrl()}file-upload` });
   const err = await adapter().uploadFile('C1', { filename: 'a.txt', data: Buffer.from('a') }).then(() => null, (e: unknown) => e);
   assert.equal(explainSlackError(err, { tool: 'upload_file', args: { channelId: 'C1' } }),
     "The upload of the file's bytes: the connection failed\n\nNothing was shared: the connection to Slack's upload " +
-      "server failed while it took the file's bytes. Slack shares a file only at the upload's last step, which wasn't " +
-      'sent. Try again shortly.');
+      "server failed. Slack shares a file only at the upload's last step, which wasn't sent. Try again shortly. If it " +
+      "keeps failing, whoever runs this host has to check its connection to Slack's upload server.");
+  assert.deepEqual(fileLeftByUpload(err), { fileId: 'F1', mayHaveShared: false });
 });
 
-test("bytes that don't reach Slack's upload server share nothing, and say so", { timeout: 5000 }, async (t) => {
+test("bytes Slack's upload server answers with an error share nothing, say so, and leave the file for rollback", { timeout: 5000 }, async (t) => {
   await steps(t, { bytes: { status: 500, body: { ok: false } } });
   const from = api.calls.length;
   const err = await adapter().uploadFile('C1', { filename: 'a.txt', data: Buffer.from('a') }).then(() => null, (e: unknown) => e);
   assert.equal(explainSlackError(err, { tool: 'upload_file', args: { channelId: 'C1' } }),
-    "The upload of the file's bytes: HTTP 500\n\nNothing was shared: Slack's upload server answered HTTP 500 while it " +
-      "took the file's bytes. Slack shares a file only at the upload's last step, which wasn't sent. Try again shortly.");
+    "The upload of the file's bytes: HTTP 500\n\nNothing was shared: Slack's upload server answered the file's bytes " +
+      "with HTTP 500. Slack shares a file only at the upload's last step, which wasn't sent. Try again shortly.");
   assert.deepEqual(called(from), ['files.getUploadURLExternal', 'file-upload'], 'the file was never shared');
-  assert.equal(fileLeftByUpload(err), undefined);
+  assert.deepEqual(fileLeftByUpload(err), { fileId: 'F1', mayHaveShared: false });
 });
 
-test("bytes that don't arrive within the client's timeout share nothing, and calling again is safe", { timeout: 5000 }, async (t) => {
+test("bytes the upload server doesn't take and answer within the client's timeout share nothing, and calling again is safe", { timeout: 5000 }, async (t) => {
   const silent = await silentSlackApi();
   t.after(() => silent.close());
   await steps(t, { url: `${silent.url}file-upload` });
@@ -162,13 +171,15 @@ test("bytes that don't arrive within the client's timeout share nothing, and cal
   assert.deepEqual(asked, [SLACK_CLIENT_OPTIONS.timeout]);
   assert.equal(explainSlackError(err, { tool: 'upload_file', args: { channelId: 'C1' } }),
     "The upload of the file's bytes: timed out\n\nNothing was shared: Slack's upload server didn't take the file's " +
-      "bytes within 10 seconds. Slack shares a file only at the upload's last step, which wasn't sent, so calling " +
-      "again is safe. If it keeps timing out, calling again won't help: this server's connection to Slack is too " +
-      'slow to send this file within 10 seconds, which whoever runs this host can look into.');
+      "bytes and answer within 10 seconds. Slack shares a file only at the upload's last step, which wasn't sent, so " +
+      "calling again is safe. If it keeps timing out, Slack's upload server or this server's connection to it is too " +
+      'slow to take this file within 10 seconds: a smaller file may go through, and whoever runs this host can look ' +
+      'into the connection.');
   assert.equal(silent.requests(), 1);
+  assert.deepEqual(fileLeftByUpload(err), { fileId: 'F1', mayHaveShared: false });
 });
 
-test("a last step the call's time leaves no room for isn't sent, shares nothing, and isn't kept for rollback", { timeout: 10_000 }, async (t) => {
+test("a last step the call's time leaves no room for isn't sent, shares nothing, and leaves its file for rollback", { timeout: 10_000 }, async (t) => {
   // 12.5 s of the call's 25 are left: enough for the first two steps, each
   // of whose 10 s fits, and the bytes take 3 s, after which the last step's
   // 10 s don't.
@@ -180,7 +191,7 @@ test("a last step the call's time leaves no room for isn't sent, shares nothing,
   assert.match(explainSlackError(err, { tool: 'upload_file', args: { channelId: 'C1' } }),
     /\n\nNothing was shared: this server gives each call 25 seconds .* It wasn't sent, so calling again is safe\.$/);
   assert.deepEqual(called(from), ['files.getUploadURLExternal', 'file-upload']);
-  assert.equal(fileLeftByUpload(err), undefined);
+  assert.deepEqual(fileLeftByUpload(err), { fileId: 'F1', mayHaveShared: false });
 });
 
 test("a refusal of the last step says nothing was shared, and a rollback still deletes the file it left, with no note of a comment", { timeout: 5000 }, async (t) => {
@@ -202,14 +213,14 @@ test("a last step that may have shared the file with its comment notes on rollba
   const { call, rollback } = await server(t);
   const before = await call('send_message', { channelId: 'C1', content: 'before' });
   assert.equal((await call('upload_file', { channelId: 'C1', filename: 'a.txt', content: 'a', comment: 'Here' })).isError, true);
-  assert.equal((await rollback(before.state!.checkpoint)).reason,
-    "The comment of uploaded file F1 may remain: this server doesn't know the message that shared it");
+  assert.equal((await rollback(before.state!.checkpoint)).reason, commentMayRemain);
 });
 
 test('a last step that fails in a way that may have shared the file says what to check, and its file is rolled back', { timeout: 5000 }, async (t) => {
   for (const [last, cause, partly] of [
     [{ body: { ok: false, error: 'internal_error' } }, 'Slack failed while handling the call', ' (Slack says part of a call can take effect before this error)'],
     [{ body: { ok: false, error: 'service_unavailable' } }, 'Slack failed while handling the call', ''],
+    [{ body: { ok: false, error: 'file_update_failed' } }, 'Slack failed while handling the call', ''],
     [{ status: 503, body: { ok: false } }, 'Slack answered with HTTP 503', ''],
   ] as const) {
     await steps(t, { last });
@@ -288,14 +299,17 @@ test("a file that can't be deleted counts as a file not deleted, and its sharing
   assert.deepEqual(called(from), ['files.delete', 'chat.delete']);
 });
 
-test('a file Slack says is gone, or no longer visible to this bot, counts as deleted', { timeout: 5000 }, async (t) => {
+test('a file Slack says is gone, or no longer visible to this bot, counts as deleted, and its sharing message is still deleted', { timeout: 5000 }, async (t) => {
   for (const error of ['file_deleted', 'file_not_found']) {
-    await steps(t, { last: sharedBy('F1') });
+    await steps(t, { last: sharedBy('F1', '5.5') });
     api.answerFor('files.delete', { body: { ok: false, error } });
     const { call, rollback } = await server(t);
     const before = await call('send_message', { channelId: 'C1', content: 'before' });
     await call('upload_file', { channelId: 'C1', filename: 'a.txt', content: 'a' });
+    const from = api.calls.length;
     assert.deepEqual(await rollback(before.state!.checkpoint), { checkpoint: before.state!.checkpoint, success: true }, error);
+    assert.deepEqual(called(from), ['files.delete', 'chat.delete'], error);
+    assert.equal(api.sent.at(-1)?.get('ts'), '5.5');
   }
 });
 
@@ -315,12 +329,32 @@ test("an upload's failed last step says which file it left and whether Slack may
     [{ body: { ok: false, error: 'not_in_channel' } }, false],
     [{ status: 429, headers: { 'retry-after': '30' }, body: { ok: false, error: 'ratelimited' } }, false],
     [{ body: { ok: false, error: 'internal_error' } }, true],
+    [{ body: { ok: false, error: 'file_update_failed' } }, true],
     [{ status: 503, body: { ok: false } }, true],
     [{ body: { ok: true, files: [] } }, true],
   ] as const) {
     await steps(t, { last });
     const err = await adapter().uploadFile('C1', { filename: 'a.txt', data: Buffer.from('a') }).then(() => null, (e: unknown) => e);
     assert.deepEqual(fileLeftByUpload(err), { fileId: 'F1', mayHaveShared }, JSON.stringify(last));
+  }
+});
+
+test('a last step whose connection was never made counts as not shared, and one that timed out as maybe shared', { timeout: 5000 }, async (t) => {
+  const silent = await silentSlackApi();
+  t.after(() => silent.close());
+  for (const [url, timeout, mayHaveShared] of [
+    [await unreachableSlackApiUrl(), SLACK_CLIENT_OPTIONS.timeout, false],
+    [silent.url, 50, true],
+  ] as const) {
+    await steps(t);
+    // The first step goes to the fake; the last to `url`.
+    const last = new SlackWebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, timeout, slackApiUrl: url });
+    const web = {
+      files: { getUploadURLExternal: client.files.getUploadURLExternal, completeUploadExternal: last.files.completeUploadExternal },
+    } as unknown as SlackWebLike;
+    const err = await new SlackAdapter(web, socket, 'UBOT', 'acme').uploadFile('C1', { filename: 'a.txt', data: Buffer.from('a') })
+      .then(() => null, (e: unknown) => e);
+    assert.deepEqual(fileLeftByUpload(err), { fileId: 'F1', mayHaveShared }, String(err));
   }
 });
 
@@ -333,7 +367,9 @@ test("the comments of two uploads whose sharing messages this server doesn't kno
   await call('upload_file', { channelId: 'C1', filename: 'a.txt', content: 'a', comment: 'One' });
   await call('upload_file', { channelId: 'C1', filename: 'b.txt', content: 'b', comment: 'Two' });
   assert.equal((await rollback(before.state!.checkpoint)).reason,
-    "The comments of uploaded files F1, F2 may remain: this server doesn't know the messages that shared them");
+    "The comments of uploaded files F1 in C1, F2 in C1 may remain: this server doesn't know the messages that shared " +
+      "them, so no rollback can delete them. delete_message may, by those messages' ids, which fetch_history shows, " +
+      'or fetch_thread if the file went into a thread');
 });
 
 test("an upload's acknowledgement removal keeps its own tries, outside the upload's call", { timeout: 5000 }, async (t) => {
@@ -376,7 +412,7 @@ test("an upload whose answer named no sharing message says on rollback that its 
   const from = api.calls.length;
   const rolledBack = await rollback(before.state!.checkpoint);
   assert.deepEqual(called(from), ['files.delete']);
-  assert.equal(rolledBack.reason, "The comment of uploaded file F1 may remain: this server doesn't know the message that shared it");
+  assert.equal(rolledBack.reason, commentMayRemain);
   // Without a comment, there is nothing to say.
   const next = await call('send_message', { channelId: 'C1', content: 'next' });
   await call('upload_file', { channelId: 'C1', filename: 'b.txt', content: 'b' });

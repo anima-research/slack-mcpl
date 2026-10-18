@@ -79,22 +79,25 @@ inline content only; it does not read a path on the server.
 Optional `messageId` selects the thread root (the message's `thread=` value,
 or its `id=` when it has no `thread=`). `title` names the
 file in Slack (defaulting to `filename`), and `comment` adds an initial
-comment. `SLACK_SEND_CHANNELS` and `SLACK_DISABLE_DMS` apply to uploads just
+comment. An optional argument given as JSON null or an empty string counts as
+not given. `SLACK_SEND_CHANNELS` and `SLACK_DISABLE_DMS` apply to uploads just
 as they do to message sends.
 
 An upload runs in Slack's three steps: `files.getUploadURLExternal` gives an
 upload URL and the file's ID, the file's bytes go to that URL, and
 `files.completeUploadExternal` shares the file. Slack shares a file only at
 the last step, so an upload that fails before it shared nothing and can be
-called again. One whose last step fails may have shared the file anyway, and
-its error says what to check before uploading again.
+called again. When the last step fails, its error says whether the file may
+have been shared anyway, and if it may, what to check before uploading again;
+a refusal this server doesn't recognize passes through as Slack gave it.
 
 Uploads belong to `slack.messaging` checkpoints, so rollback attempts to
 delete them along with later messages: the file, through Slack's file
 deletion API, and the message that shared it, which holds the comment, when
 Slack's answer named that message. When it didn't, the rollback's answer says
-the comment may remain. An upload whose last step failed is rolled back the
-same way. Rollback is best-effort and reports partial failures, by kind;
+the comment may remain, and that `delete_message` may delete it. An upload
+that failed after Slack gave the file its ID is rolled back the same way.
+Rollback is best-effort and reports partial failures, by kind;
 checkpoint history is kept in memory across host reconnects, but does not
 survive a server restart. As with message rollback, failed deletions are
 logged and reported in the partial count, but are not retained for another

@@ -115,7 +115,9 @@ test('a refused upload keeps the acknowledgement reaction, which only a confirme
   await until(() => h.reactions.includes('add:C1:111.1:eyes'), 'ack reaction');
   const refused = await call(h.host, 'upload_file', { ...uploadArgs, title: 'refused' });
   assert.equal(refused.isError, true);
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  // A removal the refused call started would be recorded by now: the fake
+  // records reactions.remove as it's called, which clearAck reaches in
+  // microtasks, before the call's answer can reach the host.
   assert.ok(!h.reactions.includes('remove:C1:111.1:eyes'), 'the reaction stays');
   assert.notEqual((await call(h.host, 'upload_file', uploadArgs)).isError, true);
   await until(() => h.reactions.includes('remove:C1:111.1:eyes'), 'ack removal');

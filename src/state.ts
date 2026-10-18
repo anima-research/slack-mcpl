@@ -76,8 +76,10 @@ export class StateTracker {
     });
   }
 
-  /** Forget a message deleted outside rollback, so no rollback deletes it
-   *  again. */
+  /** Forget a sent message deleted outside rollback, so no rollback deletes it
+   *  again. An upload's sharing message stays with its file: a rollback that
+   *  rolls the file back asks to delete the message too, and counts it
+   *  deleted when Slack answers message_not_found. */
   forgetSent(channelId: string, messageId: string): void {
     this.sentItems = this.sentItems.filter((m) => m.kind !== 'message' || m.channelId !== channelId || m.messageId !== messageId);
   }

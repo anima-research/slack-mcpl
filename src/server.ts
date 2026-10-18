@@ -628,10 +628,11 @@ export class SlackMcplServer {
       case 'upload_file': {
         const channelId = this.requireString(args, 'channelId');
         const filename = this.requireString(args, 'filename');
-        // An argument given as JSON null is not given. An optional one given
-        // as anything but a string is refused, rather than dropped: a
-        // messageId dropped would put the file in the conversation, not its
-        // thread.
+        // An argument given as JSON null is not given, and an optional one
+        // given as an empty string names nothing, so it isn't given either.
+        // An optional one given as anything but a string is refused, rather
+        // than dropped: a messageId given as a number, say, and dropped would
+        // put the file in the conversation, not its thread.
         const given = (k: string) => args[k] !== undefined && args[k] !== null;
         const optional = (k: string): string | undefined => {
           if (!given(k) || args[k] === '') return undefined;
@@ -642,7 +643,7 @@ export class SlackMcplServer {
         const key = given('content') ? 'content' : 'contentBase64';
         const input = args[key];
         if (typeof input !== 'string') throw new Error(`${key} must be a string`);
-        if (input.length === 0) throw new Error('file content is empty');
+        if (input.length === 0) throw new Error(`${key} is empty: give the file's content, at least one byte`);
         // UTF-8 can't hold a lone surrogate: Buffer.from would write U+FFFD in
         // its place, so the file or its name would differ from what was given,
         // and the client can't encode one into its request to Slack.
@@ -679,8 +680,9 @@ export class SlackMcplServer {
         try {
           result = await this.slack.uploadFile(channelId, { filename, data, title, comment, threadTs: optional('messageId') });
         } catch (err) {
-          // A failed last step leaves its file for rollback, and its comment
-          // only if Slack may have shared the file with it.
+          // An upload that failed after its first step leaves its file for
+          // rollback, and its comment only if Slack may have shared the file
+          // with it.
           const left = fileLeftByUpload(err);
           if (left) this.stateTracker.recordUploaded(left.fileId, channelId, { comment: comment !== undefined && left.mayHaveShared });
           throw err;
@@ -1331,14 +1333,22 @@ export class SlackMcplServer {
       .filter((kind) => sent[kind] > 0)
       .map((kind) => `${deleted[kind]}/${sent[kind]} ${kind}s`)
       .join(' and ');
-    const commentsLeft = toDelete.filter((item) => item.kind === 'file' && item.comment && !item.shareTs).map((item) => (item as UploadedFile).fileId);
+    // chat.delete, with a bot token, takes "only messages posted by that bot";
+    // whether Slack counts a file's sharing message as one isn't known, hence
+    // "may".
+    const commentsLeft = toDelete.filter((item): item is UploadedFile => item.kind === 'file' && item.comment && !item.shareTs);
+    const ids = "which fetch_history shows, or fetch_thread if the file went into a thread";
     const notes = [
       ...(deleted.message + deleted.file < sent.message + sent.file ? [`Rolled back (${counts} deleted)`] : []),
-      ...(commentsLeft.length > 0
-        ? [commentsLeft.length === 1
-          ? `The comment of uploaded file ${commentsLeft[0]} may remain: this server doesn't know the message that shared it`
-          : `The comments of uploaded files ${commentsLeft.join(', ')} may remain: this server doesn't know the messages that shared them`]
-        : []),
+      ...(commentsLeft.length === 1
+        ? [`The comment of uploaded file ${commentsLeft[0].fileId} may remain in conversation ${commentsLeft[0].channelId}: ` +
+          "this server doesn't know the message that shared the file, so no rollback can delete it. delete_message " +
+          `may, by that message's id, ${ids}`]
+        : commentsLeft.length > 1
+          ? [`The comments of uploaded files ${commentsLeft.map((f) => `${f.fileId} in ${f.channelId}`).join(', ')} may remain: ` +
+            "this server doesn't know the messages that shared them, so no rollback can delete them. delete_message " +
+            `may, by those messages' ids, ${ids}`]
+          : []),
     ];
     return {
       checkpoint: params.checkpoint,
