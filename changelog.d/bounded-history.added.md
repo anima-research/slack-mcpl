@@ -1,0 +1,1 @@
+- Enrich `fetch_history` and `fetch_thread` with stable author/root identity, optional reply counts, channel policy versus observed Slack restrictions, and bounded resumable pagination. Add literal substring and exact author-ID filtering to `fetch_history` without automatic thread expansion or new scopes.

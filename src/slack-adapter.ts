@@ -20,6 +20,7 @@
 
 import { WebClient } from '@slack/web-api';
 import { SocketModeClient } from '@slack/socket-mode';
+import {BoundedHistoryReader, type SlackReadCall} from './history-read.js';
 import {
   formatSlackText,
   extractSlackUserIds,
@@ -173,6 +174,13 @@ export async function connectSlack(config: SlackAdapterConfig): Promise<SlackAda
     config.sendChannels,
     config.disableDms,
     config.ackReaction,
+    // Isolate tool-read deadlines/retries from the legacy messaging client.
+    // AbortSignal reaches Axios through the SDK's supported interceptor.
+    async (method, args, signal) => await new WebClient(config.botToken, {
+      retryConfig: {retries: 0}, rejectRateLimitedCalls: true,
+      attachOriginalToWebAPIRequestError: false,
+      requestInterceptor: request => { request.signal = signal; return request; },
+    }).apiCall(method, args) as unknown as Record<string, unknown>,
   );
 }
 
@@ -207,6 +215,7 @@ export interface SlackSocketLike {
 }
 
 export class SlackAdapter {
+  private historyReader: BoundedHistoryReader;
   private userNameCache = new Map<string, string>();
   private messageHandlers: Array<(msg: SlackMessageData) => void> = [];
   private socketStarted = false;
@@ -235,7 +244,12 @@ export class SlackAdapter {
     private sendChannels?: string[],
     private disableDms = false,
     private ackReaction?: string,
+    readCall?: SlackReadCall,
   ) {
+    this.historyReader = new BoundedHistoryReader(readCall ?? (async (method, args) => {
+      const operation = method.slice('conversations.'.length) as 'info' | 'history' | 'replies';
+      return this.web.conversations[operation](args as {channel: string}) as Promise<Record<string, unknown>>;
+    }), id => this.canWrite(id), this.userNameCache, this.disableDms);
     // Register the handler at construction so start() ordering can't race
     // an early event past an unregistered listener.
     this.socket.on('message', ({ event, ack }) => {
@@ -489,6 +503,15 @@ export class SlackAdapter {
   }
 
   // ── History ──
+
+  /** The bounded public tool contract; backscroll/unread keep fetchHistory. */
+  readHistory(channelId: string, args: Record<string, unknown>) {
+    return this.historyReader.read('history', channelId, args);
+  }
+
+  readThread(channelId: string, threadTs: string, args: Record<string, unknown>) {
+    return this.historyReader.read('thread', channelId, args, threadTs);
+  }
 
   /** Channel-level history, oldest-first. Thread replies are NOT included
    *  (Slack requires conversations.replies per thread — see fetchThread). */

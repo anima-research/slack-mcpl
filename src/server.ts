@@ -638,29 +638,13 @@ export class SlackMcplServer {
 
       case 'fetch_history': {
         const channelId = this.requireString(args, 'channelId');
-        const { messages, truncated } = await this.slack.fetchHistory(channelId, {
-          limit: (args.limit as number) ?? 50,
-          ...(args.oldest ? { oldest: args.oldest as string } : {}),
-          ...(args.latest ? { latest: args.latest as string } : {}),
-        });
-        return {
-          messages: messages.map((m) => this.renderHistoryMessage(m)),
-          ...(truncated ? { note: 'Range holds more messages than the limit; the oldest were omitted.' } : {}),
-        };
+        return await this.slack.readHistory(channelId, args);
       }
 
       case 'fetch_thread': {
         const channelId = this.requireString(args, 'channelId');
         const threadTs = this.requireString(args, 'threadTs');
-        const { messages, truncated } = await this.slack.fetchThread(
-          channelId,
-          threadTs,
-          (args.limit as number) ?? 100,
-        );
-        return {
-          messages: messages.map((m) => this.renderHistoryMessage(m)),
-          ...(truncated ? { note: 'Thread holds more messages than the limit; the newest were omitted.' } : {}),
-        };
+        return await this.slack.readThread(channelId, threadTs, args);
       }
 
       case 'find_user': {
@@ -747,26 +731,6 @@ export class SlackMcplServer {
       throw new Error(`${key} is required`);
     }
     return v;
-  }
-
-  private renderHistoryMessage(m: {
-    id: string; authorName: string; content: string; threadTs?: string;
-    timestamp: Date; attachments: Array<{ name: string; mimeType?: string; url?: string }>;
-  }): Record<string, unknown> {
-    return {
-      id: m.id,
-      author: m.authorName,
-      timestamp: m.timestamp.toISOString(),
-      ...(m.threadTs ? { threadTs: m.threadTs } : {}),
-      content: m.content,
-      ...(m.attachments.length > 0
-        ? {
-            attachments: m.attachments.map((a) =>
-              `${a.name}${a.mimeType ? ` (${a.mimeType})` : ''}${a.url ? ` — fetchable via fetch_attachment: ${a.url}` : ''}`,
-            ),
-          }
-        : {}),
-    };
   }
 
   /** Record that the bot just sent to a conversation, for location headers. */

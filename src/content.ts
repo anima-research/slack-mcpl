@@ -257,6 +257,9 @@ export interface SlackHistoryMessage {
   username?: string;
   text?: string;
   thread_ts?: string;
+  root?: { thread_ts?: string; ts?: string };
+  reply_count?: number;
+  bot_id?: string;
   files?: Array<{ name?: string; mimetype?: string; url_private?: string }>;
 }
 
