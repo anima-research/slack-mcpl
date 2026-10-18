@@ -31,7 +31,10 @@ test('a plain-MCP client gets no MCPL manifest, and tool calls are ungated', asy
   assert.notEqual(called.isError, true);
 
   // MCPL-only methods are not on offer to a client that never negotiated MCPL.
-  await assert.rejects(h.host.sendRequest(method.CHANNELS_LIST), /-32601/);
+  await assert.rejects(
+    h.host.sendRequest(method.CHANNELS_LIST),
+    (err: Error & { code?: number }) => err.code === -32601,
+  );
 
   // No push events for a client that never negotiated MCPL, even on a mention.
   await h.socket.emitMessage(MENTION_EVENT);
