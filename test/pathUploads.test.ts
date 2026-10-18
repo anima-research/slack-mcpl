@@ -6,12 +6,13 @@ import {tmpdir} from 'node:os';
 import {spawnSync} from 'node:child_process';
 import {SlackAdapter} from '../src/slack-adapter.js';
 import {SlackMcplServer} from '../src/server.js';
-import {MAX_ATTACHMENT_BYTES} from '../src/content.js';
-import type {PathUploadPolicy} from '../src/upload-path.js';
+import {MAX_ATTACHMENT_BYTES, SLACK_MAX_FILE_BYTES} from '../src/content.js';
+import {PathUploadReader} from '../src/upload-path.js';
+import type {PathUploadConfig} from '../src/upload-path.js';
 import {connectHost, initialize, uploadEndpoint} from './harness.js';
 
 async function fixture(t: {after(fn: () => unknown): void}, mode?: 'restricted' | 'unrestricted',
-  options: {sendChannels?: string[]; disableDms?: boolean} = {}) {
+  options: {sendChannels?: string[]; disableDms?: boolean; maxBytes?: number} = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'path-tool-'));
   const path = join(directory, 'report.txt'); writeFileSync(path, 'synthetic report');
   // Slack's three upload steps: each started upload is in `started`, and each
@@ -35,8 +36,9 @@ async function fixture(t: {after(fn: () => unknown): void}, mode?: 'restricted' 
     },
     conversations: {async info() {return {channel: {is_im: true}};}},
   } as any, {on() {}} as any, 'UBOT', 'test', undefined, options.sendChannels, options.disableDms);
-  const pathUploads: PathUploadPolicy | undefined = mode === 'restricted' ? {mode, directories: [directory]}
-    : mode === 'unrestricted' ? {mode} : undefined;
+  const limit = options.maxBytes === undefined ? {} : {maxBytes: options.maxBytes};
+  const pathUploads: PathUploadConfig | undefined = mode === 'restricted' ? {mode, directories: [directory], ...limit}
+    : mode === 'unrestricted' ? {mode, ...limit} : undefined;
   const server = new SlackMcplServer(slack, {pathUploads});
   const h = connectHost(server);
   t.after(async () => {await h.close(); server.close(); rmSync(directory, {recursive: true, force: true});});
@@ -126,13 +128,16 @@ test('destination is revalidated after the file read before upload effects', asy
 test('adapter never hands an unchecked path or oversized data to the Slack SDK', async t => {
   const h = await fixture(t, 'unrestricted');
   await assert.rejects(h.slack.uploadFile('CDEST', {filename: 'bad', data: h.path as any}), /bounded Buffer/);
-  await assert.rejects(h.slack.uploadFile('CDEST', {filename: 'large', data: Buffer.alloc(MAX_ATTACHMENT_BYTES + 1)}), /bounded Buffer/);
+  // Past Slack's own per-file limit, without allocating it.
+  const large = Object.defineProperty(Buffer.alloc(1), 'byteLength', {value: SLACK_MAX_FILE_BYTES + 1});
+  await assert.rejects(h.slack.uploadFile('CDEST', {filename: 'large', data: large}), /bounded Buffer/);
   assert.equal(h.started.length, 0);
 });
 
 test('malformed CLI mode fails without authenticating or printing its value', () => {
   for (const value of ['true', 'null', '{}', '{"mode":"restricted","directories":[]}',
-    '{"mode":"unrestricted","directories":["/anything"]}', 'not-json']) {
+    '{"mode":"unrestricted","directories":["/anything"]}', 'not-json',
+    '{"mode":"unrestricted","maxBytes":0}', '{"mode":"unrestricted","maxBytes":1073741825}']) {
     const child = spawnSync(process.execPath, ['--import', 'tsx', 'src/index.ts', '--stdio'], {
       encoding: 'utf8', timeout: 5000,
       env: {PATH: process.env.PATH, SLACK_BOT_TOKEN: 'fixture', SLACK_APP_TOKEN: 'fixture', SLACK_PATH_UPLOADS: value},
@@ -142,3 +147,36 @@ test('malformed CLI mode fails without authenticating or printing its value', ()
     assert.equal(child.stdout, '');
   }
 });
+
+const restrictedAvailable = (() => {
+  try { new PathUploadReader({mode: 'restricted', directories: [tmpdir()]}).close(); return true; } catch { return false; }
+})();
+
+for (const mode of ['unrestricted', 'restricted'] as const) {
+  test(`${mode}: maxBytes raises the path cap only, and the three steps get every byte`,
+    {skip: mode === 'restricted' && !restrictedAvailable}, async t => {
+      const six = 6 * 1024 * 1024;
+      const capped = await fixture(t, mode);
+      writeFileSync(join(capped.directory, 'six.bin'), Buffer.alloc(six, 9));
+      const refused = await capped.call({path: join(capped.directory, 'six.bin')});
+      assert.equal(refused.isError, true);
+      assert.match(refused.content[0].text, /File exceeds the path upload limit of 5242880 bytes \(5 MiB\)/);
+      assert.equal(capped.started.length, 0);
+
+      const h = await fixture(t, mode, {maxBytes: 8 * 1024 * 1024});
+      const {tools} = await h.host.sendRequest('tools/list', {}) as any;
+      assert.match(tools.find((tool: any) => tool.name === 'upload_file').description,
+        /Inline content is capped at 5 MiB .* path files up to 8 MiB \(8388608 bytes\)/);
+      writeFileSync(join(h.directory, 'six.bin'), Buffer.alloc(six, 9));
+      assert.equal((await h.call({path: join(h.directory, 'six.bin')})).isError, undefined);
+      assert.equal(h.started[0].length, six);
+      assert.equal(h.uploads[0].file.length, six);
+      assert.ok(h.uploads[0].file.every((byte: number) => byte === 9));
+      assert.equal(h.uploads[0].filename, 'six.bin');
+      // Inline content keeps its 5 MiB cap.
+      const inline = await h.call({filename: 'big.txt', contentBase64: Buffer.alloc(MAX_ATTACHMENT_BYTES + 1).toString('base64')});
+      assert.equal(inline.isError, true);
+      assert.match(inline.content[0].text, /inline file too large/);
+      assert.equal(h.started.length, 1);
+    });
+}

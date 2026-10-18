@@ -2,7 +2,7 @@
  * MCP tool definitions and input types for Slack operations.
  * These tools work in both MCP and MCPL mode.
  */
-import type { PathUploadPolicy } from './upload-path.js';
+import { mebibytes, type PathUploadPolicy } from './upload-path.js';
 
 export interface ToolDefinition {
   name: string;
@@ -261,8 +261,10 @@ export function toolDefinitionsForPathUploads(policy?: PathUploadPolicy): ToolDe
     ...tool,
     description:
       'Upload a file to a Slack conversation, optionally into a thread and with a message. ' +
-      'Pass exactly one of path (a file on this server\'s filesystem), content (text) or contentBase64 (base64): ' +
-      'at most 5 MiB of file bytes in every mode. Same write rules as send_message. ' + boundary,
+      'Pass exactly one of path (a file on this server\'s filesystem), content (text) or contentBase64 (base64). ' +
+      'Inline content is capped at 5 MiB of file bytes, after base64 is decoded or text is encoded as UTF-8; ' +
+      `path files up to ${mebibytes(policy.maxBytes)} (${policy.maxBytes} bytes), the operator's limit. ` +
+      'Same write rules as send_message. ' + boundary,
     inputSchema: {
       ...tool.inputSchema,
       properties: {

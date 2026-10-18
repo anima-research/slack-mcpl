@@ -8,7 +8,7 @@ import { PassThrough } from 'node:stream';
 import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { MAX_ATTACHMENT_BYTES } from '../src/content.js';
+import { MAX_ATTACHMENT_BYTES, SLACK_MAX_FILE_BYTES } from '../src/content.js';
 import { PathUploadReader, validatePathUploadPolicy, RESTRICTED_UPLOAD_WORKER_SOURCE } from '../src/upload-path.js';
 
 function fixture(t: any) {
@@ -40,11 +40,66 @@ test('policy is a copied frozen value, including directories and nonenumerable u
   const source = { mode: 'restricted' as const, directories: ['/one'] };
   const result = validatePathUploadPolicy(source);
   source.directories.push('/two');
-  assert.deepEqual(result, { mode: 'restricted', directories: ['/one'] });
+  assert.deepEqual(result, { mode: 'restricted', directories: ['/one'], maxBytes: MAX_ATTACHMENT_BYTES });
   assert.equal(Object.isFrozen(result), true);
   assert.equal(Object.isFrozen((result as any).directories), true);
   assert.throws(() => validatePathUploadPolicy(Object.defineProperty({ mode: 'unrestricted' }, 'other', { value: 1 })));
 });
+
+test('maxBytes is optional in both modes, defaults to the inline cap and may reach Slack\'s 1 GiB limit', () => {
+  assert.equal(SLACK_MAX_FILE_BYTES, 1073741824);
+  assert.deepEqual(validatePathUploadPolicy({ mode: 'unrestricted' }), { mode: 'unrestricted', maxBytes: MAX_ATTACHMENT_BYTES });
+  assert.deepEqual(validatePathUploadPolicy({ mode: 'unrestricted', maxBytes: 8 * 1024 * 1024 }),
+    { mode: 'unrestricted', maxBytes: 8 * 1024 * 1024 });
+  assert.deepEqual(validatePathUploadPolicy({ mode: 'restricted', directories: ['/one'], maxBytes: SLACK_MAX_FILE_BYTES }),
+    { mode: 'restricted', directories: ['/one'], maxBytes: SLACK_MAX_FILE_BYTES });
+  assert.deepEqual(validatePathUploadPolicy({ mode: 'restricted', directories: ['/one'], maxBytes: 1 }),
+    { mode: 'restricted', directories: ['/one'], maxBytes: 1 });
+});
+
+for (const maxBytes of [0, -1, 1.5, SLACK_MAX_FILE_BYTES + 1, '8388608', null, true, NaN, Infinity, undefined, Number.MAX_SAFE_INTEGER + 2]) {
+  for (const mode of ['restricted', 'unrestricted'] as const) {
+    test(`${mode} policy refuses maxBytes ${String(typeof maxBytes === 'string' ? JSON.stringify(maxBytes) : maxBytes)}`, () => {
+      const policy = mode === 'restricted' ? { mode, directories: ['/one'], maxBytes } : { mode, maxBytes };
+      assert.throws(() => validatePathUploadPolicy(policy),
+        { message: "Path upload maxBytes must be a whole number of bytes from 1 to 1073741824 (1 GiB, Slack's per-file limit)" });
+      assert.throws(() => new PathUploadReader(policy as any));
+    });
+  }
+}
+
+test('a policy key other than mode, directories and maxBytes is still refused', () => {
+  assert.throws(() => validatePathUploadPolicy({ mode: 'unrestricted', maxBytes: 10, max: 10 }),
+    { message: 'A unrestricted path upload policy takes no key but mode, maxBytes' });
+  assert.throws(() => validatePathUploadPolicy({ mode: 'restricted', directories: ['/one'], maxBytes: 10, limit: 10 }),
+    { message: 'A restricted path upload policy takes no key but mode, directories, maxBytes' });
+});
+
+/** Whether this machine has what restricted mode needs: Python 3.9+ with
+ *  descriptor-path support. */
+const restrictedAvailable = (() => {
+  try { new PathUploadReader({ mode: 'restricted', directories: [tmpdir()] }).close(); return true; } catch { return false; }
+})();
+
+for (const mode of ['unrestricted', 'restricted'] as const) {
+  test(`${mode}: a 6 MiB file is refused at the default limit and read whole under maxBytes 8 MiB`,
+    { skip: mode === 'restricted' && !restrictedAvailable }, async (t) => {
+      const h = fixture(t), path = join(h.root, 'six');
+      writeFileSync(path, Buffer.alloc(6 * 1024 * 1024, 7));
+      const open = (maxBytes?: number) => {
+        const config = mode === 'restricted' ? { mode, directories: [h.root] } : { mode };
+        const r = new PathUploadReader(maxBytes === undefined ? config : { ...config, maxBytes });
+        t.after(() => r.close());
+        return r;
+      };
+      await assert.rejects(open().read(path), { message: 'File exceeds the path upload limit of 5242880 bytes (5 MiB)' });
+      const data = await open(8 * 1024 * 1024).read(path);
+      assert.equal(data.length, 6 * 1024 * 1024);
+      assert.ok(data.every((byte) => byte === 7));
+      await assert.rejects(open(6 * 1024 * 1024 - 1).read(path),
+        { message: 'File exceeds the path upload limit of 6291455 bytes (6 MiB)' });
+    });
+}
 
 test('restricted reader accepts configured/canonical aliases and nested regular files without changing cwd', async (t) => {
   const h = fixture(t), initialCwd = process.cwd();
@@ -143,16 +198,47 @@ test('unrestricted reader caps growth despite stale size and closes the same des
   assert.equal(closed, 1); assert.equal(capacity, MAX_ATTACHMENT_BYTES + 1);
 });
 
+test('unrestricted reader allocates from the file\'s size and stops a file growing past maxBytes', async (t) => {
+  const maxBytes = 8 * 1024 * 1024, sizes: number[] = [];
+  let capacity = 0;
+  const mock = t.mock.method(fsPromises, 'open', async () => ({
+    stat: async () => ({ isFile: () => true, size: 3 }),
+    read: async (data: Buffer, _offset: number, length: number) => {
+      sizes.push(data.length); capacity += length; return { bytesRead: length };
+    },
+    close: async () => {},
+  }));
+  syncBuiltinESMExports(); t.after(() => { mock.mock.restore(); syncBuiltinESMExports(); });
+  const r = new PathUploadReader({ mode: 'unrestricted', maxBytes }); t.after(() => r.close());
+  await assert.rejects(r.read('/fake/growing'), { message: 'File exceeds the path upload limit of 8388608 bytes (8 MiB)' });
+  assert.equal(capacity, maxBytes + 1);
+  assert.equal(sizes[0], 4); // the size fstat gave, and one byte more
+  assert.ok(sizes.every((size) => size <= 64 * 1024));
+});
+
+test('unrestricted reader refuses a file fstat says is past maxBytes before reading it', async (t) => {
+  let reads = 0;
+  const mock = t.mock.method(fsPromises, 'open', async () => ({
+    stat: async () => ({ isFile: () => true, size: SLACK_MAX_FILE_BYTES }),
+    read: async () => { reads++; return { bytesRead: 0 }; },
+    close: async () => {},
+  }));
+  syncBuiltinESMExports(); t.after(() => { mock.mock.restore(); syncBuiltinESMExports(); });
+  const r = new PathUploadReader({ mode: 'unrestricted', maxBytes: 1000 }); t.after(() => r.close());
+  await assert.rejects(r.read('/fake/huge'), { message: 'File exceeds the path upload limit of 1000 bytes (under 0.01 MiB)' });
+  assert.equal(reads, 0);
+});
+
 // Derivative programs run only in this test runner. Production's static worker
 // does not inspect a test flag, request hook, environment code or arbitrary script.
-async function runWorker(t: any, root: string, parts: string[], source: string) {
+async function runWorker(t: any, root: string, parts: string[], source: string, limit = MAX_ATTACHMENT_BYTES) {
   const r = reader(t, root), python: string = (r as any).python;
   const fd = openSync(realpathSync(root), constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
   const child = childProcess.spawn(python, ['-I', '-S', '-c', source], { cwd: '/', env: {}, stdio: ['pipe', 'pipe', 'pipe', fd] });
   const stdout: Buffer[] = [], stderr: Buffer[] = [];
   child.stdout!.on('data', (data) => stdout.push(data)); child.stderr!.on('data', (data) => stderr.push(data));
   const timeout = setTimeout(() => child.kill('SIGKILL'), 5000);
-  child.stdin!.end(JSON.stringify({ root: realpathSync(root), parts }));
+  child.stdin!.end(JSON.stringify({ root: realpathSync(root), parts, limit }));
   try {
     const code = await new Promise<number | null>((done, reject) => { child.on('close', done); child.on('error', reject); });
     return { code, stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr).toString() };
@@ -160,7 +246,7 @@ async function runWorker(t: any, root: string, parts: string[], source: string) 
 }
 const py = (text: string) => JSON.stringify(text);
 function observeReads(source: string, marker: string) {
-  return source.replace('LIMIT = ', `original_read = os.read\ndef observed_read(fd, size):\n    with open(${py(marker)}, 'w') as marker: marker.write('read')\n    return original_read(fd, size)\nos.read = observed_read\nLIMIT = `);
+  return source.replace('\nMAX_LIMIT = ', `\noriginal_read = os.read\ndef observed_read(fd, size):\n    with open(${py(marker)}, 'w') as marker: marker.write('read')\n    return original_read(fd, size)\nos.read = observed_read\nMAX_LIMIT = `);
 }
 
 for (const schedule of ['file-before-admission', 'parent-before-leaf', 'file-after-read', 'root-before-admission', 'unlinked-file'] as const) {
@@ -191,6 +277,22 @@ test('restricted worker caps bytes if the file grows after fstat', async (t) => 
   const source = RESTRICTED_UPLOAD_WORKER_SOURCE.replace('    beneath(file, canonical)', `    with open(${py(join(h.root, 'nested', 'file'))}, 'wb') as growing: growing.truncate(LIMIT + 1)\n    beneath(file, canonical)`);
   const result = await runWorker(t, h.root, ['nested', 'file'], source);
   assert.equal(result.code, 1); assert.equal(result.stderr, 'TOO_LARGE'); assert.equal(result.stdout.length, 0);
+});
+
+test('restricted worker takes its limit from the request, and caps growth past it', async (t) => {
+  const h = fixture(t), limit = 8 * 1024 * 1024;
+  writeFileSync(join(h.root, 'nested', 'file'), Buffer.alloc(6 * 1024 * 1024, 1));
+  const whole = await runWorker(t, h.root, ['nested', 'file'], RESTRICTED_UPLOAD_WORKER_SOURCE, limit);
+  assert.equal(whole.code, 0); assert.equal(whole.stdout.length, 6 * 1024 * 1024);
+  const capped = await runWorker(t, h.root, ['nested', 'file'], RESTRICTED_UPLOAD_WORKER_SOURCE);
+  assert.equal(capped.code, 1); assert.equal(capped.stderr, 'TOO_LARGE'); assert.equal(capped.stdout.length, 0);
+  const source = RESTRICTED_UPLOAD_WORKER_SOURCE.replace('    beneath(file, canonical)', `    with open(${py(join(h.root, 'nested', 'file'))}, 'wb') as growing: growing.truncate(LIMIT + 1)\n    beneath(file, canonical)`);
+  const grown = await runWorker(t, h.root, ['nested', 'file'], source, limit);
+  assert.equal(grown.code, 1); assert.equal(grown.stderr, 'TOO_LARGE'); assert.equal(grown.stdout.length, 0);
+  for (const bad of [0, SLACK_MAX_FILE_BYTES + 1, 1.5, '10', true]) {
+    const refused = await runWorker(t, h.root, ['nested', 'file'], RESTRICTED_UPLOAD_WORKER_SOURCE, bad as any);
+    assert.equal(refused.code, 1); assert.equal(refused.stderr, 'INVALID'); assert.equal(refused.stdout.length, 0);
+  }
 });
 
 test('restricted worker never realpaths a mutable descriptor-path string', async (t) => {

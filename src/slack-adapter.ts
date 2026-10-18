@@ -27,7 +27,7 @@ import {
   resolveSlackUserNames,
   fetchSlackHistory,
   classifyExtension,
-  MAX_ATTACHMENT_BYTES,
+  SLACK_MAX_FILE_BYTES,
   reactionName,
   SLACK_FAILED,
   connectionNeverMade,
@@ -919,7 +919,9 @@ export class SlackAdapter {
     channelId: string,
     file: { filename: string; data: Buffer; title?: string; comment?: string; threadTs?: string },
   ): Promise<{ fileId: string; shareTs?: string }> {
-    if (!Buffer.isBuffer(file.data) || file.data.byteLength > MAX_ATTACHMENT_BYTES) {
+    // Inline content is capped at 5 MiB and a path at the operator's limit
+    // before this; Slack's own per-file limit is the most either can be.
+    if (!Buffer.isBuffer(file.data) || file.data.byteLength > SLACK_MAX_FILE_BYTES) {
       throw new Error('Nothing was uploaded: upload data must be a bounded Buffer');
     }
     await this.requireUploadDestination(channelId);

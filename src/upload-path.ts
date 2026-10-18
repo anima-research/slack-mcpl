@@ -2,27 +2,63 @@ import { constants, openSync, closeSync, fstatSync, realpathSync } from 'node:fs
 import { open } from 'node:fs/promises';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
-import { MAX_ATTACHMENT_BYTES } from './content.js';
-export type PathUploadPolicy = { mode: 'restricted'; directories: string[] } | { mode: 'unrestricted' };
+import { MAX_ATTACHMENT_BYTES, SLACK_MAX_FILE_BYTES } from './content.js';
+
+type PathUploadMode = { mode: 'restricted'; directories: string[] } | { mode: 'unrestricted' };
+/** The operator's configuration: `maxBytes` defaults to MAX_ATTACHMENT_BYTES. */
+export type PathUploadConfig = PathUploadMode & { maxBytes?: number };
+/** A validated policy, with its byte limit always present. */
+export type PathUploadPolicy = PathUploadMode & { maxBytes: number };
+
+/** `bytes` in MiB, for messages and the tool's description. */
+export function mebibytes(bytes: number): string {
+  const mib = Math.round((bytes / (1024 * 1024)) * 100) / 100;
+  return `${mib || 'under 0.01'} MiB`;
+}
 
 /** Configuration is explicit, copied and frozen; an empty restriction must not
- * accidentally enable access to the whole filesystem. */
+ * accidentally enable access to the whole filesystem. `maxBytes` is optional in
+ * both modes: a whole number of bytes from 1 to SLACK_MAX_FILE_BYTES, Slack's
+ * own per-file limit, MAX_ATTACHMENT_BYTES when absent. Any other key is
+ * refused. */
 export function validatePathUploadPolicy(value: unknown): PathUploadPolicy {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid path upload policy');
   const config = value as Record<string, unknown>;
   const keys = Reflect.ownKeys(config);
-  if (config.mode === 'unrestricted' && keys.length === 1 && keys[0] === 'mode') return Object.freeze({ mode: 'unrestricted' });
-  if (config.mode !== 'restricted' || keys.length !== 2 || !keys.includes('mode') || !keys.includes('directories')
+  const allowed = config.mode === 'restricted' ? ['mode', 'directories', 'maxBytes']
+    : config.mode === 'unrestricted' ? ['mode', 'maxBytes'] : undefined;
+  if (!allowed || (config.mode === 'restricted' && (!keys.includes('directories')
       || !Array.isArray(config.directories) || config.directories.length === 0
-      || !config.directories.every((path) => typeof path === 'string' && isAbsolute(path) && !path.includes('\0'))) {
+      || !config.directories.every((path) => typeof path === 'string' && isAbsolute(path) && !path.includes('\0'))))) {
     throw new Error('Path uploads require unrestricted mode or restricted mode with nonempty absolute directories');
   }
-  const directories = [...config.directories] as string[];
+  if (!keys.every((key) => typeof key === 'string' && allowed.includes(key))) {
+    throw new Error(`A ${config.mode} path upload policy takes no key but ${allowed.join(', ')}`);
+  }
+  let maxBytes = MAX_ATTACHMENT_BYTES;
+  if (keys.includes('maxBytes')) {
+    const limit = config.maxBytes;
+    if (typeof limit !== 'number' || !Number.isSafeInteger(limit) || limit < 1 || limit > SLACK_MAX_FILE_BYTES) {
+      throw new Error(`Path upload maxBytes must be a whole number of bytes from 1 to ${SLACK_MAX_FILE_BYTES} ` +
+        "(1 GiB, Slack's per-file limit)");
+    }
+    maxBytes = limit;
+  }
+  if (config.mode === 'unrestricted') return Object.freeze({ mode: 'unrestricted', maxBytes });
+  const directories = [...config.directories as string[]];
   Object.freeze(directories);
-  return Object.freeze({ mode: 'restricted', directories });
+  return Object.freeze({ mode: 'restricted', directories, maxBytes });
+}
+
+/** A path upload refused for its size, naming the configured limit. */
+function tooLarge(limit: number): Error {
+  return new Error(`File exceeds the path upload limit of ${limit} bytes (${mebibytes(limit)})`);
 }
 
 const REQUEST_LIMIT = 64 * 1024;
+/** How much more an unrestricted read takes at a time once a file has grown
+ *  past the size fstat gave. */
+const GROWTH_CHUNK = 64 * 1024;
 const STDERR_LIMIT = 1024;
 const WORKER_TIMEOUT_MS = 5000;
 const PYTHON_PATH = '/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin';
@@ -31,7 +67,6 @@ const WORKER_ERRORS: Record<string, string> = {
   ROOT_CHANGED: 'Configured upload root was replaced or moved',
   OUTSIDE: 'Opened upload file is outside the pinned root or no longer linked',
   NOT_REGULAR: 'Upload path must name a regular file',
-  TOO_LARGE: 'File exceeds the 5 MiB upload limit',
   UNREADABLE: 'Upload path is unreadable, unverifiable or contains a symlink',
 };
 
@@ -72,7 +107,7 @@ def fd_path(fd):
  * Root/leaf descriptor paths are admission observations before and after reads,
  * not a sandbox against same-user code, hardlinks, mounts or later mutations. */
 export const RESTRICTED_UPLOAD_WORKER_SOURCE = PYTHON_COMMON + String.raw`
-LIMIT = ${MAX_ATTACHMENT_BYTES}
+MAX_LIMIT = ${SLACK_MAX_FILE_BYTES}
 REQUEST_LIMIT = ${REQUEST_LIMIT}
 fds = {3}
 def opened(path, flags, parent=None):
@@ -87,7 +122,8 @@ try:
     raw = sys.stdin.buffer.read(REQUEST_LIMIT + 1)
     if len(raw) > REQUEST_LIMIT: refuse('INVALID')
     request = json.loads(raw)
-    canonical, parts = request['root'], request['parts']
+    canonical, parts, LIMIT = request['root'], request['parts'], request['limit']
+    if type(LIMIT) is not int or LIMIT < 1 or LIMIT > MAX_LIMIT: refuse('INVALID')
     if not isinstance(canonical, str) or not canonical.startswith('/') or '\0' in canonical:
         refuse('INVALID')
     root_parts = [part for part in canonical.split('/') if part]
@@ -136,7 +172,7 @@ export class PathUploadReader {
   private children = new Map<ChildProcess, () => void>();
   private closed = false;
 
-  constructor(policy: PathUploadPolicy) {
+  constructor(policy: PathUploadConfig) {
     this.policy = validatePathUploadPolicy(policy);
     if (!['linux', 'darwin'].includes(process.platform)
         || ![constants.O_DIRECTORY, constants.O_NOFOLLOW, constants.O_NONBLOCK].every((flag) => typeof flag === 'number' && flag !== 0)) {
@@ -198,7 +234,8 @@ export class PathUploadReader {
   }
 
   private readRestricted(root: Root, parts: string[]): Promise<Buffer> {
-    const input = JSON.stringify({ root: root.canonical, parts });
+    const limit = this.policy.maxBytes;
+    const input = JSON.stringify({ root: root.canonical, parts, limit });
     if (Buffer.byteLength(input) > REQUEST_LIMIT) return Promise.reject(new Error('Upload path is too long'));
     return new Promise((resolveRead, reject) => {
       const child = spawn(this.python!, ['-I', '-S', '-c', RESTRICTED_UPLOAD_WORKER_SOURCE], {
@@ -211,7 +248,7 @@ export class PathUploadReader {
       const timeout = setTimeout(() => fail('Restricted upload read timed out'), WORKER_TIMEOUT_MS);
       child.stdout!.on('data', (chunk: Buffer) => {
         size += chunk.length;
-        if (size > MAX_ATTACHMENT_BYTES) { chunks.length = 0; fail('File exceeds the 5 MiB upload limit'); }
+        if (size > limit) { chunks.length = 0; failure ??= tooLarge(limit); child.kill('SIGKILL'); }
         else if (!failure) chunks.push(chunk);
       });
       child.stderr!.on('data', (chunk: Buffer) => {
@@ -226,7 +263,10 @@ export class PathUploadReader {
         this.children.delete(child);
         this.releaseRoots();
         if (failure) reject(failure);
-        else if (code !== 0 || stderrSize !== 0) reject(new Error(Object.hasOwn(WORKER_ERRORS, stderr) ? WORKER_ERRORS[stderr] : 'Restricted upload reader failed'));
+        else if (code !== 0 || stderrSize !== 0) {
+          reject(stderr === 'TOO_LARGE' ? tooLarge(limit)
+            : new Error(Object.hasOwn(WORKER_ERRORS, stderr) ? WORKER_ERRORS[stderr] : 'Restricted upload reader failed'));
+        }
         else resolveRead(Buffer.concat(chunks, size));
       });
       child.stdin!.end(input);
@@ -238,15 +278,24 @@ export class PathUploadReader {
     try {
       const stat = await file.stat();
       if (!stat.isFile()) throw new Error('Upload path must name a regular file');
-      if (stat.size > MAX_ATTACHMENT_BYTES) throw new Error('File exceeds the 5 MiB upload limit');
-      const data = Buffer.alloc(MAX_ATTACHMENT_BYTES + 1); let size = 0;
-      while (size < data.length) {
-        const { bytesRead } = await file.read(data, size, data.length - size, null);
+      const limit = this.policy.maxBytes;
+      if (stat.size > limit) throw tooLarge(limit);
+      // A buffer of the size fstat gave and one byte more, to see a file that
+      // grew; growth is read on in chunks, never past the limit and one byte.
+      const chunks: Buffer[] = [];
+      let buffer = Buffer.alloc(stat.size + 1), filled = 0, size = 0;
+      for (;;) {
+        const { bytesRead } = await file.read(buffer, filled, buffer.length - filled, null);
         if (bytesRead === 0) break;
-        size += bytesRead;
+        filled += bytesRead; size += bytesRead;
+        if (size > limit) throw tooLarge(limit);
+        if (filled === buffer.length) {
+          chunks.push(buffer);
+          buffer = Buffer.alloc(Math.min(GROWTH_CHUNK, limit + 1 - size)); filled = 0;
+        }
       }
-      if (size > MAX_ATTACHMENT_BYTES) throw new Error('File exceeds the 5 MiB upload limit');
-      return data.subarray(0, size);
+      chunks.push(buffer.subarray(0, filled));
+      return chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks, size);
     } finally { await file.close(); }
   }
 }

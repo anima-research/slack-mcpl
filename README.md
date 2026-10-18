@@ -128,6 +128,25 @@ SLACK_PATH_UPLOADS='{"mode":"restricted","directories":["/srv/reports"]}' slack-
 SLACK_PATH_UPLOADS='{"mode":"unrestricted"}' slack-mcpl --stdio
 ```
 
+Path uploads are capped at 5 MiB, as inline content is, unless the policy names
+`maxBytes`, a whole number of bytes from 1 to 1073741824 (1 GiB, Slack's own
+per-file limit), in either mode:
+
+```sh
+SLACK_PATH_UPLOADS='{"mode":"restricted","directories":["/srv/reports"],"maxBytes":104857600}' slack-mcpl --stdio
+SLACK_PATH_UPLOADS='{"mode":"unrestricted","maxBytes":1073741824}' slack-mcpl --stdio
+```
+
+`maxBytes` raises the cap for path uploads only. Inline content stays at 5 MiB:
+its bytes pass through the model's context, as text or base64 in the tool call,
+and that cap protects the context. A path's bytes never do; the model sends only
+the path. The tool's description states both limits. One file's bytes are held
+in this server's memory for the whole upload, as the Slack SDK's own path mode
+did, so a large `maxBytes` needs that much memory free per concurrent upload.
+Each upload still runs under the call's time (25 s, and 10 s for the POST of the
+bytes), and restricted mode's reader has 5 s to read the file, so how large a
+file can go in practice also depends on the disk and the link to Slack.
+
 For an embedded server, the corresponding `SlackMcplServer` option is
 `pathUploads: {mode: 'restricted', directories: ['/srv/reports']}` or
 `pathUploads: {mode: 'unrestricted'}`. Leave the option unset to retain the
@@ -158,8 +177,9 @@ to unrestricted access.
 In **unrestricted** mode, ordinary connector-account permissions determine which
 files can be read. Symlinks to regular files are allowed and there is no
 configured-directory boundary. Both modes refuse non-regular files, use a
-nonblocking open so a FIFO cannot wait for a writer, and enforce the same 5 MiB
-limit on the opened descriptor, including a bounded read if the file grows.
+nonblocking open so a FIFO cannot wait for a writer, and enforce the policy's
+limit (5 MiB unless `maxBytes` says otherwise) on the opened descriptor,
+including a bounded read if the file grows.
 Only the resulting bytes go to Slack, through the same three upload steps as
 inline content (`files.getUploadURLExternal`, a POST of the bytes to the URL it
 gives, `files.completeUploadExternal`); Slack never sees the path. Inline-only
@@ -273,7 +293,7 @@ Boolean switches take `true`/`false` (also `1`/`0`, `yes`/`no`); any other value
 |----------|----------|-------------|
 | `SLACK_BOT_TOKEN` | yes | Bot token (`xoxb-…`) for Web API calls |
 | `SLACK_APP_TOKEN` | yes | App-level token (`xapp-…`, `connections:write`) for Socket Mode |
-| `SLACK_PATH_UPLOADS` | no | Explicit JSON path policy: `{"mode":"restricted","directories":["/absolute/reports"]}` or `{"mode":"unrestricted"}`. Unset keeps inline-only uploads. Restricted mode needs Python 3.9+ and Linux/macOS descriptor-path support, pins roots and refuses below-root symlinks; unrestricted uses ordinary connector-account file access and needs no Python. See [Optional path uploads](#optional-path-uploads) |
+| `SLACK_PATH_UPLOADS` | no | Explicit JSON path policy: `{"mode":"restricted","directories":["/absolute/reports"]}` or `{"mode":"unrestricted"}`, either with an optional `maxBytes` (default 5 MiB, at most 1 GiB) for path uploads only. Unset keeps inline-only uploads. Restricted mode needs Python 3.9+ and Linux/macOS descriptor-path support, pins roots and refuses below-root symlinks; unrestricted uses ordinary connector-account file access and needs no Python. See [Optional path uploads](#optional-path-uploads) |
 | `SLACK_DM_USERS` | no | Comma-separated user-ID whitelist for DMs; others' DMs are dropped |
 | `SLACK_SEND_CHANNELS` | no | Comma-separated conversation-ID allow-list for writes (send, upload, DM, edit, delete, reaction, and the host's `channels/publish`); writes elsewhere are refused before the call reaches Slack. Other conversations are registered `inbound`, `list_channels` shows `writable: false`, and the first message the agent gets from one, addressed or not, carries a read-only note. A mention there still reaches the agent; whether it wakes is the host's policy. `send_dm` is refused before a DM is opened, and not offered, unless the list names a DM. Set but empty is refused at startup; the effective list is logged |
 | `SLACK_SUBSCRIBE_MEMBER_CHANNELS` | no | `true` delivers ambient messages from every channel the bot is a member of, so inviting the bot is the subscription. `unsubscribe_channel` then mutes a conversation (`subscribe_channel` unmutes it) and `list_subscriptions` lists the muted ones. Takes `true` or `false` (also `1`/`0`, `yes`/`no`); unset is off, and any other value, empty included, stops startup |

@@ -79,8 +79,11 @@ async function main(): Promise<void> {
   }
   let pathUploads: PathUploadPolicy | undefined;
   if (process.env.SLACK_PATH_UPLOADS !== undefined) {
-    try { pathUploads = validatePathUploadPolicy(JSON.parse(process.env.SLACK_PATH_UPLOADS)); }
-    catch { throw new Error('SLACK_PATH_UPLOADS must configure restricted directories or explicit unrestricted mode'); }
+    const refused = 'SLACK_PATH_UPLOADS must configure restricted directories or explicit unrestricted mode';
+    let parsed: unknown;
+    // JSON.parse's message can quote the value, so it isn't passed on.
+    try { parsed = JSON.parse(process.env.SLACK_PATH_UPLOADS); } catch { throw new Error(`${refused}, as JSON`); }
+    try { pathUploads = validatePathUploadPolicy(parsed); } catch (err) { throw new Error(`${refused}: ${(err as Error).message}`); }
   }
   const disableDms = flag('SLACK_DISABLE_DMS');
   const subscribeMemberChannels = flag('SLACK_SUBSCRIBE_MEMBER_CHANNELS');

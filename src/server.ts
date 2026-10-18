@@ -52,7 +52,7 @@ import {
   type SlackWait,
 } from './slack-adapter.js';
 import { toolDefinitionsForPathUploads } from './tools.js';
-import { PathUploadReader, type PathUploadPolicy } from './upload-path.js';
+import { PathUploadReader, type PathUploadConfig } from './upload-path.js';
 import { withToolClasses } from './tool-classes.js';
 import { buildFeatureSets, buildServerCapabilities, featureSetForTool, MESSAGING_FEATURE_SET } from './feature-sets.js';
 import { ChannelManager, mcplChannelId, parseMcplChannelId, toDescriptor } from './channels.js';
@@ -243,7 +243,7 @@ export class SlackMcplServer {
    */
   constructor(
     private slack: SlackAdapter,
-    private opts: { subscribeMemberChannels?: boolean; pathUploads?: PathUploadPolicy } = {},
+    private opts: { subscribeMemberChannels?: boolean; pathUploads?: PathUploadConfig } = {},
   ) {
     // Once for the server's life: the adapter keeps every handler it's
     // given, and each forwards to whichever connection is being served, so
