@@ -13,6 +13,7 @@ import {
   SLACK_CLIENT_OPTIONS,
   SlackAdapter,
   SlackWebClient,
+  connectSlack,
   leftOutNote,
   withCallTime,
   type SlackSocketLike,
@@ -157,6 +158,19 @@ const channel = (id: string) => ({ id, name: id.toLowerCase(), is_im: false, is_
 const asked = (from: number) =>
   api.calls.flatMap((called, i) =>
     i >= from && called === 'conversations.list' ? [[api.sent[i].get('types'), api.sent[i].get('cursor') ?? undefined]] : []);
+
+test("connectSlack hands auth.test's scopes to the adapter, so its first listing asks only for the types they read", { timeout: 5000 }, async (t) => {
+  t.after(() => api.answerFor('auth.test'));
+  t.after(() => api.answerFor('conversations.list'));
+  const from = api.calls.length;
+  const scopes = 'channels:read,groups:read,im:read,chat:write';
+  api.answerFor('auth.test', { headers: { 'x-oauth-scopes': scopes }, body: { ok: true, user_id: 'UBOT', team: 'acme' } });
+  api.answerFor('conversations.list', page(scopes, [channel('C1')]));
+  const slack = await connectSlack({ botToken: 'xoxb-test', appToken: 'xapp-test' }, api.url);
+  const listed = await slack.listConversations();
+  assert.deepEqual(asked(from), [['public_channel,private_channel,im', undefined]]);
+  assert.deepEqual(listed.leftOut, ['mpim']);
+});
 
 test('a refusal whose scopes leave out a type the listing asked for starts it over without that type', { timeout: 5000 }, async (t) => {
   t.after(() => api.answerFor('conversations.list'));
