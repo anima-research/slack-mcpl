@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
 import {
-  McplConnection, method, type JsonRpcRequest, type JsonRpcNotification,
+  McplConnection, RpcError, method, type JsonRpcRequest, type JsonRpcNotification,
   type ChannelsRegisterParams, type ChannelsListResult,
 } from '@animalabs/mcpl-core';
 import { SlackMcplServer } from '../src/server.js';
@@ -93,19 +93,41 @@ function serverLog(t: { after(fn: () => void): void }): string[] {
   return lines;
 }
 
-const registrationTimedOut = (line: string) =>
-  line.startsWith('[slack-mcpl] Failed to register channels:') && line.includes('Request timed out');
+/** Whether a log line is the server's on a channels/register request that
+ *  the connection timed out: its failure line, carrying the timeout's own
+ *  message. A timeout is an RpcError with code -32000, whose words mcpl-core
+ *  may change: 0.3.0 rejects with one, and so does the ConnectionTimeoutError
+ *  of anima-research/mcpl-core-ts#16. The hosts here never answer with an
+ *  error of that code. Made before the registration is sent, since it watches
+ *  the connection's requests from then on. */
+function registrationTimeouts(conn: McplConnection): (line: string) => boolean {
+  const timedOut: string[] = [];
+  const send = conn.sendRequest.bind(conn);
+  conn.sendRequest = async (...args: Parameters<typeof send>) => {
+    try {
+      return await send(...args);
+    } catch (err) {
+      if (err instanceof RpcError && err.code === -32000) timedOut.push(err.message);
+      throw err;
+    }
+  };
+  return (line) => timedOut.some((message) => line === `[slack-mcpl] Failed to register channels: ${message}`);
+}
 
 const ids = (listed: ChannelsListResult) => listed.channels.map((d) => d.id);
 
 test('a rejected registration is recoverable by refresh under the same grant', async (t) => {
+  const log = serverLog(t);
   const { slack } = fakeSlack();
   const h = connect(new SlackMcplServer(slack), (req, host) => host.sendError(req.id, -32002, 'denied'));
+  const registrationTimedOut = registrationTimeouts(h.serverConn);
   t.after(() => h.close());
   await h.initialize();
   await h.grant();
   await until(() => h.requests.length === 1, 'rejected registration');
   await settle();
+  assert.ok(log.some((line) => line.startsWith('[slack-mcpl] Failed to register channels: ')), 'the refusal is logged');
+  assert.ok(!log.some(registrationTimedOut), 'a refusal is not taken for a timeout');
   await h.grant();
   await settle();
   assert.equal(h.requests.length, 1, 'an unchanged grant does not start another registration');
@@ -196,6 +218,7 @@ test("a refresh waiting on an unanswered registration lists once that request ti
   const log = serverLog(t);
   const { slack } = fakeSlack();
   const h = connect(new SlackMcplServer(slack), () => {});
+  const registrationTimedOut = registrationTimeouts(h.serverConn);
   h.serverConn.requestTimeout = 200;
   t.after(() => h.close());
   await h.initialize();
@@ -300,6 +323,7 @@ test('a registration timeout leaves descriptors available to refresh', async (t)
   const log = serverLog(t);
   const { slack } = fakeSlack();
   const h = connect(new SlackMcplServer(slack), () => {});
+  const registrationTimedOut = registrationTimeouts(h.serverConn);
   h.serverConn.requestTimeout = 20;
   t.after(() => h.close());
   await h.initialize();
@@ -373,6 +397,7 @@ test('a later answer that refuses a known channel forgets and closes it, and sil
     const result = answer((req.params as ChannelsRegisterParams).channels.map((c) => c.id));
     if (result !== undefined) host.sendResponse(req.id, result);
   });
+  const registrationTimedOut = registrationTimeouts(h.serverConn);
   t.after(() => h.close());
   await h.initialize();
   await h.grant();
