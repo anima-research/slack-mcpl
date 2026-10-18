@@ -1467,7 +1467,7 @@ export class SlackMcplServer {
     // What the agent can do about an item left, since no rollback tries it
     // again.
     const remedy = [
-      ...(left.some((item) => item.kind === 'message') ? ['delete_message may delete a message among them, by its id'] : []),
+      ...(left.some((item) => item.kind === 'message') ? ['delete_message can try a message among them again, by its id'] : []),
       ...(left.some((item) => item.kind === 'file') ? ['no tool here deletes a file'] : []),
     ].join(', and ');
     const notes = [

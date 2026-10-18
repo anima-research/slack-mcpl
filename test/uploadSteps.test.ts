@@ -355,7 +355,7 @@ test("a sharing message that can't be deleted counts as a message not deleted, a
   await call('upload_file', { channelId: 'C1', filename: 'a.txt', content: 'a', comment: 'Here' });
   const rolledBack = await rollback(before.state!.checkpoint);
   assert.equal(rolledBack.reason, 'Rolled back (0/1 messages and 1/1 files deleted). May remain: message 5.5 in C1, which shared file F1. ' +
-    'No rollback tries these again: delete_message may delete a message among them, by its id');
+    'No rollback tries these again: delete_message can try a message among them again, by its id');
   assert.deepEqual(lines.filter((l) => l.includes('Rollback')), [
     "[slack-mcpl] Rollback couldn't delete message 5.5, which shared file F1, in C1: An API error occurred: cant_delete_message",
   ]);
@@ -386,7 +386,7 @@ test("a rollback whose file and sharing message both can't be deleted names each
   await call('upload_file', { channelId: 'C1', filename: 'a.txt', content: 'a', comment: 'Here' });
   assert.equal((await rollback(before.state!.checkpoint)).reason,
     'Rolled back (0/1 messages and 0/1 files deleted). May remain: file F1 in C1; message 5.5 in C1, which shared file F1. ' +
-      'No rollback tries these again: delete_message may delete a message among them, by its id, and no tool here deletes a file');
+      'No rollback tries these again: delete_message can try a message among them again, by its id, and no tool here deletes a file');
 });
 
 test("a delete whose outcome is unknown leaves its item named as one that may remain", { timeout: 5000 }, async (t) => {
@@ -399,7 +399,7 @@ test("a delete whose outcome is unknown leaves its item named as one that may re
   await call('upload_file', { channelId: 'C1', filename: 'a.txt', content: 'a', comment: 'Here' });
   assert.equal((await rollback(before.state!.checkpoint)).reason,
     'Rolled back (0/1 messages and 1/1 files deleted). May remain: message 5.5 in C1, which shared file F1. ' +
-      'No rollback tries these again: delete_message may delete a message among them, by its id');
+      'No rollback tries these again: delete_message can try a message among them again, by its id');
 });
 
 test("a rollback that leaves one upload's file names it, and still notes another's comment it can't reach", { timeout: 5000 }, async (t) => {
@@ -598,7 +598,7 @@ test('a rollback that deletes a file but not a later message counts each kind ap
   const from = api.calls.length;
   assert.equal((await rollback(before.state!.checkpoint)).reason,
     'Rolled back (1/2 messages and 1/1 files deleted). May remain: message 1.1 in C1. ' +
-      'No rollback tries these again: delete_message may delete a message among them, by its id');
+      'No rollback tries these again: delete_message can try a message among them again, by its id');
   assert.deepEqual(api.calls.flatMap((m, i) => (i >= from && m === 'chat.delete' ? [api.sent[i]!.get('ts')] : [])), ['5.5', '1.1']);
 });
 

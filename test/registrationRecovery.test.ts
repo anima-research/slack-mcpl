@@ -550,7 +550,7 @@ test("a rollback counts the deletes Slack confirmed, and logs each message it co
   }) as { checkpoint: string; success: boolean; reason?: string };
   assert.deepEqual(rolledBack, {
     checkpoint: sent.state.checkpoint, success: true, reason: 'Rolled back (1/2 messages deleted). May remain: message 2 in C1. ' +
-      'No rollback tries these again: delete_message may delete a message among them, by its id',
+      'No rollback tries these again: delete_message can try a message among them again, by its id',
   });
   assert.deepEqual(deleted, ['3']);
   assert.deepEqual(
