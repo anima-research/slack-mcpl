@@ -254,10 +254,14 @@ test('a refresh during an unanswered registration answers at once, and lists onc
   h.serverConn.requestTimeout = 1000;
   t.after(() => h.close());
   await h.initialize();
+  // The request's timer is held, so the registration still waits for its
+  // answer when the refresh lands, however slowly the machine runs.
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   await h.grant();
-  await until(() => h.requests.length === 1, 'registration');
+  await settled(() => h.requests.length === 1, 'registration');
   assert.equal(((await h.refresh()) as ToolResult).isError, true, 'answered at once, while registration waits for its answer');
-  await until(() => log.some(registrationTimedOut), 'the timeout', 3000);
+  t.mock.timers.tick(1000);
+  await settled(() => log.some(registrationTimedOut), 'the timeout');
   await h.refresh();
   assert.equal(h.notifications.filter((n) => n.method === method.CHANNELS_CHANGED).length, 1, 'then a refresh lists and announces');
 });
