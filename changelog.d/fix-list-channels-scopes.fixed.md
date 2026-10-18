@@ -10,7 +10,7 @@
   likewise drops `im`. Nothing changes for a token that has all four read
   scopes. A listing whose answer changes which types the token can read starts
   over with them, as often as they change, so a scope granted while the server
-  runs is listed by the call whose answer first reports it. `list_channels` and `refresh_channels` say which
+  runs is listed by the listing whose answer first reports it. `list_channels` and `refresh_channels` say which
   kinds a listing left out and the scopes they need. With no readable type, the
   server asks `auth.test` for the token's scopes, and if they still read no
   type, the call fails naming the read scopes. A listing in the background

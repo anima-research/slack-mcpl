@@ -632,10 +632,10 @@ export class SlackAdapter {
    *  group DMs, of the types whose read scopes Slack has reported the token
    *  has (every enabled type while it hasn't reported any). Slack reports the
    *  scopes with each answer, a refusal's included. A listing whose types they
-   *  change, at any answer, its own or another listing's before its own,
-   *  starts over with the new types, so its answer reflects the scopes known
-   *  at its last answer, and `leftOut` names the enabled types it didn't ask
-   *  for. With no type to ask for, auth.test is asked for the scopes, and if
+   *  change, by its own answer or another listing's, starts over with the new
+   *  types, whether the change is seen at one of its answers or as it ends, so
+   *  its answer reflects the scopes known when it returns, and `leftOut` names
+   *  the enabled types it didn't ask for. With no type to ask for, auth.test is asked for the scopes, and if
    *  they read no type either, NoReadableConversations says so.
    *  conversations.list also returns public channels the bot is NOT a member
    *  of (no events, no posting without joining) — those are excluded here;
@@ -707,7 +707,11 @@ export class SlackAdapter {
         out.push(info);
       }
       cursor = result.response_metadata?.next_cursor || undefined;
-      if (!cursor) return { conversations: out, leftOut: this.conversationTypes().filter((type) => !types.includes(type)) };
+      // Another listing's answer may have changed the scopes while this page's
+      // DM names were looked up, so they're checked once more before it ends.
+      if (!cursor && !startOver()) {
+        return { conversations: out, leftOut: this.conversationTypes().filter((type) => !types.includes(type)) };
+      }
     }
   }
 

@@ -14,6 +14,7 @@ import {
   SlackAdapter,
   SlackWebClient,
   leftOutNote,
+  withCallTime,
   type SlackSocketLike,
   type SlackWebLike,
 } from '../src/slack-adapter.js';
@@ -204,16 +205,17 @@ test("a grant another listing reports while this one waits on a page starts this
   const from = api.calls.length;
   let other: Promise<unknown> | undefined;
   api.answerFor('conversations.list',
-    // This listing's only page, slowed so the other listing's answer lands first.
-    { ...page('channels:read,groups:read,im:read', [channel('C1')]), delayMs: 200 },
+    // This listing's only page, slowed so the other listing, awaited below,
+    // has its answers well before.
+    { ...page('channels:read,groups:read,im:read', [channel('C1')]), delayMs: 2000 },
     page('channels:read,groups:read,im:read,mpim:read'),
     page('channels:read,groups:read,im:read,mpim:read', [channel('C1')]));
   const slack = realAdapter(['channels:read', 'groups:read', 'im:read']);
   const mine = slack.listConversations();
   await until(() => api.calls.length > from, 'the first listing asked');
   other = slack.listConversations();
-  const listed = await mine;
   await other;
+  const listed = await mine;
   assert.deepEqual(listed.leftOut, []);
   assert.deepEqual(listed.conversations.map((c) => c.id), ['C1']);
   assert.deepEqual(asked(from).map(([types]) => types), [
@@ -222,6 +224,23 @@ test("a grant another listing reports while this one waits on a page starts this
     'public_channel,private_channel,im,mpim',
     'public_channel,private_channel,im,mpim',
   ], "the other listing starts over at its own answer, and this one at its page's");
+});
+
+test("a grant another listing reports while this one looks up a DM's name starts this one over before it returns", { timeout: 5000 }, async (t) => {
+  t.after(() => api.answerFor('conversations.list'));
+  t.after(() => api.answerFor('users.info'));
+  const from = api.calls.length;
+  api.answerFor('users.info', { body: { ok: true, user: { name: 'ann' } }, delayMs: 300 });
+  api.answerFor('conversations.list',
+    page('channels:read,groups:read,im:read', [{ id: 'D1', is_im: true, user: 'U5' }]),
+    page('channels:read,groups:read,im:read,mpim:read'));
+  const slack = realAdapter(['channels:read', 'groups:read', 'im:read']);
+  const mine = slack.listConversations();
+  await until(() => api.calls.slice(from).includes('users.info'), "the DM's name lookup");
+  await slack.listConversations();
+  const listed = await mine;
+  assert.deepEqual(listed.leftOut, [], 'the note names no scope the token holds');
+  assert.equal(asked(from).at(-1)?.[0], 'public_channel,private_channel,im,mpim');
 });
 
 test("a refusal whose scopes read no type ends the listing unsent, rather than ask with no types", { timeout: 5000 }, async (t) => {
@@ -269,10 +288,12 @@ test('with no readable type, a background listing waits out a rate-limited auth.
   assert.deepEqual(waits, [['auth.test', 1], ['conversations.list', 1]], "each request's waits are counted on their own");
   assert.deepEqual(listed.conversations.map((c) => c.id), ['C1']);
   assert.deepEqual(api.calls.slice(from), ['auth.test', 'auth.test', 'conversations.list', 'conversations.list']);
-  // In a call, with no wait to give, the rate limit is the listing's answer.
-  api.answerFor('auth.test', { status: 429, headers: { 'retry-after': '1' }, body: { ok: false, error: 'ratelimited' } });
-  const err = await realAdapter(['chat:write']).listConversations().then(() => null, (e: unknown) => e);
-  assert.equal((err as { code?: string } | null)?.code, 'slack_webapi_rate_limited_error');
+  // In a call, a rate limit longer than the call's 5 s of waiting is the
+  // listing's answer.
+  api.answerFor('auth.test', { status: 429, headers: { 'retry-after': '30' }, body: { ok: false, error: 'ratelimited' } });
+  const err = await withCallTime(Date.now(), () => realAdapter(['chat:write']).listConversations()).then(() => null, (e: unknown) => e);
+  assert.equal((err as { code?: string; retryAfter?: number } | null)?.code, 'slack_webapi_rate_limited_error');
+  assert.equal((err as { retryAfter?: number }).retryAfter, 30);
 });
 
 test("a listing in the background that starts over counts its waits afresh, since it's a new request", { timeout: 5000 }, async (t) => {
