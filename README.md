@@ -160,8 +160,10 @@ files can be read. Symlinks to regular files are allowed and there is no
 configured-directory boundary. Both modes refuse non-regular files, use a
 nonblocking open so a FIFO cannot wait for a writer, and enforce the same 5 MiB
 limit on the opened descriptor, including a bounded read if the file grows.
-The SDK receives the resulting bytes rather than a raw path. Inline-only and
-unrestricted modes remain Node-only and require no Python runtime.
+Only the resulting bytes go to Slack, through the same three upload steps as
+inline content (`files.getUploadURLExternal`, a POST of the bytes to the URL it
+gives, `files.completeUploadExternal`); Slack never sees the path. Inline-only
+and unrestricted modes remain Node-only and require no Python runtime.
 
 The existing send-channel and DM guards run before the local read and are checked
 again by the adapter before upload. They restrict the Slack destination, while
