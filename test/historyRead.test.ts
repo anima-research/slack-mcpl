@@ -458,8 +458,14 @@ test('arguments are checked before Slack is asked: unknown names, bounds, timest
 
 test('with DMs off, a read of a DM or its thread is refused by the adapter\'s DM check before any page', { timeout: 5000 }, async () => {
   const from = api.calls.length;
-  await assert.rejects(adapter({ disableDms: true }).readHistory('D1', { channelId: 'D1' }), /direct messages are disabled/);
-  await assert.rejects(adapter({ disableDms: true }).readThread('D1', '1.0', { channelId: 'D1', threadTs: '1.0' }), /direct messages are disabled/);
+  // A read's refusal opens as its other failures do.
+  const refused =
+    'No messages were returned: D1 is a direct message or group DM, and this bot works only in channels here, ' +
+    'since direct messages are turned off. list_channels shows the ones it can use.';
+  await assert.rejects(adapter({ disableDms: true }).readHistory('D1', { channelId: 'D1' }), { message: refused });
+  await assert.rejects(adapter({ disableDms: true }).readThread('D1', '1.0', { channelId: 'D1', threadTs: '1.0' }), {
+    message: refused,
+  });
   assert.equal(api.calls.length, from);
 });
 

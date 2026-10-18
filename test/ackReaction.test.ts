@@ -6,7 +6,14 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { ErrorCode } from '@slack/web-api';
 import { SlackAdapter } from '../src/slack-adapter.js';
+
+/** A refusal in the shape the Slack client gives one: its code, and Slack's answer as `data`. */
+const refusal = (error: string) => Object.assign(new Error(`An API error occurred: ${error}`), {
+  code: ErrorCode.PlatformError,
+  data: { ok: false, error },
+});
 
 function makeAdapter(opts: { ackReaction?: string; sendChannels?: string[] } = {}) {
   const calls: string[] = [];
@@ -109,9 +116,22 @@ test('a removal that failed without an answer from Slack is tried again, a few t
   assert.equal(flaky.calls.filter((c) => c.startsWith('remove')).length, 5, 'gives up after 5 tries');
 });
 
+test("a removal Slack failed on is tried again, as one it didn't answer is", async () => {
+  for (const error of ['internal_error', 'service_unavailable']) {
+    let failure: Error | null = refusal(error);
+    const { adapter, calls, release } = makeSlowAdapter(() => failure);
+    release();
+    await adapter.acknowledge('C1', '1.0');
+    await adapter.clearAck('C1');
+    failure = null;
+    await adapter.clearAck('C1');
+    assert.deepEqual(calls.filter((c) => c.startsWith('remove')), ['remove:1.0:failed', 'remove:1.0'], error);
+  }
+});
+
 test('a removal Slack itself refused is not tried again', async () => {
   for (const error of ['message_not_found', 'is_archived', 'not_in_channel']) {
-    const { adapter, calls, release } = makeSlowAdapter(() => Object.assign(new Error(error), { data: { error } }));
+    const { adapter, calls, release } = makeSlowAdapter(() => refusal(error));
     release();
     await adapter.acknowledge('C1', '2.0');
     await adapter.clearAck('C1');

@@ -126,9 +126,9 @@ export const toolDefinitions: ToolDefinition[] = [
   {
     name: 'refresh_channels',
     description:
-      'Re-scan every Slack conversation the bot can currently see and register any that the ' +
-      'host does not yet know about. Use this if the bot was invited to a new channel after ' +
-      'startup and it is not showing up in your channel list.',
+      'Re-scan the Slack conversations the bot is in and register any that the host does not ' +
+      'yet know about. Use this if the bot was invited to a new channel after startup and it ' +
+      'is not showing up in your channel list.',
     inputSchema: {
       type: 'object',
       properties: {},
@@ -161,8 +161,9 @@ export const toolDefinitions: ToolDefinition[] = [
     name: 'fetch_thread',
     description:
       'Fetch a bounded part of one Slack thread, oldest-first (parent first on the initial unbounded-range call). ' +
-      'Use the parent ID. Check pagination.scanComplete and stopReason. To go on to newer replies, call again with ' +
-      'the same arguments and cursor set to pagination.nextCursor.',
+      'Use the parent ID: a reply shows it as thread=, and fetch_history shows the parent\'s own ID. Check ' +
+      'pagination.scanComplete and stopReason. To go on to newer replies, call again with the same arguments and ' +
+      'cursor set to pagination.nextCursor.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,

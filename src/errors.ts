@@ -24,7 +24,13 @@ export class McplRpcError extends Error {
   }
 }
 
-/** §14.6 / §5.4 — the method requires a capability not in the effective grant. */
+/** §14.6 / §5.4 — the method requires a capability not in the effective grant.
+ *  The message opens with the spec's own words, for the host and its logs. */
 export function capabilityDenied(capability: string): McplRpcError {
-  return new McplRpcError(ERR_CAPABILITY_DENIED, `Capability denied: ${capability}`, { capability });
+  return new McplRpcError(
+    ERR_CAPABILITY_DENIED,
+    `Capability denied: ${capability}. This host's policy hasn't granted it, so the request didn't run, and ` +
+      "calling again won't change that until the host grants it.",
+    { capability },
+  );
 }

@@ -69,7 +69,7 @@ test('channels/publish to a DM is refused when DMs are disabled', async () => {
   await ready(h);
   await assert.rejects(
     h.host.sendRequest(method.CHANNELS_PUBLISH, { channelId: 'slack:D1', content: [{ type: 'text', text: 'hi' }] }),
-    /disabled/,
+    /Nothing was posted: D1 is a direct message or group DM, and this bot works only in channels here, since direct messages are turned off\. list_channels shows the ones it can use\.$/,
   );
   assert.equal(h.posts.length, 0);
   await h.close();

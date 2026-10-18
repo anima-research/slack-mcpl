@@ -49,5 +49,9 @@ test('MCPL feature denial still refuses bounded history before Slack calls', asy
   await h.host.sendRequest(method.FEATURE_SETS_UPDATE, {effectiveCapabilities: ['tools'], disabled: ['slack.history']});
   const result = await tool(h, 'fetch_history', {channelId: 'C1'});
   assert.equal(result.error, true);
-  assert.match(result.value, /not enabled/);
+  assert.equal(
+    result.value,
+    "fetch_history is turned off on this host: the host's policy hasn't enabled its feature set, slack.history, so " +
+      "nothing ran, and calling again won't change that until the host enables it.",
+  );
 });

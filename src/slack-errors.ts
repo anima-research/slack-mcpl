@@ -24,7 +24,7 @@
  */
 import { ErrorCode } from '@slack/web-api';
 import { connectionNeverMade, reactionName } from './content.js';
-import { CALL_SECONDS, OutOfCallTime, SLACK_CLIENT_OPTIONS, failedRequest } from './slack-adapter.js';
+import { CALL_SECONDS, OutOfCallTime, SLACK_CLIENT_OPTIONS, failedRequest, slackRefusal } from './slack-adapter.js';
 
 /** The call an error came from: a tool's name, or `channels/publish` for the
  *  host's publish, and the arguments it names Slack's objects by. */
@@ -83,12 +83,6 @@ export function explainSlackError(err: unknown, call: SlackCall): string {
   const text = typeof carried === 'string' ? carried : String(err);
   const why = explanation(err, call);
   return why ? `${text}\n\n${why}` : text;
-}
-
-/** Slack's code, when Slack refused the call; undefined for any other error. */
-export function slackRefusal(err: unknown): string | undefined {
-  const e = err as { code?: unknown; data?: { error?: unknown } } | null;
-  return e?.code === ErrorCode.PlatformError && typeof e.data?.error === 'string' ? e.data.error : undefined;
 }
 
 function explanation(err: unknown, call: SlackCall): string | undefined {
