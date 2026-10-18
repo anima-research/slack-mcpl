@@ -38,7 +38,12 @@ const ACK_TTL_MS = 10 * 60 * 1000;
 const ACK_RETRY_MS = 60 * 1000;
 const ACK_MAX_TRIES = 5;
 
-type AckEntry = { timer: ReturnType<typeof setTimeout>; added: Promise<boolean>; tries: number };
+type AckEntry = {
+  timer: ReturnType<typeof setTimeout>;
+  added: Promise<boolean>;
+  tries: number;
+  removing?: Promise<void>;
+};
 
 /** Message subtypes that represent real user content. Everything else
  * (message_changed, message_deleted, channel_join, bot_message, …) is noise
@@ -262,6 +267,11 @@ export class SlackAdapter {
     // cannot, and leaves them on Slack. No new ones while that runs.
     this.stopping = true;
     await Promise.all([...this.ackPending.keys()].map((c) => this.clearAck(c)));
+    // A removal that failed just before stop() began has armed its retry, and
+    // the clear above only joined it. Nothing is tried again after a stop.
+    for (const [channelId, pending] of [...this.ackPending]) {
+      for (const [ts, entry] of [...pending]) this.dropAck(channelId, ts, entry);
+    }
     if (this.socketStarted) {
       await this.socket.disconnect().catch(() => {});
       this.socketStarted = false;
@@ -384,21 +394,32 @@ export class SlackAdapter {
     const pending = this.ackPending.get(channelId);
     if (!pending || !this.ackReaction) return;
     const targets = ts === undefined ? [...pending.keys()] : pending.has(ts) ? [ts] : [];
-    await Promise.all(targets.map(async (t) => {
+    await Promise.all(targets.map((t) => {
       const entry = pending.get(t);
       if (!entry) return;
-      clearTimeout(entry.timer);
-      if (!(await entry.added)) return this.dropAck(channelId, t, entry);
-      try {
-        await this.web.reactions.remove({ channel: channelId, timestamp: t, name: this.ackReaction! });
-        this.dropAck(channelId, t, entry);
-      } catch (err) {
-        // Slack's own answer (data.error) will be the same next time.
-        const answered = !!(err as { data?: { error?: string } }).data?.error;
-        if (answered || ++entry.tries >= ACK_MAX_TRIES) this.dropAck(channelId, t, entry);
-        else entry.timer = this.armAck(channelId, t, ACK_RETRY_MS);
-      }
+      // Posts, expiry, and shutdown share one removal, including the wait
+      // for reactions.add. Reserve it before any asynchronous work settles.
+      entry.removing ??= this.removeAck(channelId, t, entry).finally(() => {
+        entry.removing = undefined;
+      });
+      return entry.removing;
     }));
+  }
+
+  private async removeAck(channelId: string, ts: string, entry: AckEntry): Promise<void> {
+    clearTimeout(entry.timer);
+    if (!(await entry.added)) return this.dropAck(channelId, ts, entry);
+    entry.tries++;
+    try {
+      await this.web.reactions.remove({ channel: channelId, timestamp: ts, name: this.ackReaction! });
+      this.dropAck(channelId, ts, entry);
+    } catch (err) {
+      // Slack's own answer (data.error) will be the same next time. The fifth
+      // failure drops the entry, so no sixth attempt can start.
+      const answered = !!(err as { data?: { error?: string } } | null)?.data?.error;
+      if (answered || this.stopping || entry.tries >= ACK_MAX_TRIES) this.dropAck(channelId, ts, entry);
+      else entry.timer = this.armAck(channelId, ts, ACK_RETRY_MS);
+    }
   }
 
   async sendMessage(
