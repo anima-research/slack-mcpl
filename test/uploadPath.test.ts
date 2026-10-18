@@ -70,9 +70,9 @@ for (const maxBytes of [0, -1, 1.5, SLACK_MAX_FILE_BYTES + 1, '8388608', null, t
 
 test('a policy key other than mode, directories and maxBytes is still refused', () => {
   assert.throws(() => validatePathUploadPolicy({ mode: 'unrestricted', maxBytes: 10, max: 10 }),
-    { message: 'A unrestricted path upload policy takes no key but mode, maxBytes' });
+    { message: 'In unrestricted mode, a path upload policy takes no key but mode, maxBytes' });
   assert.throws(() => validatePathUploadPolicy({ mode: 'restricted', directories: ['/one'], maxBytes: 10, limit: 10 }),
-    { message: 'A restricted path upload policy takes no key but mode, directories, maxBytes' });
+    { message: 'In restricted mode, a path upload policy takes no key but mode, directories, maxBytes' });
 });
 
 /** Whether this machine has what restricted mode needs: Python 3.9+ with

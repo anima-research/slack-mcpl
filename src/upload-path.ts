@@ -33,7 +33,7 @@ export function validatePathUploadPolicy(value: unknown): PathUploadPolicy {
     throw new Error('Path uploads require unrestricted mode or restricted mode with nonempty absolute directories');
   }
   if (!keys.every((key) => typeof key === 'string' && allowed.includes(key))) {
-    throw new Error(`A ${config.mode} path upload policy takes no key but ${allowed.join(', ')}`);
+    throw new Error(`In ${config.mode} mode, a path upload policy takes no key but ${allowed.join(", ")}`);
   }
   let maxBytes = MAX_ATTACHMENT_BYTES;
   if (keys.includes('maxBytes')) {
