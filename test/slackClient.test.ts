@@ -32,7 +32,7 @@ import {
 import { SlackMcplServer } from '../src/server.js';
 import { explainSlackError } from '../src/slack-errors.js';
 import { resolveSlackUserNames, type SlackUserInfoClient } from '../src/content.js';
-import { FULL_GRANT, connectHost, htmlSlackApiUrl, initialize, until } from './harness.js';
+import { FULL_GRANT, connectHost, nonJsonSlackApiUrl, initialize, until } from './harness.js';
 import { fakeSlackApi, silentSlackApi, unreachableSlackApiUrl, type FakeSlackApi, type SlackApiAnswer } from './slackApi.js';
 
 let api: FakeSlackApi;
@@ -566,7 +566,7 @@ test('a user Slack refuses to look up is kept as the id, and a lookup that fails
 });
 
 test("a lookup answered in a form Slack doesn't use isn't a refusal, so it isn't kept and is asked again", { timeout: 5000 }, async (t) => {
-  const page = new WebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: await htmlSlackApiUrl(t) });
+  const page = new WebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: await nonJsonSlackApiUrl(t) });
   const cache = new Map<string, string>();
   const failed = await resolveSlackUserNames(page as unknown as SlackUserInfoClient, cache, ['U3']);
   assert.equal(cache.has('U3'), false, 'the name is still unknown, not the id');
@@ -574,7 +574,7 @@ test("a lookup answered in a form Slack doesn't use isn't a refusal, so it isn't
 });
 
 test("work no call waits on waits after an answer in a form Slack doesn't use, as after an HTTP error, and asks again", { timeout: 5000 }, async (t) => {
-  const page = new WebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: await htmlSlackApiUrl(t) });
+  const page = new WebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: await nonJsonSlackApiUrl(t) });
   const { err } = await failure(() => page.conversations.list({}));
   assert.deepEqual(waitToAskAgain(err, 'conversations.list'), { method: 'conversations.list', seconds: 30, why: 'failed' });
 });
@@ -582,7 +582,7 @@ test("work no call waits on waits after an answer in a form Slack doesn't use, a
 test("with DMs off, a conversation check answered in a form Slack doesn't use writes nothing, and says to try again", { timeout: 5000 }, async (t) => {
   // The adapter's own client, which marks its errors with the request they
   // came from, so the explainer reads the check as a request before the post.
-  const page = new SlackWebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: await htmlSlackApiUrl(t) });
+  const page = new SlackWebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: await nonJsonSlackApiUrl(t) });
   const web = {
     conversations: { info: (args: Record<string, unknown>) => page.conversations.info(args as never) },
     chat: { postMessage: (args: Record<string, unknown>) => client.chat.postMessage(args as never) },
@@ -604,7 +604,7 @@ test("an acknowledgement's add counts as there, and is removed, only when it may
   t.after(() => silent.close());
   const timedOut = new WebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, timeout: 200, slackApiUrl: silent.url });
   // A page that isn't JSON, which the client reads as a refusal whose code is the body.
-  const page = new WebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: await htmlSlackApiUrl(t) });
+  const page = new WebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: await nonJsonSlackApiUrl(t) });
   const removals = () => api.calls.filter((c) => c === 'reactions.remove').length;
   for (const [what, add, removed] of [
     ['an HTTP 503', { status: 503, body: { ok: false } }, true],

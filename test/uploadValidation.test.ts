@@ -192,6 +192,30 @@ test('upload handler enforces the inline cap on UTF-8 bytes and decoded base64 b
   assert.deepEqual(bytes(1), atLimit);
 });
 
+test("content past the cap, and contentBase64 longer than the cap's own base64, are refused before they're made into bytes (R1-1)", async (t) => {
+  const { asked, call } = await fixture(t);
+  const base64Cap = Math.ceil(LIMIT / 3) * 4;
+  for (const [key, input, says] of [
+    ['content', 'é'.repeat(LIMIT / 2 + 1), `inline file too large: ${LIMIT + 2} bytes, past this server's inline limit of ${LIMIT} bytes`],
+    ['contentBase64', 'A'.repeat(base64Cap + 4), `inline file too large: contentBase64 is ${base64Cap + 4} characters, and ` +
+      `canonical base64 longer than ${base64Cap} characters holds more than this server's inline limit of ${LIMIT} bytes`],
+  ] as const) {
+    // Buffer.from, watched for the input itself.
+    const made: string[] = [];
+    const from = Buffer.from;
+    const watched = t.mock.method(Buffer, 'from', function (this: unknown, ...args: unknown[]) {
+      if (args[0] === input) made.push(key);
+      return (from as (...a: unknown[]) => Buffer).apply(this, args);
+    });
+    const result = await call({ [key]: input });
+    watched.mock.restore();
+    assert.equal(result.isError, true);
+    assert.ok(result.content[0].text.startsWith(`Nothing was uploaded: ${says}`), result.content[0].text);
+    assert.deepEqual(made, [], 'the input was never made into bytes');
+  }
+  assert.equal(asked.length, 0);
+});
+
 test('upload handler preserves valid text, binary base64 and optional metadata, through the three steps', async (t) => {
   const { asked, shared, bytes, call } = await fixture(t);
   assert.notEqual((await call({ content: 'héllo', title: 'Report', comment: 'See this', messageId: '1.0' })).isError, true);

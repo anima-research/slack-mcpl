@@ -452,6 +452,22 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
       return call.tool === 'upload_file'
         ? `${lead}: Slack couldn't find the file this upload's first step set up. Calling again starts a new upload.`
         : undefined;
+    // A workspace's refusals of an upload, which last until its admins change
+    // them (R1-2). files.getUploadURLExternal documents all five, and
+    // files.completeUploadExternal the two about file types.
+    case 'file_uploads_disabled':
+    case 'file_uploads_except_images_disabled':
+    case 'file_type_not_allowed':
+    case 'file_upload_size_restricted':
+      return call.tool === 'upload_file'
+        ? `${lead}: this workspace's settings don't allow this upload (${code}). Calling again won't change that; ` +
+            `the workspace's admins can.${code === 'file_upload_size_restricted' ? ' A smaller file may go.' : ''}`
+        : undefined;
+    case 'storage_limit_reached':
+      return call.tool === 'upload_file'
+        ? `${lead}: this workspace has reached its file storage limit (${code}). Calling again won't change that; ` +
+            "the workspace's admins can."
+        : undefined;
     case 'user_not_found':
       return (
         `${lead}: Slack has no user ${userId ?? 'by the id given'}. ${RECALLED}. find_user returns each ` +

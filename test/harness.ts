@@ -81,12 +81,15 @@ export function uploadEndpoint(): Promise<{ url: string; bytes: Map<string, Buff
 }
 
 /** A `slackApiUrl` whose every answer is an HTTP 200 whose body isn't JSON,
- *  such as a proxy's page, which the client reads as a refusal whose code is
- *  the body itself. It closes when the test ends. */
-export async function htmlSlackApiUrl(t: { after(fn: () => void): void }): Promise<string> {
+ *  by default a proxy's page, which the client reads as a refusal whose code
+ *  is the body itself. It closes when the test ends. */
+export async function nonJsonSlackApiUrl(
+  t: { after(fn: () => void): void },
+  body = '<html>Bad gateway</html>',
+): Promise<string> {
   const page = http.createServer((req, res) => {
     req.resume();
-    req.on('end', () => { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<html>Bad gateway</html>'); });
+    req.on('end', () => { res.writeHead(200, { 'content-type': 'text/html' }); res.end(body); });
   });
   await new Promise<void>((resolve) => page.listen(0, '127.0.0.1', () => resolve()));
   t.after(() => { page.closeAllConnections(); page.close(); });

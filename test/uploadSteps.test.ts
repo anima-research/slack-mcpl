@@ -22,7 +22,7 @@ import {
 import { SlackMcplServer } from '../src/server.js';
 import { explainSlackError } from '../src/slack-errors.js';
 import { MESSAGING_FEATURE_SET } from '../src/feature-sets.js';
-import { FULL_GRANT, connectHost, htmlSlackApiUrl, initialize, until, uploadEndpoint } from './harness.js';
+import { FULL_GRANT, connectHost, nonJsonSlackApiUrl, initialize, until, uploadEndpoint } from './harness.js';
 import { fakeSlackApi, silentSlackApi, unreachableSlackApiUrl, type FakeSlackApi, type SlackApiAnswer } from './slackApi.js';
 
 let api: FakeSlackApi;
@@ -118,6 +118,30 @@ test("a failure of the first step uploads nothing, says so, and isn't kept for r
     assert.match(explainSlackError(err, { tool: 'upload_file', args: { channelId: 'C1' } }), says);
     assert.deepEqual(called(from), ['files.getUploadURLExternal']);
     assert.equal(fileLeftByUpload(err), undefined);
+  }
+});
+
+test("a workspace's refusal of an upload says calling again won't change it, at whichever step Slack refuses (R1-2)", { timeout: 5000 }, async (t) => {
+  const settings = (code: string, lead: string, more = '') =>
+    `\n\n${lead}: this workspace's settings don't allow this upload (${code}). Calling again won't change that; the ` +
+    `workspace's admins can.${more}`;
+  for (const [step, code, says] of [
+    ['first', 'file_uploads_disabled', settings('file_uploads_disabled', 'Nothing was uploaded')],
+    ['first', 'file_uploads_except_images_disabled', settings('file_uploads_except_images_disabled', 'Nothing was uploaded')],
+    ['first', 'file_type_not_allowed', settings('file_type_not_allowed', 'Nothing was uploaded')],
+    ['first', 'file_upload_size_restricted', settings('file_upload_size_restricted', 'Nothing was uploaded', ' A smaller file may go.')],
+    ['first', 'storage_limit_reached', "\n\nNothing was uploaded: this workspace has reached its file storage limit " +
+      "(storage_limit_reached). Calling again won't change that; the workspace's admins can."],
+    ['last', 'file_type_not_allowed', settings('file_type_not_allowed', 'Nothing was shared')],
+    ['last', 'file_uploads_except_images_disabled', settings('file_uploads_except_images_disabled', 'Nothing was shared')],
+  ] as const) {
+    const refusal = { body: { ok: false, error: code } };
+    await steps(t, step === 'first' ? { first: refusal } : { last: refusal });
+    const err = await adapter().uploadFile('C1', { filename: 'a.txt', data: Buffer.from('a') }).then(() => null, (e: unknown) => e);
+    const said = explainSlackError(err, { tool: 'upload_file', args: { channelId: 'C1' } });
+    assert.ok(said.endsWith(says), said);
+    // A refused last step leaves its file for rollback, as not shared.
+    assert.deepEqual(fileLeftByUpload(err), step === 'first' ? undefined : { fileId: 'F1', mayHaveShared: false });
   }
 });
 
@@ -275,7 +299,7 @@ test("a last step Slack can't find the upload's file for shares nothing, and cal
 test("a last step answered in a form Slack doesn't use may have shared the file, and says to check before uploading again", { timeout: 5000 }, async (t) => {
   await steps(t);
   // The first step goes to the fake; the last to a page that isn't JSON.
-  const last = new SlackWebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: await htmlSlackApiUrl(t) });
+  const last = new SlackWebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: await nonJsonSlackApiUrl(t) });
   const web = {
     files: { getUploadURLExternal: client.files.getUploadURLExternal, completeUploadExternal: last.files.completeUploadExternal },
   } as unknown as SlackWebLike;
@@ -522,7 +546,7 @@ test("an upload's acknowledgement removal keeps its own tries, outside the uploa
 test("an acknowledgement's removal answered in a form Slack doesn't use is tried again later", { timeout: 5000 }, async (t) => {
   await steps(t);
   // The removal goes to a page that isn't JSON; everything else to the fake.
-  const page = new SlackWebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: await htmlSlackApiUrl(t) });
+  const page = new SlackWebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: await nonJsonSlackApiUrl(t) });
   const web = {
     reactions: { add: client.reactions.add, remove: page.reactions.remove },
     files: { getUploadURLExternal: client.files.getUploadURLExternal, completeUploadExternal: client.files.completeUploadExternal },
@@ -567,7 +591,7 @@ test("a first step whose connection is never made, or that Slack doesn't answer,
     [silent.url, 50, /\n\nNothing was uploaded: Slack went 10 seconds without answering, or the connection to it failed\. Try again shortly\.$/],
     // An answer in no form of Slack's to the first step, which comes before
     // the upload, wrote nothing either.
-    [await htmlSlackApiUrl(t), SLACK_CLIENT_OPTIONS.timeout,
+    [await nonJsonSlackApiUrl(t), SLACK_CLIENT_OPTIONS.timeout,
       /\n\nNothing was uploaded: Slack answered in a form this server can't read\. Try again shortly\. If it keeps failing, whoever runs this host has to check its connection to Slack\.$/],
   ] as const) {
     await steps(t);

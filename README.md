@@ -74,7 +74,9 @@ with padding where required, and no whitespace or data-URI prefix). The
 content must be nonempty. This server limits inline content to 5 MiB
 (5,242,880 bytes), measured after UTF-8 encoding or base64 decoding; this is
 the server's inline limit, not Slack's file-size limit. The tool accepts
-inline content only; it does not read a path on the server.
+inline content only; it does not read a path on the server. An agent writes
+the whole file out as the tool's arguments, so the content goes through the
+model's own output, and `contentBase64` suits small binary files.
 
 Optional `messageId` selects the thread root (the message's `thread=` value,
 or its `id=` when it has no `thread=`). `title` names the

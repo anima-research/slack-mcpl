@@ -17,12 +17,13 @@ import {
   SLACK_CLIENT_OPTIONS,
   SlackAdapter,
   SlackWebClient,
+  slackRefusal,
   type SlackSocketLike,
   type SlackWebLike,
 } from '../src/slack-adapter.js';
 import { SlackMcplServer } from '../src/server.js';
 import { toolDefinitions } from '../src/tools.js';
-import { connectHost, htmlSlackApiUrl, initialize, FULL_GRANT } from './harness.js';
+import { connectHost, nonJsonSlackApiUrl, initialize, FULL_GRANT } from './harness.js';
 import { fakeSlackApi, silentSlackApi, unreachableSlackApiUrl, type FakeSlackApi } from './slackApi.js';
 
 let api: FakeSlackApi;
@@ -510,6 +511,10 @@ test('other errors and other codes pass through unchanged', async () => {
     await explain('file_not_found', 'edit_message', { channelId: 'C1', messageId: '1.1', content: 'hi' }),
     'An API error occurred: file_not_found',
   );
+  // So are a workspace's refusals of an upload, which no other tool gets.
+  for (const code of ['file_uploads_disabled', 'storage_limit_reached']) {
+    assert.equal(await explain(code, 'send_message', { channelId: 'C1', content: 'hi' }), `An API error occurred: ${code}`);
+  }
   const local = new Error('channelId is required');
   assert.equal(explainSlackError(local, { tool: 'send_message', args: {} }), 'channelId is required');
   // A refusal's shape without the client's code is not read as one.
@@ -518,10 +523,18 @@ test('other errors and other codes pass through unchanged', async () => {
   assert.equal(explainSlackError('a string', { tool: 'send_message', args: {} }), 'a string');
 });
 
+test("a body that is one lowercase word reads as Slack's refusal, as the shape rule takes it (R1-4)", async (t) => {
+  const err = await clientError(new WebClient('xoxb-test', {
+    ...SLACK_CLIENT_OPTIONS, slackApiUrl: await nonJsonSlackApiUrl(t, 'upstream_error'),
+  }));
+  assert.equal(slackRefusal(err), 'upstream_error');
+  assert.equal(explainSlackError(err, { tool: 'send_message', args: { channelId: 'C1', content: 'hi' } }), 'An API error occurred: upstream_error');
+});
+
 test("an answer that isn't in Slack's form leaves a write's outcome unknown, and another call says to try again", async (t) => {
   // A body that isn't JSON, such as a proxy's page, which the client reads as
   // a refusal whose code is the body itself.
-  const err = await clientError(new WebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: await htmlSlackApiUrl(t) }));
+  const err = await clientError(new WebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: await nonJsonSlackApiUrl(t) }));
   const posted = explainSlackError(err, { tool: 'send_message', args: { channelId: 'C1', content: 'hi' } });
   assert.ok(posted.endsWith(
     "\n\nSlack answered in a form this server can't read, so whether the message was posted is unknown. Check " +

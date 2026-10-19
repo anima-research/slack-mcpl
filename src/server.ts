@@ -90,6 +90,9 @@ const REGISTRATION_TRIES = 10;
 /** The most bytes upload_file takes inline: the file's bytes, after base64 is
  *  decoded or text is encoded as UTF-8. */
 const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
+/** The length of the cap's canonical base64: four characters for every three
+ *  bytes, padded, so canonical base64 any longer holds more than the cap. */
+const MAX_UPLOAD_BASE64 = Math.ceil(MAX_UPLOAD_BYTES / 3) * 4;
 /** files.delete's answers for a file that's already gone, or that this bot
  *  can't see any more: Slack's own words are "already been deleted" and "does
  *  not exist, or is not visible to the calling user". */
@@ -689,11 +692,28 @@ export class SlackMcplServer {
           }
         };
         loneSurrogate('filename', filename, 'remove it from the name');
+        const tooLarge = (size: string) => refuse(
+          `inline file too large: ${size}, past this server's inline limit of ${MAX_UPLOAD_BYTES} bytes, so upload_file ` +
+            'can\'t send it. A smaller file can go, such as this one split into parts.',
+        );
         let data: Buffer;
         if (key === 'content') {
           loneSurrogate('content', input, 'remove it, or pass the file\'s bytes as contentBase64');
+          // Measured before the bytes are made, so content past the cap isn't
+          // copied (R1-1).
+          const length = Buffer.byteLength(input, 'utf8');
+          if (length > MAX_UPLOAD_BYTES) throw tooLarge(`${length} bytes`);
           data = Buffer.from(input, 'utf8');
         } else {
+          // Longer than the cap's canonical base64, it's refused before it's
+          // decoded and encoded again (R1-1).
+          if (input.length > MAX_UPLOAD_BASE64) {
+            throw refuse(
+              `inline file too large: contentBase64 is ${input.length} characters, and canonical base64 longer than ` +
+                `${MAX_UPLOAD_BASE64} characters holds more than this server's inline limit of ${MAX_UPLOAD_BYTES} bytes, ` +
+                'so upload_file can\'t send it. A smaller file can go, such as this one split into parts.',
+            );
+          }
           // Buffer.from skips what isn't base64 and reads a data URI's prefix
           // as bytes, so only base64 that it writes back the same is taken:
           // canonical RFC 4648, with padding and zero unused bits.
@@ -702,12 +722,7 @@ export class SlackMcplServer {
             throw refuse('contentBase64 must be canonical RFC 4648 base64 with padding, on one line: no line breaks, spaces or data URI');
           }
         }
-        if (data.byteLength > MAX_UPLOAD_BYTES) {
-          throw refuse(
-            `inline file too large: ${data.byteLength} bytes, past this server's inline limit of ${MAX_UPLOAD_BYTES} ` +
-              'bytes, so upload_file can\'t send it. A smaller file can go, such as this one split into parts.',
-          );
-        }
+        if (data.byteLength > MAX_UPLOAD_BYTES) throw tooLarge(`${data.byteLength} bytes`);
         const comment = optional('comment');
         const title = optional('title');
         loneSurrogate('comment', comment, 'remove it from the comment');
