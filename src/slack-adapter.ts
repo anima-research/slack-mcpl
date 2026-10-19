@@ -777,8 +777,9 @@ export class SlackAdapter {
     // an early event past an unregistered listener. Events are handled one
     // at a time per conversation, in arrival order: the lookups before a
     // message is delivered (its author's and mentions' names) take different
-    // times, and a later message must not
-    // reach the host, or become the reply target, before an earlier one.
+    // times, and a later message must not reach the host, or become the reply
+    // target, before an earlier one. From delivery on, the server keeps the
+    // same order with its own chain per conversation (setupSlackForwarding).
     this.socket.on('message', ({ event, ack }) => {
       // Always ack first — Slack redelivers unacked envelopes.
       void Promise.resolve().then(() => ack()).catch(() => { /* ignore */ });
