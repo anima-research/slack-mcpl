@@ -44,6 +44,11 @@ function fakeSocket(): FakeSocket {
 
 function fakeWeb(posts: unknown[], reactions: string[], reads: string[]): SlackWebLike {
   return {
+    auth: {
+      async test() {
+        return {};
+      },
+    },
     conversations: {
       async list() {
         return { channels: [{ id: 'C1', name: 'general', is_member: true, is_im: false, is_mpim: false }] };
