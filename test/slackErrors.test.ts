@@ -566,6 +566,13 @@ test("an answer that isn't in Slack's form leaves a write's outcome unknown, and
   assert.ok(listed.endsWith(
     "\n\nNothing was listed: Slack answered in a form this server can't read. Try again shortly. If it keeps failing, " +
       'whoever runs this host has to check its connection to Slack.'), listed);
+  // A read's failure opens with what every failure of a read opens with.
+  for (const [tool, args] of [['fetch_history', { channelId: 'C1' }], ['fetch_thread', { channelId: 'C1', threadTs: '1.1' }]] as const) {
+    const read = explainSlackError(err, { tool, args });
+    assert.ok(read.endsWith(
+      "\n\nNo messages were returned: Slack answered in a form this server can't read. Try again shortly. If it keeps " +
+        'failing, whoever runs this host has to check its connection to Slack.'), read);
+  }
 });
 
 const socket: SlackSocketLike = { on() {}, async start() {}, async disconnect() {} };
