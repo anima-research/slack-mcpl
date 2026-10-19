@@ -283,11 +283,10 @@ resume. A stalled pagination response is incomplete, never silently exhausted.
 `scanComplete` describes only the selected channel-message range or single
 thread, never all channel threads. `oldest` and `latest` are exclusive bounds
 on both tools; without `latest`, the first page reads up to Slack's own now,
-except that `fetch_history` given `oldest` alone reads up to this host's clock
-plus a minute, since in a live run Slack answered `oldest` alone with the
-messages just after it. A host whose clock is more than a minute behind
-Slack's can then miss the newest messages while the read reports itself
-complete.
+except that `fetch_history` given `oldest` alone names `latest` as this host's
+clock plus a minute on its first page. A host whose clock is more than a
+minute behind Slack's can then miss the newest messages while the read
+reports itself complete.
 History continues toward older messages from the cursor, so its continuations
 never return a message posted after the first call; a thread read's
 continuations go toward newer replies and include ones posted since. Slack history remains

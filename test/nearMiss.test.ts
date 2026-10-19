@@ -18,8 +18,9 @@ test('isNearMiss: the same ignoring case, or a few edits; past that, a different
   }
   assert.equal(isNearMiss('workspace--read', 'workspace--write'), false,
     'a shared prefix is a namespace, so neighbours in it are counted by what follows it');
-  // refilIntervalM is two edits from refillIntervalMs, the most its 11
-  // characters after the shared prefix allow; this is three against the same two.
+  // refilIntervalM, above, is two edits from refillIntervalMs, the most a slip
+  // may be with 11 characters after the shared prefix. tyytConzains is three
+  // edits from textContains, which also has 11 after its prefix: one past it.
   assert.equal(isNearMiss('tyytConzains', 'textContains'), false, 'three edits are past what a slip allows here');
 });
 

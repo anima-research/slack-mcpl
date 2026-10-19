@@ -537,6 +537,8 @@ test('arguments are checked before Slack is asked: unknown names, bounds, timest
     [{ authorIds: ['not-a-user'] }, author(0, '"not-a-user"')],
     [{ authorIds: ['U1', 'B2', 'Ann', 'nope'] }, author(2, '"Ann"')],
     [{ authorIds: ['U1', 5] }, author(1, 'a number')],
+    // An array the pattern would pass once made a string, as 'B2'.
+    [{ authorIds: ['U1', ['B2']] }, author(1, 'an array')],
     [{ authorIds: [] }, authors],
     [{ authorIds: Array.from({ length: 51 }, (_, i) => `U${i}`) }, authors],
     [{ authorIds: 'U1' }, authors],

@@ -1386,12 +1386,12 @@ export class SlackAdapter {
       page: (at, limit) => this.web.conversations.history({
         channel: channelId, limit, inclusive: false,
         // Slack's reference says latest defaults to now, with the most recent
-        // messages first, but in a live run oldest alone got the messages just
-        // after oldest. This read pages back, so it stopped after that page
-        // and called the range covered. So oldest always comes with a latest:
-        // the host's now plus a minute, which still reaches the newest
-        // messages from a host clock up to a minute behind Slack's. A clock
-        // further behind misses them, and the read still reports itself
+        // messages first, but #32 reports a live run in which oldest alone got
+        // the messages just after oldest. This read pages back, so it stopped
+        // after that page and called the range covered. So oldest always comes
+        // with a latest: the host's now plus a minute, which still reaches the
+        // newest messages from a host clock up to a minute behind Slack's. A
+        // clock further behind misses them, and the read still reports itself
         // complete.
         ...(at ? { latest: at } : opts.oldest ? { latest: (Date.now() / 1000 + 60).toFixed(6) } : {}),
         ...(opts.oldest ? { oldest: opts.oldest } : {}),
