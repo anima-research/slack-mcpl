@@ -78,10 +78,9 @@ test('every header names the conversation by channelId, the DM included', () => 
     locationHeader({ conversation: 'DM', teamName: 'acme', channelId: 'D2', messageId: '2.0' }),
     '[DM (acme) channelId=D2 id=2.0] ',
   );
-  assert.match(backscrollBlock([], { isDM: true, channelId: 'D2' }), /^<backscroll dm="true" channelId="D2" count="0">/);
 });
 
-test("a DM's message names its channelId, and a send to another DM names who it went to", async (t) => {
+test("a DM's message names its channelId, and each write to another DM names who it went to", async (t) => {
   const { FULL_GRANT, harness, initialize, until } = await import('./harness.js');
   const { method } = await import('@animalabs/mcpl-core');
   const h = harness({ dms: [{ id: 'D1', user: 'UVASYL' }, { id: 'D2', user: 'UDENIS' }] });
@@ -95,4 +94,9 @@ test("a DM's message names its channelId, and a send to another DM names who it 
   assert.match(delivered, /\[DM \(acme\) channelId=D2 id=5\.0\]/, 'the header gives the id to reply with');
   const sent = await h.host.sendRequest('tools/call', { name: 'send_message', arguments: { channelId: 'D1', content: 'the answer' } }) as { content: { text: string }[] };
   assert.deepEqual(JSON.parse(sent.content[0].text), { messageId: '100.1', to: 'DM: @UVASYL (acme)' }, 'the wrong recipient shows in the same turn');
+  const replied = await h.host.sendRequest('tools/call', { name: 'reply_message', arguments: { channelId: 'D1', messageId: '5.0', content: 'the answer' } }) as { content: { text: string }[] };
+  assert.deepEqual(JSON.parse(replied.content[0].text), { messageId: '100.2', threadTs: '5.0', to: 'DM: @UVASYL (acme)' });
+  // The fake opens D1 for any user.
+  const dm = await h.host.sendRequest('tools/call', { name: 'send_dm', arguments: { userId: 'UVASYL', content: 'the answer' } }) as { content: { text: string }[] };
+  assert.deepEqual(JSON.parse(dm.content[0].text), { messageId: '100.3', channelId: 'D1', to: 'DM: @UVASYL (acme)' });
 });

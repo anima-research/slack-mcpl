@@ -137,9 +137,10 @@ const ARGUMENT_SOURCES = {
 
 /** The bracketed header in front of an incoming message, e.g.
  *  `[#support (acme) channelId=C1 thread=1718000000.000100 id=1718000000.000200] `.
- *  channelId is given every time, as the tools take it: a DM is otherwise
- *  named only "DM", and an agent that types a DM's id from memory can send
- *  a reply to the wrong person. */
+ *  channelId is given every time, under the tools' argument name, so each
+ *  message carries both halves of the address a reply to it takes: a DM is
+ *  otherwise named only "DM", and the header that named a conversation may
+ *  be many messages back, or folded away. */
 export function locationHeader(loc: {
   conversation?: string;
   teamName?: string;
@@ -174,12 +175,11 @@ export function backscrollLine(m: {
 /** The `<backscroll>` block given with the first message from a conversation. */
 export function backscrollBlock(
   messages: Parameters<typeof backscrollLine>[0][],
-  where: { channelName?: string; isDM: boolean; channelId?: string },
+  where: { channelName?: string; isDM: boolean },
 ): string {
   const attrs: string[] = [];
   if (where.channelName && !where.isDM) attrs.push(`channel="#${where.channelName}"`);
   if (where.isDM) attrs.push('dm="true"');
-  if (where.channelId) attrs.push(`channelId="${where.channelId}"`);
   attrs.push(`count="${messages.length}"`);
   return [`<backscroll ${attrs.join(' ')}>`, ...messages.map(backscrollLine), '</backscroll>'].join('\n');
 }
@@ -1749,7 +1749,7 @@ export class SlackMcplServer {
       );
     }
     if (backscroll.length > 0) {
-      blocks.push(backscrollBlock(backscroll, { channelName: meta?.name, isDM: msg.isDM, channelId: msg.channelId }));
+      blocks.push(backscrollBlock(backscroll, { channelName: meta?.name, isDM: msg.isDM }));
     }
     // Told with the first message the agent gets from here, addressed or not.
     // Counted as told only once the host has taken that message.
