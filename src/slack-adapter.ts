@@ -972,18 +972,24 @@ export class SlackAdapter {
    *  answer (SlackWebClient). The URL needs no token. */
   private async postFileBytes(url: string, data: Buffer): Promise<void> {
     assertRequestFits("The upload of the file's bytes", SLACK_CLIENT_OPTIONS.timeout);
+    const timeout = AbortSignal.timeout(SLACK_CLIENT_OPTIONS.timeout);
     try {
       const answer = await fetch(url, {
         method: 'POST',
         body: data,
         headers: { 'content-type': 'application/octet-stream' },
-        signal: AbortSignal.timeout(SLACK_CLIENT_OPTIONS.timeout),
+        signal: timeout,
       });
       await answer.arrayBuffer();
       if (!answer.ok) throw new UploadBytesFailed(answer.status);
     } catch (err) {
       if (err instanceof UploadBytesFailed) throw err;
-      throw new UploadBytesFailed((err as { name?: unknown } | null)?.name === 'TimeoutError' ? 'TimeoutError' : 'transit');
+      // Only the timeout aborts this post, and the error an abort gives
+      // depends on the runtime and on when it lands: Node 22's fetch (22.12.0
+      // and 22.23.3 alike) gives an AbortError for a body not yet being read,
+      // where Node 24 gives the signal's TimeoutError. So the signal says
+      // whether it fired.
+      throw new UploadBytesFailed(timeout.aborted ? 'TimeoutError' : 'transit');
     }
   }
 
