@@ -36,8 +36,9 @@ function fakeSocket(): FakeSocket {
     async emitMessage(event) {
       if (!handler) throw new Error('no message handler registered');
       handler({ event, ack: async () => {} });
-      // handleMessageEvent runs inside a fire-and-forget async IIFE; give it
-      // a couple of ticks to resolve before the caller asserts.
+      // The adapter prepares the event and delivers it on its conversation's
+      // chain, which nothing here awaits; give that 20 ms before the caller
+      // asserts.
       await new Promise((r) => setTimeout(r, 20));
     },
   };
