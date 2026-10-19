@@ -15,10 +15,11 @@ import { FULL_GRANT, harness, initialize, until } from './harness.js';
  *  `entered` settles once the code under test has started waiting on it. */
 function held() {
   let release!: () => void;
+  let fail!: (error: Error) => void;
   let enter!: () => void;
-  const answered = new Promise<void>((resolve) => { release = resolve; });
+  const answered = new Promise<void>((resolve, reject) => { release = resolve; fail = reject; });
   const entered = new Promise<void>((resolve) => { enter = resolve; });
-  return { answered, release, entered, enter };
+  return { answered, release, fail, entered, enter };
 }
 type Held = ReturnType<typeof held>;
 
@@ -45,7 +46,8 @@ function adapter(holds: Record<string, Held> = {}) {
         looked.push(user);
         holds[user]?.enter();
         await holds[user]?.answered;
-        return { user: { name: user, real_name: user, profile: { display_name: user }, is_bot: false } };
+        const name = `${user}'s name`;
+        return { user: { name, real_name: name, profile: { display_name: name }, is_bot: false } };
       },
     },
   } as unknown as SlackWebLike;
@@ -122,11 +124,14 @@ test('a message that arrives once an earlier turn has finished still waits for t
 test("an ack still pending holds no delivery, and one that rejects isn't left unhandled", { timeout: 5000 }, async (t) => {
   const unhandled = unhandledRejections(t);
   const ack = held();
+  let rejected = 0;
   const { seen, emit, delivered } = adapter();
-  emit('C1', '1.0', 'U1', { ack: () => ack.answered });
-  emit('C1', '2.0', 'U2', { ack: async () => { throw new Error('the ack failed'); } });
+  emit('C1', '1.0', 'U1', { ack: () => { ack.enter(); return ack.answered; } });
+  emit('C1', '2.0', 'U2', { ack: async () => { rejected++; throw new Error('the ack failed'); } });
+  await ack.entered;
   await delivered(2);
   assert.deepEqual(seen, ['C1:1.0', 'C1:2.0']);
+  assert.equal(rejected, 1, "2.0's ack was called, and rejected");
   await settled();
   assert.deepEqual(unhandled, []);
   ack.release();
@@ -148,13 +153,14 @@ test("a preparation that fails before its turn isn't left unhandled, and is logg
   const unhandled = unhandledRejections(t);
   const errors = t.mock.method(console, 'error', () => {});
   const u1 = held();
-  const { seen, emit, delivered } = adapter({ U1: u1 });
+  const { seen, looked, emit, delivered } = adapter({ U1: u1 });
   emit('C1', '1.0', 'U1');
   // A file entry that isn't an object fails 2.0's preparation, after its
   // lookups and while 1.0 still waits for its own.
   emit('C1', '2.0', 'U2', { event: { files: [null] } });
   emit('C1', '3.0', 'U3');
   await settled();
+  assert.ok(looked.includes('U2'), "2.0's preparation ran, and failed, before its turn");
   assert.deepEqual(unhandled, []);
   assert.equal(errors.mock.callCount(), 0, '2.0 waits for its turn to be logged');
   u1.release();
@@ -163,7 +169,23 @@ test("a preparation that fails before its turn isn't left unhandled, and is logg
   assert.equal(errors.mock.callCount(), 1);
 });
 
-test('through the server, the host sees a conversation in arrival order, so a publish without a threadId follows the last message the host took, as #6 describes', { timeout: 10_000 }, async () => {
+test("a lookup that fails still delivers its message in its turn, with the user's id", { timeout: 5000 }, async () => {
+  const u1 = held();
+  const { slack, seen, emit, delivered } = adapter({ U1: u1 });
+  const authors: string[] = [];
+  slack.onMessage((m) => authors.push(m.authorName));
+  emit('C1', '1.0', 'U1');
+  emit('C1', '2.0', 'U2');
+  await u1.entered;
+  u1.fail(new Error('users.info failed'));
+  await delivered(2);
+  assert.deepEqual(seen, ['C1:1.0', 'C1:2.0']);
+  assert.deepEqual(authors, ['U1', "U2's name"]);
+});
+
+// main's rule, which #6 asks to change to the thread of the message being
+// answered: a publish without a threadId follows the last message the host took.
+test('through the server, the host sees a conversation in arrival order, so a publish without a threadId follows the last message the host took, the top-level one', { timeout: 10_000 }, async () => {
   const h = harness();
   const u1 = held();
   // White-box: the server's adapter and the adapter's client are private.

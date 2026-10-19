@@ -781,8 +781,9 @@ export class SlackAdapter {
     // different times, and a later message must not reach the host before an
     // earlier one. Preparing at arrival keeps one conversation's lookups side
     // by side, so a run of slow or failing ones costs the slowest, not their
-    // sum. From delivery on, the server keeps the same order with its own
-    // chain per conversation (setupSlackForwarding).
+    // sum, within the Web API client's 100 requests at once, which every
+    // conversation's lookups share. From delivery on, the server keeps the
+    // same order with its own chain per conversation (setupSlackForwarding).
     this.socket.on('message', ({ event, ack }) => {
       // Always ack first — Slack redelivers unacked envelopes.
       void Promise.resolve().then(() => ack()).catch(() => { /* ignore */ });

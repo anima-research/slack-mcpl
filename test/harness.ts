@@ -20,8 +20,9 @@ export const FULL_GRANT = [
 ];
 
 interface FakeSocket extends SlackSocketLike {
-  /** Simulate an incoming Socket Mode message event and wait for the
-   *  adapter's async handler to settle. */
+  /** Simulate an incoming Socket Mode message event, then wait 20 ms: long
+   *  enough for a delivery that waits on nothing, not for one held behind a
+   *  lookup. */
   emitMessage(event: Record<string, unknown>): Promise<void>;
 }
 

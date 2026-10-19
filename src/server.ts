@@ -1397,8 +1397,8 @@ export class SlackMcplServer {
       return { delivered: false, messageId: undefined };
     }
 
-    // Reply in the thread of the most recent incoming message on this
-    // conversation; top-level when it wasn't threaded.
+    // Reply in the thread of the last incoming message the host took from
+    // this conversation; top-level when it wasn't threaded.
     const threadTs = this.lastIncomingThreadTs.get(parsed.conversationId);
     Object.assign(published, { channelId: parsed.conversationId, threadTs });
     const result = await this.posting(text, () => this.slack.sendMessage(
