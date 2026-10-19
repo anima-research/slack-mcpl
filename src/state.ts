@@ -5,20 +5,28 @@
  * delete the ones the target checkpoint's state doesn't hold (best-effort).
  *
  * Checkpoints form a tree: each one's parent is the checkpoint current when it
- * was made, so a rollback starts a new branch from its target. An item
- * belongs to the first checkpoint made after it was sent, whose state is the
- * first to hold it. A checkpoint's state then holds the items that belong to
- * it or to a checkpoint before it on its branch, so a rollback can find them
- * whatever branch it comes from.
+ * was made, so a rollback starts a new branch from its target. The tree's root
+ * is made with the tracker, before anything is sent, so its state holds
+ * nothing. It is the parent of the first checkpoint a call returns, so a
+ * rollback to it deletes what the first call sent too, though a host learns it
+ * only as that parent. An item belongs to the first checkpoint made after it was
+ * sent, whose state is the first to hold it. A checkpoint's state then holds
+ * the items that belong to it or to a checkpoint before it on its branch, so a
+ * rollback can find them whatever branch it comes from.
  */
 
 import { randomUUID } from 'node:crypto';
 
 export interface SentMessage {
   kind: 'message';
-  /** Slack message ts. */
-  messageId: string;
+  /** Slack message ts. Absent for a post this server can't name: Slack's
+   *  answer named no message, or its call failed in a way that may have
+   *  posted it. No delete can name it, so a rollback says it may remain. */
+  messageId?: string;
   channelId: string;
+  /** For a post this server can't name, the thread it went into, if any:
+   *  fetch_thread finds a reply there, where fetch_history doesn't. */
+  threadTs?: string;
   content: string;
   timestamp: string;
   /** The first checkpoint made after it was sent; undefined until one is. */
@@ -47,10 +55,23 @@ export interface Checkpoint {
   parent: string | null;
 }
 
+/** A checkpoint's ID: a whole UUID, so no two checkpoints share one, which
+ *  would close a loop in the tree, and one from an earlier process isn't taken
+ *  for a checkpoint of this one. */
+const newCheckpointId = () => `chk_${randomUUID()}`;
+
 export class StateTracker {
   private sentItems: SentItem[] = [];
   private checkpoints: Map<string, Checkpoint> = new Map();
-  private currentCheckpoint: string | null = null;
+  private currentCheckpoint: string;
+
+  /** Starts the tree at its root, the state before anything was sent (the
+   *  module's account). */
+  constructor() {
+    const root = newCheckpointId();
+    this.checkpoints.set(root, { id: root, parent: null });
+    this.currentCheckpoint = root;
+  }
 
   /** Record a message we sent (so we can undo it on rollback). */
   recordSent(messageId: string, channelId: string, content: string): void {
@@ -58,6 +79,18 @@ export class StateTracker {
       kind: 'message',
       messageId,
       channelId,
+      content,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  /** Record a post this server can't name (SentMessage's messageId), with its
+   *  conversation and thread, where a rollback says the agent can find it. */
+  recordUnnamed(channelId: string, content: string, threadTs?: string): void {
+    this.sentItems.push({
+      kind: 'message',
+      channelId,
+      ...(threadTs ? { threadTs } : {}),
       content,
       timestamp: new Date().toISOString(),
     });
@@ -79,21 +112,21 @@ export class StateTracker {
   /** Forget a sent message deleted outside rollback, so no rollback deletes it
    *  again. An upload's sharing message stays with its file: a rollback that
    *  rolls the file back asks to delete the message too, and counts it
-   *  deleted when Slack answers message_not_found. */
+   *  deleted when Slack answers message_not_found. A post this server can't
+   *  name stays, since nothing tells it from the message deleted. */
   forgetSent(channelId: string, messageId: string): void {
     this.sentItems = this.sentItems.filter((m) => m.kind !== 'message' || m.channelId !== channelId || m.messageId !== messageId);
   }
 
-  /** Create a new checkpoint. Returns the checkpoint ID: a whole UUID, so no
-   *  two checkpoints share one, which would close a loop in the tree, and one
-   *  from an earlier process isn't taken for a checkpoint of this one. */
+  /** Create a new checkpoint, whose parent is the current one. Returns its
+   *  ID (newCheckpointId). */
   createCheckpoint(): string {
-    const id = `chk_${randomUUID()}`;
+    const id = newCheckpointId();
     this.checkpoints.set(id, { id, parent: this.currentCheckpoint });
     // The items no checkpoint covers yet are always the last ones recorded:
-    // recordSent and recordUploaded append, a rollback keeps only covered
-    // ones, and forgetSent keeps the order. So the walk stops at the first
-    // covered one.
+    // recordSent, recordUnnamed and recordUploaded append, a rollback keeps
+    // only covered ones, and forgetSent keeps the order. So the walk stops at
+    // the first covered one.
     for (let i = this.sentItems.length - 1; i >= 0 && this.sentItems[i].checkpoint === undefined; i--) {
       this.sentItems[i].checkpoint = id;
     }
@@ -102,7 +135,7 @@ export class StateTracker {
   }
 
   /** Get the current checkpoint ID. */
-  get current(): string | null {
+  get current(): string {
     return this.currentCheckpoint;
   }
 
@@ -125,11 +158,10 @@ export class StateTracker {
     return toDelete;
   }
 
-  /** Get the last checkpoint state (for returning to host in tool responses). */
-  getCheckpointState(): { checkpoint: string; parent: string | null } | null {
-    if (!this.currentCheckpoint) return null;
-    const cp = this.checkpoints.get(this.currentCheckpoint);
-    if (!cp) return null;
-    return { checkpoint: cp.id, parent: cp.parent };
+  /** The current checkpoint and its parent, the checkpoint before it, as a
+   *  messaging tool's result gives them to the host (MCPL §8.2). The root's
+   *  parent is null; every checkpoint a call makes has one. */
+  getCheckpointState(): { checkpoint: string; parent: string | null } {
+    return { checkpoint: this.currentCheckpoint, parent: this.checkpoints.get(this.currentCheckpoint)!.parent };
   }
 }

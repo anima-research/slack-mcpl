@@ -9,7 +9,8 @@ import http from 'node:http';
 export interface SlackApiAnswer {
   status?: number;
   headers?: Record<string, string>;
-  body: Record<string, unknown>;
+  /** Sent as JSON. null sends the JSON body null, as a broken proxy might. */
+  body: Record<string, unknown> | null;
   /** How long to take before answering, in ms. */
   delayMs?: number;
   /** Answer only once this settles, then after delayMs: for a test that
