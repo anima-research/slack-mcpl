@@ -24,6 +24,7 @@ test('rollback deletes an uploaded file and later message, preserving the checkp
   await ready(h);
   const before = await call(h.host, 'send_message', { channelId: 'C1', content: 'before' });
   const uploaded = await call(h.host, 'upload_file', uploadArgs);
+  assert.deepEqual(JSON.parse(uploaded.content[0].text), { fileId: 'F1' });
   assert.ok(uploaded.state?.checkpoint, 'an upload returns a checkpoint');
   await call(h.host, 'send_message', { channelId: 'C1', content: 'after' });
   const rollback = await h.host.sendRequest(method.STATE_ROLLBACK, {
@@ -87,7 +88,7 @@ test('upload_file belongs to slack.messaging and cannot upload while that featur
     "upload_file is turned off on this host: the host's policy hasn't enabled its feature set, slack.messaging, so " +
       "nothing ran, and calling again won't change that until the host enables it.",
   );
-  assert.deepEqual(h.uploads, []);
+  assert.deepEqual(h.uploadsBegun, [], 'no upload was begun, so no bytes went either');
 });
 
 test('SLACK_DISABLE_DMS refuses an upload before Slack receives file bytes', async (t) => {
@@ -101,7 +102,7 @@ test('SLACK_DISABLE_DMS refuses an upload before Slack receives file bytes', asy
     'Nothing was uploaded: D1 is a direct message or group DM, and this bot works only in channels here, since ' +
       'direct messages are turned off. list_channels shows the ones it can use.',
   );
-  assert.deepEqual(h.uploads, []);
+  assert.deepEqual(h.uploadsBegun, [], 'no upload was begun, so no bytes went either');
 });
 
 test('a successful upload clears the acknowledgement reaction', async (t) => {
@@ -132,9 +133,36 @@ test('a refused upload keeps the acknowledgement reaction, which only a confirme
   await until(() => h.reactions.includes('remove:C1:111.1:eyes'), 'ack removal');
 });
 
+test('an upload whose last answer names no file keeps the acknowledgement reaction', async (t) => {
+  const h = harness({ ackReaction: 'eyes' });
+  t.after(() => h.close());
+  await ready(h);
+  await h.socket.emitMessage(MENTION_EVENT);
+  await until(() => h.reactions.includes('add:C1:111.1:eyes'), 'ack reaction');
+  const unconfirmed = await call(h.host, 'upload_file', { ...uploadArgs, title: 'unconfirmed' });
+  assert.equal(unconfirmed.isError, true);
+  // As for a refused upload, a removal the call started would be recorded by
+  // now.
+  assert.ok(!h.reactions.includes('remove:C1:111.1:eyes'), 'the reaction stays');
+});
+
+test("deleting an upload's sharing message leaves its file for a rollback to delete", async (t) => {
+  const h = harness();
+  t.after(() => h.close());
+  await ready(h);
+  const before = await call(h.host, 'send_message', { channelId: 'C1', content: 'before' });
+  await call(h.host, 'upload_file', uploadArgs);
+  assert.notEqual((await call(h.host, 'delete_message', { channelId: 'C1', messageId: '900.1' })).isError, true);
+  const rollback = await h.host.sendRequest(method.STATE_ROLLBACK, {
+    featureSet: MESSAGING_FEATURE_SET, checkpoint: before.state!.checkpoint,
+  }) as { success: boolean };
+  assert.equal(rollback.success, true);
+  assert.deepEqual(h.deletedFiles, ['F1']);
+});
+
 test('rollback reports a failed file deletion while still deleting its sharing message and later messages', async (t) => {
   const fake = fakeSlack();
-  t.mock.method(fake.slack, 'deleteFile', async () => { throw new Error('Slack refused file deletion'); });
+  t.mock.method(fake.slack, 'deleteFile', async () => { throw new Error('the file deletion failed'); });
   const h = connectHost(new SlackMcplServer(fake.slack));
   t.after(() => h.close());
   await ready(h);
@@ -145,7 +173,9 @@ test('rollback reports a failed file deletion while still deleting its sharing m
     featureSet: MESSAGING_FEATURE_SET, checkpoint: before.state!.checkpoint,
   }) as { success: boolean; reason?: string };
   assert.equal(rollback.success, true, 'rollback retains the existing best-effort contract');
-  assert.equal(rollback.reason, 'Rolled back (2/2 messages and 0/1 files deleted)');
+  // An error that isn't Slack's refusal leaves the file as one that may remain.
+  assert.equal(rollback.reason, 'Rolled back (2/2 messages and 0/1 files deleted). May remain: file F1 in C1. No rollback tries these ' +
+    "again: no tool here deletes a file, and whoever runs this host can delete it with Slack's files.delete, by its id");
   assert.deepEqual(ts(fake.deletedMessages), ['900.1', '100.2']);
 });
 

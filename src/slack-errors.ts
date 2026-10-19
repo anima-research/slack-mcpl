@@ -16,18 +16,22 @@
  * (`slack_webapi_request_error`, or `slack_webapi_http_error` with the HTTP
  * status), which leaves a write's outcome unknown, unless the connection
  * couldn't be made at all, which Node's code on the request error's
- * `original` tells. Four more are this server's own: a request its call's
+ * `original` tells. Five more are this server's own: a request its call's
  * deadline left no time to send (OutOfCallTime), fetch_attachment's download
- * running past its timeout, a failed post of an upload's bytes to Slack's
+ * running past its timeout, a listing the token's scopes leave no type to ask
+ * for (NoReadableConversations), a failed post of an upload's bytes to Slack's
  * upload server (UploadBytesFailed), and an upload whose last step named no file
  * (UploadNotConfirmed). Each refusal code here is one Slack's
- * reference documents for a method these tools call. Other errors, and codes
- * not listed, pass through unchanged.
+ * reference documents for a method these tools call. A refusal whose code
+ * isn't in Slack's form, as the client reads a body such as an HTML page, is
+ * read as an answer that shows nothing about what Slack did. Other errors,
+ * and codes not listed, pass through unchanged.
  */
 import { ErrorCode } from '@slack/web-api';
 import { connectionNeverMade, reactionName } from './content.js';
 import {
   CALL_SECONDS,
+  NoReadableConversations,
   OutOfCallTime,
   SLACK_CLIENT_OPTIONS,
   UploadBytesFailed,
@@ -88,6 +92,22 @@ const TS_FORM = 'which looks like 1718000000.000100';
 
 /** Slack's answers that the message or thread a call named isn't one. */
 const THREAD_REFUSALS = new Set(['thread_not_found', 'message_not_found', 'bad_timestamp']);
+/** What each of a workspace's settings that refuse an upload allows, as
+ *  Slack's pages for files.getUploadURLExternal and
+ *  files.completeUploadExternal describe it. */
+const UPLOAD_SETTINGS: Record<string, string> = {
+  file_uploads_disabled: "don't allow file uploads",
+  file_uploads_except_images_disabled: 'allow only image uploads',
+  file_type_not_allowed: "don't allow this type of file",
+  file_upload_size_restricted: 'restrict uploads of large files',
+};
+/** What may still go under a setting, where the setting says what may.
+ *  file_type_not_allowed gets nothing, so the text doesn't hint at a way round
+ *  the workspace's rule. */
+const UPLOAD_SETTING_REMEDIES: Record<string, string> = {
+  file_uploads_except_images_disabled: ' An image file may go.',
+  file_upload_size_restricted: ' A smaller file may go.',
+};
 
 export function explainSlackError(err: unknown, call: SlackCall): string {
   const carried = (err as { message?: unknown } | null)?.message;
@@ -191,10 +211,12 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
     const unshared = "Slack shares a file only at the upload's last step, which wasn't sent";
     if (err.why === 'TimeoutError') {
       // The timeout covers the whole post: the bytes, the answer and its body.
+      // The bytes may have reached the server, so this says only that the
+      // post didn't finish.
       return (
-        `${lead}: Slack's upload server didn't take the file's bytes and answer within ${seconds} seconds. ` +
+        `${lead}: the post of the file's bytes to Slack's upload server didn't finish within ${seconds} seconds. ` +
         `${unshared}, so calling again is safe. If it keeps timing out, Slack's upload server or this server's ` +
-        `connection to it is too slow to take this file within ${seconds} seconds: a smaller file may go through, ` +
+        `connection to it is too slow for this file within ${seconds} seconds: a smaller file may go through, ` +
         'and whoever runs this host can look into the connection.'
       );
     }
@@ -214,6 +236,16 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
       `had used ${err.usedSeconds} of them, waiting behind earlier calls or on its own earlier requests, so too ` +
       `few were left to send this request to Slack. It wasn't sent, so calling again is safe.` +
       startsOver(`a call's ${CALL_SECONDS} seconds`)
+    );
+  }
+  if (err instanceof NoReadableConversations) {
+    // Not sent: Slack refuses a listing for a type whose read scope the token
+    // lacks, and the scopes Slack last reported read none of them. Its message,
+    // which the answer opens with, names the read scopes.
+    return (
+      `${lead}: Slack lists each kind of conversation only for a token with that kind's read scope. Calling ` +
+      "again won't change that: whoever runs this host has to add one of those scopes to the app's bot token " +
+      'scopes and reinstall the app to the workspace.'
     );
   }
   if (call.tool === 'fetch_attachment' && (err as { name?: unknown } | null)?.name === 'TimeoutError') {
@@ -247,6 +279,15 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
     return mayHaveWritten ? unknown(cause) : `${lead}: ${cause}. Try again shortly.`;
   }
   const code = slackRefusal(err);
+  // An answer the client reads as a refusal but whose code isn't in Slack's
+  // form, such as an HTML page, shows nothing about what Slack did.
+  if (code === undefined && e?.code === ErrorCode.PlatformError) {
+    const cause = "Slack answered in a form this server can't read";
+    return mayHaveWritten
+      ? unknown(cause)
+      : `${lead}: ${cause}. Try again shortly. If it keeps failing, whoever runs this host has to check its ` +
+          'connection to Slack.';
+  }
   if (code === undefined) return undefined;
   const messageIds = call.tool === 'reply_message' || call.tool === 'fetch_thread' || call.tool === 'upload_file' ? PARENT_IDS : MESSAGE_IDS;
 
@@ -421,6 +462,28 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
         'Slack failed while handling the call',
         code === 'internal_error' || code === 'fatal_error' ? ' (Slack says part of a call can take effect before this error)' : '',
       );
+    case 'file_not_found':
+      // files.completeUploadExternal's: "Could not find the file from the
+      // upload ticket."
+      return call.tool === 'upload_file'
+        ? `${lead}: Slack couldn't find the file this upload's first step set up. Calling again starts a new upload.`
+        : undefined;
+    // A workspace's refusals of an upload, which last until its admins change
+    // them (R1-2). files.getUploadURLExternal documents all five, and
+    // files.completeUploadExternal the two about file types.
+    case 'file_uploads_disabled':
+    case 'file_uploads_except_images_disabled':
+    case 'file_type_not_allowed':
+    case 'file_upload_size_restricted':
+      return call.tool === 'upload_file'
+        ? `${lead}: this workspace's settings ${UPLOAD_SETTINGS[code]} (${code}). Calling again won't change that; ` +
+            `the workspace's admins can.${UPLOAD_SETTING_REMEDIES[code] ?? ''}`
+        : undefined;
+    case 'storage_limit_reached':
+      return call.tool === 'upload_file'
+        ? `${lead}: this workspace has reached its file storage limit (${code}). Calling again won't change that; ` +
+            "the workspace's admins can."
+        : undefined;
     case 'user_not_found':
       return (
         `${lead}: Slack has no user ${userId ?? 'by the id given'}. ${RECALLED}. find_user returns each ` +

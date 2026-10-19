@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { SlackAdapter } from '../src/slack-adapter.js';
 import { SlackMcplServer } from '../src/server.js';
+import { toolDefinitions } from '../src/tools.js';
 import { connectHost, initialize, uploadEndpoint } from './harness.js';
 
 /** The documented inline limit: 5 MiB of file bytes. */
@@ -47,7 +48,7 @@ test('upload handler requires exactly one content argument', async (t) => {
   for (const args of [{}, { content: 'hello', contentBase64: 'aGVsbG8=' }, { content: '', contentBase64: 'aGVsbG8=' }, { content: null, contentBase64: null }]) {
     const result = await call(args);
     assert.equal(result.isError, true);
-    assert.match(result.content[0].text, /exactly one of content or contentBase64/);
+    assert.equal(result.content[0].text, 'Nothing was uploaded: pass exactly one of content or contentBase64');
   }
   assert.equal(asked.length, 0);
 });
@@ -75,12 +76,44 @@ test('upload handler requires a filename', async (t) => {
   assert.equal(asked.length, 0);
 });
 
+test('upload handler requires a conversation', async (t) => {
+  const { asked, call } = await fixture(t);
+  for (const [channelId, passed] of [[undefined, 'left it out'], ['', 'passed an empty string'], [42, 'passed a number']]) {
+    const result = await call({ channelId, content: 'hello' });
+    assert.equal(result.isError, true);
+    assert.equal(
+      result.content[0].text,
+      `Nothing was done: channelId must be a non-empty string, and this call ${passed}. list_channels shows each ` +
+        "conversation's id.",
+    );
+  }
+  assert.equal(asked.length, 0);
+});
+
+test("upload_file's schema names what its handler reads: these arguments, each a string, two of them required, each refused when it isn't one", async (t) => {
+  const schema = toolDefinitions.find((d) => d.name === 'upload_file')!.inputSchema as {
+    properties: Record<string, { type: string }>; required: string[];
+  };
+  assert.deepEqual(Object.keys(schema.properties).sort(), ['channelId', 'comment', 'content', 'contentBase64', 'filename', 'messageId', 'title']);
+  assert.deepEqual([...schema.required].sort(), ['channelId', 'filename']);
+  const { asked, call } = await fixture(t);
+  for (const [name, property] of Object.entries(schema.properties)) {
+    assert.equal(property.type, 'string', name);
+    // A number where the schema says a string is refused as one; contentBase64
+    // goes alone, since with content the call is refused for giving both.
+    const result = await call(name === 'contentBase64' ? { [name]: 17 } : { content: 'hello', [name]: 17 });
+    assert.equal(result.isError, true, name);
+    assert.match(result.content[0].text, new RegExp(`${name} must be a (non-empty )?string`), name);
+  }
+  assert.equal(asked.length, 0);
+});
+
 test('upload handler refuses empty content with an explicit empty-content error', async (t) => {
   const { asked, call } = await fixture(t);
   for (const key of ['content', 'contentBase64']) {
     const result = await call({ [key]: '' });
     assert.equal(result.isError, true);
-    assert.match(result.content[0].text, new RegExp(`^${key} is empty: give the file's content, at least one byte`));
+    assert.equal(result.content[0].text, `Nothing was uploaded: ${key} is empty: give the file's content, at least one byte`);
   }
   assert.equal(asked.length, 0);
 });
@@ -91,7 +124,7 @@ test('upload handler refuses non-string content before Slack', async (t) => {
     for (const value of [123, {}, ['hello']]) {
       const result = await call({ [key]: value });
       assert.equal(result.isError, true);
-      assert.match(result.content[0].text, new RegExp(`${key} must be a string`));
+      assert.equal(result.content[0].text, `Nothing was uploaded: ${key} must be a string`);
     }
   }
   assert.equal(asked.length, 0);
@@ -103,7 +136,7 @@ test('an optional argument that is not a string is refused before Slack, not dro
     for (const value of [17, true, {}, ['1.0']]) {
       const result = await call({ content: 'hello', [key]: value });
       assert.equal(result.isError, true, `${key}: ${JSON.stringify(value)}`);
-      assert.match(result.content[0].text, new RegExp(`^${key} must be a string`));
+      assert.equal(result.content[0].text, `Nothing was uploaded: ${key} must be a string`);
     }
   }
   assert.equal(asked.length, 0);
@@ -114,12 +147,12 @@ test('text holding a lone UTF-16 surrogate is refused before Slack, and a whole 
   for (const content of ['\uD800', 'a\uDC00b', 'x\uD83D']) {
     const result = await call({ content });
     assert.equal(result.isError, true, JSON.stringify(content));
-    assert.match(result.content[0].text, /^content holds a lone UTF-16 surrogate, which UTF-8 can't encode: remove it, or pass the file's bytes as contentBase64/);
+    assert.match(result.content[0].text, /^Nothing was uploaded: content holds a lone UTF-16 surrogate, which UTF-8 can't encode: remove it, or pass the file's bytes as contentBase64/);
   }
   for (const key of ['filename', 'title', 'comment']) {
     const result = await call({ content: 'a', [key]: 'x\uD800y' });
     assert.equal(result.isError, true, key);
-    assert.match(result.content[0].text, new RegExp(`^${key} holds a lone UTF-16 surrogate, which UTF-8 can't encode: remove it from the`));
+    assert.match(result.content[0].text, new RegExp(`^Nothing was uploaded: ${key} holds a lone UTF-16 surrogate, which UTF-8 can't encode: remove it from the`));
   }
   assert.equal(asked.length, 0);
   assert.notEqual((await call({ content: 'smile \uD83D\uDE00' })).isError, true);
@@ -133,7 +166,8 @@ test('upload handler refuses malformed and noncanonical base64 before Slack', as
   for (const contentBase64 of ['data:text/plain;base64,aGVsbG8=', 'aGVsbG8=!', 'aGVs\nbG8=', 'aGVs\nbG8gd29ybGQ', 'aGVsbG8', 'a===', '====', 'aGVsbG8==', 'Zh==', 'SGVsbG_=', ' ']) {
     const result = await call({ contentBase64 });
     assert.equal(result.isError, true, contentBase64);
-    assert.match(result.content[0].text, /canonical RFC 4648 base64 with padding, on one line: no line breaks, spaces or data URI/);
+    assert.equal(result.content[0].text,
+      'Nothing was uploaded: contentBase64 must be canonical RFC 4648 base64 with padding, on one line: no line breaks, spaces or data URI');
   }
   assert.equal(asked.length, 0);
 });
@@ -148,7 +182,7 @@ test('upload handler enforces the inline cap on UTF-8 bytes and decoded base64 b
   ]) {
     const result = await call(args);
     assert.equal(result.isError, true);
-    assert.match(result.content[0].text, /^inline file too large: \d+ bytes, past this server's inline limit of \d+ bytes, so upload_file can't send it\. A smaller file can go/);
+    assert.match(result.content[0].text, /^Nothing was uploaded: inline file too large: \d+ bytes, past this server's inline limit of \d+ bytes, so upload_file can't send it\. A smaller file can go/);
   }
   assert.equal(asked.length, 0);
   // Base64's encoded representation exceeds the cap; its decoded bytes do not.
@@ -156,6 +190,30 @@ test('upload handler enforces the inline cap on UTF-8 bytes and decoded base64 b
   const result = await call({ contentBase64: atLimit.toString('base64') });
   assert.notEqual(result.isError, true);
   assert.deepEqual(bytes(1), atLimit);
+});
+
+test("content past the cap, and contentBase64 longer than the cap's own base64, are refused before they're made into bytes (R1-1)", async (t) => {
+  const { asked, call } = await fixture(t);
+  const base64Cap = Math.ceil(LIMIT / 3) * 4;
+  for (const [key, input, says] of [
+    ['content', 'é'.repeat(LIMIT / 2 + 1), `inline file too large: ${LIMIT + 2} bytes, past this server's inline limit of ${LIMIT} bytes`],
+    ['contentBase64', 'A'.repeat(base64Cap + 4), `inline file too large: contentBase64 is ${base64Cap + 4} characters, and ` +
+      `canonical base64 longer than ${base64Cap} characters holds more than this server's inline limit of ${LIMIT} bytes`],
+  ] as const) {
+    // Buffer.from, watched for the input itself.
+    const made: string[] = [];
+    const from = Buffer.from;
+    const watched = t.mock.method(Buffer, 'from', function (this: unknown, ...args: unknown[]) {
+      if (args[0] === input) made.push(key);
+      return (from as (...a: unknown[]) => Buffer).apply(this, args);
+    });
+    const result = await call({ [key]: input });
+    watched.mock.restore();
+    assert.equal(result.isError, true);
+    assert.ok(result.content[0].text.startsWith(`Nothing was uploaded: ${says}`), result.content[0].text);
+    assert.deepEqual(made, [], 'the input was never made into bytes');
+  }
+  assert.equal(asked.length, 0);
 });
 
 test('upload handler preserves valid text, binary base64 and optional metadata, through the three steps', async (t) => {

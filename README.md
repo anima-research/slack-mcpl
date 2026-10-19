@@ -16,7 +16,7 @@ that grant arrives; plain MCP tool calls are unaffected.
 
 ## Features
 
-- **Channels**: every conversation the bot can act in is registered as an MCPL channel (`slack:<conversationId>`) when the host grants `channels.register`, and `refresh_channels` registers ones joined since. `channels/publish` posts in the thread of the last message the server passed to the host from that conversation, which can change while the agent is answering. Use [`reply_message` for an explicit thread](#reply-to-a-specific-thread).
+- **Channels**: every conversation the bot can act in, of each kind its token has the read scope for, is registered as an MCPL channel (`slack:<conversationId>`) when the host grants `channels.register`, and `refresh_channels` registers ones joined since. `channels/publish` posts in the thread of the last message the server passed to the host from that conversation, which can change while the agent is answering. Use [`reply_message` for an explicit thread](#reply-to-a-specific-thread).
 - **Real-time events** via Socket Mode — no public webhook URL needed, so the
   server can be spawned over stdio like any other MCPL server.
 - **Addressing model**: mentions (`<@bot>`) and DMs are always delivered;
@@ -74,7 +74,10 @@ with padding where required, and no whitespace or data-URI prefix). The
 content must be nonempty. This server limits inline content to 5 MiB
 (5,242,880 bytes), measured after UTF-8 encoding or base64 decoding; this is
 the server's inline limit, not Slack's file-size limit. The tool accepts
-inline content only. Operators can separately enable the path modes below.
+inline content only. An agent writes the whole file out as the tool's
+arguments, so the content goes through the model's own output, and
+`contentBase64` suits small binary files. Operators can separately enable the
+path modes below, whose bytes never pass through the model.
 
 Optional `messageId` selects the thread root (the message's `thread=` value,
 or its `id=` when it has no `thread=`). `title` names the
@@ -89,7 +92,7 @@ upload URL and the file's ID, the file's bytes go to that URL, and
 the last step, so an upload that fails before it shared nothing and can be
 called again. When the last step fails, its error says whether the file may
 have been shared anyway, and if it may, what to check before uploading again;
-a refusal this server doesn't recognize passes through as Slack gave it.
+an error this server doesn't recognize passes through as it came.
 
 Uploads belong to `slack.messaging` checkpoints, so rollback attempts to
 delete them along with later messages: the file, through Slack's file
@@ -97,11 +100,13 @@ deletion API, and the message that shared it, which holds the comment, when
 Slack's answer named that message. When it didn't, the rollback's answer says
 the comment may remain, and that `delete_message` may delete it. An upload
 that failed after Slack gave the file its ID is rolled back the same way.
-Rollback is best-effort and reports partial failures, by kind;
-checkpoint history is kept in memory across host reconnects, but does not
-survive a server restart. As with message rollback, failed deletions are
-logged and reported in the partial count, but are not retained for another
-rollback attempt.
+Rollback is best-effort and reports partial failures by kind, naming each
+message and file it couldn't delete, with its conversation, and apart from
+the rest those Slack refused to delete for good; checkpoint
+history is kept in memory across host reconnects, but does not survive a
+server restart. As with message rollback, failed deletions are logged and
+reported in the rollback's answer, but are not retained for another rollback
+attempt.
 
 **Operators:** the bot token needs `files:write`. After adding that scope to
 an existing Slack app, reinstall the app to the workspace through Slack's
