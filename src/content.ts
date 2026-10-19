@@ -293,6 +293,13 @@ export interface SlackUserInfoClient {
  *  couldn't take then, which say nothing about what the call asked for. */
 export const SLACK_FAILED = new Set(['internal_error', 'fatal_error', 'service_unavailable', 'request_timeout', 'ratelimited']);
 
+/** The form of Slack's error codes. web-api 7.19.0 reads an answer whose body
+ *  isn't JSON as a refusal whose code is the body itself (buildResult, in
+ *  dist/WebClient.js), which shows nothing about what Slack did, so a code
+ *  of any other form isn't Slack's. A body that is itself one such word
+ *  reads exactly as a refusal of Slack's carrying only that code. */
+export const SLACK_CODE = /^[a-z0-9_]+$/;
+
 /** Node's codes for a connection never made, which the client's request error
  *  keeps on `original`: nothing reached Slack, so nothing was done. Every code
  *  the resolver reports (ENOTFOUND, and EAI_AGAIN, EAI_FAIL and the other EAI_
@@ -308,10 +315,10 @@ export const connectionNeverMade = (nodeCode: unknown): boolean =>
  * is: a refusal answers for the user, the app's scopes or token, or the
  * workspace's settings, which seldom change while the process runs, and a
  * restart asks again, as it does for a renamed user. A lookup that fails
- * otherwise (a rate limit, a failure in transit, or Slack failing) isn't
- * cached, so the next message that names the user asks again; meanwhile
- * callers show the raw ID (best-effort). Returns the error of each lookup
- * left uncached, by user ID.
+ * otherwise (a rate limit, a failure in transit, Slack failing, or an answer
+ * not in Slack's form) isn't cached, so the next message that names the user
+ * asks again; meanwhile callers show the raw ID (best-effort). Returns the
+ * error of each lookup left uncached, by user ID.
  */
 export async function resolveSlackUserNames(
   client: SlackUserInfoClient,
@@ -330,9 +337,10 @@ export async function resolveSlackUserNames(
         const { user } = await client.users.info({ user: id });
         cache.set(id, user?.profile?.display_name || user?.real_name || user?.name || id);
       } catch (err) {
-        // Slack's own answer is in data.error (the client's platform error).
+        // Slack's own answer is in data.error (the client's platform error),
+        // when its code is in Slack's form.
         const refused = (err as { data?: { error?: unknown } } | null)?.data?.error;
-        if (typeof refused === 'string' && !SLACK_FAILED.has(refused)) cache.set(id, id);
+        if (typeof refused === 'string' && SLACK_CODE.test(refused) && !SLACK_FAILED.has(refused)) cache.set(id, id);
         else failed.set(id, err);
       }
     }));

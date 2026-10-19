@@ -16,12 +16,14 @@ import {
   OutOfCallTime,
   SLACK_CLIENT_OPTIONS,
   SlackAdapter,
+  SlackWebClient,
+  slackRefusal,
   type SlackSocketLike,
   type SlackWebLike,
 } from '../src/slack-adapter.js';
 import { SlackMcplServer } from '../src/server.js';
 import { toolDefinitions } from '../src/tools.js';
-import { connectHost, initialize, FULL_GRANT } from './harness.js';
+import { connectHost, nonJsonSlackApiUrl, initialize, FULL_GRANT } from './harness.js';
 import { fakeSlackApi, silentSlackApi, unreachableSlackApiUrl, type FakeSlackApi } from './slackApi.js';
 
 let api: FakeSlackApi;
@@ -29,6 +31,10 @@ let client: WebClient;
 
 before(async () => {
   api = await fakeSlackApi();
+  // An upload's first two steps succeed, so its tests reach
+  // files.completeUploadExternal, whose answer each test gives.
+  api.answerFor('files.getUploadURLExternal', { body: { ok: true, file_id: 'FTEST', upload_url: `${api.url}file-upload` } });
+  api.answerFor('file-upload', { body: { ok: true } });
   client = new WebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: api.url });
 });
 
@@ -86,6 +92,7 @@ const CALLS: Array<[tool: string, lead: string, writes: boolean]> = [
   ['reply_message', 'Nothing was posted', true],
   ['channels/publish', 'Nothing was posted', true],
   ['send_dm', 'Nothing was sent', true],
+  ['upload_file', 'Nothing was uploaded', true],
   ['edit_message', "The message wasn't changed", true],
   ['delete_message', 'Nothing was deleted', true],
   ['add_reaction', 'No reaction was added', true],
@@ -521,12 +528,44 @@ test("other errors and other codes pass through unchanged, and a read's still sa
     explainSlackError(reacted, { tool: 'add_reaction', args: { channelId: 'C1', messageId: '1.1', emoji: 'eyes' } }),
     'An API error occurred: already_reacted',
   );
+  // file_not_found is explained for an upload's last step alone; chat.update's
+  // passes through.
+  assert.equal(
+    await explain('file_not_found', 'edit_message', { channelId: 'C1', messageId: '1.1', content: 'hi' }),
+    'An API error occurred: file_not_found',
+  );
+  // So are a workspace's refusals of an upload, which no other tool gets.
+  for (const code of ['file_uploads_disabled', 'storage_limit_reached']) {
+    assert.equal(await explain(code, 'send_message', { channelId: 'C1', content: 'hi' }), `An API error occurred: ${code}`);
+  }
   const local = new Error('channelId is required');
   assert.equal(explainSlackError(local, { tool: 'send_message', args: {} }), 'channelId is required');
   // A refusal's shape without the client's code is not read as one.
   const lookalike = Object.assign(new Error('An API error occurred: channel_not_found'), { data: { error: 'channel_not_found' } });
   assert.equal(explainSlackError(lookalike, { tool: 'send_message', args: { channelId: 'C1' } }), lookalike.message);
   assert.equal(explainSlackError('a string', { tool: 'send_message', args: {} }), 'a string');
+});
+
+test("a body that is one lowercase word reads as Slack's refusal, as the shape rule takes it (R1-4)", async (t) => {
+  const err = await clientError(new WebClient('xoxb-test', {
+    ...SLACK_CLIENT_OPTIONS, slackApiUrl: await nonJsonSlackApiUrl(t, 'upstream_error'),
+  }));
+  assert.equal(slackRefusal(err), 'upstream_error');
+  assert.equal(explainSlackError(err, { tool: 'send_message', args: { channelId: 'C1', content: 'hi' } }), 'An API error occurred: upstream_error');
+});
+
+test("an answer that isn't in Slack's form leaves a write's outcome unknown, and another call says to try again", async (t) => {
+  // A body that isn't JSON, such as a proxy's page, which the client reads as
+  // a refusal whose code is the body itself.
+  const err = await clientError(new WebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: await nonJsonSlackApiUrl(t) }));
+  const posted = explainSlackError(err, { tool: 'send_message', args: { channelId: 'C1', content: 'hi' } });
+  assert.ok(posted.endsWith(
+    "\n\nSlack answered in a form this server can't read, so whether the message was posted is unknown. Check " +
+      "fetch_history for conversation C1 before posting again, so it isn't posted twice."), posted);
+  const listed = explainSlackError(err, { tool: 'list_channels', args: {} });
+  assert.ok(listed.endsWith(
+    "\n\nNothing was listed: Slack answered in a form this server can't read. Try again shortly. If it keeps failing, " +
+      'whoever runs this host has to check its connection to Slack.'), listed);
 });
 
 const socket: SlackSocketLike = { on() {}, async start() {}, async disconnect() {} };
@@ -564,6 +603,53 @@ test("a tool's refusal reaches the agent explained, still marked as an error", a
     /^An API error occurred: channel_not_found\n\nNothing was posted: Slack doesn't know conversation C0NOPE/,
   );
   await h.close();
+});
+
+test("an upload refusal reaches the agent with an upload-specific explanation", async () => {
+  // The adapter's own client, which marks each error with its request, as
+  // connectSlack builds it: the last step's errors read as the sharing's.
+  const own = new SlackWebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: api.url });
+  const slack = new SlackAdapter(own as unknown as SlackWebLike, socket, 'UBOT', 'acme');
+  const h = connectHost(new SlackMcplServer(slack));
+  await initialize(h, false);
+  try {
+    for (const [error, messageId] of [
+      ['missing_scope', undefined],
+      ['not_in_channel', undefined],
+      ['internal_error', undefined],
+      ['internal_error', '1.7'],
+    ] as const) {
+      api.answerFor('files.completeUploadExternal', { body: { ok: false, error, needed: 'files:write' } });
+      const result = (await h.host.sendRequest('tools/call', {
+        name: 'upload_file',
+        arguments: { channelId: 'CFILES', filename: 'report.txt', content: 'report', ...(messageId ? { messageId } : {}) },
+      })) as { isError?: boolean; content: { text: string }[] };
+      assert.equal(result.isError, true);
+      assert.equal(api.calls.at(-1), 'files.completeUploadExternal');
+      const text = result.content[0].text;
+      assert.ok(text.startsWith(`An API error occurred: ${error}\n\n`), text);
+      assert.doesNotMatch(text, /Nothing was done|Nothing was sent|the message was posted/);
+      if (error === 'internal_error') {
+        assert.match(text, /whether the file was shared is unknown/);
+        assert.doesNotMatch(text, /Nothing was (uploaded|shared)/);
+        assert.ok(text.includes(messageId
+          ? 'fetch_thread for the thread under message 1.7 in conversation CFILES'
+          : 'fetch_history for conversation CFILES'), text);
+        assert.match(text, /before uploading again, so it isn't shared twice\.$/);
+      } else {
+        // The last step shares the file, so its refusal shared nothing.
+        assert.match(text, /\n\nNothing was shared: /);
+        if (error === 'missing_scope') assert.match(text, /Slack names files:write/);
+        else {
+          assert.match(text, /Slack didn't let it share the file there/);
+          assert.doesNotMatch(text, /chat:write.public/);
+        }
+      }
+    }
+  } finally {
+    api.answerFor('files.completeUploadExternal');
+    await h.close();
+  }
 });
 
 test('an emoji Slack refuses is named as add_reaction sent it', async () => {

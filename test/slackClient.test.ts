@@ -24,6 +24,7 @@ import {
   outsideCallTime,
   slackClients,
   stderrLogger,
+  waitToAskAgain,
   withCallTime,
   type SlackSocketLike,
   type SlackWebLike,
@@ -31,7 +32,7 @@ import {
 import { SlackMcplServer } from '../src/server.js';
 import { explainSlackError } from '../src/slack-errors.js';
 import { resolveSlackUserNames, type SlackUserInfoClient } from '../src/content.js';
-import { FULL_GRANT, connectHost, initialize, until } from './harness.js';
+import { FULL_GRANT, connectHost, nonJsonSlackApiUrl, initialize, until } from './harness.js';
 import { fakeSlackApi, silentSlackApi, unreachableSlackApiUrl, type FakeSlackApi, type SlackApiAnswer } from './slackApi.js';
 
 let api: FakeSlackApi;
@@ -564,12 +565,46 @@ test('a user Slack refuses to look up is kept as the id, and a lookup that fails
   assert.equal(cache.get('U2'), 'ann');
 });
 
+test("a lookup answered in a form Slack doesn't use isn't a refusal, so it isn't kept and is asked again", { timeout: 5000 }, async (t) => {
+  const page = new WebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: await nonJsonSlackApiUrl(t) });
+  const cache = new Map<string, string>();
+  const failed = await resolveSlackUserNames(page as unknown as SlackUserInfoClient, cache, ['U3']);
+  assert.equal(cache.has('U3'), false, 'the name is still unknown, not the id');
+  assert.ok(failed.has('U3'), 'and its error comes back to the caller');
+});
+
+test("work no call waits on waits after an answer in a form Slack doesn't use, as after an HTTP error, and asks again", { timeout: 5000 }, async (t) => {
+  const page = new WebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: await nonJsonSlackApiUrl(t) });
+  const { err } = await failure(() => page.conversations.list({}));
+  assert.deepEqual(waitToAskAgain(err, 'conversations.list'), { method: 'conversations.list', seconds: 30, why: 'failed' });
+});
+
+test("with DMs off, a conversation check answered in a form Slack doesn't use writes nothing, and says to try again", { timeout: 5000 }, async (t) => {
+  // The adapter's own client, which marks its errors with the request they
+  // came from, so the explainer reads the check as a request before the post.
+  const page = new SlackWebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: await nonJsonSlackApiUrl(t) });
+  const web = {
+    conversations: { info: (args: Record<string, unknown>) => page.conversations.info(args as never) },
+    chat: { postMessage: (args: Record<string, unknown>) => client.chat.postMessage(args as never) },
+  } as unknown as SlackWebLike;
+  const slack = new SlackAdapter(web, socket, 'UBOT', 'acme', undefined, undefined, true);
+  const from = api.calls.length;
+  const err = await slack.sendMessage('C7', 'hi').then(() => null, (e: unknown) => e);
+  assert.equal(api.calls.slice(from).filter((c) => c === 'chat.postMessage').length, 0, 'nothing was posted');
+  const said = explainSlackError(err, { tool: 'send_message', args: { channelId: 'C7', content: 'hi' } });
+  assert.ok(said.endsWith(
+    "\n\nNothing was posted: Slack answered in a form this server can't read. Try again shortly. If it keeps failing, " +
+      'whoever runs this host has to check its connection to Slack.'), said);
+});
+
 test("an acknowledgement's add counts as there, and is removed, only when it may have landed", { timeout: 5000 }, async (t) => {
   const unreachable = new WebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: await unreachableSlackApiUrl() });
   // A Slack that takes the request and never answers, so the client's timeout ends it, shortened here.
   const silent = await silentSlackApi();
   t.after(() => silent.close());
   const timedOut = new WebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, timeout: 200, slackApiUrl: silent.url });
+  // A page that isn't JSON, which the client reads as a refusal whose code is the body.
+  const page = new WebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: await nonJsonSlackApiUrl(t) });
   const removals = () => api.calls.filter((c) => c === 'reactions.remove').length;
   for (const [what, add, removed] of [
     ['an HTTP 503', { status: 503, body: { ok: false } }, true],
@@ -578,6 +613,7 @@ test("an acknowledgement's add counts as there, and is removed, only when it may
     ['fatal_error', { body: { ok: false, error: 'fatal_error' } }, true],
     ['service_unavailable', { body: { ok: false, error: 'service_unavailable' } }, true],
     ["already_reacted, this bot's reaction being there already", { body: { ok: false, error: 'already_reacted' } }, true],
+    ["an answer in no form of Slack's", 'a page', true],
     ['a connection never made', 'unreachable', false],
     ['a rate limit', { status: 429, headers: { 'retry-after': '30' }, body: { ok: false, error: 'ratelimited' } }, false],
     ['ratelimited in an HTTP 200', { body: { ok: false, error: 'ratelimited' } }, false],
@@ -587,7 +623,7 @@ test("an acknowledgement's add counts as there, and is removed, only when it may
   ] as const) {
     // The add goes to the endpoint, to a port nothing listens on, or to a Slack
     // that never answers; the removal always goes to the endpoint.
-    const adds = add === 'unreachable' ? unreachable : add === 'timed out' ? timedOut : client;
+    const adds = add === 'unreachable' ? unreachable : add === 'timed out' ? timedOut : add === 'a page' ? page : client;
     const web = {
       reactions: {
         add: (args: Record<string, unknown>) => adds.reactions.add(args as never),

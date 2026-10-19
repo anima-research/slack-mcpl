@@ -39,7 +39,8 @@ const refused = (text: string) => new Error(`${NOTHING_RETURNED}: ${text}`);
 /** What a Slack timestamp looks like, for a refusal of one. */
 export const TS_FORM = 'which looks like 1718000000.000100';
 /** Where a thread's parent id comes from, for a refusal of an argument that
- *  names one: fetch_thread's threadTs, and reply_message's messageId. */
+ *  names one: fetch_thread's threadTs, and reply_message's and upload_file's
+ *  messageId. */
 export const PARENT_IDS =
   "Pass the thread's parent id: a reply's thread=, or a message's rootTs in fetch_history or fetch_thread results";
 /** What an answer this server can't read means for calling again. */
