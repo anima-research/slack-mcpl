@@ -60,6 +60,35 @@ test('a rollback deletes the messages sent after its checkpoint', { timeout: 500
   assert.deepEqual(deleted(from), ['1.2', '1.3']);
 });
 
+/** A messaging call's checkpoint and its parent, as the result gives them. */
+type State = { checkpoint: string; parent: string | null };
+
+test("a process's first post can be rolled back: its result names the tree's root as its checkpoint's parent", { timeout: 5000 }, async (t) => {
+  const { h, rollback, deleted } = await server(t);
+  const first = (await h.host.sendRequest('tools/call', {
+    name: 'send_message', arguments: { channelId: 'C1', content: 'one' },
+  })) as { state: State };
+  const { checkpoint, parent } = first.state;
+  assert.match(parent ?? 'none', /^chk_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  assert.notEqual(parent, checkpoint);
+  const from = api.calls.length;
+  assert.deepEqual(await rollback(parent!), { checkpoint: parent, success: true });
+  assert.deepEqual(deleted(from), ['1.1']);
+});
+
+test('each messaging result names the checkpoint before its own, which after a rollback is its target', { timeout: 5000 }, async (t) => {
+  const { h, rollback } = await server(t);
+  const post = async (content: string) => ((await h.host.sendRequest('tools/call', {
+    name: 'send_message', arguments: { channelId: 'C1', content },
+  })) as { state: State }).state;
+  const one = await post('one');
+  const two = await post('two');
+  assert.equal(two.parent, one.checkpoint);
+  await rollback(one.checkpoint);
+  const three = await post('three');
+  assert.equal(three.parent, one.checkpoint, 'three starts a branch from one');
+});
+
 test('a rollback to a checkpoint on the branch an earlier rollback left deletes what the later branch sent', { timeout: 5000 }, async (t) => {
   const { send, rollback, deleted } = await server(t);
   const one = await send('one');

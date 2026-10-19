@@ -7,7 +7,8 @@
   - `SLACK_DISABLE_DMS`: drops incoming DMs and group DMs, and refuses writes
     and history reads on them.
   - `SLACK_ACK_REACTION`: an emoji put on a message that addresses the bot,
-    removed at the bot's next post in that conversation or after 10 minutes.
+    removed at the bot's next post in that conversation that Slack confirms,
+    or after 10 minutes.
   - `SLACK_SUBSCRIBE_MEMBER_CHANNELS`: delivers ambient messages from every
     channel the bot is a member of, so inviting the bot is the subscription;
     `unsubscribe_channel` then mutes a conversation.
