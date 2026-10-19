@@ -100,7 +100,8 @@ Slack's answer named that message. When it didn't, the rollback's answer says
 the comment may remain, and that `delete_message` may delete it. An upload
 that failed after Slack gave the file its ID is rolled back the same way.
 Rollback is best-effort and reports partial failures by kind, naming each
-message and file that may remain, with its conversation; checkpoint
+message and file it couldn't delete, with its conversation, and apart from
+the rest those Slack refused to delete for good; checkpoint
 history is kept in memory across host reconnects, but does not survive a
 server restart. As with message rollback, failed deletions are logged and
 reported in the rollback's answer, but are not retained for another rollback

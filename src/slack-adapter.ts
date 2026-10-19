@@ -54,6 +54,14 @@ export function slackRefusal(err: unknown): string | undefined {
   return typeof code === 'string' && SLACK_CODE.test(code) ? code : undefined;
 }
 
+/** Whether Slack refused `err`'s request in its form and will refuse it the
+ *  same way again: a refusal that isn't Slack's own failure (SLACK_FAILED), so
+ *  one waitToAskAgain gives no wait. */
+export function refusedForGood(err: unknown): boolean {
+  const code = slackRefusal(err);
+  return code !== undefined && !SLACK_FAILED.has(code);
+}
+
 /** Slack's answers to conversations.info that it has no such conversation to
  *  show this bot (channel_not_found), or that the id isn't one at all
  *  (invalid_channel_id). */
@@ -1041,9 +1049,7 @@ export class SlackAdapter {
       // Slack's refusal will be the same next time. A rate limit, an HTTP
       // error, a failure in transit or Slack's own failure can pass. The fifth
       // failure drops the entry, so no sixth attempt can start.
-      const code = slackRefusal(err);
-      const lasting = code !== undefined && !SLACK_FAILED.has(code);
-      if (lasting || this.stopping || entry.tries >= ACK_MAX_TRIES) this.dropAck(channelId, ts, entry);
+      if (refusedForGood(err) || this.stopping || entry.tries >= ACK_MAX_TRIES) this.dropAck(channelId, ts, entry);
       else entry.timer = this.armAck(channelId, ts, ACK_RETRY_MS);
     }
   }

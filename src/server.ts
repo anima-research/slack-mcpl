@@ -46,6 +46,7 @@ import {
   fileLeftByUpload,
   leftOutNote,
   outsideCallTime,
+  refusedForGood,
   slackRefusal,
   withCallTime,
   type SlackAdapter,
@@ -1433,7 +1434,7 @@ export class SlackMcplServer {
     const sent = { message: 0, file: 0 };
     const deleted = { message: 0, file: 0 };
     /** Each item a delete didn't confirm gone, by kind, id and conversation. */
-    const left: Array<{ kind: 'message' | 'file'; named: string }> = [];
+    const left: Array<{ kind: 'message' | 'file'; named: string; forGood: boolean }> = [];
     const attempt = async (
       kind: 'message' | 'file', id: string, channelId: string, gone: string[], remove: () => Promise<void>, sharedFile?: string,
     ) => {
@@ -1447,14 +1448,14 @@ export class SlackMcplServer {
           deleted[kind]++;
           return;
         }
-        // Best-effort otherwise: the delete was refused, rate-limited, out of
-        // this call's time, or failed in a way that leaves it unknown, on the
-        // way or by Slack's own failure. Either way the item may remain, and
-        // the tracker has dropped it with the branch, so no later rollback
-        // tries it again: the reason names it, for the agent, and stderr says
-        // why, for an operator.
+        // Best-effort otherwise: Slack refused the delete, or the check before
+        // it, for good; or it was rate-limited, out of this call's time, or
+        // failed in a way that leaves it unknown, on the way or by Slack's own
+        // failure, and the item may remain. Either way the tracker has
+        // dropped it with the branch, so no later rollback tries it again: the
+        // reason names it, for the agent, and stderr says why, for an operator.
         const shared = sharedFile ? `, which shared file ${sharedFile}` : '';
-        left.push({ kind, named: `${kind} ${id} in ${channelId}${shared}` });
+        left.push({ kind, named: `${kind} ${id} in ${channelId}${shared}`, forGood: refusedForGood(err) });
         console.error(
           `[slack-mcpl] Rollback couldn't delete ${kind} ${id}${shared && `${shared},`} in ${channelId}: ` +
             `${(err as Error)?.message ?? String(err)}`,
@@ -1489,15 +1490,24 @@ export class SlackMcplServer {
     const commentsLeft = toDelete.filter((item): item is UploadedFile => item.kind === 'file' && item.comment && !item.shareTs);
     const ids = "which fetch_history shows, or fetch_thread if the file went into a thread";
     // What the agent can do about an item left, since no rollback tries it
-    // again.
+    // again: one whose delete can pass can be deleted by its id, and one
+    // Slack refused for good can't be, however often it's asked.
+    const mayRemain = left.filter((item) => !item.forGood);
+    const refused = left.filter((item) => item.forGood);
+    const named = (items: typeof left) => items.map((item) => item.named).join('; ');
     const remedy = [
-      ...(left.some((item) => item.kind === 'message') ? ['delete_message can try a message among them again, by its id'] : []),
-      ...(left.some((item) => item.kind === 'file') ? ['no tool here deletes a file'] : []),
+      ...(mayRemain.some((item) => item.kind === 'message') ? ['delete_message can try a message among them again, by its id'] : []),
+      ...(mayRemain.some((item) => item.kind === 'file')
+        ? ["no tool here deletes a file, and whoever runs this host can delete it with Slack's files.delete, by its id"]
+        : []),
     ].join(', and ');
     const notes = [
       ...(left.length > 0
-        ? [`Rolled back (${counts} deleted). May remain: ${left.map((item) => item.named).join('; ')}. No rollback tries ` +
-          `these again: ${remedy}`]
+        ? [[
+            `Rolled back (${counts} deleted)`,
+            ...(mayRemain.length > 0 ? [`May remain: ${named(mayRemain)}. No rollback tries these again: ${remedy}`] : []),
+            ...(refused.length > 0 ? [`Slack refused these, and calling again won't change that: ${named(refused)}`] : []),
+          ].join('. ')]
         : []),
       ...(commentsLeft.length === 1
         ? [`The comment of uploaded file ${commentsLeft[0].fileId} may remain in conversation ${commentsLeft[0].channelId}: ` +

@@ -92,6 +92,22 @@ const TS_FORM = 'which looks like 1718000000.000100';
 
 /** Slack's answers that the message or thread a call named isn't one. */
 const THREAD_REFUSALS = new Set(['thread_not_found', 'message_not_found', 'bad_timestamp']);
+/** What each of a workspace's settings that refuse an upload allows, as
+ *  Slack's pages for files.getUploadURLExternal and
+ *  files.completeUploadExternal describe it. */
+const UPLOAD_SETTINGS: Record<string, string> = {
+  file_uploads_disabled: "don't allow file uploads",
+  file_uploads_except_images_disabled: 'allow only image uploads',
+  file_type_not_allowed: "don't allow this type of file",
+  file_upload_size_restricted: 'restrict uploads of large files',
+};
+/** What may still go under a setting, where the setting says what may.
+ *  file_type_not_allowed gets nothing, so the text doesn't hint at a way round
+ *  the workspace's rule. */
+const UPLOAD_SETTING_REMEDIES: Record<string, string> = {
+  file_uploads_except_images_disabled: ' An image file may go.',
+  file_upload_size_restricted: ' A smaller file may go.',
+};
 
 export function explainSlackError(err: unknown, call: SlackCall): string {
   const carried = (err as { message?: unknown } | null)?.message;
@@ -460,8 +476,8 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
     case 'file_type_not_allowed':
     case 'file_upload_size_restricted':
       return call.tool === 'upload_file'
-        ? `${lead}: this workspace's settings don't allow this upload (${code}). Calling again won't change that; ` +
-            `the workspace's admins can.${code === 'file_upload_size_restricted' ? ' A smaller file may go.' : ''}`
+        ? `${lead}: this workspace's settings ${UPLOAD_SETTINGS[code]} (${code}). Calling again won't change that; ` +
+            `the workspace's admins can.${UPLOAD_SETTING_REMEDIES[code] ?? ''}`
         : undefined;
     case 'storage_limit_reached':
       return call.tool === 'upload_file'

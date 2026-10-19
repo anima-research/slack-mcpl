@@ -173,7 +173,9 @@ test('rollback reports a failed file deletion while still deleting its sharing m
     featureSet: MESSAGING_FEATURE_SET, checkpoint: before.state!.checkpoint,
   }) as { success: boolean; reason?: string };
   assert.equal(rollback.success, true, 'rollback retains the existing best-effort contract');
-  assert.equal(rollback.reason, 'Rolled back (2/2 messages and 0/1 files deleted). May remain: file F1 in C1. No rollback tries these again: no tool here deletes a file');
+  // An error that isn't Slack's refusal leaves the file as one that may remain.
+  assert.equal(rollback.reason, 'Rolled back (2/2 messages and 0/1 files deleted). May remain: file F1 in C1. No rollback tries these ' +
+    "again: no tool here deletes a file, and whoever runs this host can delete it with Slack's files.delete, by its id");
   assert.deepEqual(ts(fake.deletedMessages), ['900.1', '100.2']);
 });
 

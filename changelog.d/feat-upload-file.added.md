@@ -19,8 +19,9 @@
   each request under the call's time. A failure in any of them says whether
   the file may have been shared, and if it may, what to check before
   uploading again, unless it's a refusal the explainer doesn't know, which
-  passes through as Slack gave it. A refusal by the workspace's settings or
-  its file storage limit says so, and that calling again won't change it.
+  passes through as Slack gave it. A refusal by the workspace's settings
+  says what they allow, one by its file storage limit says so, and each
+  says that calling again won't change it.
   Once the first step has given the file its ID, a failed upload's file is
   rolled back like a sent one's.
   **Operators:** the tool needs `files:write` on the bot token. After
