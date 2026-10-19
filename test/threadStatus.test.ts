@@ -59,6 +59,14 @@ test('a post in the thread ends the status, so the next refresh sets it again', 
   assert.deepEqual(calls, ['C1:1.0:is thinking…', 'C1:1.0:is thinking…']);
 });
 
+test('a stop after a post in the thread still clears the status', async () => {
+  const { adapter, calls } = makeAdapter();
+  await adapter.setThreadStatus('C1', '1.0');
+  await adapter.sendMessage('C1', 'the answer', { threadTs: '1.0' });
+  await adapter.setThreadStatus('C1', undefined);
+  assert.deepEqual(calls, ['C1:1.0:is thinking…', 'C1:1.0:']);
+});
+
 async function ready(h: Pick<Harness, 'host' | 'hostSaw'>, grant = FULL_GRANT) {
   await initialize(h, true);
   await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: grant });

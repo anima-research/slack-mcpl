@@ -1198,8 +1198,10 @@ export class SlackAdapter {
     // outcome, as a failure that may have posted does.
     if (typeof result.ts !== 'string' || !result.ts) throw left(new PostNotConfirmed(channelId));
     void outsideCallTime(() => this.clearAck(channelId));
-    // Slack clears a thread's status when the bot posts in that thread.
-    if (opts.threadTs && this.statusOn.get(channelId)?.ts === opts.threadTs) this.statusOn.delete(channelId);
+    // A post may clear Slack's status; allow a refresh but retain ownership so
+    // a stop before that refresh still explicitly clears the same thread.
+    const status = this.statusOn.get(channelId);
+    if (opts.threadTs && status?.ts === opts.threadTs) status.at = -Infinity;
     return { messageId: result.ts };
   }
 
