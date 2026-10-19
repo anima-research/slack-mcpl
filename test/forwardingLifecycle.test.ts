@@ -278,7 +278,7 @@ test('a DM whose peer leaves during its backscroll fetch changes nothing for the
     await until(() => f.cleared.length > 0, 'the abandoned DM releases its reaction');
     f.emit('112.1', 'D1', dm);
     await until(() => next.deliveries().length > 0, "the new peer's DM");
-    assert.match(pushText(next.deliveries()[0]), /\[DM \(acme\) id=112\.1\] /, 'the abandoned DM left the new peer no context');
+    assert.match(pushText(next.deliveries()[0]), /\[DM \(acme\) channelId=D1 id=112\.1\] /, 'the abandoned DM left the new peer no context');
     assert.ok(errors.mock.calls.map((c) => c.arguments.join(' ')).includes(
       '[slack-mcpl] Dropped addressed message 111.1 in D1 before delivery: its peer disconnected',
     ));
@@ -636,8 +636,8 @@ for (const lookup of ['history', 'name', 'location'] as const) {
       // A conversation whose name didn't come in time is named by its ID, and
       // its next message, in the same context, names nothing and looks up
       // nothing.
-      assert.match(first, lookup === 'history' ? /\[#general \(acme\) id=111\.1\] / : /\[C1 \(acme\) id=111\.1\] /);
-      assert.match(second, /\[id=111\.2\] /);
+      assert.match(first, lookup === 'history' ? /\[#general \(acme\) channelId=C1 id=111\.1\] / : /\[C1 \(acme\) channelId=C1 id=111\.1\] /);
+      assert.match(second, /\[channelId=C1 id=111\.2\] /);
       assert.deepEqual(logLines(errors).filter((l) => l.includes('Gave up on')), [
         lookup === 'history'
           ? '[slack-mcpl] Gave up on the backscroll for message 111.1 in C1 after 5 s; delivering without it'
@@ -669,7 +669,7 @@ test('a lookup Slack fails says so on stderr, and the message goes without it', 
     await until(() => peer.deliveries().length === 1, 'the message, without its lookups');
     const text = pushText(peer.deliveries()[0]);
     assert.doesNotMatch(text, /<backscroll/);
-    assert.match(text, /\[C1 \(acme\) id=111\.1\] /);
+    assert.match(text, /\[C1 \(acme\) channelId=C1 id=111\.1\] /);
     assert.deepEqual(logLines(errors).filter((l) => l.includes("Couldn't get")), [
       `[slack-mcpl] Couldn't get the backscroll for message 111.1 in C1 (${limited}); delivering without it`,
       `[slack-mcpl] Couldn't get the name of conversation C1 (${limited}); delivering without it`,
@@ -964,8 +964,8 @@ test('a DM looks up no conversation name, and its header says DM', async (t) => 
   f.emit('111.3', 'D1', dm);
   await until(() => peer.deliveries().length === 3, 'a DM after another conversation');
   const texts = peer.deliveries().map(pushText);
-  assert.match(texts[0], /\[DM \(acme\) id=111\.1\] /);
-  assert.match(texts[2], /\[DM \(acme\) id=111\.3\] /);
+  assert.match(texts[0], /\[DM \(acme\) channelId=D1 id=111\.1\] /);
+  assert.match(texts[2], /\[DM \(acme\) channelId=D1 id=111\.3\] /);
   assert.equal(metaCalls, 1, "only C1's name is looked up");
 });
 

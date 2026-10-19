@@ -679,7 +679,7 @@ test("an upload whose answer named no sharing message says on rollback that its 
   const before = await call('send_message', { channelId: 'C1', content: 'before' });
   // Confirmed, though Slack's answer named no sharing message.
   const uploaded = await call('upload_file', { channelId: 'C1', filename: 'a.txt', content: 'a', comment: 'Here' });
-  assert.deepEqual(JSON.parse(uploaded.content[0].text), { fileId: 'F1' });
+  assert.deepEqual(JSON.parse(uploaded.content[0].text), { fileId: 'F1', to: "conversation C1, which this server hasn't listed" });
   const from = api.calls.length;
   const rolledBack = await rollback(before.state!.checkpoint);
   assert.deepEqual(called(from), ['files.delete']);

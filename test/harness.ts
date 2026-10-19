@@ -98,6 +98,7 @@ export async function nonJsonSlackApiUrl(
 
 function fakeWeb(
   posts: unknown[], reactions: string[], uploads: unknown[], deletedMessages: unknown[], deletedFiles: string[], uploadsBegun: unknown[],
+  dms: Array<{ id: string; user: string }> = [],
 ): SlackWebLike {
   let started = 0;
   return {
@@ -108,7 +109,12 @@ function fakeWeb(
     },
     conversations: {
       async list() {
-        return { channels: [{ id: 'C1', name: 'general', is_member: true, is_im: false, is_mpim: false }] };
+        return {
+          channels: [
+            { id: 'C1', name: 'general', is_member: true, is_im: false, is_mpim: false },
+            ...dms.map((dm) => ({ id: dm.id, user: dm.user, is_im: true, is_mpim: false })),
+          ],
+        };
       },
       async info({ channel }) {
         return { channel: { id: channel, name: 'general', is_member: true, is_im: false, is_mpim: false } };
@@ -190,6 +196,8 @@ export interface HarnessOptions {
   subscribeMemberChannels?: boolean;
   /** What the host answers to push/event (default true). */
   pushAccepted?: boolean;
+  /** DMs conversations.list returns besides C1. */
+  dms?: Array<{ id: string; user: string }>;
 }
 
 export interface Harness {
@@ -221,7 +229,7 @@ export function fakeSlack(opts: HarnessOptions = {}) {
   const deletedMessages: unknown[] = [];
   const deletedFiles: string[] = [];
   const slack = new SlackAdapter(
-    fakeWeb(posts, reactions, uploads, deletedMessages, deletedFiles, uploadsBegun), socket, 'UBOT', 'acme',
+    fakeWeb(posts, reactions, uploads, deletedMessages, deletedFiles, uploadsBegun, opts.dms), socket, 'UBOT', 'acme',
     undefined, opts.sendChannels, opts.disableDms, opts.ackReaction,
   );
   return { slack, socket, posts, reactions, uploads, uploadsBegun, deletedMessages, deletedFiles };

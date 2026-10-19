@@ -71,3 +71,28 @@ test('backscroll block: what the agent sees on first interaction names the paren
   );
   assert.match(backscrollBlock([], { isDM: true }), /^<backscroll dm="true" count="0">/);
 });
+
+test('every header names the conversation by channelId, the DM included', () => {
+  assert.equal(locationHeader({ channelId: 'D2', messageId: '2.0' }), '[channelId=D2 id=2.0] ');
+  assert.equal(
+    locationHeader({ conversation: 'DM', teamName: 'acme', channelId: 'D2', messageId: '2.0' }),
+    '[DM (acme) channelId=D2 id=2.0] ',
+  );
+  assert.match(backscrollBlock([], { isDM: true, channelId: 'D2' }), /^<backscroll dm="true" channelId="D2" count="0">/);
+});
+
+test("a DM's message names its channelId, and a send to another DM names who it went to", async (t) => {
+  const { FULL_GRANT, harness, initialize, until } = await import('./harness.js');
+  const { method } = await import('@animalabs/mcpl-core');
+  const h = harness({ dms: [{ id: 'D1', user: 'UVASYL' }, { id: 'D2', user: 'UDENIS' }] });
+  t.after(() => h.close());
+  await initialize(h, true);
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await until(() => h.hostSaw.some((r) => r.method === method.CHANNELS_REGISTER), 'registration');
+  await h.socket.emitMessage({ type: 'message', channel: 'D2', channel_type: 'im', user: 'UDENIS', text: 'what is refprice?', ts: '5.0' });
+  await until(() => JSON.stringify(h.hostSaw).includes('what is refprice?'), "Denis's DM reaches the host");
+  const delivered = JSON.stringify(h.hostSaw.filter((r) => JSON.stringify(r).includes('what is refprice?')));
+  assert.match(delivered, /\[DM \(acme\) channelId=D2 id=5\.0\]/, 'the header gives the id to reply with');
+  const sent = await h.host.sendRequest('tools/call', { name: 'send_message', arguments: { channelId: 'D1', content: 'the answer' } }) as { content: { text: string }[] };
+  assert.deepEqual(JSON.parse(sent.content[0].text), { messageId: '100.1', to: 'DM: @UVASYL (acme)' }, 'the wrong recipient shows in the same turn');
+});

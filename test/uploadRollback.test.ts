@@ -24,7 +24,7 @@ test('rollback deletes an uploaded file and later message, preserving the checkp
   await ready(h);
   const before = await call(h.host, 'send_message', { channelId: 'C1', content: 'before' });
   const uploaded = await call(h.host, 'upload_file', uploadArgs);
-  assert.deepEqual(JSON.parse(uploaded.content[0].text), { fileId: 'F1' });
+  assert.deepEqual(JSON.parse(uploaded.content[0].text), { fileId: 'F1', to: '#general (acme)' });
   assert.ok(uploaded.state?.checkpoint, 'an upload returns a checkpoint');
   await call(h.host, 'send_message', { channelId: 'C1', content: 'after' });
   const rollback = await h.host.sendRequest(method.STATE_ROLLBACK, {
