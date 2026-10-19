@@ -433,6 +433,24 @@ test('fetch_thread passes latest on to Slack as the bound of every page', { time
   assert.deepEqual(sentTo('conversations.replies', from).map((p) => [p.oldest, p.latest]), [[undefined, '9.0'], ['2.0', '9.0']]);
 });
 
+test('a history read given only oldest still names latest, so Slack pages back from now', { timeout: 5000 }, async (t) => {
+  answers(t, {
+    'conversations.history': [
+      page([row('8.0', 'U1', 'eight'), row('7.0', 'U1', 'seven')], true),
+      page([row('6.0', 'U1', 'six')], false),
+    ],
+    'users.info': [{ body: { ok: true, user: { profile: { display_name: 'Ann' } } } }],
+  });
+  const from = api.calls.length;
+  const before = Date.now() / 1000;
+  const out = await adapter().readHistory('C1', { channelId: 'C1', oldest: '5.0' });
+  const sent = sentTo('conversations.history', from).map((p) => [p.oldest, p.latest]);
+  assert.equal(sent[0]![0], '5.0');
+  assert.ok(Number(sent[0]![1]) >= before, `the first page names latest, not just oldest: ${sent[0]![1]}`);
+  assert.deepEqual(sent[1], ['5.0', '7.0']);
+  assert.deepEqual(out.messages.map((m) => m.id), ['6.0', '7.0', '8.0']);
+});
+
 test("a thread page out of Slack's documented order is read in reading order too", { timeout: 5000 }, async (t) => {
   answers(t, {
     'conversations.replies': [page([row('3.0', 'U2', 'two', { thread_ts: '1.0' }), row('1.0', 'U1', 'parent', { thread_ts: '1.0' }),

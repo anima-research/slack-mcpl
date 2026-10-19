@@ -1301,7 +1301,12 @@ export class SlackAdapter {
     return readBounded(opts, {
       page: (at, limit) => this.web.conversations.history({
         channel: channelId, limit, inclusive: false,
-        ...(at ? { latest: at } : {}), ...(opts.oldest ? { oldest: opts.oldest } : {}),
+        // Given oldest without latest, Slack pages forward from oldest, but
+        // this read pages back: it would stop after one page and call the
+        // range covered. So oldest always comes with a latest, now's here.
+        // ponytail: a box clock over a minute behind Slack's misses the newest messages.
+        ...(at ? { latest: at } : opts.oldest ? { latest: (Date.now() / 1000 + 60).toFixed(6) } : {}),
+        ...(opts.oldest ? { oldest: opts.oldest } : {}),
       }),
       shape: (messages) => this.shapeHistory(messages),
       writable: this.canWrite(channelId),
