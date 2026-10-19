@@ -16,7 +16,7 @@ that grant arrives; plain MCP tool calls are unaffected.
 
 ## Features
 
-- **Channels**: every conversation the bot can act in is registered as an MCPL channel (`slack:<conversationId>`) when the host grants `channels.register`, and `refresh_channels` registers ones joined since. `channels/publish` posts in the thread of the last message the server passed to the host from that conversation, which can change while the agent is answering. Use [`reply_message` for an explicit thread](#reply-to-a-specific-thread).
+- **Channels**: every conversation the bot can act in, of each kind its token has the read scope for, is registered as an MCPL channel (`slack:<conversationId>`) when the host grants `channels.register`, and `refresh_channels` registers ones joined since. `channels/publish` posts in the thread of the last message the server passed to the host from that conversation, which can change while the agent is answering. Use [`reply_message` for an explicit thread](#reply-to-a-specific-thread).
 - **Real-time events** via Socket Mode — no public webhook URL needed, so the
   server can be spawned over stdio like any other MCPL server.
 - **Addressing model**: mentions (`<@bot>`) and DMs are always delivered;

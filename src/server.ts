@@ -44,6 +44,7 @@ import {
   SLACK_CLIENT_OPTIONS,
   assertRequestFits,
   fileLeftByUpload,
+  leftOutNote,
   outsideCallTime,
   slackRefusal,
   withCallTime,
@@ -777,8 +778,8 @@ export class SlackMcplServer {
       }
 
       case 'list_channels': {
-        const convs = await this.slack.listConversations(args.includeNonMember === true);
-        return convs.map((c) => ({
+        const { conversations, leftOut } = await this.slack.listConversations(args.includeNonMember === true);
+        const listed = conversations.map((c) => ({
           id: c.id,
           kind: c.kind,
           name: c.kind === 'dm' ? `DM: @${c.name}` : c.name,
@@ -786,6 +787,13 @@ export class SlackMcplServer {
           ...(c.kind === 'channel' || c.kind === 'private_channel' ? { isMember: c.isMember } : {}),
           writable: this.slack.canWrite(c.id),
         }));
+        // A listing that left out types the token can't read says which
+        // beside the list, so an agent asked about its DMs can tell "none"
+        // from "the token can't read them"; one that left none out answers
+        // with the list alone. Types the host has turned off aren't listed
+        // or noted, as the tool's description says.
+        if (leftOut.length === 0) return listed;
+        return { _content: [textContent(JSON.stringify(listed)), textContent(leftOutNote(leftOut))] };
       }
 
       case 'refresh_channels':
@@ -1079,7 +1087,7 @@ export class SlackMcplServer {
       // answers at once), so a request Slack rate-limits is waited out, as
       // Slack asks, and one that fails in a way that can pass is asked again
       // after a wait, and the listing goes on from there.
-      const convs = await this.slack.listConversations(false, (wait, inARow) =>
+      const { conversations: convs } = await this.slack.listConversations(false, (wait, inARow) =>
         this.waitToAskAgain(wait, inARow, isCurrent));
       descriptors = convs.map((c) => toDescriptor(c, this.slack.teamName, this.slack.canWrite(c.id)));
     } catch (err) {
@@ -1188,9 +1196,9 @@ export class SlackMcplServer {
     return added;
   }
 
-  /** Re-enumerate every conversation currently visible and register any the
-   *  host doesn't yet know about — the agent-facing catch-all for "I was
-   *  invited to a channel but don't see it". */
+  /** Re-enumerate every conversation currently visible, of the kinds the
+   *  token can read, and register any the host doesn't yet know about — the
+   *  agent-facing catch-all for "I was invited to a channel but don't see it". */
   private async refreshChannels(): Promise<{
     visible: number;
     added: Array<{ id: string; label: string }>;
@@ -1235,7 +1243,7 @@ export class SlackMcplServer {
       );
     }
     const gone = () => this.conn !== conn || !!conn?.isClosed;
-    const convs = await this.slack.listConversations();
+    const { conversations: convs, leftOut: typesLeftOut } = await this.slack.listConversations();
     // The host keeps the label a conversation is first announced with, and a
     // refresh never announces a known one again, so a new DM whose user's name
     // this server couldn't get from Slack just now waits for a later refresh
@@ -1270,7 +1278,8 @@ export class SlackMcplServer {
           ? `Registered ${added.length} newly-visible conversation(s).`
           : unnamed.length > 0
             ? 'No conversation was registered.'
-            : 'No new conversations: the host already has every one this listing found.') + leftOut,
+            : 'No new conversations: the host already has every one this listing found.') + leftOut +
+        (typesLeftOut.length > 0 ? ` ${leftOutNote(typesLeftOut)}` : ''),
     };
   }
 
