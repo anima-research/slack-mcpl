@@ -142,7 +142,7 @@ For example, to answer `[channelId=C123 thread=1718000000.000100 id=1718000000.0
 }
 ```
 
-This selects the thread root even if another message arrives before the tool call. Its answer, like `send_message`'s, `send_dm`'s and `upload_file`'s, names the conversation it went to in `to`, by the label this server registered it with the host under (`#support (acme)`, `DM: @Ann (acme)`), so a reply sent to the wrong conversation shows in the same turn. A conversation without a registered label gets no `to`: every conversation for a plain MCP client, and one the last listing didn't have, such as a DM first written in since, until `refresh_channels`. The automatic `channels/publish` route still has the limitation above; explicit tool replies do not change its destination.
+This selects the thread root even if another message arrives before the tool call. Its answer, like `send_message`'s, `send_dm`'s and `upload_file`'s, names the conversation it went to in `to`, by its label in this server's channel registry (`#support (acme)`, `DM: @Ann (acme)`), so a reply sent to the wrong conversation shows in the same turn. The registry holds the conversations an MCPL host took when this server connected, and those `refresh_channels` has registered since. A write to any other conversation, such as a DM first written in after the listing, answers without `to`, and so does every write from a plain MCP client, which registers none. The automatic `channels/publish` route still has the limitation above; explicit tool replies do not change its destination.
 
 ## Setup
 

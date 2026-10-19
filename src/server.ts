@@ -1023,15 +1023,14 @@ export class SlackMcplServer {
     };
   }
 
-  /** Who a write went to, as `to`: the conversation's registered label, a
-   *  name the agent didn't supply, so one that sent to the wrong conversation
-   *  sees it in the same turn. A conversation with no registered label (any,
-   *  for a plain MCP client; one the host didn't take, or the last listing
-   *  didn't have, such as a DM first written in since) gets no `to`, since
-   *  all it could say is the id the agent passed. */
+  /** Who a write went to, as `to`: the conversation's label in this server's
+   *  channel registry, a name the agent didn't supply, so one that sent to
+   *  the wrong conversation sees it in the same turn. A conversation the
+   *  registry doesn't hold, and every one for a plain MCP client, has no
+   *  label, and all `to` could say is the id the agent passed, so it's left
+   *  undefined, which the answer's JSON leaves out. */
   private recipient(channelId: string): { to?: string } {
-    const label = this.channelManager.get(mcplChannelId(channelId))?.label;
-    return label === undefined ? {} : { to: label };
+    return { to: this.channelManager.get(mcplChannelId(channelId))?.label };
   }
 
   /** Record that the bot just sent to a conversation, for location headers. */

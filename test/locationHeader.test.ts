@@ -97,6 +97,11 @@ test("a DM's message names its channelId, and a write to another DM names who it
   await until(() => JSON.stringify(h.hostSaw).includes('what is refprice?'), "Denis's DM reaches the host");
   const delivered = JSON.stringify(h.hostSaw.filter((r) => JSON.stringify(r).includes('what is refprice?')));
   assert.match(delivered, /\[DM \(acme\) channelId=D2 id=5\.0\]/, 'the header gives the id to reply with');
+  // A reply in that DM's thread, in the same context, gives the DM's id, the
+  // thread and its own id.
+  await h.socket.emitMessage({ type: 'message', channel: 'D2', channel_type: 'im', user: 'UDENIS', text: 'and in its thread', ts: '6.0', thread_ts: '5.0' });
+  await until(() => JSON.stringify(h.hostSaw).includes('and in its thread'), 'the thread reply reaches the host');
+  assert.match(JSON.stringify(h.hostSaw.filter((r) => JSON.stringify(r).includes('and in its thread'))), /\[channelId=D2 thread=5\.0 id=6\.0\]/);
   const sent = await h.host.sendRequest('tools/call', { name: 'send_message', arguments: { channelId: 'D1', content: 'the answer' } }) as { content: { text: string }[] };
   assert.deepEqual(JSON.parse(sent.content[0].text), { messageId: '100.1', to: 'DM: @UVASYL (acme)' }, 'the wrong recipient shows in the same turn');
   const replied = await h.host.sendRequest('tools/call', { name: 'reply_message', arguments: { channelId: 'D1', messageId: '5.0', content: 'the answer' } }) as { content: { text: string }[] };
@@ -110,4 +115,13 @@ test("a DM's message names its channelId, and a write to another DM names who it
     async () => ({ channel: { id: 'D7' } });
   const opened = await h.host.sendRequest('tools/call', { name: 'send_dm', arguments: { userId: 'UNEW', content: 'hello' } }) as { content: { text: string }[] };
   assert.deepEqual(JSON.parse(opened.content[0].text), { messageId: '100.4', channelId: 'D7' });
+});
+
+test('a plain MCP client registers no conversation, so its writes answer without `to`', async (t) => {
+  const { harness, initialize } = await import('./harness.js');
+  const h = harness();
+  t.after(() => h.close());
+  await initialize(h, false);
+  const sent = await h.host.sendRequest('tools/call', { name: 'send_message', arguments: { channelId: 'C1', content: 'hi' } }) as { content: { text: string }[] };
+  assert.deepEqual(JSON.parse(sent.content[0].text), { messageId: '100.1' });
 });

@@ -5,8 +5,8 @@
   so an agent answering by a tool needed the id from elsewhere, such as
   `list_channels`.
 - `send_message`, `reply_message`, `send_dm` and `upload_file` answer with
-  `to`, the label the conversation the write went to was registered under
+  `to`, the conversation's label in this server's channel registry
   (`#support (acme)`, `DM: @Ann (acme)`), so a write to the wrong
-  conversation shows in the same turn. A conversation without a registered
-  label, as with a plain MCP client or a DM first written in after the
-  listing, gets no `to`.
+  conversation shows in the same turn. A conversation the registry doesn't
+  hold, such as a DM first written in after the listing, gets no `to`, and
+  neither does any write from a plain MCP client.

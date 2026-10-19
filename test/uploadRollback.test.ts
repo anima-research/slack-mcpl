@@ -179,7 +179,7 @@ test('rollback reports a failed file deletion while still deleting its sharing m
   assert.deepEqual(ts(fake.deletedMessages), ['900.1', '100.2']);
 });
 
-test('an upload marks its conversation as the one last posted in, so a message there names no conversation', async (t) => {
+test('an upload marks its conversation as the one last posted in, so a message there leaves out its name', async (t) => {
   const h = harness();
   t.after(() => h.close());
   await ready(h);
@@ -188,7 +188,7 @@ test('an upload marks its conversation as the one last posted in, so a message t
   await until(() => h.hostSaw.some((r) => r.method === method.PUSH_EVENT), 'push/event');
   const pushed = h.hostSaw.find((r) => r.method === method.PUSH_EVENT)!.params as { payload: { content: { text: string }[] } };
   assert.doesNotMatch(pushed.payload.content.map((c) => c.text).join('\n'), /#general \(acme\)/);
-  // Without the upload, the same message names its conversation.
+  // Without the upload, the same message names its conversation by name.
   const fresh = harness();
   t.after(() => fresh.close());
   await ready(fresh);
