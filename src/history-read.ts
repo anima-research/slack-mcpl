@@ -38,11 +38,12 @@ export const NOTHING_RETURNED = 'No messages were returned';
 const refused = (text: string) => new Error(`${NOTHING_RETURNED}: ${text}`);
 /** What a Slack timestamp looks like, for a refusal of one. */
 export const TS_FORM = 'which looks like 1718000000.000100';
-/** Where a thread's parent id comes from, for a refusal of an argument that
- *  names one: fetch_thread's threadTs, and reply_message's and upload_file's
- *  messageId. */
+/** Where a thread's parent id comes from, for fetch_thread's description and
+ *  a refusal of an argument that names one: fetch_thread's threadTs, and
+ *  reply_message's and upload_file's messageId. */
 export const PARENT_IDS =
-  "Pass the thread's parent id: a reply's thread=, or a message's rootTs in fetch_history or fetch_thread results";
+  "Pass the thread's parent id: a reply's thread=, a message's own id= when it shows no thread=, or a message's rootTs in " +
+  'fetch_history or fetch_thread results';
 /** What an answer this server can't read means for calling again. */
 const UNREADABLE = "Calling again may work; if it fails the same way, this server can't read Slack's answer for this range.";
 
@@ -146,12 +147,23 @@ export function readOptions(args: Record<string, unknown>, kind: Kind, channelId
     throw refused('textContains must contain 1 to 256 characters.');
   }
   if (args.caseSensitive !== undefined && typeof args.caseSensitive !== 'boolean') throw refused('caseSensitive must be a boolean.');
-  if (args.authorIds !== undefined && (!Array.isArray(args.authorIds) || args.authorIds.length < 1 || args.authorIds.length > 50 ||
-    !args.authorIds.every((id) => typeof id === 'string' && AUTHOR_ID.test(id)))) {
-    throw refused(
-      "authorIds must contain 1 to 50 Slack user or bot IDs, as a message's authorId or authorBotId gives them, or find_user's " +
-        'userId.',
-    );
+  if (args.authorIds !== undefined) {
+    const ids = args.authorIds;
+    if (!Array.isArray(ids) || ids.length < 1 || ids.length > 50) {
+      throw refused(
+        "authorIds must contain 1 to 50 Slack user or bot IDs, as a message's authorId or authorBotId gives them, or find_user's " +
+          'userId.',
+      );
+    }
+    // The first malformed entry, by its place, so a call that passes many can
+    // tell which to fix.
+    const bad = ids.findIndex((id) => typeof id !== 'string' || !AUTHOR_ID.test(id));
+    if (bad >= 0) {
+      throw refused(
+        `authorIds[${bad}] must be a Slack user or bot ID, as a message's authorId or authorBotId gives it, or find_user's ` +
+          `userId, and this call passed ${passed(ids[bad])}.`,
+      );
+    }
   }
   const query = {
     kind, channelId, threadTs, oldest, latest,
@@ -251,8 +263,10 @@ export async function readBounded(opts: ReadOptions, source: ReadSource): Promis
   const filtering = opts.textContains !== undefined || opts.authorIds.length > 0;
   const fold = (text: string) => (opts.caseSensitive ? text : text.toLowerCase());
   const needle = opts.textContains === undefined ? undefined : fold(opts.textContains);
-  // History pages back from `latest`, Slack's own now unless given; a thread
-  // pages forward from `oldest`, its start unless given.
+  // History pages back from `latest`, Slack's own now unless given, except
+  // that given `oldest` alone the adapter's first page names the host's now
+  // plus a minute; a thread pages forward from `oldest`, its start unless
+  // given.
   let at = opts.at ?? (kind === 'history' ? opts.latest : opts.oldest);
   const records: ReadRecord[] = [];
   let scanned = 0, matched = 0, pages = 0;

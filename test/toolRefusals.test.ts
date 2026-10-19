@@ -105,7 +105,7 @@ for (const [tool, args, text] of [
     'fetch_thread',
     { channelId: 'C1' },
     "threadTs must be a non-empty string, and this call left it out. Pass the thread's parent id: a reply's thread=, " +
-      "or a message's rootTs in fetch_history or fetch_thread results.",
+      "a message's own id= when it shows no thread=, or a message's rootTs in fetch_history or fetch_thread results.",
   ],
   ['fetch_thread', {}, `channelId must be a non-empty string, and this call left it out. ${CHANNEL_ID_SOURCE}`],
   ['send_dm', {}, "userId must be a non-empty string, and this call left it out. find_user returns each person's userId."],

@@ -1,7 +1,8 @@
 /**
  * isNearMiss, the rule an unknown argument's refusal uses to name what was
  * probably meant. These are agent-framework's own tests of the rule
- * (test/closest-names.test.ts), so the copy here keeps to it.
+ * (test/closest-names.test.ts), so the copy here keeps to it, with one more:
+ * a name one edit past the limit.
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -17,6 +18,9 @@ test('isNearMiss: the same ignoring case, or a few edits; past that, a different
   }
   assert.equal(isNearMiss('workspace--read', 'workspace--write'), false,
     'a shared prefix is a namespace, so neighbours in it are counted by what follows it');
+  // refilIntervalM is two edits from refillIntervalMs, the most its 11
+  // characters after the shared prefix allow; this is three against the same two.
+  assert.equal(isNearMiss('tyytConzains', 'textContains'), false, 'three edits are past what a slip allows here');
 });
 
 test('isNearMiss: a part of a name, of three characters or more, is a slip for it; a name holding another, more edits from it than a slip allows, is not', () => {

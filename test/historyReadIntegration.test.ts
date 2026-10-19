@@ -67,7 +67,7 @@ test("a read missing its channel or thread opens with what the read's other fail
   assert.deepEqual(await tool(h, 'fetch_thread', {channelId: 'C1', threadTs: ''}), {
     error: true,
     value: 'No messages were returned: threadTs must be a non-empty string, and this call passed an empty string. ' +
-      "Pass the thread's parent id: a reply's thread=, or a message's rootTs in fetch_history or fetch_thread results.",
+      "Pass the thread's parent id: a reply's thread=, a message's own id= when it shows no thread=, or a message's rootTs in fetch_history or fetch_thread results.",
   });
   assert.deepEqual(h.reads, []);
 });

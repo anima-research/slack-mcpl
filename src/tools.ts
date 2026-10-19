@@ -2,7 +2,7 @@
  * MCP tool definitions and input types for Slack operations.
  * These tools work in both MCP and MCPL mode.
  */
-import {AUTHOR_ID, READ_LIMITS} from './history-read.js';
+import {AUTHOR_ID, PARENT_IDS, READ_LIMITS} from './history-read.js';
 
 const readProperties = {
   maxScanned: {type: 'integer', ...READ_LIMITS.maxScanned, description: 'Candidate messages scanned per call, independently of returned matches'},
@@ -184,9 +184,8 @@ export const toolDefinitions: ToolDefinition[] = [
     name: 'fetch_thread',
     description:
       'Fetch a bounded part of one Slack thread, oldest-first (parent first on the initial unbounded-range call). ' +
-      'Use the parent ID: a reply shows it as thread=, and fetch_history shows the parent\'s own ID. Check ' +
-      'pagination.scanComplete and stopReason. To go on to newer replies, call again with the same arguments and ' +
-      'cursor set to pagination.nextCursor.',
+      `${PARENT_IDS}. Check pagination.scanComplete and stopReason. To go on to newer replies, call again with the ` +
+      'same arguments and cursor set to pagination.nextCursor.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,

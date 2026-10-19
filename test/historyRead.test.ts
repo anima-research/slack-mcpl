@@ -16,7 +16,7 @@ import {
   type SlackSocketLike,
   type SlackWebLike,
 } from '../src/slack-adapter.js';
-import { READ_ARGUMENTS, readOptions } from '../src/history-read.js';
+import { PARENT_IDS, READ_ARGUMENTS, readOptions } from '../src/history-read.js';
 import { explainSlackError } from '../src/slack-errors.js';
 import { toolDefinitions } from '../src/tools.js';
 import { fakeSlackApi, type FakeSlackApi, type SlackApiAnswer } from './slackApi.js';
@@ -433,7 +433,9 @@ test('fetch_thread passes latest on to Slack as the bound of every page', { time
   assert.deepEqual(sentTo('conversations.replies', from).map((p) => [p.oldest, p.latest]), [[undefined, '9.0'], ['2.0', '9.0']]);
 });
 
-test('a history read given only oldest still names latest, so Slack pages back from now', { timeout: 5000 }, async (t) => {
+test("a history read given only oldest names latest on its first page, as the host's now plus a minute", { timeout: 5000 }, async (t) => {
+  // Date alone: the fake API still answers through a real setTimeout.
+  t.mock.timers.enable({ apis: ['Date'], now: 1_718_000_000_000 });
   answers(t, {
     'conversations.history': [
       page([row('8.0', 'U1', 'eight'), row('7.0', 'U1', 'seven')], true),
@@ -442,12 +444,9 @@ test('a history read given only oldest still names latest, so Slack pages back f
     'users.info': [{ body: { ok: true, user: { profile: { display_name: 'Ann' } } } }],
   });
   const from = api.calls.length;
-  const before = Date.now() / 1000;
   const out = await adapter().readHistory('C1', { channelId: 'C1', oldest: '5.0' });
   const sent = sentTo('conversations.history', from).map((p) => [p.oldest, p.latest]);
-  assert.equal(sent[0]![0], '5.0');
-  assert.ok(Number(sent[0]![1]) >= before, `the first page names latest, not just oldest: ${sent[0]![1]}`);
-  assert.deepEqual(sent[1], ['5.0', '7.0']);
+  assert.deepEqual(sent, [['5.0', '1718000060.000000'], ['5.0', '7.0']]);
   assert.deepEqual(out.messages.map((m) => m.id), ['6.0', '7.0', '8.0']);
 });
 
@@ -507,6 +506,8 @@ test('arguments are checked before Slack is asked: unknown names, bounds, timest
   const bound = "Take one from fetch_history's ids, or from a message's id=.";
   const authors = "authorIds must contain 1 to 50 Slack user or bot IDs, as a message's authorId or authorBotId gives them, or " +
     "find_user's userId.";
+  const author = (i: number, value: string) => `authorIds[${i}] must be a Slack user or bot ID, as a message's authorId or ` +
+    `authorBotId gives it, or find_user's userId, and this call passed ${value}.`;
   for (const [args, said] of [
     [{ regex: '.*' }, `fetch_history takes no argument named regex. ${historyTakes}`],
     [{ maxPages: 3, maxMs: 100 }, `fetch_history takes no arguments named maxPages, maxMs. ${historyTakes}`],
@@ -532,7 +533,10 @@ test('arguments are checked before Slack is asked: unknown names, bounds, timest
     [{ oldest: '2.0', latest: '1.0' }, 'oldest must precede latest.'],
     [{ textContains: '' }, 'textContains must contain 1 to 256 characters.'],
     [{ caseSensitive: 'yes' }, 'caseSensitive must be a boolean.'],
-    [{ authorIds: ['not-a-user'] }, authors],
+    // A malformed entry is named by its place, the first one when there are more.
+    [{ authorIds: ['not-a-user'] }, author(0, '"not-a-user"')],
+    [{ authorIds: ['U1', 'B2', 'Ann', 'nope'] }, author(2, '"Ann"')],
+    [{ authorIds: ['U1', 5] }, author(1, 'a number')],
     [{ authorIds: [] }, authors],
     [{ authorIds: Array.from({ length: 51 }, (_, i) => `U${i}`) }, authors],
     [{ authorIds: 'U1' }, authors],
@@ -546,7 +550,7 @@ test('arguments are checked before Slack is asked: unknown names, bounds, timest
   });
   await assert.rejects(reader.readThread('C1', 'nope', { channelId: 'C1', threadTs: 'nope' }), {
     message: 'No messages were returned: threadTs must be a Slack timestamp, which looks like 1718000000.000100, and this call ' +
-      "passed \"nope\". Pass the thread's parent id: a reply's thread=, or a message's rootTs in fetch_history or fetch_thread " +
+      "passed \"nope\". Pass the thread's parent id: a reply's thread=, a message's own id= when it shows no thread=, or a message's rootTs in fetch_history or fetch_thread " +
       'results.',
   });
   await assert.rejects(reader.readThread('C1', '1.0', { channelId: 'C1', threadTs: '1.0', textContains: 'x' }), {
@@ -765,6 +769,23 @@ test('a cursor belongs to its whole query: another thread, bound or filter refus
   assert.equal(sentTo('conversations.history', from)[0]!.latest, '9.0', 'the same authors, reordered and repeated, continue the read');
 });
 
+test("every text that says where a thread's parent id comes from names a reply's thread=, a message's own id= and a result's rootTs", () => {
+  const described = (tool: string, argument?: string): string => {
+    const definition = toolDefinitions.find((d) => d.name === tool)!;
+    if (!argument) return definition.description;
+    return (definition.inputSchema.properties as Record<string, { description: string }>)[argument]!.description;
+  };
+  for (const [where, text] of [
+    ['PARENT_IDS, for the refusals and fetch_thread', PARENT_IDS],
+    ["fetch_thread's description", described('fetch_thread')],
+    ["reply_message's description", described('reply_message')],
+    ["reply_message's messageId", described('reply_message', 'messageId')],
+    ["upload_file's messageId", described('upload_file', 'messageId')],
+  ] as const) {
+    for (const route of ['thread=', 'id=', 'rootTs']) assert.ok(text.includes(route), `${where} names ${route}: ${text}`);
+  }
+});
+
 test("each read tool's schema takes what its read takes: the same arguments, each bound at its edge, and the defaults", () => {
   type Property = { type: string; minimum?: number; maximum?: number; default?: unknown; minItems?: number; maxItems?: number;
     minLength?: number; maxLength?: number; items?: { pattern: string } };
@@ -791,9 +812,10 @@ test("each read tool's schema takes what its read takes: the same arguments, eac
         const ids = (n: number) => Array.from({ length: n }, (_, i) => 'U' + i);
         at(ids(p.minItems!)); at(ids(p.maxItems!));
         refuses(ids(p.minItems! - 1)); refuses(ids(p.maxItems! + 1));
+        // An entry the pattern refuses is named by its place.
         for (const id of ['U1', 'W1', 'B1', 'u1', 'C1', 'U-1']) {
           if (new RegExp(p.items!.pattern).test(id)) at([id]);
-          else refuses([id]);
+          else assert.throws(() => at([id]), new RegExp(`${name}\\[0\\] must`), tool + ' ' + name + ' ' + JSON.stringify([id]));
         }
       } else if (p.type === 'boolean') {
         assert.equal(defaults[name], p.default, tool + ' ' + name + "'s default");

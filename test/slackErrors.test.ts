@@ -166,7 +166,7 @@ test('a message id Slack does not know names where real ones show', async () => 
   // reply_message's messageId and fetch_thread's threadTs name a thread's parent, so each is told how to
   // pass one; the tools that name the message itself are told to copy its id=, as above.
   const parent =
-    "Pass the thread's parent id: a reply's thread=, or a message's rootTs in fetch_history or fetch_thread results";
+    "Pass the thread's parent id: a reply's thread=, a message's own id= when it shows no thread=, or a message's rootTs in fetch_history or fetch_thread results";
   assert.ok(
     (await explain('bad_timestamp', 'fetch_thread', { channelId: 'C4', threadTs: 'nope' })).endsWith(
       `No messages were returned: nope isn't a message id, which looks like 1718000000.000100. ${parent}.`,
@@ -196,7 +196,7 @@ test('a message id Slack does not know names where real ones show', async () => 
 test("a thread or a history bound Slack doesn't know says which value it was", async () => {
   assert.match(
     await explain('thread_not_found', 'fetch_thread', { channelId: 'C5', threadTs: '9.9' }),
-    /No messages were returned: Slack has no thread under message 9\.9 in conversation C5\..*Pass the thread's parent id: a reply's thread=, or a message's rootTs in fetch_history or fetch_thread results\.$/s,
+    /No messages were returned: Slack has no thread under message 9\.9 in conversation C5\..*Pass the thread's parent id: a reply's thread=, a message's own id= when it shows no thread=, or a message's rootTs in fetch_history or fetch_thread results\.$/s,
   );
   // reply_message names the thread it replies under as messageId.
   assert.match(
