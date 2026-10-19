@@ -3,6 +3,7 @@
  * with a fake Slack, driven the way an MCPL host would drive it.
  */
 
+import http from 'node:http';
 import { PassThrough } from 'node:stream';
 import { McplConnection, method, type JsonRpcRequest } from '@animalabs/mcpl-core';
 import { SlackAdapter, type SlackSocketLike, type SlackWebLike } from '../src/slack-adapter.js';
@@ -43,7 +44,63 @@ function fakeSocket(): FakeSocket {
   };
 }
 
-function fakeWeb(posts: unknown[], reactions: string[], statuses: string[]): SlackWebLike {
+/** What an upload URL was sent: the request's method and headers, and its
+ *  bytes. */
+export interface UploadPost {
+  method: string | undefined;
+  headers: http.IncomingHttpHeaders;
+  bytes: Buffer;
+}
+
+/** A local endpoint that takes an upload's bytes, as the upload URL Slack
+ *  gives does, for the fake Web API's uploads. It's started on first use and
+ *  doesn't hold the process open. `bytes` holds what each file's URL was sent,
+ *  by file ID, and `posts` the whole request. */
+let byteEndpoint: Promise<{ url: string; bytes: Map<string, Buffer>; posts: Map<string, UploadPost> }> | undefined;
+export function uploadEndpoint(): Promise<{ url: string; bytes: Map<string, Buffer>; posts: Map<string, UploadPost> }> {
+  byteEndpoint ??= new Promise((resolve) => {
+    const bytes = new Map<string, Buffer>();
+    const posts = new Map<string, UploadPost>();
+    const server = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (chunk: Buffer) => chunks.push(chunk));
+      req.on('end', () => {
+        const body = Buffer.concat(chunks);
+        const id = (req.url ?? '').split('/').pop() ?? '';
+        bytes.set(id, body);
+        posts.set(id, { method: req.method, headers: req.headers, bytes: body });
+        res.writeHead(200, { 'content-type': 'text/plain' });
+        res.end(`OK - ${body.length}`);
+      });
+    });
+    server.listen(0, '127.0.0.1', () => {
+      server.unref();
+      resolve({ url: `http://127.0.0.1:${(server.address() as { port: number }).port}/upload`, bytes, posts });
+    });
+  });
+  return byteEndpoint;
+}
+
+/** A `slackApiUrl` whose every answer is an HTTP 200 whose body isn't JSON,
+ *  by default a proxy's page, which the client reads as a refusal whose code
+ *  is the body itself. It closes when the test ends. */
+export async function nonJsonSlackApiUrl(
+  t: { after(fn: () => void): void },
+  body = '<html>Bad gateway</html>',
+): Promise<string> {
+  const page = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => { res.writeHead(200, { 'content-type': 'text/html' }); res.end(body); });
+  });
+  await new Promise<void>((resolve) => page.listen(0, '127.0.0.1', () => resolve()));
+  t.after(() => { page.closeAllConnections(); page.close(); });
+  return `http://127.0.0.1:${(page.address() as { port: number }).port}/api/`;
+}
+
+function fakeWeb(
+  posts: unknown[], reactions: string[], uploads: unknown[], deletedMessages: unknown[], deletedFiles: string[], uploadsBegun: unknown[], statuses: string[],
+): SlackWebLike {
+  let started = 0;
   return {
     assistant: {
       threads: {
@@ -51,6 +108,11 @@ function fakeWeb(posts: unknown[], reactions: string[], statuses: string[]): Sla
           statuses.push(`${channel_id}:${thread_ts}:${status}`);
           return {};
         },
+      },
+    },
+    auth: {
+      async test() {
+        return {};
       },
     },
     conversations: {
@@ -73,12 +135,13 @@ function fakeWeb(posts: unknown[], reactions: string[], statuses: string[]): Sla
     chat: {
       async postMessage(args) {
         posts.push(args);
-        return { ts: '100.1' };
+        return { ts: `100.${posts.length}` };
       },
       async update() {
         return {};
       },
-      async delete() {
+      async delete(args) {
+        deletedMessages.push(args);
         return {};
       },
     },
@@ -89,6 +152,32 @@ function fakeWeb(posts: unknown[], reactions: string[], statuses: string[]): Sla
       },
       async remove({ channel, timestamp, name }) {
         reactions.push(`remove:${channel}:${timestamp}:${name}`);
+        return {};
+      },
+    },
+    files: {
+      async getUploadURLExternal(args) {
+        uploadsBegun.push(args);
+        const { url } = await uploadEndpoint();
+        const id = `F${++started}`;
+        return { upload_url: `${url}/${id}`, file_id: id };
+      },
+      // Each upload is shared by a message of its own, 900.<n>. One titled
+      // "refused" is refused, as Slack refuses to share where the bot isn't,
+      // and one titled "unconfirmed" is answered without its file.
+      async completeUploadExternal(args) {
+        const [{ id, title }] = args.files as Array<{ id: string; title: string }>;
+        if (title === 'refused') {
+          throw Object.assign(new Error('An API error occurred: not_in_channel'), {
+            code: 'slack_webapi_platform_error', data: { ok: false, error: 'not_in_channel' },
+          });
+        }
+        if (title === 'unconfirmed') return { files: [] };
+        uploads.push(args);
+        return { files: [{ id, shares: { public: { [args.channel_id as string]: [{ ts: `900.${uploads.length}` }] } } }] };
+      },
+      async delete({ file }: { file: string }) {
+        deletedFiles.push(file);
         return {};
       },
     },
@@ -123,6 +212,12 @@ export interface Harness {
   reactions: string[];
   /** assistant.threads.setStatus calls, as `<channel>:<thread_ts>:<status>`. */
   statuses: string[];
+  /** files.completeUploadExternal's calls, each a shared upload. */
+  uploads: unknown[];
+  /** files.getUploadURLExternal's calls, each an upload's first step. */
+  uploadsBegun: unknown[];
+  deletedMessages: unknown[];
+  deletedFiles: string[];
   served: Promise<void>;
   close(): Promise<void>;
 }
@@ -132,12 +227,16 @@ export function fakeSlack(opts: HarnessOptions = {}) {
   const socket = fakeSocket();
   const posts: unknown[] = [];
   const reactions: string[] = [];
+  const uploads: unknown[] = [];
+  const uploadsBegun: unknown[] = [];
+  const deletedMessages: unknown[] = [];
+  const deletedFiles: string[] = [];
   const statuses: string[] = [];
   const slack = new SlackAdapter(
-    fakeWeb(posts, reactions, statuses), socket, 'UBOT', 'acme',
+    fakeWeb(posts, reactions, uploads, deletedMessages, deletedFiles, uploadsBegun, statuses), socket, 'UBOT', 'acme',
     undefined, opts.sendChannels, opts.disableDms, opts.ackReaction,
   );
-  return { slack, socket, posts, reactions, statuses };
+  return { slack, socket, posts, reactions, uploads, uploadsBegun, deletedMessages, deletedFiles, statuses };
 }
 
 /** Answer the server's requests on `host` as an MCPL host would; returns the
@@ -191,10 +290,10 @@ export function connectHost(server: SlackMcplServer, opts: HarnessOptions = {}) 
 }
 
 export function harness(opts: HarnessOptions = {}): Harness {
-  const { slack, socket, posts, reactions, statuses } = fakeSlack(opts);
+  const { slack, socket, posts, reactions, uploads, uploadsBegun, deletedMessages, deletedFiles, statuses } = fakeSlack(opts);
   const server = new SlackMcplServer(slack, { subscribeMemberChannels: opts.subscribeMemberChannels });
   const { host, hostSaw, served, close } = connectHost(server, opts);
-  return { server, socket, host, hostSaw, posts, reactions, statuses, served, close };
+  return { server, socket, host, hostSaw, posts, reactions, uploads, uploadsBegun, deletedMessages, deletedFiles, statuses, served, close };
 }
 
 export async function initialize(h: { host: McplConnection }, mcpl: boolean) {

@@ -48,6 +48,27 @@ export const toolDefinitions: ToolDefinition[] = [
     },
   },
   {
+    name: 'upload_file',
+    description:
+      'Upload a file to a Slack conversation, optionally into a thread and with a message. ' +
+      'Pass the file as text (content) or as base64 (contentBase64), not both: at most 5 MiB of file bytes, ' +
+      'after base64 is decoded or text is encoded as UTF-8. ' +
+      'Same write rules as send_message.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        channelId: { type: 'string', description: 'Slack conversation ID' },
+        filename: { type: 'string', description: 'File name shown in Slack, with extension (e.g. positions.csv)' },
+        content: { type: 'string', description: 'File contents as text' },
+        contentBase64: { type: 'string', description: 'File contents as canonical RFC 4648 base64 with required padding, for binary files; no whitespace or data URI prefix' },
+        messageId: { type: 'string', description: 'Thread to upload into: the message\'s `thread=` if it has one, else its `id=`' },
+        comment: { type: 'string', description: 'Message posted with the file (Slack mrkdwn)' },
+        title: { type: 'string', description: 'Title shown above the file; defaults to the file name' },
+      },
+      required: ['channelId', 'filename'],
+    },
+  },
+  {
     name: 'send_dm',
     description: 'Send a direct message to a Slack user (opens the DM conversation if needed)',
     inputSchema: {
@@ -100,9 +121,11 @@ export const toolDefinitions: ToolDefinition[] = [
   {
     name: 'list_channels',
     description:
-      'List Slack conversations: channels the bot is a member of, private channels, DMs, ' +
-      'and group DMs. Set includeNonMember to also list public channels the bot has not joined ' +
-      '(it cannot receive events from or post to those without being invited).',
+      'List Slack conversations: channels the bot is a member of, private channels, and, unless this host ' +
+      "has turned direct messages off, DMs and group DMs: each kind the bot's token has the read scope for. An " +
+      "answer that leaves out a kind the token can't read says which, beside the list. Set includeNonMember to " +
+      'also list public channels the bot has not ' +
+      'joined (it cannot receive events from or post to those without being invited).',
     inputSchema: {
       type: 'object',
       properties: {

@@ -16,15 +16,29 @@
  * (`slack_webapi_request_error`, or `slack_webapi_http_error` with the HTTP
  * status), which leaves a write's outcome unknown, unless the connection
  * couldn't be made at all, which Node's code on the request error's
- * `original` tells. Two more are this server's own: a request its call's
- * deadline left no time to send (OutOfCallTime), and fetch_attachment's
- * download running past its timeout. Each refusal code here is one Slack's
- * reference documents for a method these tools call. Other errors, and codes
- * not listed, pass through unchanged.
+ * `original` tells. Five more are this server's own: a request its call's
+ * deadline left no time to send (OutOfCallTime), fetch_attachment's download
+ * running past its timeout, a listing the token's scopes leave no type to ask
+ * for (NoReadableConversations), a failed post of an upload's bytes to Slack's
+ * upload server (UploadBytesFailed), and an upload whose last step named no file
+ * (UploadNotConfirmed). Each refusal code here is one Slack's
+ * reference documents for a method these tools call. A refusal whose code
+ * isn't in Slack's form, as the client reads a body such as an HTML page, is
+ * read as an answer that shows nothing about what Slack did. Other errors,
+ * and codes not listed, pass through unchanged.
  */
 import { ErrorCode } from '@slack/web-api';
 import { connectionNeverMade, reactionName } from './content.js';
-import { CALL_SECONDS, OutOfCallTime, SLACK_CLIENT_OPTIONS, failedRequest, slackRefusal } from './slack-adapter.js';
+import {
+  CALL_SECONDS,
+  NoReadableConversations,
+  OutOfCallTime,
+  SLACK_CLIENT_OPTIONS,
+  UploadBytesFailed,
+  UploadNotConfirmed,
+  failedRequest,
+  slackRefusal,
+} from './slack-adapter.js';
 
 /** The call an error came from: a tool's name, or `channels/publish` for the
  *  host's publish, and the arguments it names Slack's objects by. */
@@ -39,6 +53,7 @@ const NOT_DONE: Record<string, string> = {
   reply_message: 'Nothing was posted',
   'channels/publish': 'Nothing was posted',
   send_dm: 'Nothing was sent',
+  upload_file: 'Nothing was uploaded',
   edit_message: "The message wasn't changed",
   delete_message: 'Nothing was deleted',
   add_reaction: 'No reaction was added',
@@ -50,14 +65,15 @@ const NOT_DONE: Record<string, string> = {
   refresh_channels: 'Nothing was announced to the host',
 };
 
-const POSTS = new Set(['send_message', 'reply_message', 'channels/publish', 'send_dm']);
+const POSTS = new Set(['send_message', 'reply_message', 'channels/publish', 'send_dm', 'upload_file']);
 /** The requests a write tool makes before its write: the conversation check
- *  under SLACK_DISABLE_DMS and send_dm's opening of the DM. A failure of one of
+ *  under SLACK_DISABLE_DMS, send_dm's opening of the DM, and an upload's first
+ *  step, which only gives it somewhere to send the file. A failure of one of
  *  these wrote nothing. Any other request a write tool makes reads as its own
  *  write, so a method missing here costs only a check before trying again,
  *  where one missing from a list of writes would say nothing was written when
  *  something may have been. */
-const BEFORE_WRITE = new Set(['conversations.info', 'conversations.open']);
+const BEFORE_WRITE = new Set(['conversations.info', 'conversations.open', 'files.getUploadURLExternal']);
 const WRITES = new Set([...POSTS, 'edit_message', 'delete_message', 'add_reaction']);
 /** Tools whose listing pages through Slack inside the call, from the first
  *  page each time, so in a workspace too large to list within Slack's rate
@@ -67,7 +83,8 @@ const LISTINGS = new Set(['list_channels', 'find_user', 'refresh_channels']);
 const RECALLED = 'The id may be mistyped or remembered rather than copied';
 const MESSAGE_IDS =
   "Copy the message's id= from where it arrived, or take it from fetch_history (fetch_thread for a thread's replies)";
-/** reply_message's messageId and fetch_thread's threadTs name a thread's parent. */
+/** reply_message's and upload_file's messageId, and fetch_thread's threadTs,
+ *  name a thread's parent. */
 const PARENT_IDS =
   "Pass the thread's parent id: a reply's thread=, or the id of the message the replies are under, which " +
   'fetch_history shows';
@@ -75,6 +92,22 @@ const TS_FORM = 'which looks like 1718000000.000100';
 
 /** Slack's answers that the message or thread a call named isn't one. */
 const THREAD_REFUSALS = new Set(['thread_not_found', 'message_not_found', 'bad_timestamp']);
+/** What each of a workspace's settings that refuse an upload allows, as
+ *  Slack's pages for files.getUploadURLExternal and
+ *  files.completeUploadExternal describe it. */
+const UPLOAD_SETTINGS: Record<string, string> = {
+  file_uploads_disabled: "don't allow file uploads",
+  file_uploads_except_images_disabled: 'allow only image uploads',
+  file_type_not_allowed: "don't allow this type of file",
+  file_upload_size_restricted: 'restrict uploads of large files',
+};
+/** What may still go under a setting, where the setting says what may.
+ *  file_type_not_allowed gets nothing, so the text doesn't hint at a way round
+ *  the workspace's rule. */
+const UPLOAD_SETTING_REMEDIES: Record<string, string> = {
+  file_uploads_except_images_disabled: ' An image file may go.',
+  file_upload_size_restricted: ' A smaller file may go.',
+};
 
 export function explainSlackError(err: unknown, call: SlackCall): string {
   const carried = (err as { message?: unknown } | null)?.message;
@@ -98,16 +131,21 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
     const v = call.args[key];
     return typeof v === 'string' && v.trim() ? v : undefined;
   };
-  const lead = NOT_DONE[call.tool] ?? 'Nothing was done';
+  // An upload's file is shared only at its last step, so a failure there, or
+  // of the bytes before it, which may have reached Slack's upload server,
+  // leads with what is true of the file by then.
+  const sharing = call.tool === 'upload_file' &&
+    (failedRequest(err) === 'files.completeUploadExternal' || err instanceof UploadBytesFailed);
+  const lead = sharing ? 'Nothing was shared' : NOT_DONE[call.tool] ?? 'Nothing was done';
   const channel = given('channelId');
   const conversation = channel ? `conversation ${channel}` : 'the conversation';
   // The message a call names: messageId, or fetch_thread's threadTs.
   const ts = given('messageId') ?? given('threadTs');
   const theMessage = ts ? `message ${ts}` : 'the message';
   // The thread a call reads or posts into: fetch_thread's threadTs, the parent
-  // reply_message replies under (its messageId), or, for channels/publish, the
+  // reply_message or upload_file replies under (its messageId), or, for channels/publish, the
   // thread its publish was sent to, which handleRequest passes as threadTs.
-  const thread = call.tool === 'reply_message' ? given('messageId') : given('threadTs');
+  const thread = call.tool === 'reply_message' || call.tool === 'upload_file' ? given('messageId') : given('threadTs');
   const userId = given('userId');
   const theUser = userId ? `user ${userId}` : 'the user given';
   const isWrite = WRITES.has(call.tool);
@@ -135,6 +173,12 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
         : thread
           ? `fetch_thread for the thread under message ${thread} in ${conversation}`
           : `fetch_history for ${conversation}`;
+      if (call.tool === 'upload_file') {
+        return (
+          `${cause}, so whether the file was shared is unknown${note}. Check ${where} before uploading again, so ` +
+          "it isn't shared twice."
+        );
+      }
       return (
         `${cause}, so whether the message was posted is unknown${note}. Check ${where} before posting again, so ` +
         "it isn't posted twice."
@@ -158,6 +202,32 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
     );
   };
 
+  if (err instanceof UploadNotConfirmed) {
+    // Its ID came from the first step, so a rollback deletes it either way.
+    return unknown("Slack's answer to the upload's last step named no file");
+  }
+  if (err instanceof UploadBytesFailed) {
+    const seconds = SLACK_CLIENT_OPTIONS.timeout / 1000;
+    const unshared = "Slack shares a file only at the upload's last step, which wasn't sent";
+    if (err.why === 'TimeoutError') {
+      // The timeout covers the whole post: the bytes, the answer and its body.
+      // The bytes may have reached the server, so this says only that the
+      // post didn't finish.
+      return (
+        `${lead}: the post of the file's bytes to Slack's upload server didn't finish within ${seconds} seconds. ` +
+        `${unshared}, so calling again is safe. If it keeps timing out, Slack's upload server or this server's ` +
+        `connection to it is too slow for this file within ${seconds} seconds: a smaller file may go through, ` +
+        'and whoever runs this host can look into the connection.'
+      );
+    }
+    if (err.why === 'transit') {
+      return (
+        `${lead}: the connection to Slack's upload server failed. ${unshared}. Try again shortly. If it keeps ` +
+        "failing, whoever runs this host has to check its connection to Slack's upload server."
+      );
+    }
+    return `${lead}: Slack's upload server answered the file's bytes with HTTP ${err.why}. ${unshared}. Try again shortly.`;
+  }
   if (err instanceof OutOfCallTime) {
     // Not sent: a call's request goes out only if its timeout fits
     // (assertRequestFits).
@@ -166,6 +236,16 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
       `had used ${err.usedSeconds} of them, waiting behind earlier calls or on its own earlier requests, so too ` +
       `few were left to send this request to Slack. It wasn't sent, so calling again is safe.` +
       startsOver(`a call's ${CALL_SECONDS} seconds`)
+    );
+  }
+  if (err instanceof NoReadableConversations) {
+    // Not sent: Slack refuses a listing for a type whose read scope the token
+    // lacks, and the scopes Slack last reported read none of them. Its message,
+    // which the answer opens with, names the read scopes.
+    return (
+      `${lead}: Slack lists each kind of conversation only for a token with that kind's read scope. Calling ` +
+      "again won't change that: whoever runs this host has to add one of those scopes to the app's bot token " +
+      'scopes and reinstall the app to the workspace.'
     );
   }
   if (call.tool === 'fetch_attachment' && (err as { name?: unknown } | null)?.name === 'TimeoutError') {
@@ -199,8 +279,17 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
     return mayHaveWritten ? unknown(cause) : `${lead}: ${cause}. Try again shortly.`;
   }
   const code = slackRefusal(err);
+  // An answer the client reads as a refusal but whose code isn't in Slack's
+  // form, such as an HTML page, shows nothing about what Slack did.
+  if (code === undefined && e?.code === ErrorCode.PlatformError) {
+    const cause = "Slack answered in a form this server can't read";
+    return mayHaveWritten
+      ? unknown(cause)
+      : `${lead}: ${cause}. Try again shortly. If it keeps failing, whoever runs this host has to check its ` +
+          'connection to Slack.';
+  }
   if (code === undefined) return undefined;
-  const messageIds = call.tool === 'reply_message' || call.tool === 'fetch_thread' ? PARENT_IDS : MESSAGE_IDS;
+  const messageIds = call.tool === 'reply_message' || call.tool === 'fetch_thread' || call.tool === 'upload_file' ? PARENT_IDS : MESSAGE_IDS;
 
   // channels/publish names no message or thread itself: this server replies in
   // the thread of the last message from the conversation that the host took
@@ -231,6 +320,9 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
         'list_channels shows the conversations this bot can use, with their ids.'
       );
     case 'not_in_channel':
+      if (call.tool === 'upload_file') {
+        return `${lead}: this bot isn't a member of ${conversation}, so Slack didn't let it share the file there. ${invite}`;
+      }
       return POSTS.has(call.tool)
         ? `${lead}: this bot isn't a member of ${conversation}, so Slack didn't let it post there. ${invite} ` +
             'For a public channel, whoever runs this host can instead grant the Slack app the chat:write.public ' +
@@ -307,12 +399,15 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
       );
     }
     case 'restricted_action_thread_only_channel':
-      return (
-        `${lead}: ${conversation} takes messages only as thread replies. Use reply_message with the id of the ` +
-        "message you're answering."
-      );
+      return call.tool === 'upload_file'
+        ? `${lead}: ${conversation} takes messages only as thread replies. Pass messageId, the id of the message ` +
+          'whose thread the file goes in.'
+        : `${lead}: ${conversation} takes messages only as thread replies. Use reply_message with the id of the ` +
+          "message you're answering.";
     case 'restricted_action_non_threadable_channel':
-      return `${lead}: ${conversation} doesn't take thread replies. Post with send_message instead.`;
+      return call.tool === 'upload_file'
+        ? `${lead}: ${conversation} doesn't take thread replies. Upload without messageId instead.`
+        : `${lead}: ${conversation} doesn't take thread replies. Post with send_message instead.`;
     case 'restricted_action':
     case 'restricted_action_read_only_channel':
     case 'restricted_action_thread_locked':
@@ -359,11 +454,36 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
     case 'internal_error':
     case 'fatal_error':
     case 'service_unavailable':
+    // files.completeUploadExternal's: "Failure occurred when attempting to
+    // update the file."
+    case 'file_update_failed':
       if (!mayHaveWritten) return `${lead}: Slack failed while handling the call. Try again shortly.`;
       return unknown(
         'Slack failed while handling the call',
-        code === 'service_unavailable' ? '' : ' (Slack says part of a call can take effect before this error)',
+        code === 'internal_error' || code === 'fatal_error' ? ' (Slack says part of a call can take effect before this error)' : '',
       );
+    case 'file_not_found':
+      // files.completeUploadExternal's: "Could not find the file from the
+      // upload ticket."
+      return call.tool === 'upload_file'
+        ? `${lead}: Slack couldn't find the file this upload's first step set up. Calling again starts a new upload.`
+        : undefined;
+    // A workspace's refusals of an upload, which last until its admins change
+    // them (R1-2). files.getUploadURLExternal documents all five, and
+    // files.completeUploadExternal the two about file types.
+    case 'file_uploads_disabled':
+    case 'file_uploads_except_images_disabled':
+    case 'file_type_not_allowed':
+    case 'file_upload_size_restricted':
+      return call.tool === 'upload_file'
+        ? `${lead}: this workspace's settings ${UPLOAD_SETTINGS[code]} (${code}). Calling again won't change that; ` +
+            `the workspace's admins can.${UPLOAD_SETTING_REMEDIES[code] ?? ''}`
+        : undefined;
+    case 'storage_limit_reached':
+      return call.tool === 'upload_file'
+        ? `${lead}: this workspace has reached its file storage limit (${code}). Calling again won't change that; ` +
+            "the workspace's admins can."
+        : undefined;
     case 'user_not_found':
       return (
         `${lead}: Slack has no user ${userId ?? 'by the id given'}. ${RECALLED}. find_user returns each ` +

@@ -28,7 +28,10 @@ function fakeSlack(list = async () => [conversation()]) {
     dmsWritable: true,
     canWrite: () => true,
     onMessage() {},
-    listConversations: list,
+    // A listing that left no type out, as a token with every read scope gets.
+    async listConversations(...args: unknown[]) {
+      return { conversations: await (list as (...given: unknown[]) => Promise<unknown[]>)(...args), leftOut: [] };
+    },
     async sendMessage() { return { messageId: String(++sent) }; },
     async deleteMessage(_channel: string, id: string) { deleted.push(id); },
   } as unknown as SlackAdapter;
@@ -548,7 +551,10 @@ test("a rollback counts the deletes Slack confirmed, and logs each message it co
   const rolledBack = await h.host.sendRequest(method.STATE_ROLLBACK, {
     featureSet: 'slack.messaging', checkpoint: sent.state.checkpoint,
   }) as { checkpoint: string; success: boolean; reason?: string };
-  assert.deepEqual(rolledBack, { checkpoint: sent.state.checkpoint, success: true, reason: 'Rolled back (1/2 messages deleted)' });
+  assert.deepEqual(rolledBack, {
+    checkpoint: sent.state.checkpoint, success: true, reason: 'Rolled back (1/2 messages deleted). May remain: message 2 in C1. ' +
+      'No rollback tries these again: delete_message can try a message among them again, by its id',
+  });
   assert.deepEqual(deleted, ['3']);
   assert.deepEqual(
     lines.filter((line) => line.includes('Rollback')),
@@ -565,6 +571,9 @@ test('a refresh whose host leaves during its listing writes nothing for the next
   await first.initialize();
   await first.grant();
   await until(() => first.requests.length === 1, 'first registration');
+  // The refresh lists only once that registration has ended; while it runs, a
+  // refresh answers at once without listing.
+  await first.ended();
   const refreshed = first.refresh().catch(() => undefined); // its answer can't arrive: the host leaves
   await until(() => calls === 2, "the refresh's listing");
   const leaving = first.close();

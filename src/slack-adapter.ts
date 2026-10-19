@@ -30,6 +30,7 @@ import {
   fetchSlackHistory,
   classifyExtension,
   reactionName,
+  SLACK_CODE,
   SLACK_FAILED,
   connectionNeverMade,
   type AttachmentRef,
@@ -42,18 +43,29 @@ const ACK_TTL_MS = 10 * 60 * 1000;
  *  up to ACK_MAX_TRIES tries in all. */
 const ACK_RETRY_MS = 60 * 1000;
 const ACK_MAX_TRIES = 5;
-/** Slack's answers to an acknowledgement's add after which it may be there:
- *  already_reacted, and the failures the explainer calls an unknown outcome. */
-const MAY_HAVE_LANDED = new Set(['already_reacted', 'internal_error', 'fatal_error', 'service_unavailable']);
+/** Slack's answers to a write after which it may have taken effect:
+ *  already_reacted, to an acknowledgement's add, and the failures the
+ *  explainer calls an unknown outcome. */
+const MAY_HAVE_LANDED = new Set(['already_reacted', 'internal_error', 'fatal_error', 'service_unavailable', 'file_update_failed']);
 /** The host refreshes typing every few seconds; Slack keeps a thread status
  *  for 2 minutes, so it is set again only after this. */
 const STATUS_REFRESH_MS = 60 * 1000;
 const STATUS_TEXT = 'is thinking…';
 
-/** Slack's code, when Slack refused the call; undefined for any other error. */
+/** Slack's code, when Slack refused the call; undefined for any other error,
+ *  an answer with no code in Slack's form (SLACK_CODE) included. */
 export function slackRefusal(err: unknown): string | undefined {
   const e = err as { code?: unknown; data?: { error?: unknown } } | null;
-  return e?.code === ErrorCode.PlatformError && typeof e.data?.error === 'string' ? e.data.error : undefined;
+  const code = e?.code === ErrorCode.PlatformError ? e.data?.error : undefined;
+  return typeof code === 'string' && SLACK_CODE.test(code) ? code : undefined;
+}
+
+/** Whether Slack refused `err`'s request in its form and will refuse it the
+ *  same way again: a refusal that isn't Slack's own failure (SLACK_FAILED), so
+ *  one waitToAskAgain gives no wait. */
+export function refusedForGood(err: unknown): boolean {
+  const code = slackRefusal(err);
+  return code !== undefined && !SLACK_FAILED.has(code);
 }
 
 /** Slack's answers to conversations.info that it has no such conversation to
@@ -84,6 +96,66 @@ function afterFailedCheck(err: unknown): string {
   return "Calling again won't change Slack's answer; only whoever runs this host, or the workspace's admins, can.";
 }
 
+/** The read scope conversations.list needs for each conversation type. */
+const TYPE_SCOPE: Record<string, string> = {
+  public_channel: 'channels:read',
+  private_channel: 'groups:read',
+  im: 'im:read',
+  mpim: 'mpim:read',
+};
+
+/** Each conversation type in an agent's words. */
+const TYPE_WORDS: Record<string, string> = {
+  public_channel: 'public channels',
+  private_channel: 'private channels',
+  im: 'DMs',
+  mpim: 'group DMs',
+};
+
+const andList = (items: string[]): string =>
+  items.length <= 1 ? items.join('') : `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`;
+
+/** The scopes a Slack answer, or a refusal's data, reports the token has, or
+ *  undefined when it reports none. Slack returns an x-oauth-scopes header with
+ *  every response, naming the token's scopes, and the client splits it on
+ *  commas, so a blank header comes back as ['']. A blank or empty list is read
+ *  as a header that didn't come through, not as a token without scopes. */
+function reportedScopes(metadata: unknown): string[] | undefined {
+  const scopes = (metadata as { scopes?: unknown } | null | undefined)?.scopes;
+  if (!Array.isArray(scopes) || !scopes.every((scope) => typeof scope === 'string')) return undefined;
+  const named = scopes.filter((scope) => scope !== '');
+  return named.length > 0 ? named : undefined;
+}
+
+/** A listing's conversations, and the enabled types it left out because the
+ *  token's scopes can't read them. */
+export interface SlackListing {
+  conversations: SlackConversationInfo[];
+  leftOut: string[];
+}
+
+/** What a listing's answer says of the types it left out, or '' when it left
+ *  none out. */
+export function leftOutNote(leftOut: string[]): string {
+  if (leftOut.length === 0) return '';
+  const scopes = leftOut.map((type) => TYPE_SCOPE[type]);
+  const one = leftOut.length === 1;
+  return `This listing leaves out ${andList(leftOut.map((type) => TYPE_WORDS[type]))}: this bot's token doesn't have ` +
+    `${andList(scopes)}, the read scope${one ? '' : 's'} Slack needs to list ${one ? 'them' : 'those'}. Whoever runs ` +
+    `this host can add ${one ? 'it' : 'them'} to the app's bot token scopes and reinstall the app to the workspace. ` +
+    `Calling again won't list ${one ? 'them' : 'those'} until then.`;
+}
+
+/** A listing with no type to ask for: the token has the read scope of none of
+ *  the types this server lists, as Slack last reported its scopes. `needed`
+ *  holds those read scopes. */
+export class NoReadableConversations extends Error {
+  constructor(readonly needed: string[]) {
+    super(`This bot's token has none of the read scopes ${andList(needed)}`);
+    this.name = 'NoReadableConversations';
+  }
+}
+
 type AckEntry = {
   timer: ReturnType<typeof setTimeout>;
   added: Promise<boolean>;
@@ -98,8 +170,9 @@ const FAILED_WAIT_SECONDS = 30;
 /** Why work no call waits on, such as channel registration, waits before
  *  asking Slack again after a request to `method`: Slack rate-limited it and
  *  asked for this many seconds (`limited`), or it failed in a way that can
- *  pass: in transit, with an HTTP error, by Slack's own failure, or by not
- *  being sent because its call was out of time (`failed`). */
+ *  pass: in transit, with an HTTP error, by Slack's own failure, with an
+ *  answer not in Slack's form, or by not being sent because its call was out
+ *  of time (`failed`). */
 export interface SlackWait {
   method: string;
   seconds: number;
@@ -121,7 +194,9 @@ export function waitToAskAgain(err: unknown, method: string): SlackWait | undefi
   if (err instanceof OutOfCallTime) return { method, seconds: 0, why: 'failed' };
   const refused = slackRefusal(err);
   const failedAtSlack = refused !== undefined && SLACK_FAILED.has(refused);
-  if (e?.code === ErrorCode.RequestError || e?.code === ErrorCode.HTTPError || failedAtSlack) {
+  // An answer not in Slack's form shows nothing about what Slack did.
+  const unreadable = e?.code === ErrorCode.PlatformError && refused === undefined;
+  if (e?.code === ErrorCode.RequestError || e?.code === ErrorCode.HTTPError || failedAtSlack || unreadable) {
     return { method, seconds: FAILED_WAIT_SECONDS, why: 'failed' };
   }
   return undefined;
@@ -325,12 +400,72 @@ export class OutOfCallTime extends Error {
  *  it. */
 const failedRequests = new WeakMap<object, string>();
 
-/** The Web API method of the request `err` came from: OutOfCallTime's own, or
- *  the one SlackWebClient marked it with; undefined for an error no request of
- *  SlackWebClient's threw. */
+/** The request `err` came from: the Web API method SlackWebClient marked it
+ *  with, or OutOfCallTime's own, which names a Web API method or what else the
+ *  request was, such as an upload's bytes; undefined for an error no request
+ *  of SlackWebClient's threw. */
 export function failedRequest(err: unknown): string | undefined {
   if (err instanceof OutOfCallTime) return err.method;
   return err !== null && typeof err === 'object' ? failedRequests.get(err) : undefined;
+}
+
+/** The file an upload left when it failed after its first step, and whether
+ *  Slack may have shared it. */
+export interface FileLeft {
+  fileId: string;
+  mayHaveShared: boolean;
+}
+const filesLeft = new WeakMap<object, FileLeft>();
+
+/** The file an upload left when it failed after its first step, which a
+ *  rollback deletes too, and whether Slack may have shared it; undefined for
+ *  any other error. */
+export function fileLeftByUpload(err: unknown): FileLeft | undefined {
+  return err !== null && typeof err === 'object' ? filesLeft.get(err) : undefined;
+}
+
+/** Whether a request's failure leaves it undone: the call's time left no room
+ *  to send it, the connection to Slack was never made, or Slack refused it or
+ *  rate-limited it. A failure Slack says may have taken effect
+ *  (MAY_HAVE_LANDED), an answer not in Slack's form, an HTTP error, a timeout
+ *  or a connection that failed once made doesn't say. */
+function cannotHaveLanded(err: unknown): boolean {
+  if (err instanceof OutOfCallTime) return true;
+  const e = err as { code?: unknown; original?: { code?: unknown } } | null;
+  if (e?.code === ErrorCode.RequestError) return connectionNeverMade(e.original?.code);
+  if (e?.code === ErrorCode.RateLimitedError) return true;
+  const refused = slackRefusal(err);
+  return refused !== undefined && !MAY_HAVE_LANDED.has(refused);
+}
+
+/** An upload's last step answered without the file: whether Slack shared it
+ *  can't be told. */
+export class UploadNotConfirmed extends Error {
+  constructor(readonly fileId: string) {
+    super(`files.completeUploadExternal: the answer named no file ${fileId}`);
+    this.name = 'UploadNotConfirmed';
+  }
+}
+
+/** A post of a file's bytes to Slack's upload server that failed: its timeout
+ *  ran out (`TimeoutError`), the connection failed (`transit`), or the server
+ *  answered with this HTTP status. The bytes may have reached the server, but
+ *  Slack shares a file only at the upload's last step, so nothing was shared. */
+export class UploadBytesFailed extends Error {
+  constructor(readonly why: 'TimeoutError' | 'transit' | number) {
+    super(`The upload of the file's bytes: ${why === 'TimeoutError' ? 'timed out' : why === 'transit' ? 'the connection failed' : `HTTP ${why}`}`);
+    this.name = 'UploadBytesFailed';
+  }
+}
+
+/** The ts of the message that shared `file` in `channelId`, from
+ *  files.completeUploadExternal's answer, if it names one. */
+function sharingTs(file: SlackUploadedFile, channelId: string): string | undefined {
+  for (const where of [file.shares?.public, file.shares?.private]) {
+    const ts = where?.[channelId]?.[0]?.ts;
+    if (typeof ts === 'string' && ts) return ts;
+  }
+  return undefined;
 }
 
 /** The start rule for every request a request from the host makes, made
@@ -374,8 +509,8 @@ export function assertRequestFits(method: string, requestMs: number): void {
  * A request made outside a request from the host has no deadline and answers a
  * rate limit at once. The client binds each of its methods to apiCall as it's
  * built (`dist/methods.js`, bindApiCall), so this override reaches every Web
- * API method call. filesUploadV2's upload of a file's bytes is the one request
- * the client makes without it (`makeRequest`, `dist/WebClient.js`).
+ * API method call. An upload's bytes go out with fetch, outside the client,
+ * under the same start rule (postFileBytes).
  */
 export class SlackWebClient extends WebClient {
   /** Each request's timeout, in ms: the longest a request can take. */
@@ -464,10 +599,11 @@ export function slackClients(
 
 /**
  * Connect to Slack and build an adapter: auth.test resolves the bot's own
- * user ID (for self-filtering and mention detection) and the team name
- * (for channel labels), then Socket Mode is wired but not yet started —
- * call start() after registering the message handler. `slackApiUrl` is
- * Slack's own unless given, as slackClients' is.
+ * user ID (for self-filtering and mention detection), team name (for channel
+ * labels), and token scopes used to narrow conversation listings, then Socket
+ * Mode is wired but not yet started — call start() after registering the
+ * message handler. `slackApiUrl` is Slack's own unless given, as
+ * slackClients' is.
  */
 export async function connectSlack(config: SlackAdapterConfig, slackApiUrl?: string): Promise<SlackAdapter> {
   const clients = slackClients(config.botToken, config.appToken, slackApiUrl);
@@ -484,17 +620,29 @@ export async function connectSlack(config: SlackAdapterConfig, slackApiUrl?: str
     config.sendChannels,
     config.disableDms,
     config.ackReaction,
+    // Granted scopes, from the x-oauth-scopes header of auth.test.
+    reportedScopes(auth.response_metadata),
   );
+}
+
+/** A file as files.completeUploadExternal's answer describes it: `shares` names
+ *  the messages that shared it, by conversation. */
+export interface SlackUploadedFile {
+  id?: string;
+  shares?: { public?: Record<string, Array<{ ts?: string }>>; private?: Record<string, Array<{ ts?: string }>> };
 }
 
 /** The client surfaces the adapter needs — structural, so tests can inject fakes. */
 export interface SlackWebLike {
   conversations: {
-    list(args: Record<string, unknown>): Promise<{ channels?: unknown[]; response_metadata?: { next_cursor?: string } }>;
+    list(args: Record<string, unknown>): Promise<{ channels?: unknown[]; response_metadata?: { next_cursor?: string; scopes?: string[] } }>;
     info(args: { channel: string }): Promise<{ channel?: unknown }>;
     open(args: { users: string }): Promise<{ channel?: { id?: string } }>;
     history(args: Record<string, unknown>): Promise<{ messages?: unknown[]; response_metadata?: { next_cursor?: string } }>;
     replies(args: Record<string, unknown>): Promise<{ messages?: unknown[]; response_metadata?: { next_cursor?: string } }>;
+  };
+  auth: {
+    test(): Promise<{ response_metadata?: { scopes?: string[] } }>;
   };
   chat: {
     postMessage(args: Record<string, unknown>): Promise<{ ts?: string }>;
@@ -508,6 +656,11 @@ export interface SlackWebLike {
   /** Optional so test fakes need not carry it; the real WebClient has it. */
   assistant?: {
     threads: { setStatus(args: { channel_id: string; thread_ts: string; status: string }): Promise<unknown> };
+  };
+  files: {
+    getUploadURLExternal(args: { filename: string; length: number }): Promise<{ upload_url?: string; file_id?: string }>;
+    completeUploadExternal(args: Record<string, unknown>): Promise<{ files?: SlackUploadedFile[] }>;
+    delete(args: { file: string }): Promise<unknown>;
   };
   users: {
     info(args: { user: string }): Promise<{ user?: { profile?: { display_name?: string }; real_name?: string; name?: string } }>;
@@ -541,6 +694,11 @@ export class SlackAdapter {
 
   private stopping = false;
 
+  /** The bot token's scopes, as Slack has reported them with auth.test's
+   *  answers and with the listings' answers and refusals, each added to those
+   *  before; undefined while Slack hasn't. */
+  private scopes: string[] | undefined;
+
   constructor(
     private web: SlackWebLike,
     private socket: SlackSocketLike,
@@ -550,7 +708,13 @@ export class SlackAdapter {
     private sendChannels?: string[],
     private disableDms = false,
     private ackReaction?: string,
+    /** The bot token's scopes, as auth.test reported them; undefined, or an
+     *  empty list, is unknown, so a listing asks for every type. */
+    scopes?: string[],
   ) {
+    this.scopes = reportedScopes({ scopes });
+    const omitted = this.leftOutTypes();
+    if (omitted.length) this.logLeftOut(omitted, '');
     // Register the handler at construction so start() ordering can't race
     // an early event past an unregistered listener.
     this.socket.on('message', ({ event, ack }) => {
@@ -595,38 +759,124 @@ export class SlackAdapter {
 
   // ── Conversations ──
 
+  private conversationTypes(): string[] {
+    return this.disableDms ? ['public_channel', 'private_channel'] : Object.keys(TYPE_SCOPE);
+  }
+
+  /** The enabled types the token's scopes can read: every one while they're
+   *  unknown. */
+  private readableTypes(): string[] {
+    return this.conversationTypes().filter((type) => !this.scopes || this.scopes.includes(TYPE_SCOPE[type]));
+  }
+
+  /** The enabled types the token's scopes can't read: none while they're
+   *  unknown. */
+  private leftOutTypes(): string[] {
+    return this.conversationTypes().filter((type) => this.scopes && !this.scopes.includes(TYPE_SCOPE[type]));
+  }
+
+  private logLeftOut(omitted: string[], now: '' | 'now '): void {
+    console.error(omitted.length
+      ? `[slack-mcpl] Conversation listing ${now}omits types without a granted read scope: ${omitted.map((type) => `${type} (requires ${TYPE_SCOPE[type]})`).join(', ')}.`
+      : '[slack-mcpl] Conversation listing now asks for every type it lists: the token has each one\'s read scope.');
+  }
+
+  /** Adds the scopes a Slack answer reports, if it reports any, to those
+   *  known, and says on stderr which types listings leave out whenever that
+   *  changes. Slack never narrows a token's scopes, so an answer naming fewer,
+   *  such as one sent before a grant that lands after it, takes none away. */
+  private takeScopes(reported: string[] | undefined): void {
+    if (!reported) return;
+    const before = this.leftOutTypes().join(',');
+    this.scopes = [...new Set([...(this.scopes ?? []), ...reported])];
+    const omitted = this.leftOutTypes();
+    if (omitted.join(',') !== before) this.logLeftOut(omitted, 'now ');
+  }
+
   /** Enumerate conversations the bot can act in: member channels, DMs, and
-   *  group DMs. conversations.list also returns public channels the bot is
-   *  NOT a member of (no events, no posting without joining) — those are
-   *  excluded here; list_channels with includeNonMember surfaces them.
+   *  group DMs, of the types whose read scopes Slack has reported the token
+   *  has (every enabled type while it hasn't reported any). Slack reports the
+   *  scopes with each answer, and the client hands them on with an answer or a
+   *  refusal, though not with an HTTP error such as a 429. A listing whose
+   *  types they change, by its own answer or another listing's, starts over
+   *  with the new types, whether the change is seen at one of its answers or as
+   *  it ends, so its answer reflects the scopes known when it returns, and
+   *  `leftOut` names the enabled types it didn't ask for. With no type to ask
+   *  for, auth.test is asked for the scopes, and if they read no type either,
+   *  NoReadableConversations says so. conversations.list also returns public
+   *  channels the bot is NOT a member of (no events, no posting without
+   *  joining) — those are excluded here; list_channels with includeNonMember
+   *  surfaces them.
    *
    *  A page Slack rate-limits past what a call's client waits out, or that
    *  its call's deadline leaves no time for (SlackWebClient), or that fails in
    *  a way that can pass, ends the listing, unless `waitOut` is given, for a
    *  listing that runs in the background. Then the page, or the name of a DM's
    *  user, is asked for again once `waitOut` resolves (waitToAskAgain says how
-   *  long). A DM whose name is still missing carries `nameWait`. */
-  async listConversations(includeNonMember = false, waitOut?: SlackWaitOut): Promise<SlackConversationInfo[]> {
-    const out: SlackConversationInfo[] = [];
+   *  long), even when the types changed meanwhile. A DM whose name is still
+   *  missing carries `nameWait`. */
+  async listConversations(includeNonMember = false, waitOut?: SlackWaitOut): Promise<SlackListing> {
+    const noneReadable = () => new NoReadableConversations(this.conversationTypes().map((type) => TYPE_SCOPE[type]));
+    let types = this.readableTypes();
+    let out: SlackConversationInfo[] = [];
     let cursor: string | undefined;
     let limited = 0;
     const names = { waitOut };
+    // A listing keeps its types while it pages, so a cursor keeps its meaning,
+    // and starts over whenever the types the token can read change. Once
+    // Slack has reported the scopes, they only grow, so a listing starts over
+    // at most once more than there are types.
+    const startOver = (): boolean => {
+      const now = this.readableTypes();
+      if (now.join(',') === types.join(',')) return false;
+      if (now.length === 0) throw noneReadable();
+      types = now;
+      out = [];
+      cursor = undefined;
+      limited = 0;
+      return true;
+    };
     for (;;) {
       let result: Awaited<ReturnType<SlackWebLike['conversations']['list']>>;
       try {
+        // Slack refuses the whole call when one type lacks its read scope, and
+        // an empty types value has undocumented behavior, so a listing never
+        // sends one: with no type to ask for, the scopes held may be older
+        // than the token's, and auth.test reports them. In the background it's
+        // waited out and asked again like a page.
+        if (types.length === 0) {
+          this.takeScopes(reportedScopes((await this.web.auth.test()).response_metadata));
+          limited = 0;
+          types = this.readableTypes();
+          if (types.length === 0) throw noneReadable();
+          continue;
+        }
         result = await this.web.conversations.list({
-          types: this.disableDms ? 'public_channel,private_channel' : 'public_channel,private_channel,im,mpim',
+          types: types.join(','),
           exclude_archived: true,
           limit: 200,
           cursor,
         });
       } catch (err) {
-        const wait = waitOut && waitToAskAgain(err, 'conversations.list');
-        if (!wait) throw err;
-        await waitOut!(wait, ++limited);
-        continue;
+        const method = types.length > 0 ? 'conversations.list' : 'auth.test';
+        this.takeScopes(reportedScopes((err as { data?: { response_metadata?: unknown } } | null)?.data?.response_metadata));
+        const changed = startOver();
+        // A rate limit, or a failure that can pass, is waited out before
+        // anything is asked again, even when the types changed meanwhile, or
+        // ends a listing nothing waits out. A refusal whose scopes changed the
+        // types starts over at once.
+        const wait = waitToAskAgain(err, method);
+        if (wait) {
+          if (!waitOut) throw err;
+          await waitOut(wait, ++limited);
+          continue;
+        }
+        if (changed) continue;
+        throw err;
       }
       limited = 0;
+      this.takeScopes(reportedScopes(result.response_metadata));
+      if (startOver()) continue;
       for (const raw of (result.channels ?? []) as SlackApiConversation[]) {
         const info = await this.describeConversation(raw, names);
         if (!info) continue;
@@ -634,7 +884,11 @@ export class SlackAdapter {
         out.push(info);
       }
       cursor = result.response_metadata?.next_cursor || undefined;
-      if (!cursor) return out;
+      // Another listing's answer may have changed the scopes while this page's
+      // DM names were looked up, so they're checked once more before it ends.
+      if (!cursor && !startOver()) {
+        return { conversations: out, leftOut: this.conversationTypes().filter((type) => !types.includes(type)) };
+      }
     }
   }
 
@@ -782,21 +1036,22 @@ export class SlackAdapter {
       // The add counts as there, and is removed like an added one, when it may
       // have landed: already_reacted says it's there; Slack's failure while
       // handling it leaves it unknown, as the explainer says (internal_error
-      // and fatal_error can take effect in part); and so does an HTTP error or
-      // a request that failed after it may have reached Slack. Slack's other
-      // refusals, its rate limits (a 429, or ratelimited in a 200) and
-      // request_timeout say it didn't act, a connection never made reached
-      // nothing, and this server's own refusal, such as the write allow-list's,
-      // sent nothing. So did a failure of a request before the add, such as
-      // the DM check's conversations.info. Slack answers a removal of one that
-      // isn't there with no_reaction.
+      // and fatal_error can take effect in part); and so does an HTTP error,
+      // an answer not in Slack's form, or a request that failed after it may
+      // have reached Slack. Slack's other refusals, its rate limits (a 429, or
+      // ratelimited in a 200) and request_timeout say it didn't act, a
+      // connection never made reached nothing, and this server's own refusal,
+      // such as the write allow-list's, sent nothing. So did a failure of a
+      // request before the add, such as the DM check's conversations.info.
+      // Slack answers a removal of one that isn't there with no_reaction.
       (err: { code?: unknown; original?: { code?: unknown } } | null) => {
         const failed = failedRequest(err);
         if (failed !== undefined && failed !== 'reactions.add') return false;
         if (err?.code === ErrorCode.RequestError) return !connectionNeverMade(err.original?.code);
         if (err?.code === ErrorCode.HTTPError) return true;
         const answer = slackRefusal(err);
-        return answer !== undefined && MAY_HAVE_LANDED.has(answer);
+        if (answer === undefined) return err?.code === ErrorCode.PlatformError;
+        return MAY_HAVE_LANDED.has(answer);
       },
     );
     // Recorded before the add resolves, so a reply that lands first still removes it.
@@ -838,9 +1093,7 @@ export class SlackAdapter {
       // Slack's refusal will be the same next time. A rate limit, an HTTP
       // error, a failure in transit or Slack's own failure can pass. The fifth
       // failure drops the entry, so no sixth attempt can start.
-      const code = slackRefusal(err);
-      const lasting = code !== undefined && !SLACK_FAILED.has(code);
-      if (lasting || this.stopping || entry.tries >= ACK_MAX_TRIES) this.dropAck(channelId, ts, entry);
+      if (refusedForGood(err) || this.stopping || entry.tries >= ACK_MAX_TRIES) this.dropAck(channelId, ts, entry);
       else entry.timer = this.armAck(channelId, ts, ACK_RETRY_MS);
     }
   }
@@ -864,6 +1117,99 @@ export class SlackAdapter {
     // Slack clears a thread's status when the bot posts in that thread.
     if (opts.threadTs && this.statusOn.get(channelId)?.ts === opts.threadTs) this.statusOn.delete(channelId);
     return { messageId: result.ts ? String(result.ts) : '' };
+  }
+
+  /** Upload a file into a conversation, in the three steps of Slack's
+   *  working-with-files page: files.getUploadURLExternal gives an upload URL
+   *  and the file's ID, the file's bytes go to that URL, and
+   *  files.completeUploadExternal shares the file. Same write checks as
+   *  sendMessage. Needs the files:write scope.
+   *
+   *  A file is shared only at the last step, so a failure before it shared
+   *  nothing. Once the first step has given the file its ID, a failure leaves
+   *  that file on its error (fileLeftByUpload) for rollback, with whether
+   *  Slack may have shared it: only if the last step's own request may have
+   *  taken effect. An answer that names no file throws UploadNotConfirmed,
+   *  whose file rides on it the same way, possibly shared. `shareTs` is the
+   *  message that shared the file, when the answer names it: it holds the
+   *  comment, which rollback deletes after the file. */
+  async uploadFile(
+    channelId: string,
+    file: { filename: string; data: Buffer; title?: string; comment?: string; threadTs?: string },
+  ): Promise<{ fileId: string; shareTs?: string }> {
+    this.assertWritable(channelId, 'Nothing was uploaded');
+    await this.assertNotDm(channelId, 'Nothing was uploaded');
+    const target = await this.web.files.getUploadURLExternal({ filename: file.filename, length: file.data.byteLength });
+    const url = target.upload_url;
+    const fileId = target.file_id;
+    if (typeof fileId !== 'string' || !fileId) {
+      throw new Error("files.getUploadURLExternal: Slack's answer gave no file ID, so nothing was uploaded");
+    }
+    // Slack gave the file its ID at the first step, so whatever fails from
+    // here leaves that file for a rollback to delete. Only the last step's
+    // own request can have shared it.
+    const left = (err: unknown, mayHaveShared: boolean): unknown => {
+      if (err !== null && typeof err === 'object') filesLeft.set(err, { fileId, mayHaveShared });
+      return err;
+    };
+    if (typeof url !== 'string' || !url) {
+      throw left(new Error("files.getUploadURLExternal: Slack's answer gave no upload URL, so nothing was uploaded"), false);
+    }
+    try {
+      await this.postFileBytes(url, file.data);
+    } catch (err) {
+      throw left(err, false);
+    }
+    let answer: Awaited<ReturnType<SlackWebLike['files']['completeUploadExternal']>>;
+    try {
+      answer = await this.web.files.completeUploadExternal({
+        files: [{ id: fileId, title: file.title ?? file.filename }],
+        channel_id: channelId,
+        ...(file.comment ? { initial_comment: file.comment } : {}),
+        ...(file.threadTs ? { thread_ts: file.threadTs } : {}),
+      });
+    } catch (err) {
+      throw left(err, !cannotHaveLanded(err));
+    }
+    // An answer whose files aren't a list of files names none.
+    const files: unknown = answer.files;
+    const shared = Array.isArray(files)
+      ? (files as Array<SlackUploadedFile | null>).find((f) => f !== null && typeof f === 'object' && f.id === fileId)
+      : undefined;
+    if (!shared) throw left(new UploadNotConfirmed(fileId), true);
+    // The working reaction comes off whatever time the call has left, as a
+    // sent message's does.
+    void outsideCallTime(() => this.clearAck(channelId));
+    return { fileId, shareTs: sharingTs(shared, channelId) };
+  }
+
+  /** Posts a file's bytes to the upload URL Slack gave, as Slack's
+   *  working-with-files page does: the bytes as the body. Like every request a
+   *  call makes, it keeps the start rule for the client's timeout, and
+   *  AbortSignal.timeout ends the whole post at that length: the bytes, the
+   *  answer and its body. The client's own timeout ends only a pause in an
+   *  answer (SlackWebClient). The URL needs no token. */
+  private async postFileBytes(url: string, data: Buffer): Promise<void> {
+    assertRequestFits("The upload of the file's bytes", SLACK_CLIENT_OPTIONS.timeout);
+    const timeout = AbortSignal.timeout(SLACK_CLIENT_OPTIONS.timeout);
+    try {
+      const answer = await fetch(url, {
+        method: 'POST',
+        body: data,
+        headers: { 'content-type': 'application/octet-stream' },
+        signal: timeout,
+      });
+      await answer.arrayBuffer();
+      if (!answer.ok) throw new UploadBytesFailed(answer.status);
+    } catch (err) {
+      if (err instanceof UploadBytesFailed) throw err;
+      // Only the timeout aborts this post, and the error an abort gives
+      // depends on the runtime and on when it lands: Node 22's fetch (22.12.0
+      // and 22.23.3 alike) gives an AbortError for a body not yet being read,
+      // where Node 24 gives the signal's TimeoutError. So the signal says
+      // whether it fired.
+      throw new UploadBytesFailed(timeout.aborted ? 'TimeoutError' : 'transit');
+    }
   }
 
   /** With SLACK_DISABLE_DMS, only a conversation Slack confirmed to be a
@@ -940,6 +1286,14 @@ export class SlackAdapter {
     this.assertWritable(channelId, 'Nothing was deleted');
     await this.assertNotDm(channelId, 'Nothing was deleted');
     await this.web.chat.delete({ channel: channelId, ts });
+  }
+
+  /** Deletes a file this bot uploaded, with the same write checks as a
+   *  message's delete. */
+  async deleteFile(channelId: string, fileId: string): Promise<void> {
+    this.assertWritable(channelId, 'Nothing was deleted');
+    await this.assertNotDm(channelId, 'Nothing was deleted');
+    await this.web.files.delete({ file: fileId });
   }
 
   async addReaction(channelId: string, ts: string, emoji: string): Promise<void> {

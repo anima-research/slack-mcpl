@@ -12,6 +12,9 @@ export interface SlackApiAnswer {
   body: Record<string, unknown>;
   /** How long to take before answering, in ms. */
   delayMs?: number;
+  /** Answer only once this settles, then after delayMs: for a test that
+   *  orders an answer after an event rather than after a length of time. */
+  after?: Promise<unknown>;
 }
 
 export interface FakeSlackApi {
@@ -46,11 +49,13 @@ export async function fakeSlackApi(): Promise<FakeSlackApi> {
       calls.push(called);
       sent.push(new URLSearchParams(received));
       const queue = answersFor.get(called) ?? answers;
-      const { status = 200, headers = {}, body, delayMs = 0 } = queue.length > 1 ? queue.shift()! : queue[0];
-      setTimeout(() => {
+      const { status = 200, headers = {}, body, delayMs = 0, after } = queue.length > 1 ? queue.shift()! : queue[0];
+      const send = () => setTimeout(() => {
         res.writeHead(status, { 'content-type': 'application/json', ...headers });
         res.end(JSON.stringify(body));
       }, delayMs);
+      if (after) void after.then(send, send);
+      else send();
     });
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
