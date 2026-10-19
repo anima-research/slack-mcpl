@@ -7,6 +7,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { SlackAdapter } from '../src/slack-adapter.js';
+import { uploadEndpoint } from './harness.js';
 
 function makeAdapter(sendChannels?: string[]) {
   const calls: string[] = [];
@@ -94,4 +95,29 @@ test('canWrite follows the allow-list', () => {
   assert.equal(adapter.canWrite('CALLOWED'), true);
   assert.equal(adapter.canWrite('COTHER'), false);
   assert.equal(makeAdapter().adapter.canWrite('COTHER'), true);
+});
+
+test('upload_file follows the allow-list and passes the file to Slack', async () => {
+  const asked: any[] = [];
+  const shared: any[] = [];
+  const socket = { on() {} } as any;
+  const { url, bytes } = await uploadEndpoint();
+  const web = {
+    files: {
+      getUploadURLExternal: async (args: any) => { asked.push(args); return { upload_url: `${url}/FSC1`, file_id: 'FSC1' }; },
+      completeUploadExternal: async (args: any) => { shared.push(args); return { files: [{ id: 'FSC1' }] }; },
+    },
+  } as any;
+  const adapter = new SlackAdapter(web, socket, 'UBOT', 'acme', undefined, ['CALLOWED']);
+  await assert.rejects(adapter.uploadFile('COTHER', { filename: 'a.csv', data: Buffer.from('x') }), {
+    message: refusal('Nothing was uploaded'),
+  });
+  assert.equal(asked.length, 0);
+  const r = await adapter.uploadFile('CALLOWED', { filename: 'a.csv', data: Buffer.from('a,b'), threadTs: '1.0', comment: 'please load:' });
+  assert.equal(r.fileId, 'FSC1');
+  assert.deepEqual(asked[0], { filename: 'a.csv', length: 3 });
+  assert.deepEqual(bytes.get('FSC1'), Buffer.from('a,b'));
+  assert.deepEqual(shared[0], {
+    files: [{ id: 'FSC1', title: 'a.csv' }], channel_id: 'CALLOWED', initial_comment: 'please load:', thread_ts: '1.0',
+  });
 });
