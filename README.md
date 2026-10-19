@@ -91,7 +91,7 @@ upload URL and the file's ID, the file's bytes go to that URL, and
 the last step, so an upload that fails before it shared nothing and can be
 called again. When the last step fails, its error says whether the file may
 have been shared anyway, and if it may, what to check before uploading again;
-a refusal this server doesn't recognize passes through as Slack gave it.
+an error this server doesn't recognize passes through as it came.
 
 Uploads belong to `slack.messaging` checkpoints, so rollback attempts to
 delete them along with later messages: the file, through Slack's file

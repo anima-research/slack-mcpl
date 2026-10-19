@@ -23,9 +23,9 @@
  * upload server (UploadBytesFailed), and an upload whose last step named no file
  * (UploadNotConfirmed). Each refusal code here is one Slack's
  * reference documents for a method these tools call. A refusal whose code
- * isn't in Slack's form, as the client reads a body that isn't JSON, is read
- * as an answer that shows nothing about what Slack did. Other errors, and
- * codes not listed, pass through unchanged.
+ * isn't in Slack's form, as the client reads a body such as an HTML page, is
+ * read as an answer that shows nothing about what Slack did. Other errors,
+ * and codes not listed, pass through unchanged.
  */
 import { ErrorCode } from '@slack/web-api';
 import { connectionNeverMade, reactionName } from './content.js';
@@ -280,7 +280,7 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
   }
   const code = slackRefusal(err);
   // An answer the client reads as a refusal but whose code isn't in Slack's
-  // form, such as a body that isn't JSON, shows nothing about what Slack did.
+  // form, such as an HTML page, shows nothing about what Slack did.
   if (code === undefined && e?.code === ErrorCode.PlatformError) {
     const cause = "Slack answered in a form this server can't read";
     return mayHaveWritten

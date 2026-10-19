@@ -1448,12 +1448,12 @@ export class SlackMcplServer {
           deleted[kind]++;
           return;
         }
-        // Best-effort otherwise: Slack refused the delete, or the check before
-        // it, for good; or it was rate-limited, out of this call's time, or
-        // failed in a way that leaves it unknown, on the way or by Slack's own
-        // failure, and the item may remain. Either way the tracker has
-        // dropped it with the branch, so no later rollback tries it again: the
-        // reason names it, for the agent, and stderr says why, for an operator.
+        // Best-effort otherwise: Slack refused the delete for good; or it was
+        // rate-limited, out of this call's time, or failed in a way that
+        // leaves it unknown, on the way or by Slack's own failure, and the
+        // item may remain. Either way the tracker has dropped it with the
+        // branch, so no later rollback tries it again: the reason names it,
+        // for the agent, and stderr says why, for an operator.
         const shared = sharedFile ? `, which shared file ${sharedFile}` : '';
         left.push({ kind, named: `${kind} ${id} in ${channelId}${shared}`, forGood: refusedForGood(err) });
         console.error(
@@ -1506,7 +1506,7 @@ export class SlackMcplServer {
         ? [[
             `Rolled back (${counts} deleted)`,
             ...(mayRemain.length > 0 ? [`May remain: ${named(mayRemain)}. No rollback tries these again: ${remedy}`] : []),
-            ...(refused.length > 0 ? [`Slack refused these, and calling again won't change that: ${named(refused)}`] : []),
+            ...(refused.length > 0 ? [`Slack refused to delete these, and calling again won't change that: ${named(refused)}`] : []),
           ].join('. ')]
         : []),
       ...(commentsLeft.length === 1

@@ -18,8 +18,8 @@
   process, across host reconnects. The upload runs in Slack's three steps,
   each request under the call's time. A failure in any of them says whether
   the file may have been shared, and if it may, what to check before
-  uploading again, unless it's a refusal the explainer doesn't know, which
-  passes through as Slack gave it. A refusal by the workspace's settings
+  uploading again, unless it's an error the explainer doesn't know, which
+  passes through as it came. A refusal by the workspace's settings
   says what they allow, one by its file storage limit says so, and each
   says that calling again won't change it.
   Once the first step has given the file its ID, a failed upload's file is

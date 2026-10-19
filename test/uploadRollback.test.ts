@@ -162,7 +162,7 @@ test("deleting an upload's sharing message leaves its file for a rollback to del
 
 test('rollback reports a failed file deletion while still deleting its sharing message and later messages', async (t) => {
   const fake = fakeSlack();
-  t.mock.method(fake.slack, 'deleteFile', async () => { throw new Error('Slack refused file deletion'); });
+  t.mock.method(fake.slack, 'deleteFile', async () => { throw new Error('the file deletion failed'); });
   const h = connectHost(new SlackMcplServer(fake.slack));
   t.after(() => h.close());
   await ready(h);

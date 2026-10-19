@@ -384,7 +384,7 @@ test("a sharing message Slack refuses to delete counts as a message not deleted,
   await call('upload_file', { channelId: 'C1', filename: 'a.txt', content: 'a', comment: 'Here' });
   const rolledBack = await rollback(before.state!.checkpoint);
   // Slack will refuse it the same way, so nothing says to try it again.
-  assert.equal(rolledBack.reason, 'Rolled back (0/1 messages and 1/1 files deleted). Slack refused these, and calling again ' +
+  assert.equal(rolledBack.reason, 'Rolled back (0/1 messages and 1/1 files deleted). Slack refused to delete these, and calling again ' +
     "won't change that: message 5.5 in C1, which shared file F1");
   assert.deepEqual(lines.filter((l) => l.includes('Rollback')), [
     "[slack-mcpl] Rollback couldn't delete message 5.5, which shared file F1, in C1: An API error occurred: cant_delete_message",
@@ -400,7 +400,7 @@ test("a file Slack refuses to delete counts as a file not deleted, and its shari
   const before = await call('send_message', { channelId: 'C1', content: 'before' });
   await call('upload_file', { channelId: 'C1', filename: 'a.txt', content: 'a', comment: 'Here' });
   const from = api.calls.length;
-  assert.equal((await rollback(before.state!.checkpoint)).reason, 'Rolled back (1/1 messages and 0/1 files deleted). Slack refused these, ' +
+  assert.equal((await rollback(before.state!.checkpoint)).reason, 'Rolled back (1/1 messages and 0/1 files deleted). Slack refused to delete these, ' +
     "and calling again won't change that: file F1 in C1");
   assert.deepEqual(called(from), ['files.delete', 'chat.delete']);
   // stderr names the file left, for whoever runs this host to clean up.
@@ -416,7 +416,7 @@ test("a rollback whose file and sharing message Slack both refuses to delete nam
   const before = await call('send_message', { channelId: 'C1', content: 'before' });
   await call('upload_file', { channelId: 'C1', filename: 'a.txt', content: 'a', comment: 'Here' });
   assert.equal((await rollback(before.state!.checkpoint)).reason,
-    "Rolled back (0/1 messages and 0/1 files deleted). Slack refused these, and calling again won't change that: file F1 in C1; " +
+    "Rolled back (0/1 messages and 0/1 files deleted). Slack refused to delete these, and calling again won't change that: file F1 in C1; " +
       'message 5.5 in C1, which shared file F1');
 });
 
@@ -431,8 +431,29 @@ test("a rollback names apart what Slack refused for good and what may remain, ea
   await call('upload_file', { channelId: 'C1', filename: 'a.txt', content: 'a', comment: 'Here' });
   assert.equal((await rollback(before.state!.checkpoint)).reason,
     'Rolled back (0/1 messages and 0/1 files deleted). May remain: file F1 in C1. No rollback tries these again: no tool here ' +
-      "deletes a file, and whoever runs this host can delete it with Slack's files.delete, by its id. Slack refused these, and " +
+      "deletes a file, and whoever runs this host can delete it with Slack's files.delete, by its id. Slack refused to delete these, and " +
       "calling again won't change that: message 5.5 in C1, which shared file F1");
+});
+
+test("the remedy says what can be done for each kind that may remain, and nothing for a kind Slack refused", { timeout: 5000 }, async (t) => {
+  // Slack's own failure can pass; this bot may delete only its own files.
+  t.mock.method(console, 'error', () => {});
+  for (const [file, says] of [
+    [{ body: { ok: false, error: 'cant_delete_file' } }, 'May remain: message 5.5 in C1, which shared file F1. No rollback tries ' +
+      "these again: delete_message can try a message among them again, by its id. Slack refused to delete these, and calling again won't " +
+      'change that: file F1 in C1'],
+    [{ body: { ok: false, error: 'internal_error' } }, 'May remain: file F1 in C1; message 5.5 in C1, which shared file F1. No ' +
+      'rollback tries these again: delete_message can try a message among them again, by its id, and no tool here deletes a ' +
+      "file, and whoever runs this host can delete it with Slack's files.delete, by its id"],
+  ] as const) {
+    await steps(t, { last: sharedBy('F1', '5.5') });
+    api.answerFor('files.delete', file);
+    api.answerFor('chat.delete', { body: { ok: false, error: 'internal_error' } });
+    const { call, rollback } = await server(t);
+    const before = await call('send_message', { channelId: 'C1', content: 'before' });
+    await call('upload_file', { channelId: 'C1', filename: 'a.txt', content: 'a', comment: 'Here' });
+    assert.equal((await rollback(before.state!.checkpoint)).reason, `Rolled back (0/1 messages and 0/1 files deleted). ${says}`);
+  }
 });
 
 test("a delete whose outcome is unknown leaves its item named as one that may remain", { timeout: 5000 }, async (t) => {
@@ -459,7 +480,7 @@ test("a rollback that leaves one upload's file names it, and still notes another
   await call('upload_file', { channelId: 'C1', filename: 'a.txt', content: 'a', comment: 'One' });
   await call('upload_file', { channelId: 'C1', filename: 'b.txt', content: 'b', comment: 'Two' });
   assert.equal((await rollback(before.state!.checkpoint)).reason,
-    "Rolled back (1/1 messages and 1/2 files deleted). Slack refused these, and calling again won't change that: file F1 in C1. The comment of uploaded file F2 may " +
+    "Rolled back (1/1 messages and 1/2 files deleted). Slack refused to delete these, and calling again won't change that: file F1 in C1. The comment of uploaded file F2 may " +
       "remain in conversation C1: this server doesn't know the message that shared the file, so no rollback can delete it. " +
       "delete_message may, by that message's id, which fetch_history shows, or fetch_thread if the file went into a thread");
 });
@@ -643,7 +664,7 @@ test('a rollback that deletes a file but not a later message counts each kind ap
   await call('send_message', { channelId: 'C1', content: 'after' });
   const from = api.calls.length;
   assert.equal((await rollback(before.state!.checkpoint)).reason,
-    "Rolled back (1/2 messages and 1/1 files deleted). Slack refused these, and calling again won't change that: message 1.1 in C1");
+    "Rolled back (1/2 messages and 1/1 files deleted). Slack refused to delete these, and calling again won't change that: message 1.1 in C1");
   assert.deepEqual(api.calls.flatMap((m, i) => (i >= from && m === 'chat.delete' ? [api.sent[i]!.get('ts')] : [])), ['5.5', '1.1']);
 });
 
