@@ -78,9 +78,14 @@ test('every header names the conversation by channelId, the DM included', () => 
     locationHeader({ conversation: 'DM', teamName: 'acme', channelId: 'D2', messageId: '2.0' }),
     '[DM (acme) channelId=D2 id=2.0] ',
   );
+  assert.equal(locationHeader({ channelId: 'C1', threadTs: '1.0', messageId: '2.0' }), '[channelId=C1 thread=1.0 id=2.0] ');
+  assert.equal(
+    locationHeader({ conversation: '#support', teamName: 'acme', channelId: 'C1', threadTs: '1.0', messageId: '2.0' }),
+    '[#support (acme) channelId=C1 thread=1.0 id=2.0] ',
+  );
 });
 
-test("a DM's message names its channelId, and each write to another DM names who it went to", async (t) => {
+test("a DM's message names its channelId, and a write to another DM names who it went to when that DM has a label", async (t) => {
   const { FULL_GRANT, harness, initialize, until } = await import('./harness.js');
   const { method } = await import('@animalabs/mcpl-core');
   const h = harness({ dms: [{ id: 'D1', user: 'UVASYL' }, { id: 'D2', user: 'UDENIS' }] });
@@ -99,4 +104,10 @@ test("a DM's message names its channelId, and each write to another DM names who
   // The fake opens D1 for any user.
   const dm = await h.host.sendRequest('tools/call', { name: 'send_dm', arguments: { userId: 'UVASYL', content: 'the answer' } }) as { content: { text: string }[] };
   assert.deepEqual(JSON.parse(dm.content[0].text), { messageId: '100.3', channelId: 'D1', to: 'DM: @UVASYL (acme)' });
+  // A DM no listing had has no label, so its answer has no `to`.
+  const slack = (h.server as unknown as { slack: SlackAdapter }).slack;
+  (slack as unknown as { web: { conversations: { open(): Promise<unknown> } } }).web.conversations.open =
+    async () => ({ channel: { id: 'D7' } });
+  const opened = await h.host.sendRequest('tools/call', { name: 'send_dm', arguments: { userId: 'UNEW', content: 'hello' } }) as { content: { text: string }[] };
+  assert.deepEqual(JSON.parse(opened.content[0].text), { messageId: '100.4', channelId: 'D7' });
 });

@@ -675,7 +675,7 @@ export class SlackMcplServer {
         const result = await this.posting(content, () => this.slack.sendMessage(channelId, content));
         this.stateTracker.recordSent(result.messageId, channelId, content);
         this.markOutbound(channelId);
-        return { messageId: result.messageId, to: this.recipient(channelId) };
+        return { messageId: result.messageId, ...this.recipient(channelId) };
       }
 
       case 'reply_message': {
@@ -685,7 +685,7 @@ export class SlackMcplServer {
         const result = await this.posting(content, () => this.slack.sendMessage(channelId, content, { threadTs }));
         this.stateTracker.recordSent(result.messageId, channelId, content);
         this.markOutbound(channelId);
-        return { messageId: result.messageId, threadTs, to: this.recipient(channelId) };
+        return { messageId: result.messageId, threadTs, ...this.recipient(channelId) };
       }
 
       case 'upload_file': {
@@ -766,7 +766,7 @@ export class SlackMcplServer {
         }
         this.markOutbound(channelId);
         this.stateTracker.recordUploaded(result.fileId, channelId, { shareTs: result.shareTs, comment: comment !== undefined });
-        return { fileId: result.fileId, to: this.recipient(channelId) };
+        return { fileId: result.fileId, ...this.recipient(channelId) };
       }
 
       case 'send_dm': {
@@ -775,7 +775,7 @@ export class SlackMcplServer {
         const result = await this.posting(content, () => this.slack.sendDM(userId, content));
         this.stateTracker.recordSent(result.messageId, result.channelId, content);
         this.markOutbound(result.channelId);
-        return { messageId: result.messageId, channelId: result.channelId, to: this.recipient(result.channelId) };
+        return { messageId: result.messageId, channelId: result.channelId, ...this.recipient(result.channelId) };
       }
 
       case 'add_reaction': {
@@ -1023,11 +1023,15 @@ export class SlackMcplServer {
     };
   }
 
-  /** Who a write went to, as the conversation's registered label, so an
-   *  agent that sent to the wrong conversation sees it in the same turn. */
-  private recipient(channelId: string): string {
-    return this.channelManager.get(mcplChannelId(channelId))?.label
-      ?? `conversation ${channelId}, which this server hasn't listed`;
+  /** Who a write went to, as `to`: the conversation's registered label, a
+   *  name the agent didn't supply, so one that sent to the wrong conversation
+   *  sees it in the same turn. A conversation with no registered label (any,
+   *  for a plain MCP client; one the host didn't take, or the last listing
+   *  didn't have, such as a DM first written in since) gets no `to`, since
+   *  all it could say is the id the agent passed. */
+  private recipient(channelId: string): { to?: string } {
+    const label = this.channelManager.get(mcplChannelId(channelId))?.label;
+    return label === undefined ? {} : { to: label };
   }
 
   /** Record that the bot just sent to a conversation, for location headers. */
@@ -1720,10 +1724,10 @@ export class SlackMcplServer {
 
     // The conversation is named only when it differs from the last context
     // this peer was sent, which is read here, after the lookups above, since
-    // another conversation's message can go out while they run. The thread
-    // and the message ID are given every time: two threads in one channel are
-    // otherwise indistinguishable, and replying or reacting to a message needs
-    // its ID.
+    // another conversation's message can go out while they run. The
+    // conversation's ID, the thread and the message ID are given every time:
+    // two threads in one channel are otherwise indistinguishable, and replying
+    // or reacting to a message needs its conversation's ID and its own.
     const contextChanged = this.lastChannelId !== msg.channelId;
     if (contextChanged && meta === undefined && !msg.isDM) {
       meta = await this.lookUpMeta(msg);

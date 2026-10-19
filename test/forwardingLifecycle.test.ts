@@ -634,8 +634,8 @@ for (const lookup of ['history', 'name', 'location'] as const) {
       assert.equal(/<backscroll/.test(first), lookup === 'name');
       assert.doesNotMatch(second, /<backscroll/);
       // A conversation whose name didn't come in time is named by its ID, and
-      // its next message, in the same context, names nothing and looks up
-      // nothing.
+      // its next message, in the same context, names its conversation only by
+      // channelId and looks up nothing.
       assert.match(first, lookup === 'history' ? /\[#general \(acme\) channelId=C1 id=111\.1\] / : /\[C1 \(acme\) channelId=C1 id=111\.1\] /);
       assert.match(second, /\[channelId=C1 id=111\.2\] /);
       assert.deepEqual(logLines(errors).filter((l) => l.includes('Gave up on')), [
