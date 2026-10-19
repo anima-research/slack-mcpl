@@ -15,11 +15,17 @@ const refusal = (error: string) => Object.assign(new Error(`An API error occurre
   data: { ok: false, error },
 });
 
-function makeAdapter(opts: { ackReaction?: string; sendChannels?: string[] } = {}) {
+/** `posts` answers the adapter's posts in turn, and then each answers with a ts. */
+function makeAdapter(opts: { ackReaction?: string; sendChannels?: string[]; posts?: Array<() => { ts?: string }> } = {}) {
   const calls: string[] = [];
   const socket = { on() {}, async start() {}, async disconnect() {} } as any;
   const web = {
-    chat: { postMessage: async ({ channel }: any) => { calls.push(`post:${channel}`); return { ts: '9.0' }; } },
+    chat: {
+      postMessage: async ({ channel }: any) => {
+        calls.push(`post:${channel}`);
+        return (opts.posts?.shift() ?? (() => ({ ts: '9.0' })))();
+      },
+    },
     reactions: {
       add: async ({ channel, timestamp, name }: any) => { calls.push(`add:${channel}:${timestamp}:${name}`); },
       remove: async ({ channel, timestamp, name }: any) => { calls.push(`remove:${channel}:${timestamp}:${name}`); },
@@ -37,6 +43,21 @@ test('reaction is added on acknowledge and removed when the bot posts there', as
   await adapter.sendMessage('C1', 'answer');
   await settle();
   assert.deepEqual(calls, ['add:C1:1.0:eyes', 'add:C1:2.0:eyes', 'post:C1', 'remove:C1:1.0:eyes', 'remove:C1:2.0:eyes']);
+});
+
+test('a post whose answer names no message leaves the reaction in place, as a failed post does, until a post Slack names', async () => {
+  const { adapter, calls, settle } = makeAdapter({
+    ackReaction: 'eyes',
+    posts: [() => ({}), () => { throw refusal('internal_error'); }],
+  });
+  await adapter.acknowledge('C1', '1.0');
+  await assert.rejects(adapter.sendMessage('C1', 'unnamed'), { name: 'PostNotConfirmed' });
+  await assert.rejects(adapter.sendMessage('C1', 'failed'), { message: 'An API error occurred: internal_error' });
+  await settle();
+  assert.deepEqual(calls, ['add:C1:1.0:eyes', 'post:C1', 'post:C1']);
+  await adapter.sendMessage('C1', 'answer');
+  await settle();
+  assert.deepEqual(calls.slice(3), ['post:C1', 'remove:C1:1.0:eyes']);
 });
 
 test('a post in another conversation leaves the reaction in place', async () => {
@@ -345,6 +366,19 @@ test('an unanswered acknowledgement comes off at the ten-minute mark, with no po
   t.mock.timers.tick(1);
   await flush();
   assert.deepEqual(removals(calls), ['remove:1.0']);
+});
+
+test('a post whose answer names no message leaves the ten-minute removal in place', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { adapter, calls } = makeAdapter({ ackReaction: 'eyes', posts: [() => ({})] });
+  await adapter.acknowledge('C1', '1.0');
+  await assert.rejects(adapter.sendMessage('C1', 'unnamed'), { name: 'PostNotConfirmed' });
+  t.mock.timers.tick(10 * 60 * 1000 - 1);
+  await flush();
+  assert.deepEqual(removals(calls), []);
+  t.mock.timers.tick(1);
+  await flush();
+  assert.deepEqual(removals(calls), ['remove:C1:1.0:eyes']);
 });
 
 test('a failed removal is tried again a minute later, with no one calling', async (t) => {

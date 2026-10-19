@@ -418,18 +418,84 @@ export function fileLeftByUpload(err: unknown): FileLeft | undefined {
   return err !== null && typeof err === 'object' ? filesLeft.get(err) : undefined;
 }
 
-/** Whether a request's failure leaves it undone: the call's time left no room
- *  to send it, the connection to Slack was never made, or Slack refused it or
- *  rate-limited it. A failure Slack says may have taken effect
- *  (MAY_HAVE_LANDED), an answer not in Slack's form, an HTTP error, a timeout
- *  or a connection that failed once made doesn't say. */
+/** Whether a request's failure is taken to leave it undone: the call's time
+ *  left no room to send it, the connection to Slack was never made, Slack
+ *  refused it or rate-limited it, or the error is neither one of the client's
+ *  request, HTTP or platform errors nor a TypeError. A failure Slack says may
+ *  have taken effect (MAY_HAVE_LANDED), an answer not in Slack's form, an HTTP
+ *  error, a timeout, a connection that failed once made, or a TypeError
+ *  doesn't say.
+ *
+ *  Taking an error the client doesn't classify as undone turns round the
+ *  messaging contract's default, "possibly done" unless it's known to come
+ *  before the write, so it rests on the client. In @slack/web-api 7.19.0's
+ *  makeRequest (dist/WebClient.js:476-518), a failure of the request itself
+ *  becomes a coded request error (:514-515), a status other than 200 a coded
+ *  HTTP error (:504-505), and apiCall makes a refusal in a 200 a coded
+ *  platform error (:231-236). Its other errors are thrown before the request
+ *  is sent, such as Node's URIError (ERR_INVALID_URI) for a lone surrogate
+ *  while the request interceptor builds the body (:606), or after a 429
+ *  (:498, and :501's "Retry header did not contain a valid timeout"), but for
+ *  the TypeErrors it throws after a 200, reading an answer not in the shape of
+ *  Slack's: a JSON body that isn't an object (:668), or response_metadata
+ *  whose warnings or messages aren't lists (:205-211), as a broken proxy might
+ *  send. So a TypeError keeps the contract's default. Taking one as undone
+ *  risks the duplicate post the default is there to prevent, while a
+ *  TypeError from a bug of this server's before a request costs the agent a
+ *  check, and, when it's thrown inside a post's request, a rollback's note of
+ *  a post that may remain. (buildResult's JSON parse at :656 is for
+ *  admin.analytics.getFile, which this server doesn't call.) Apart from
+ *  TypeErrors, in that version an error the client doesn't classify means
+ *  Slack never took the call.
+ *
+ *  It rests on SLACK_CLIENT_OPTIONS too. With retryConfig's retries: 0, the
+ *  client sends a request once, so the error read here never follows an
+ *  earlier attempt Slack may have taken: SlackWebClient sends one again only
+ *  after a 429, which Slack didn't take. With rejectRateLimitedCalls, a 429
+ *  with a usable Retry-After is the coded rate-limited error (:483), so of the
+ *  plain errors after a 429 only :501's is reached here; :498's needs it off.
+ *  Check this again when the client or SLACK_CLIENT_OPTIONS change. */
 function cannotHaveLanded(err: unknown): boolean {
-  if (err instanceof OutOfCallTime) return true;
   const e = err as { code?: unknown; original?: { code?: unknown } } | null;
-  if (e?.code === ErrorCode.RequestError) return connectionNeverMade(e.original?.code);
-  if (e?.code === ErrorCode.RateLimitedError) return true;
-  const refused = slackRefusal(err);
-  return refused !== undefined && !MAY_HAVE_LANDED.has(refused);
+  switch (e?.code) {
+    case ErrorCode.RequestError:
+      return connectionNeverMade(e.original?.code);
+    case ErrorCode.HTTPError:
+      return false;
+    case ErrorCode.PlatformError: {
+      const refused = slackRefusal(err);
+      return refused !== undefined && !MAY_HAVE_LANDED.has(refused);
+    }
+    default:
+      // A rate limit, this server's OutOfCallTime, or an error the client
+      // doesn't classify, but for a TypeError.
+      return !(err instanceof TypeError);
+  }
+}
+
+/** A post this server can't name: chat.postMessage answered without the
+ *  message's ts, or failed in a way that may have posted it. */
+export interface PostLeft {
+  channelId: string;
+  /** The thread it was posted into, for a reply. */
+  threadTs?: string;
+}
+const postsLeft = new WeakMap<object, PostLeft>();
+
+/** The post a failed sendMessage may have left, which a rollback says may
+ *  remain; undefined for any other error, such as a refusal or one from a
+ *  request before the post. */
+export function postLeftBy(err: unknown): PostLeft | undefined {
+  return err !== null && typeof err === 'object' ? postsLeft.get(err) : undefined;
+}
+
+/** chat.postMessage answered without the message's ts: whether it posted
+ *  can't be told, and if it did, the message can't be named. */
+export class PostNotConfirmed extends Error {
+  constructor(readonly channelId: string) {
+    super(`chat.postMessage: the answer named no message in ${channelId}`);
+    this.name = 'PostNotConfirmed';
+  }
 }
 
 /** An upload's last step answered without the file: whether Slack shared it
@@ -960,8 +1026,9 @@ export class SlackAdapter {
 
   // ── Acknowledgement reaction ──
   // Slack has no typing indicator for bots, so "received" is shown as a
-  // reaction on the message that addressed the bot, removed when the bot next
-  // posts in that conversation or after ACK_TTL_MS, whichever comes first.
+  // reaction on the message that addressed the bot, removed at the bot's next
+  // post in that conversation that Slack confirms, or after ACK_TTL_MS,
+  // whichever comes first.
 
   /** `added` settles once reactions.add is answered or its request fails, so a
    *  removal never overtakes an add Slack has answered. An add whose request
@@ -990,27 +1057,25 @@ export class SlackAdapter {
     const added = this.addReaction(channelId, ts, this.ackReaction).then(
       () => true,
       // The add counts as there, and is removed like an added one, when it may
-      // have landed: already_reacted says it's there; Slack's failure while
-      // handling it leaves it unknown, as the explainer says (internal_error
-      // and fatal_error can take effect in part); and so does an HTTP error,
-      // an answer not in Slack's form, or a request that failed after it may
-      // have reached Slack. Slack's other refusals, its rate limits (a 429, or
-      // ratelimited in a 200) and request_timeout say it didn't act, a
-      // connection never made reached nothing, and this server's own refusal,
-      // such as the write allow-list's, sent nothing. So did a failure of a
-      // request before the add, such as the DM check's conversations.info.
-      // Slack answers a removal of one that isn't there with no_reaction.
-      (err: { code?: unknown; original?: { code?: unknown } } | null) => {
+      // have landed, by the rule that reads a post's failure
+      // (cannotHaveLanded): already_reacted says it's there; Slack's failure
+      // while handling it leaves it unknown, as the explainer says
+      // (internal_error and fatal_error can take effect in part); and so does
+      // an HTTP error, an answer not in Slack's form or one the client can't
+      // read (a TypeError), or a request that failed after it may have reached
+      // Slack. Slack's other refusals, its rate limits (a 429, or ratelimited
+      // in a 200) and request_timeout say it didn't act, a connection never
+      // made reached nothing, and this server's own refusal, such as the write
+      // allow-list's, sent nothing. So did a failure of a request before the
+      // add, such as the DM check's conversations.info. Slack answers a
+      // removal of one that isn't there with no_reaction.
+      (err: unknown) => {
         const failed = failedRequest(err);
         if (failed !== undefined && failed !== 'reactions.add') return false;
-        if (err?.code === ErrorCode.RequestError) return !connectionNeverMade(err.original?.code);
-        if (err?.code === ErrorCode.HTTPError) return true;
-        const answer = slackRefusal(err);
-        if (answer === undefined) return err?.code === ErrorCode.PlatformError;
-        return MAY_HAVE_LANDED.has(answer);
+        return !cannotHaveLanded(err);
       },
     );
-    // Recorded before the add resolves, so a reply that lands first still removes it.
+    // Recorded before the add resolves, so a reply Slack confirms first still removes it.
     let pending = this.ackPending.get(channelId);
     if (!pending) this.ackPending.set(channelId, (pending = new Map()));
     const entry: AckEntry = { timer: this.armAck(channelId, ts, ACK_TTL_MS), added, tries: 0 };
@@ -1055,7 +1120,10 @@ export class SlackAdapter {
   }
 
   /** `notDone` opens this server's own refusals: send_dm's reads "Nothing was
-   *  sent". */
+   *  sent". A post that fails in a way that may have posted it (one
+   *  cannotHaveLanded doesn't rule out), or whose answer names no message
+   *  (PostNotConfirmed), marks its error with what it may have left
+   *  (postLeftBy), for rollback. */
   async sendMessage(
     channelId: string,
     text: string,
@@ -1064,13 +1132,29 @@ export class SlackAdapter {
   ): Promise<{ messageId: string }> {
     this.assertWritable(channelId, notDone);
     await this.assertNotDm(channelId, notDone);
-    const result = await this.web.chat.postMessage({
-      channel: channelId,
-      text,
-      ...(opts.threadTs ? { thread_ts: opts.threadTs } : {}),
-    });
+    const left = (err: unknown): unknown => {
+      if (err !== null && typeof err === 'object') {
+        postsLeft.set(err, { channelId, ...(opts.threadTs ? { threadTs: opts.threadTs } : {}) });
+      }
+      return err;
+    };
+    let result: { ts?: string };
+    try {
+      result = await this.web.chat.postMessage({
+        channel: channelId,
+        text,
+        ...(opts.threadTs ? { thread_ts: opts.threadTs } : {}),
+      });
+    } catch (err) {
+      throw cannotHaveLanded(err) ? err : left(err);
+    }
+    // An answer whose ts isn't a message's id, a string with something in it,
+    // names nothing the agent or a rollback could edit, reply to or delete,
+    // and can't show the post went through, so it reads as an unknown
+    // outcome, as a failure that may have posted does.
+    if (typeof result.ts !== 'string' || !result.ts) throw left(new PostNotConfirmed(channelId));
     void outsideCallTime(() => this.clearAck(channelId));
-    return { messageId: result.ts ? String(result.ts) : '' };
+    return { messageId: result.ts };
   }
 
   /** Upload a file into a conversation, in the three steps of Slack's

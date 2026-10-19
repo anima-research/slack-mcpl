@@ -16,16 +16,19 @@
  * (`slack_webapi_request_error`, or `slack_webapi_http_error` with the HTTP
  * status), which leaves a write's outcome unknown, unless the connection
  * couldn't be made at all, which Node's code on the request error's
- * `original` tells. Five more are this server's own: a request its call's
+ * `original` tells. Six more are this server's own: a request its call's
  * deadline left no time to send (OutOfCallTime), fetch_attachment's download
  * running past its timeout, a listing the token's scopes leave no type to ask
  * for (NoReadableConversations), a failed post of an upload's bytes to Slack's
- * upload server (UploadBytesFailed), and an upload whose last step named no file
- * (UploadNotConfirmed). Each refusal code here is one Slack's
+ * upload server (UploadBytesFailed), an upload whose last step named no file
+ * (UploadNotConfirmed), and a post whose answer named no message
+ * (PostNotConfirmed). Each refusal code here is one Slack's
  * reference documents for a method these tools call. A refusal whose code
  * isn't in Slack's form, as the client reads a body such as an HTML page, is
- * read as an answer that shows nothing about what Slack did. Other errors,
- * and codes not listed, pass through unchanged.
+ * read as an answer that shows nothing about what Slack did, and so is a
+ * TypeError from a write, which the client throws after a 200 it can't read
+ * (cannotHaveLanded). Other errors, and codes not listed, pass through
+ * unchanged.
  */
 import { ErrorCode } from '@slack/web-api';
 import { connectionNeverMade, reactionName } from './content.js';
@@ -33,6 +36,7 @@ import {
   CALL_SECONDS,
   NoReadableConversations,
   OutOfCallTime,
+  PostNotConfirmed,
   SLACK_CLIENT_OPTIONS,
   UploadBytesFailed,
   UploadNotConfirmed,
@@ -206,6 +210,10 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
     // Its ID came from the first step, so a rollback deletes it either way.
     return unknown("Slack's answer to the upload's last step named no file");
   }
+  if (err instanceof PostNotConfirmed) {
+    // No ID, so a rollback can only say it may remain.
+    return unknown("Slack's answer to the post named no message");
+  }
   if (err instanceof UploadBytesFailed) {
     const seconds = SLACK_CLIENT_OPTIONS.timeout / 1000;
     const unshared = "Slack shares a file only at the upload's last step, which wasn't sent";
@@ -277,6 +285,11 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
       ? `Slack answered with HTTP ${e.statusCode}`
       : `Slack went ${SLACK_CLIENT_OPTIONS.timeout / 1000} seconds without answering, or the connection to it failed`;
     return mayHaveWritten ? unknown(cause) : `${lead}: ${cause}. Try again shortly.`;
+  }
+  if (err instanceof TypeError && mayHaveWritten) {
+    // The client throws one after a 200 whose answer isn't in Slack's shape,
+    // so cannotHaveLanded keeps such a write possibly done.
+    return unknown("Slack's answer, if one came, couldn't be read");
   }
   const code = slackRefusal(err);
   // An answer the client reads as a refusal but whose code isn't in Slack's

@@ -514,6 +514,11 @@ test("an upload's failed last step says which file it left and whether Slack may
   for (const [last, mayHaveShared] of [
     [{ body: { ok: false, error: 'not_in_channel' } }, false],
     [{ status: 429, headers: { 'retry-after': '30' }, body: { ok: false, error: 'ratelimited' } }, false],
+    // Without a usable Retry-After, the client's error for a 429 is a plain
+    // Error, which it doesn't classify: Slack didn't act on the request.
+    [{ status: 429, body: { ok: false } }, false],
+    // A 200 the client can't read throws a TypeError: Slack may have acted.
+    [{ body: null }, true],
     // Slack received the request only in part, so it didn't act on it.
     [{ body: { ok: false, error: 'request_timeout' } }, false],
     [{ body: { ok: false, error: 'internal_error' } }, true],
