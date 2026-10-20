@@ -20,8 +20,9 @@ export const FULL_GRANT = [
 ];
 
 interface FakeSocket extends SlackSocketLike {
-  /** Simulate an incoming Socket Mode message event and wait for the
-   *  adapter's async handler to settle. */
+  /** Simulate an incoming Socket Mode message event, then wait 20 ms: long
+   *  enough for a delivery that waits on nothing, not for one held behind a
+   *  lookup. */
   emitMessage(event: Record<string, unknown>): Promise<void>;
 }
 
@@ -36,8 +37,9 @@ function fakeSocket(): FakeSocket {
     async emitMessage(event) {
       if (!handler) throw new Error('no message handler registered');
       handler({ event, ack: async () => {} });
-      // handleMessageEvent runs inside a fire-and-forget async IIFE; give it
-      // a couple of ticks to resolve before the caller asserts.
+      // The adapter prepares the event and delivers it on its conversation's
+      // chain, which nothing here awaits; give that 20 ms before the caller
+      // asserts.
       await new Promise((r) => setTimeout(r, 20));
     },
   };
