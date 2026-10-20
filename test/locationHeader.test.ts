@@ -71,3 +71,57 @@ test('backscroll block: what the agent sees on first interaction names the paren
   );
   assert.match(backscrollBlock([], { isDM: true }), /^<backscroll dm="true" count="0">/);
 });
+
+test('every header names the conversation by channelId, the DM included', () => {
+  assert.equal(locationHeader({ channelId: 'D2', messageId: '2.0' }), '[channelId=D2 id=2.0] ');
+  assert.equal(
+    locationHeader({ conversation: 'DM', teamName: 'acme', channelId: 'D2', messageId: '2.0' }),
+    '[DM (acme) channelId=D2 id=2.0] ',
+  );
+  assert.equal(locationHeader({ channelId: 'C1', threadTs: '1.0', messageId: '2.0' }), '[channelId=C1 thread=1.0 id=2.0] ');
+  assert.equal(
+    locationHeader({ conversation: '#support', teamName: 'acme', channelId: 'C1', threadTs: '1.0', messageId: '2.0' }),
+    '[#support (acme) channelId=C1 thread=1.0 id=2.0] ',
+  );
+});
+
+test("a DM's message names its channelId, and a write to another DM names who it went to when that DM has a label", async (t) => {
+  const { FULL_GRANT, harness, initialize, until } = await import('./harness.js');
+  const { method } = await import('@animalabs/mcpl-core');
+  const h = harness({ dms: [{ id: 'D1', user: 'UVASYL' }, { id: 'D2', user: 'UDENIS' }] });
+  t.after(() => h.close());
+  await initialize(h, true);
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await until(() => h.hostSaw.some((r) => r.method === method.CHANNELS_REGISTER), 'registration');
+  await h.socket.emitMessage({ type: 'message', channel: 'D2', channel_type: 'im', user: 'UDENIS', text: 'what is refprice?', ts: '5.0' });
+  await until(() => JSON.stringify(h.hostSaw).includes('what is refprice?'), "Denis's DM reaches the host");
+  const delivered = JSON.stringify(h.hostSaw.filter((r) => JSON.stringify(r).includes('what is refprice?')));
+  assert.match(delivered, /\[DM \(acme\) channelId=D2 id=5\.0\]/, 'the header gives the id to reply with');
+  // A reply in that DM's thread, in the same context, gives the DM's id, the
+  // thread and its own id.
+  await h.socket.emitMessage({ type: 'message', channel: 'D2', channel_type: 'im', user: 'UDENIS', text: 'and in its thread', ts: '6.0', thread_ts: '5.0' });
+  await until(() => JSON.stringify(h.hostSaw).includes('and in its thread'), 'the thread reply reaches the host');
+  assert.match(JSON.stringify(h.hostSaw.filter((r) => JSON.stringify(r).includes('and in its thread'))), /\[channelId=D2 thread=5\.0 id=6\.0\]/);
+  const sent = await h.host.sendRequest('tools/call', { name: 'send_message', arguments: { channelId: 'D1', content: 'the answer' } }) as { content: { text: string }[] };
+  assert.deepEqual(JSON.parse(sent.content[0].text), { messageId: '100.1', to: 'DM: @UVASYL (acme)' }, 'the wrong recipient shows in the same turn');
+  const replied = await h.host.sendRequest('tools/call', { name: 'reply_message', arguments: { channelId: 'D1', messageId: '5.0', content: 'the answer' } }) as { content: { text: string }[] };
+  assert.deepEqual(JSON.parse(replied.content[0].text), { messageId: '100.2', threadTs: '5.0', to: 'DM: @UVASYL (acme)' });
+  // The fake opens D1 for any user.
+  const dm = await h.host.sendRequest('tools/call', { name: 'send_dm', arguments: { userId: 'UVASYL', content: 'the answer' } }) as { content: { text: string }[] };
+  assert.deepEqual(JSON.parse(dm.content[0].text), { messageId: '100.3', channelId: 'D1', to: 'DM: @UVASYL (acme)' });
+  // A DM no listing had has no label, so its answer has no `to`.
+  const slack = (h.server as unknown as { slack: SlackAdapter }).slack;
+  (slack as unknown as { web: { conversations: { open(): Promise<unknown> } } }).web.conversations.open =
+    async () => ({ channel: { id: 'D7' } });
+  const opened = await h.host.sendRequest('tools/call', { name: 'send_dm', arguments: { userId: 'UNEW', content: 'hello' } }) as { content: { text: string }[] };
+  assert.deepEqual(JSON.parse(opened.content[0].text), { messageId: '100.4', channelId: 'D7' });
+});
+
+test('a plain MCP client registers no conversation, so its writes answer without `to`', async (t) => {
+  const { harness, initialize } = await import('./harness.js');
+  const h = harness();
+  t.after(() => h.close());
+  await initialize(h, false);
+  const sent = await h.host.sendRequest('tools/call', { name: 'send_message', arguments: { channelId: 'C1', content: 'hi' } }) as { content: { text: string }[] };
+  assert.deepEqual(JSON.parse(sent.content[0].text), { messageId: '100.1' });
+});

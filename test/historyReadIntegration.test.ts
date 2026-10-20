@@ -62,7 +62,7 @@ test("a read missing its channel or thread opens with what the read's other fail
   await initialize(h, false);
   assert.deepEqual(await tool(h, 'fetch_history', {}), {
     error: true,
-    value: "No messages were returned: channelId must be a non-empty string, and this call left it out. list_channels shows each conversation's id.",
+    value: "No messages were returned: channelId must be a non-empty string, and this call left it out. Take it from the message's channelId=, or list_channels shows each conversation's id.",
   });
   assert.deepEqual(await tool(h, 'fetch_thread', {channelId: 'C1', threadTs: ''}), {
     error: true,

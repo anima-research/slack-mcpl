@@ -41,6 +41,8 @@ export const TS_FORM = 'which looks like 1718000000.000100';
 /** Where a thread's parent id comes from, for fetch_thread's description and
  *  a refusal of an argument that names one: fetch_thread's threadTs, and
  *  reply_message's and upload_file's messageId. */
+/** Where a conversation's id comes from, for a call that didn't pass a right one. */
+export const CHANNEL_IDS = "Take it from the message's channelId=, or list_channels shows each conversation's id";
 export const PARENT_IDS =
   "Pass the thread's parent id: a reply's thread=, a message's own id= when it shows no thread=, or a message's rootTs in " +
   'fetch_history or fetch_thread results';
@@ -123,7 +125,7 @@ export function readOptions(args: Record<string, unknown>, kind: Kind, channelId
   if (!/^[CGD][A-Z0-9]+$/.test(channelId)) {
     throw refused(
       `channelId must be a Slack conversation id, such as C0123456789, and this call passed ${passed(channelId)}. ` +
-        "list_channels shows each conversation's id.",
+        `${CHANNEL_IDS}.`,
     );
   }
   if (kind === 'thread') timestamp(threadTs, 'threadTs', `${PARENT_IDS}.`);

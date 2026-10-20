@@ -548,7 +548,7 @@ test('arguments are checked before Slack is asked: unknown names, bounds, timest
   }
   await assert.rejects(reader.readHistory('U1', { channelId: 'U1' }), {
     message: 'No messages were returned: channelId must be a Slack conversation id, such as C0123456789, and this call passed "U1". ' +
-      "list_channels shows each conversation's id.",
+      "Take it from the message's channelId=, or list_channels shows each conversation's id.",
   });
   await assert.rejects(reader.readThread('C1', 'nope', { channelId: 'C1', threadTs: 'nope' }), {
     message: 'No messages were returned: threadTs must be a Slack timestamp, which looks like 1718000000.000100, and this call ' +

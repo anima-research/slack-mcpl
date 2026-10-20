@@ -79,7 +79,7 @@ test('an unknown tool lists the tools this server offers', async (t) => {
   assert.doesNotMatch(offCalled.content[0].text, /send_dm/);
 });
 
-const CHANNEL_ID_SOURCE = "list_channels shows each conversation's id.";
+const CHANNEL_ID_SOURCE = "Take it from the message's channelId=, or list_channels shows each conversation's id.";
 for (const [tool, args, text] of [
   ['send_message', {}, `channelId must be a non-empty string, and this call left it out. ${CHANNEL_ID_SOURCE}`],
   ['send_message', { channelId: '' }, `channelId must be a non-empty string, and this call passed an empty string. ${CHANNEL_ID_SOURCE}`],
