@@ -741,6 +741,9 @@ export interface SlackSocketLike {
 }
 
 export class SlackAdapter {
+  /** Each conversation's last event's turn, which the next event's delivery
+   *  waits for. */
+  private inbound = new Map<string, Promise<void>>();
   private userNameCache = new Map<string, string>();
   private messageHandlers: Array<(msg: SlackMessageData) => void> = [];
   private socketStarted = false;
@@ -782,17 +785,34 @@ export class SlackAdapter {
     const omitted = this.leftOutTypes();
     if (omitted.length) this.logLeftOut(omitted, '');
     // Register the handler at construction so start() ordering can't race
-    // an early event past an unregistered listener.
+    // an early event past an unregistered listener. Each event is prepared as
+    // it arrives, its author's and mentions' names looked up, and delivered
+    // after the event before it in its conversation: the lookups take
+    // different times, and a later message must not reach the host before an
+    // earlier one. Preparing at arrival keeps one conversation's lookups side
+    // by side, so a run of slow or failing ones costs the slowest, not their
+    // sum, within the Web API client's 100 requests at once, which every
+    // conversation's lookups share. From delivery on, the server keeps the
+    // same order with its own chain per conversation (setupSlackForwarding).
     this.socket.on('message', ({ event, ack }) => {
-      void (async () => {
-        // Always ack first — Slack redelivers unacked envelopes.
-        try { await ack(); } catch { /* ignore */ }
-        try {
-          await this.handleMessageEvent(event);
-        } catch (error) {
-          console.error('[slack-mcpl] Failed to handle Slack message event:', error);
-        }
-      })();
+      // Always ack first — Slack redelivers unacked envelopes.
+      void Promise.resolve().then(() => ack()).catch(() => { /* ignore */ });
+      // Settled into a value at once, so a preparation that fails before its
+      // turn is never a rejection nothing handles.
+      const prepared = this.prepareMessageEvent(event).then(
+        (msg) => ({ ok: true as const, msg }),
+        (error: unknown) => ({ ok: false as const, error }),
+      );
+      const key = typeof event?.channel === 'string' ? event.channel : '';
+      const turn = (this.inbound.get(key) ?? Promise.resolve())
+        .then(() => prepared)
+        .then((done) => {
+          if (!done.ok) throw done.error;
+          if (done.msg) for (const handler of this.messageHandlers) handler(done.msg);
+        })
+        .catch((error) => console.error('[slack-mcpl] Failed to handle Slack message event:', error));
+      this.inbound.set(key, turn);
+      void turn.then(() => { if (this.inbound.get(key) === turn) this.inbound.delete(key); });
     });
   }
 
@@ -1494,7 +1514,9 @@ export class SlackAdapter {
 
   // ── Incoming events ──
 
-  private async handleMessageEvent(event: SlackMessageEvent): Promise<void> {
+  /** An event's checks and its author's and mentions' names, and the message
+   *  they make, or undefined for an event that isn't delivered. */
+  private async prepareMessageEvent(event: SlackMessageEvent): Promise<SlackMessageData | undefined> {
     if (!event || event.type !== 'message') return;
     if (!CONTENT_SUBTYPES.has(event.subtype)) return;
     // Self-filter: skip our own messages and other bots' (bot_id covers
@@ -1549,8 +1571,7 @@ export class SlackAdapter {
       timestamp: new Date(parseFloat(event.ts) * 1000),
       attachments,
     };
-
-    for (const handler of this.messageHandlers) handler(msg);
+    return msg;
   }
 
   /** Resolve user IDs into this adapter's cache (shared logic in content.ts).

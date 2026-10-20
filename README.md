@@ -16,7 +16,7 @@ that grant arrives; plain MCP tool calls are unaffected.
 
 ## Features
 
-- **Channels**: every conversation the bot can act in, of each kind its token has the read scope for, is registered as an MCPL channel (`slack:<conversationId>`) when the host grants `channels.register`, and `refresh_channels` registers ones joined since. `channels/publish` posts in the thread of the last message the server passed to the host from that conversation, which can change while the agent is answering. Use [`reply_message` for an explicit thread](#reply-to-a-specific-thread).
+- **Channels**: every conversation the bot can act in, of each kind its token has the read scope for, is registered as an MCPL channel (`slack:<conversationId>`) when the host grants `channels.register`, and `refresh_channels` registers ones joined since. `channels/publish` posts in the thread of the last message from that conversation the host took, which can change while the agent is answering. Use [`reply_message` for an explicit thread](#reply-to-a-specific-thread).
 - **Real-time events** via Socket Mode — no public webhook URL needed, so the
   server can be spawned over stdio like any other MCPL server.
 - **Addressing model**: mentions (`<@bot>`) and DMs are always delivered;
@@ -130,13 +130,13 @@ uploads with `missing_scope`.
 
 ## Reply to a specific thread
 
-When answering a particular message, use `reply_message` to select its thread explicitly. Automatic prose delivery through `channels/publish` carries no thread or triggering message ID. The server uses the thread of the last message it passed to the host from that Slack conversation instead, whether or not the host accepted it, so another message can redirect the reply to a different thread, or to the channel's top level ([#6](https://github.com/anima-research/slack-mcpl/issues/6)). The server keeps that in memory only: after a restart, a publish goes to the top level until the server passes on a message from the conversation.
+When answering a particular message, use `reply_message` to select its thread explicitly. Automatic prose delivery through `channels/publish` carries no thread or triggering message ID. The server uses the thread of the last message from that Slack conversation the host took instead, so another message can redirect the reply to a different thread, or to the channel's top level ([#6](https://github.com/anima-research/slack-mcpl/issues/6)). The server keeps that in memory only: after a restart, a publish goes to the top level until the host takes a message from the conversation.
 
-1. Select the Slack conversation ID, such as `C123`, rather than its MCPL ID, `slack:C123`.
+1. Select the Slack conversation ID, such as `C123`, rather than its MCPL ID, `slack:C123`. Every incoming message's header gives it as `channelId=`; copy it from there, a DM's included, rather than from memory.
 2. For `messageId`, use the target message's displayed `thread=` value. If it has no `thread=`, use its `id=`: the reply goes into that message's own thread, which starts one if it has none. History results call these fields `threadTs` and `id`.
 3. Send the reply through `reply_message`.
 
-For example, to answer `[thread=1718000000.000100 id=1718000000.000200] Ann: Can you check this?` in conversation `C123`, call `reply_message` with:
+For example, to answer `[channelId=C123 thread=1718000000.000100 id=1718000000.000200] Ann: Can you check this?`, call `reply_message` with:
 
 ```json
 {
@@ -146,7 +146,7 @@ For example, to answer `[thread=1718000000.000100 id=1718000000.000200] Ann: Can
 }
 ```
 
-This selects the thread root even if another message arrives before the tool call. The automatic `channels/publish` route still has the limitation above; explicit tool replies do not change its destination.
+This selects the thread root even if another message arrives before the tool call. Its answer, like `send_message`'s, `send_dm`'s and `upload_file`'s, names the conversation it went to in `to`, by its label in this server's channel registry (`#support (acme)`, `DM: @Ann (acme)`), so a reply sent to the wrong conversation shows in the same turn. The registry holds the conversations an MCPL host took when this server connected, and those `refresh_channels` has registered since. A write to any other conversation, such as a DM first written in after the listing, answers without `to`, and so does every write from a plain MCP client, which registers none. The automatic `channels/publish` route still has the limitation above; explicit tool replies do not change its destination.
 
 ## Setup
 

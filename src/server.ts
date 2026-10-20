@@ -121,7 +121,7 @@ function dbg(tag: string, info: Record<string, unknown> = {}): void {
 
 /** Where the value of each argument a tool requires comes from, for a call that didn't give it. */
 const ARGUMENT_SOURCES = {
-  channelId: "list_channels shows each conversation's id.",
+  channelId: "Take it from the message's channelId=, or list_channels shows each conversation's id.",
   messageId:
     "Take it from the message: its id= (reply_message takes its thread= when it shows one), or from fetch_history's ids.",
   threadTs:
@@ -136,16 +136,22 @@ const ARGUMENT_SOURCES = {
 } satisfies Record<string, string>;
 
 /** The bracketed header in front of an incoming message, e.g.
- *  `[#support (acme) thread=1718000000.000100 id=1718000000.000200] `. */
+ *  `[#support (acme) channelId=C1 thread=1718000000.000100 id=1718000000.000200] `.
+ *  channelId is given every time, under the tools' argument name, so each
+ *  message carries both halves of the address a reply to it takes: a DM is
+ *  otherwise named only "DM", and the header that named a conversation may
+ *  be many messages back, or folded away. */
 export function locationHeader(loc: {
   conversation?: string;
   teamName?: string;
+  channelId?: string;
   threadTs?: string;
   messageId: string;
 }): string {
   const parts: string[] = [];
   if (loc.conversation) parts.push(loc.conversation);
   if (loc.teamName) parts.push(`(${loc.teamName})`);
+  if (loc.channelId) parts.push(`channelId=${loc.channelId}`);
   if (loc.threadTs) parts.push(`thread=${loc.threadTs}`);
   parts.push(`id=${loc.messageId}`);
   return `[${parts.join(' ')}] `;
@@ -679,7 +685,7 @@ export class SlackMcplServer {
         const result = await this.posting(content, () => this.slack.sendMessage(channelId, content));
         this.stateTracker.recordSent(result.messageId, channelId, content);
         this.markOutbound(channelId);
-        return { messageId: result.messageId };
+        return { messageId: result.messageId, ...this.recipient(channelId) };
       }
 
       case 'reply_message': {
@@ -689,7 +695,7 @@ export class SlackMcplServer {
         const result = await this.posting(content, () => this.slack.sendMessage(channelId, content, { threadTs }));
         this.stateTracker.recordSent(result.messageId, channelId, content);
         this.markOutbound(channelId);
-        return { messageId: result.messageId, threadTs };
+        return { messageId: result.messageId, threadTs, ...this.recipient(channelId) };
       }
 
       case 'upload_file': {
@@ -770,7 +776,7 @@ export class SlackMcplServer {
         }
         this.markOutbound(channelId);
         this.stateTracker.recordUploaded(result.fileId, channelId, { shareTs: result.shareTs, comment: comment !== undefined });
-        return { fileId: result.fileId };
+        return { fileId: result.fileId, ...this.recipient(channelId) };
       }
 
       case 'send_dm': {
@@ -779,7 +785,7 @@ export class SlackMcplServer {
         const result = await this.posting(content, () => this.slack.sendDM(userId, content));
         this.stateTracker.recordSent(result.messageId, result.channelId, content);
         this.markOutbound(result.channelId);
-        return { messageId: result.messageId, channelId: result.channelId };
+        return { messageId: result.messageId, channelId: result.channelId, ...this.recipient(result.channelId) };
       }
 
       case 'add_reaction': {
@@ -1025,6 +1031,16 @@ export class SlackMcplServer {
           }
         : {}),
     };
+  }
+
+  /** Who a write went to, as `to`: the conversation's label in this server's
+   *  channel registry, a name the agent didn't supply, so one that sent to
+   *  the wrong conversation sees it in the same turn. A conversation the
+   *  registry doesn't hold, and every one for a plain MCP client, has no
+   *  label, and all `to` could say is the id the agent passed, so it's left
+   *  undefined, which the answer's JSON leaves out. */
+  private recipient(channelId: string): { to?: string } {
+    return { to: this.channelManager.get(mcplChannelId(channelId))?.label };
   }
 
   /** Record that the bot just sent to a conversation, for location headers. */
@@ -1407,8 +1423,8 @@ export class SlackMcplServer {
       return { delivered: false, messageId: undefined };
     }
 
-    // Reply in the thread of the most recent incoming message on this
-    // conversation; top-level when it wasn't threaded.
+    // Reply in the thread of the last incoming message the host took from
+    // this conversation; top-level when it wasn't threaded.
     const threadTs = this.lastIncomingThreadTs.get(parsed.conversationId);
     Object.assign(published, { channelId: parsed.conversationId, threadTs });
     const result = await this.posting(text, () => this.slack.sendMessage(
@@ -1717,10 +1733,10 @@ export class SlackMcplServer {
 
     // The conversation is named only when it differs from the last context
     // this peer was sent, which is read here, after the lookups above, since
-    // another conversation's message can go out while they run. The thread
-    // and the message ID are given every time: two threads in one channel are
-    // otherwise indistinguishable, and replying or reacting to a message needs
-    // its ID.
+    // another conversation's message can go out while they run. The
+    // conversation's ID, the thread and the message ID are given every time:
+    // two threads in one channel are otherwise indistinguishable, and replying
+    // or reacting to a message needs its conversation's ID and its own.
     const contextChanged = this.lastChannelId !== msg.channelId;
     if (contextChanged && meta === undefined && !msg.isDM) {
       meta = await this.lookUpMeta(msg);
@@ -1766,6 +1782,7 @@ export class SlackMcplServer {
     const location = locationHeader({
       conversation,
       teamName: contextChanged ? this.slack.teamName : undefined,
+      channelId: msg.channelId,
       threadTs: msg.threadTs,
       messageId: msg.id,
     });
