@@ -113,7 +113,7 @@ test('an unfiltered read asks for the matches it still needs, and a match limit 
   assert.equal(next.pagination.nextCursor, undefined);
 });
 
-test("a cursor from another query, or one this server didn't give, is refused before Slack is asked", { timeout: 5000 }, async (t) => {
+test("a cursor from another query, or one not in nextCursor's form, is refused before Slack is asked", { timeout: 5000 }, async (t) => {
   answers(t, { 'conversations.history': [page([row('9.0', 'U1', 'target'), row('8.0', 'U1', 'target')], true)] });
   const reader = adapter();
   const first = await reader.readHistory('C1', { channelId: 'C1', limit: 1, textContains: 'target' });
@@ -442,7 +442,7 @@ test('a history read given oldest never sends it, pages back from Slack\'s own n
     'conversations.history': [
       page([row('8.0', 'U1', 'eight'), row('7.0', 'U1', 'seven')], true),
       // Slack would go on: the read's range ends at 5.0.
-      page([row('6.0', 'U1', 'six'), row('5.0', 'U1', 'five'), row('4.0', 'U1', 'four')], true),
+      page([row('6.0', 'U1', 'six'), row('5.0', 'U2', 'five'), row('4.0', 'U3', 'four')], true),
     ],
     'users.info': [{ body: { ok: true, user: { profile: { display_name: 'Ann' } } } }],
   });
@@ -454,6 +454,55 @@ test('a history read given oldest never sends it, pages back from Slack\'s own n
   assert.deepEqual(sent, [[undefined, undefined], [undefined, '7.0']]);
   assert.deepEqual(out.messages.map((m) => m.id), ['6.0', '7.0', '8.0']);
   assert.deepEqual([out.pagination.scanComplete, out.pagination.stopReason, out.pagination.scanned, out.pagination.pages], [true, 'exhausted', 3, 2]);
+  assert.deepEqual(sentTo('users.info', from).map((p) => p.user), ['U1'], 'no name is looked up for a message past the range');
+});
+
+test('a history read whose range holds no message ends as covered, and an oldest between two messages ends the range at the one below it', { timeout: 5000 }, async (t) => {
+  answers(t, {
+    'conversations.history': [
+      page([row('4.0', 'U1', 'four'), row('3.0', 'U1', 'three')], true),
+      page([row('6.0', 'U1', 'six'), row('5.0', 'U1', 'five'), row('4.0', 'U1', 'four')], true),
+    ],
+    'users.info': [{ body: { ok: true, user: { profile: { display_name: 'Ann' } } } }],
+  });
+  const reader = adapter();
+  const empty = await reader.readHistory('C1', { channelId: 'C1', oldest: '4.5', latest: '5.0' });
+  assert.deepEqual([empty.messages.length, empty.pagination.scanComplete, empty.pagination.stopReason, empty.pagination.scanned, empty.pagination.pages],
+    [0, true, 'exhausted', 0, 1]);
+  const between = await reader.readHistory('C1', { channelId: 'C1', oldest: '4.5' });
+  assert.deepEqual(between.messages.map((m) => m.id), ['5.0', '6.0']);
+  assert.equal(between.pagination.scanComplete, true);
+});
+
+test("a history read given oldest covers its range against a Slack that answers oldest with the messages just after it", { timeout: 5000 }, async (t) => {
+  // Messages 1.0 to 12.0. Given oldest, this Slack answers with the messages
+  // just after it, as theaspirational's live run found for oldest alone;
+  // otherwise as its reference says, the newest before latest.
+  const all = Array.from({ length: 12 }, (_, i) => row(`${i + 1}.0`, 'U1', `m${i + 1}`));
+  const history = (sent: URLSearchParams) => {
+    const bound = (name: string) => (sent.has(name) ? Number(sent.get(name)) : undefined);
+    const [oldest, latest, limit] = [bound('oldest'), bound('latest'), Number(sent.get('limit'))];
+    const inRange = all.filter(({ ts }) => (oldest === undefined || Number(ts) > oldest) && (latest === undefined || Number(ts) < latest));
+    const window = oldest === undefined ? inRange.slice(-limit) : inRange.slice(0, limit);
+    return { ok: true, messages: [...window].reverse(), has_more: inRange.length > window.length };
+  };
+  answers(t, {
+    'conversations.history': [{ body: history }],
+    'users.info': [{ body: { ok: true, user: { profile: { display_name: 'Ann' } } } }],
+  });
+  const reader = adapter();
+  const read: string[] = [];
+  let cursor: string | undefined;
+  let complete = false;
+  for (let call = 0; call < 6 && !complete; call++) {
+    const out = await reader.readHistory('C1', { channelId: 'C1', oldest: '4.0', maxScanned: 3, ...(cursor === undefined ? {} : { cursor }) });
+    read.push(...out.messages.map((m) => m.id));
+    complete = out.pagination.scanComplete;
+    cursor = out.pagination.nextCursor;
+  }
+  assert.equal(complete, true, 'the range is covered');
+  assert.deepEqual([...read].sort((a, b) => Number(a) - Number(b)), ['5.0', '6.0', '7.0', '8.0', '9.0', '10.0', '11.0', '12.0'],
+    'every message after oldest, each once');
 });
 
 test('a page that says no more remain but gives a next_cursor is taken as more remaining', { timeout: 5000 }, async (t) => {
@@ -800,8 +849,13 @@ test("a cursor whose position is outside its query's range is refused before Sla
   const reader = adapter();
   const history = { channelId: 'C1', limit: 1, oldest: '2.0', latest: '10.0' };
   const thread = { channelId: 'C1', threadTs: '3.0', limit: 1, oldest: '3.5', latest: '9.0' };
+  const fromStart = { channelId: 'C1', threadTs: '3.0', limit: 1 };
   const historyCursor = (await reader.readHistory('C1', history)).pagination.nextCursor!;
   const threadCursor = (await reader.readThread('C1', '3.0', thread)).pagination.nextCursor!;
+  // A thread read with no oldest that stops after the parent leaves its
+  // cursor at the parent.
+  const afterParent = (await reader.readThread('C1', '3.0', fromStart)).pagination.nextCursor!;
+  assert.equal(JSON.parse(Buffer.from(afterParent, 'base64url').toString()).at, '3.0');
   // The same cursor, its position moved: the query's hash still matches.
   const moved = (cursor: string, at: string) =>
     Buffer.from(JSON.stringify({ ...JSON.parse(Buffer.from(cursor, 'base64url').toString()), at })).toString('base64url');
@@ -811,15 +865,25 @@ test("a cursor whose position is outside its query's range is refused before Sla
     await assert.rejects(reader.readHistory('C1', { ...history, cursor: moved(historyCursor, at) }),
       new RegExp(`^Error: No messages were returned: cursor's position, ${at.replace('.', '\\.')}, is outside this query's range\\.`), at);
   }
-  // A thread: at >= threadTs, at >= oldest, at < latest.
+  // A thread: at >= threadTs, at >= oldest, at < latest. With no oldest, the
+  // parent's bound alone refuses a position before the parent.
   for (const at of ['2.0', '3.2', '9.0']) {
     await assert.rejects(reader.readThread('C1', '3.0', { ...thread, cursor: moved(threadCursor, at) }), /outside this query's range/, at);
   }
+  await assert.rejects(reader.readThread('C1', '3.0', { ...fromStart, cursor: moved(afterParent, '2.0') }), /outside this query's range/);
   assert.equal(api.calls.length, from, 'nothing was asked');
-  // Positions at the range's ends that a read can reach are taken.
-  await reader.readHistory('C1', { ...history, cursor: moved(historyCursor, '10.0') });
-  await reader.readThread('C1', '3.0', { ...thread, cursor: moved(threadCursor, '3.5') });
-  assert.deepEqual([sentTo('conversations.history', from)[0]!.latest, sentTo('conversations.replies', from)[0]!.oldest], ['10.0', '3.5']);
+  // Taken: history's latest and a thread's oldest, which read what the
+  // query's first call reads, and the parent, where a read can stop.
+  const firstPage = async (method: string, read: () => Promise<unknown>) => {
+    const at = api.calls.length;
+    await read();
+    return sentTo(method, at)[0]!;
+  };
+  assert.deepEqual([
+    (await firstPage('conversations.history', () => reader.readHistory('C1', { ...history, cursor: moved(historyCursor, '10.0') }))).latest,
+    (await firstPage('conversations.replies', () => reader.readThread('C1', '3.0', { ...thread, cursor: moved(threadCursor, '3.5') }))).oldest,
+    (await firstPage('conversations.replies', () => reader.readThread('C1', '3.0', { ...fromStart, cursor: afterParent }))).oldest,
+  ], ['10.0', '3.5', '3.0']);
 });
 
 test("every text that says where a thread's parent id comes from names a reply's thread=, a message's own id= and a result's rootTs", () => {

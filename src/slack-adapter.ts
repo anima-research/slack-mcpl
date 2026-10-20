@@ -1405,12 +1405,14 @@ export class SlackAdapter {
     return readBounded(opts, {
       page: (at, limit) => this.web.conversations.history({
         channel: channelId, limit, inclusive: false,
-        // Pages back from the position, the read's latest, or else Slack's own
-        // now, the paging backscroll and a read without oldest use. oldest is
-        // never sent: readBounded ends the range at the first message at or
-        // before it, so coverage rests neither on the host's clock nor on how
-        // Slack anchors a page when oldest is sent, which a live run reported
-        // on #32 found to differ from Slack's reference.
+        // Each page sends latest alone, the position or the read's latest, or
+        // else no bound, for Slack's own now. Slack's reference says such a
+        // page holds the newest messages before latest, which backscroll's
+        // requests, sent with latest alone, rely on too. oldest is never sent:
+        // readBounded ends the range at the first message at or before it, so
+        // coverage rests neither on the host's clock nor on how Slack anchors
+        // a page when oldest is sent, which a live run reported on #32 found
+        // to differ from Slack's reference.
         ...(at ? { latest: at } : {}),
       }),
       shape: (messages) => this.shapeHistory(messages),

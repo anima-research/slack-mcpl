@@ -284,7 +284,7 @@ resume. A stalled pagination response is incomplete, never silently exhausted.
 thread, never all channel threads. `oldest` and `latest` are exclusive bounds
 on both tools; without `latest`, the first page reads up to Slack's own now.
 `fetch_history` doesn't send `oldest` to Slack: it pages back and stops at the
-first message at or before `oldest`, so its last page may run partly past it.
+first message at or before `oldest`, so its last page may run past it.
 History continues toward older messages from the cursor, so its continuations
 never return a message posted after the first call; a thread read's
 continuations go toward newer replies and include ones posted since. Slack history remains
