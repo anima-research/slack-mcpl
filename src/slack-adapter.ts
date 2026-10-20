@@ -12,8 +12,10 @@
  * reply/publish routing posts into the thread of the referenced message
  * (top-level when the conversation isn't threaded).
  *
- * No typing indicator: Slack's Web API exposes none for bots (RTM-only,
- * deprecated), so the server treats channels/typing as a no-op.
+ * Typing: Slack has no typing indicator for bots outside RTM. channels/typing
+ * is shown instead as a thread status ("is thinking…",
+ * assistant.threads.setStatus, which works in channels with chat:write since
+ * 2026-03) on the thread of the message being answered.
  *
  * Event handling salvaged from zulip-mcp PR #8's SlackAdapter.
  */
@@ -45,6 +47,10 @@ const ACK_MAX_TRIES = 5;
  *  already_reacted, to an acknowledgement's add, and the failures the
  *  explainer calls an unknown outcome. */
 const MAY_HAVE_LANDED = new Set(['already_reacted', 'internal_error', 'fatal_error', 'service_unavailable', 'file_update_failed']);
+/** The host refreshes typing every few seconds; Slack keeps a thread status
+ *  for 2 minutes, so it is set again only after this. */
+const STATUS_REFRESH_MS = 60 * 1000;
+const STATUS_TEXT = 'is thinking…';
 
 /** Slack's code, when Slack refused the call; undefined for any other error,
  *  an answer with no code in Slack's form (SLACK_CODE) included. */
@@ -713,6 +719,10 @@ export interface SlackWebLike {
     add(args: { channel: string; timestamp: string; name: string }): Promise<unknown>;
     remove(args: { channel: string; timestamp: string; name: string }): Promise<unknown>;
   };
+  /** Optional so test fakes need not carry it; the real WebClient has it. */
+  assistant?: {
+    threads: { setStatus(args: { channel_id: string; thread_ts: string; status: string }): Promise<unknown> };
+  };
   files: {
     getUploadURLExternal(args: { filename: string; length: number }): Promise<{ upload_url?: string; file_id?: string }>;
     completeUploadExternal(args: Record<string, unknown>): Promise<{ files?: SlackUploadedFile[] }>;
@@ -1070,6 +1080,40 @@ export class SlackAdapter {
     if (pending.size === 0) this.ackPending.delete(channelId);
   }
 
+  // ── Thread status ──
+
+  /** Per conversation, the thread showing our status and when it was set. */
+  private statusOn = new Map<string, { ts: string; at: number }>();
+
+  /** Show "is thinking…" on thread `threadTs` of `channelId`, or clear the
+   *  conversation's status when `threadTs` is undefined. Moving to another
+   *  thread clears the old one. Only where the bot may write: a status in a
+   *  read-only conversation would tell its readers the bot is reading.
+   *  Best-effort: never throws. */
+  async setThreadStatus(channelId: string, threadTs: string | undefined): Promise<void> {
+    const cur = this.statusOn.get(channelId);
+    if (threadTs && cur?.ts === threadTs && Date.now() - cur.at < STATUS_REFRESH_MS) return;
+    if (cur && cur.ts !== threadTs) {
+      this.statusOn.delete(channelId);
+      await this.callStatus(channelId, cur.ts, '');
+    }
+    if (!threadTs || !this.canWrite(channelId)) return;
+    if (this.disableDms && (this.dmIds.has(channelId) || channelId.startsWith('D'))) return;
+    this.statusOn.set(channelId, { ts: threadTs, at: Date.now() });
+    if (!(await this.callStatus(channelId, threadTs, STATUS_TEXT))) this.statusOn.delete(channelId);
+  }
+
+  private async callStatus(channelId: string, threadTs: string, status: string): Promise<boolean> {
+    if (!this.web.assistant) return false;
+    try {
+      await this.web.assistant.threads.setStatus({ channel_id: channelId, thread_ts: threadTs, status });
+      return true;
+    } catch (err) {
+      console.error(`[slack-mcpl] thread status on ${channelId} failed:`, (err as Error).message);
+      return false;
+    }
+  }
+
   /** Mark an addressed message as received. Best-effort: never throws. */
   async acknowledge(channelId: string, ts: string): Promise<void> {
     if (!this.ackReaction || this.stopping) return;
@@ -1174,6 +1218,10 @@ export class SlackAdapter {
     // outcome, as a failure that may have posted does.
     if (typeof result.ts !== 'string' || !result.ts) throw left(new PostNotConfirmed(channelId));
     void outsideCallTime(() => this.clearAck(channelId));
+    // A post may clear Slack's status; allow a refresh but retain ownership so
+    // a stop before that refresh still explicitly clears the same thread.
+    const status = this.statusOn.get(channelId);
+    if (opts.threadTs && status?.ts === opts.threadTs) status.at = -Infinity;
     return { messageId: result.ts };
   }
 
