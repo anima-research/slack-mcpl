@@ -175,6 +175,17 @@ export function readOptions(args: Record<string, unknown>, kind: Kind, channelId
   };
   const queryHash = createHash('sha256').update(JSON.stringify(query)).digest('hex').slice(0, 32);
   const at = args.cursor === undefined ? undefined : cursorPosition(args.cursor, queryHash);
+  // A position the query's reads can't reach would read outside its range,
+  // or past part of it.
+  if (at !== undefined && !(kind === 'history'
+    ? (oldest === undefined || compareTs(at, oldest) > 0) && (latest === undefined || compareTs(at, latest) <= 0)
+    : compareTs(at, threadTs!) >= 0 && (oldest === undefined || compareTs(at, oldest) >= 0) &&
+      (latest === undefined || compareTs(at, latest) < 0))) {
+    throw refused(
+      `cursor's position, ${at}, is outside this query's range. Pass it exactly as pagination.nextCursor gave it, with ` +
+        'the same arguments as the call that gave it.',
+    );
+  }
   return { ...limits, ...query, queryHash, at };
 }
 
@@ -192,7 +203,7 @@ function cursorPosition(cursor: unknown, queryHash: string): string {
     decoded = undefined;
   }
   if (!decoded || typeof decoded.at !== 'string' || !SLACK_TS.test(decoded.at) || typeof decoded.q !== 'string') {
-    throw refused("cursor isn't a nextCursor this server gave. Pass it exactly as pagination.nextCursor gave it.");
+    throw refused("cursor isn't in the form this server gives nextCursor in. Pass it exactly as pagination.nextCursor gave it.");
   }
   if (decoded.q !== queryHash) {
     throw refused(
@@ -245,7 +256,7 @@ export type ReadStop = { reason: 'time_limit' } | { reason: 'rate_limited'; retr
  *  shaping of the messages it returns, whether this bot may write here, and
  *  which of a page's failures stop the read rather than fail it. */
 export interface ReadSource {
-  page(at: string | undefined, limit: number): Promise<{ messages?: unknown; has_more?: unknown }>;
+  page(at: string | undefined, limit: number): Promise<{ messages?: unknown; has_more?: unknown; response_metadata?: unknown }>;
   shape(messages: SlackHistoryMessage[]): Promise<HistoryMessage[]>;
   writable: boolean;
   stopped(err: unknown): ReadStop | undefined;
@@ -265,10 +276,9 @@ export async function readBounded(opts: ReadOptions, source: ReadSource): Promis
   const filtering = opts.textContains !== undefined || opts.authorIds.length > 0;
   const fold = (text: string) => (opts.caseSensitive ? text : text.toLowerCase());
   const needle = opts.textContains === undefined ? undefined : fold(opts.textContains);
-  // History pages back from `latest`, Slack's own now unless given, except
-  // that given `oldest` alone the adapter's first page names the host's now
-  // plus a minute; a thread pages forward from `oldest`, its start unless
-  // given.
+  // History pages back from `latest`, Slack's own now unless given, and ends
+  // at the first message at or before `oldest`, which isn't sent to Slack; a
+  // thread pages forward from `oldest`, its start unless given.
   let at = opts.at ?? (kind === 'history' ? opts.latest : opts.oldest);
   const records: ReadRecord[] = [];
   let scanned = 0, matched = 0, pages = 0;
@@ -322,6 +332,12 @@ export async function readBounded(opts: ReadOptions, source: ReadSource): Promis
         .sort((a, b) => (kind === 'history' ? compareTs(b.ts, a.ts) : compareTs(a.ts, b.ts)))) {
         if (beyond(row.ts, rows.at(-1)?.ts ?? at)) rows.push(row);
       }
+      // History's range ends at the first message at or before `oldest`:
+      // that message and the ones past it are neither scanned nor matched.
+      const end = kind === 'history' && opts.oldest !== undefined
+        ? rows.findIndex(({ ts }) => compareTs(ts, opts.oldest!) <= 0)
+        : -1;
+      if (end >= 0) rows.splice(end);
       const isMatch = (m: SlackHistoryMessage) =>
         (needle === undefined || fold(formatSlackText(m.text ?? '', BY_ID)).includes(needle)) &&
         (!opts.authorIds.length || [m.user, m.bot_id].some((id) => id !== undefined && opts.authorIds.includes(id)));
@@ -351,7 +367,10 @@ export async function readBounded(opts: ReadOptions, source: ReadSource): Promis
         at = ts;
         if (records.length >= opts.limit && i < rows.length - 1) { stopReason = 'match_limit'; break pages; }
       }
-      if (page.has_more !== true) { complete = true; break; }
+      if (end >= 0) { complete = true; break; }
+      // Either sign that more remain is taken as one.
+      const nextCursor = (page.response_metadata as { next_cursor?: unknown } | undefined)?.next_cursor;
+      if (page.has_more !== true && !(typeof nextCursor === 'string' && nextCursor !== '')) { complete = true; break; }
       if (rows.length === 0) { stopReason = 'pagination_stalled'; break; }
     }
   } catch (err) {

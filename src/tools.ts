@@ -183,7 +183,7 @@ export const toolDefinitions: ToolDefinition[] = [
   {
     name: 'fetch_thread',
     description:
-      'Fetch a bounded part of one Slack thread, oldest-first (parent first on the initial unbounded-range call). ' +
+      'Fetch a bounded part of one Slack thread, oldest-first (parent first on a call without oldest or cursor). ' +
       `${PARENT_IDS}. Check pagination.scanComplete and stopReason. To go on to newer replies, call again with the ` +
       'same arguments and cursor set to pagination.nextCursor.',
     inputSchema: {

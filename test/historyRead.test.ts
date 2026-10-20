@@ -129,7 +129,7 @@ test("a cursor from another query, or one this server didn't give, is refused be
   assert.ok(padded.length > 256, String(padded.length));
   for (const cursor of ['not-a-cursor', Buffer.from(JSON.stringify({ q: 'x', at: 'nope' })).toString('base64url'), padded]) {
     await assert.rejects(reader.readHistory('C1', { channelId: 'C1', limit: 1, textContains: 'target', cursor }),
-      /^Error: No messages were returned: cursor isn't a nextCursor this server gave\. Pass it exactly as pagination\.nextCursor gave it\.$/);
+      /^Error: No messages were returned: cursor isn't in the form this server gives nextCursor in\. Pass it exactly as pagination\.nextCursor gave it\.$/);
   }
   assert.equal(api.calls.length, from, 'nothing was asked');
   // Budgets aren't part of the query, so a cursor carries over a new limit.
@@ -429,25 +429,46 @@ test('fetch_thread passes latest on to Slack as the bound of every page', { time
     ],
   });
   const from = api.calls.length;
-  await adapter().readThread('C1', '1.0', { channelId: 'C1', threadTs: '1.0', latest: '9.0' });
+  const out = await adapter().readThread('C1', '1.0', { channelId: 'C1', threadTs: '1.0', latest: '9.0' });
   assert.deepEqual(sentTo('conversations.replies', from).map((p) => [p.oldest, p.latest]), [[undefined, '9.0'], ['2.0', '9.0']]);
+  // A call bounded by latest alone also starts at the parent, as the tool's
+  // description says.
+  assert.equal(out.messages[0]!.id, '1.0');
+  assert.match(toolDefinitions.find((d) => d.name === 'fetch_thread')!.description, /\(parent first on a call without oldest or cursor\)/);
 });
 
-test("a history read given only oldest names latest on its first page, as the host's now plus a minute", { timeout: 5000 }, async (t) => {
-  // Date alone: the fake API still answers through a real setTimeout.
-  t.mock.timers.enable({ apis: ['Date'], now: 1_718_000_000_000 });
+test('a history read given oldest never sends it, pages back from Slack\'s own now, and ends at the first message at or before it', { timeout: 5000 }, async (t) => {
   answers(t, {
     'conversations.history': [
       page([row('8.0', 'U1', 'eight'), row('7.0', 'U1', 'seven')], true),
-      page([row('6.0', 'U1', 'six')], false),
+      // Slack would go on: the read's range ends at 5.0.
+      page([row('6.0', 'U1', 'six'), row('5.0', 'U1', 'five'), row('4.0', 'U1', 'four')], true),
     ],
     'users.info': [{ body: { ok: true, user: { profile: { display_name: 'Ann' } } } }],
   });
   const from = api.calls.length;
   const out = await adapter().readHistory('C1', { channelId: 'C1', oldest: '5.0' });
+  // Neither oldest, whose answer would rest on how Slack anchors it, nor a
+  // latest from this host's clock.
   const sent = sentTo('conversations.history', from).map((p) => [p.oldest, p.latest]);
-  assert.deepEqual(sent, [['5.0', '1718000060.000000'], ['5.0', '7.0']]);
+  assert.deepEqual(sent, [[undefined, undefined], [undefined, '7.0']]);
   assert.deepEqual(out.messages.map((m) => m.id), ['6.0', '7.0', '8.0']);
+  assert.deepEqual([out.pagination.scanComplete, out.pagination.stopReason, out.pagination.scanned, out.pagination.pages], [true, 'exhausted', 3, 2]);
+});
+
+test('a page that says no more remain but gives a next_cursor is taken as more remaining', { timeout: 5000 }, async (t) => {
+  answers(t, {
+    'conversations.history': [
+      { body: { ok: true, messages: [row('8.0', 'U1', 'eight')], has_more: false, response_metadata: { next_cursor: 'bmV4dA==' } } },
+      { body: { ok: true, messages: [row('7.0', 'U1', 'seven')], has_more: false, response_metadata: { next_cursor: '' } } },
+    ],
+    'users.info': [{ body: { ok: true, user: { profile: { display_name: 'Ann' } } } }],
+  });
+  const from = api.calls.length;
+  const out = await adapter().readHistory('C1', { channelId: 'C1' });
+  assert.deepEqual(sentTo('conversations.history', from).map((p) => p.latest), [undefined, '8.0']);
+  assert.deepEqual(out.messages.map((m) => m.id), ['7.0', '8.0']);
+  assert.equal(out.pagination.scanComplete, true);
 });
 
 test("a thread page out of Slack's documented order is read in reading order too", { timeout: 5000 }, async (t) => {
@@ -610,11 +631,11 @@ test('the thread fields: a root from the parent, a broadcast reply and an ordina
     ['9.0', '1.0', undefined, undefined, 'U1'],
   ]);
 });
-test('a history read passes oldest on to Slack as the bound of every page', { timeout: 5000 }, async (t) => {
+test('a history read given oldest and latest sends Slack only its position, never oldest', { timeout: 5000 }, async (t) => {
   answers(t, { 'conversations.history': [page([row('9.0', 'U1', 'a')], true), page([row('8.0', 'U1', 'b')], false)] });
   const from = api.calls.length;
   await adapter().readHistory('C1', { channelId: 'C1', oldest: '2.0', latest: '10.0' });
-  assert.deepEqual(sentTo('conversations.history', from).map((p) => [p.latest, p.oldest]), [['10.0', '2.0'], ['9.0', '2.0']]);
+  assert.deepEqual(sentTo('conversations.history', from).map((p) => [p.latest, p.oldest]), [['10.0', undefined], ['9.0', undefined]]);
 });
 
 test('a read without limit asks Slack for its default match count: 50 history messages, 100 of a thread', { timeout: 5000 }, async (t) => {
@@ -769,6 +790,36 @@ test('a cursor belongs to its whole query: another thread, bound or filter refus
   assert.equal(api.calls.length, from, 'nothing was asked');
   await reader.readHistory('C1', { ...query, authorIds: ['U2', 'U1', 'U2'], cursor: history });
   assert.equal(sentTo('conversations.history', from)[0]!.latest, '9.0', 'the same authors, reordered and repeated, continue the read');
+});
+
+test("a cursor whose position is outside its query's range is refused before Slack is asked", { timeout: 5000 }, async (t) => {
+  answers(t, {
+    'conversations.history': [page([row('9.0', 'U1', 'target'), row('8.0', 'U2', 'target')], true)],
+    'conversations.replies': [page([row('3.0', 'U1', 'parent', { thread_ts: '3.0' }), row('4.0', 'U2', 'one', { thread_ts: '3.0' })], true)],
+  });
+  const reader = adapter();
+  const history = { channelId: 'C1', limit: 1, oldest: '2.0', latest: '10.0' };
+  const thread = { channelId: 'C1', threadTs: '3.0', limit: 1, oldest: '3.5', latest: '9.0' };
+  const historyCursor = (await reader.readHistory('C1', history)).pagination.nextCursor!;
+  const threadCursor = (await reader.readThread('C1', '3.0', thread)).pagination.nextCursor!;
+  // The same cursor, its position moved: the query's hash still matches.
+  const moved = (cursor: string, at: string) =>
+    Buffer.from(JSON.stringify({ ...JSON.parse(Buffer.from(cursor, 'base64url').toString()), at })).toString('base64url');
+  const from = api.calls.length;
+  // History: oldest < at <= latest.
+  for (const at of ['2.0', '1.0', '10.5']) {
+    await assert.rejects(reader.readHistory('C1', { ...history, cursor: moved(historyCursor, at) }),
+      new RegExp(`^Error: No messages were returned: cursor's position, ${at.replace('.', '\\.')}, is outside this query's range\\.`), at);
+  }
+  // A thread: at >= threadTs, at >= oldest, at < latest.
+  for (const at of ['2.0', '3.2', '9.0']) {
+    await assert.rejects(reader.readThread('C1', '3.0', { ...thread, cursor: moved(threadCursor, at) }), /outside this query's range/, at);
+  }
+  assert.equal(api.calls.length, from, 'nothing was asked');
+  // Positions at the range's ends that a read can reach are taken.
+  await reader.readHistory('C1', { ...history, cursor: moved(historyCursor, '10.0') });
+  await reader.readThread('C1', '3.0', { ...thread, cursor: moved(threadCursor, '3.5') });
+  assert.deepEqual([sentTo('conversations.history', from)[0]!.latest, sentTo('conversations.replies', from)[0]!.oldest], ['10.0', '3.5']);
 });
 
 test("every text that says where a thread's parent id comes from names a reply's thread=, a message's own id= and a result's rootTs", () => {
