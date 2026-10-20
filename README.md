@@ -16,7 +16,7 @@ that grant arrives; plain MCP tool calls are unaffected.
 
 ## Features
 
-- **Channels**: every conversation the bot can act in, of each kind its token has the read scope for, is registered as an MCPL channel (`slack:<conversationId>`) when the host grants `channels.register`, and `refresh_channels` registers ones joined since. `channels/publish` posts in the thread of the last message the server passed to the host from that conversation, which can change while the agent is answering. Use [`reply_message` for an explicit thread](#reply-to-a-specific-thread).
+- **Channels**: every conversation the bot can act in, of each kind its token has the read scope for, is registered as an MCPL channel (`slack:<conversationId>`) when the host grants `channels.register`, and `refresh_channels` registers ones joined since. `channels/publish` posts in the thread of the last message from that conversation the host took, which can change while the agent is answering. Use [`reply_message` for an explicit thread](#reply-to-a-specific-thread).
 - **Real-time events** via Socket Mode — no public webhook URL needed, so the
   server can be spawned over stdio like any other MCPL server.
 - **Addressing model**: mentions (`<@bot>`) and DMs are always delivered;
@@ -126,7 +126,7 @@ uploads with `missing_scope`.
 
 ## Reply to a specific thread
 
-When answering a particular message, use `reply_message` to select its thread explicitly. Automatic prose delivery through `channels/publish` carries no thread or triggering message ID. The server uses the thread of the last message it passed to the host from that Slack conversation instead, whether or not the host accepted it, so another message can redirect the reply to a different thread, or to the channel's top level ([#6](https://github.com/anima-research/slack-mcpl/issues/6)). The server keeps that in memory only: after a restart, a publish goes to the top level until the server passes on a message from the conversation.
+When answering a particular message, use `reply_message` to select its thread explicitly. Automatic prose delivery through `channels/publish` carries no thread or triggering message ID. The server uses the thread of the last message from that Slack conversation the host took instead, so another message can redirect the reply to a different thread, or to the channel's top level ([#6](https://github.com/anima-research/slack-mcpl/issues/6)). The server keeps that in memory only: after a restart, a publish goes to the top level until the host takes a message from the conversation.
 
 1. Select the Slack conversation ID, such as `C123`, rather than its MCPL ID, `slack:C123`. Every incoming message's header gives it as `channelId=`; copy it from there, a DM's included, rather than from memory.
 2. For `messageId`, use the target message's displayed `thread=` value. If it has no `thread=`, use its `id=`: the reply goes into that message's own thread, which starts one if it has none. History results call these fields `threadTs` and `id`.
