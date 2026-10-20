@@ -83,7 +83,7 @@ test('upload handler requires a conversation', async (t) => {
     assert.equal(result.isError, true);
     assert.equal(
       result.content[0].text,
-      `Nothing was done: channelId must be a non-empty string, and this call ${passed}. list_channels shows each ` +
+      `Nothing was done: channelId must be a non-empty string, and this call ${passed}. Take it from the message's channelId=, or list_channels shows each ` +
         "conversation's id.",
     );
   }
