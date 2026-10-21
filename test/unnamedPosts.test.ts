@@ -177,6 +177,9 @@ test('a failed post is marked as one that may have posted exactly when the expla
     return slack.sendMessage('C1', 'x');
   };
   const toC1: SlackCall = { tool: 'send_message', args: { channelId: 'C1', content: 'x' } };
+  /** What the case for the client's URIError saw, checked after the cases,
+   *  since a case's every rejection is the error it reads. */
+  let uriError: { code: unknown; requests: number } | undefined;
   /** `says`, where given, is what the explainer's text must also say. */
   const cases: Array<{ what: string; unknown: boolean; says?: RegExp; call?: SlackCall; send: () => Promise<unknown> }> = [
     { what: 'HTTP 503', unknown: true, send: () => post({ status: 503, body: { ok: false } }) },
@@ -194,7 +197,12 @@ test('a failed post is marked as one that may have posted exactly when the expla
       what: 'a lone surrogate ending the channel id',
       unknown: false,
       call: { tool: 'send_message', args: { channelId: 'C1\ud800', content: 'x' } },
-      send: () => slack.sendMessage('C1\ud800', 'x'),
+      send: async () => {
+        const calls = api.calls.length;
+        const err = await slack.sendMessage('C1\ud800', 'x').then(() => undefined, (e: unknown) => e);
+        uriError = { code: (err as { code?: unknown } | undefined)?.code, requests: api.calls.length - calls };
+        throw err;
+      },
     },
     // The client's TypeError for a JSON body that isn't an object, after a
     // 200: Slack may have acted, so it keeps the default.
@@ -256,6 +264,7 @@ test('a failed post is marked as one that may have posted exactly when the expla
     if (says) assert.match(told, says, what);
     assert.equal(postLeftBy(err) !== undefined, unknown, `${what}: marked as one that may have posted`);
   }
+  assert.deepEqual(uriError, { code: 'ERR_INVALID_URI', requests: 0 }, "the client's URIError, with no request sent");
 });
 
 test("a DM this server can't name may remain in the DM's conversation", { timeout: 5000 }, async (t) => {

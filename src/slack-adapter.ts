@@ -458,10 +458,12 @@ export const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\u
  *  node:querystring (dist/WebClient.js:606), which takes a lone surrogate and
  *  the code unit after it as one pair, so Slack would post a different
  *  character, and throws "URI malformed" for one that ends the text. The
- *  other fields a post or an edit sends are the agent's ids, which this
- *  leaves to Slack: a pair made from a lone surrogate is outside the Basic
- *  Multilingual Plane, so a changed id can't be another conversation's or
- *  message's, whose ids are letters, digits and dots. */
+ *  other fields a post, an edit or a DM's opening sends are ids the agent
+ *  passed, which aren't checked: a pair made from a lone surrogate is outside
+ *  the Basic Multilingual Plane, so an id with one inside names no
+ *  conversation, message or user, whose ids are letters, digits and dots,
+ *  and an id that ends with one makes the client throw before anything is
+ *  sent. */
 function assertSendable(text: string, notDone: string): void {
   if (LONE_SURROGATE.test(text)) {
     throw new Error(`${notDone}: the text holds a lone UTF-16 surrogate, which UTF-8 can't encode: remove it.`);
@@ -1374,6 +1376,8 @@ export class SlackAdapter {
           `where it may write. ${toChannels}`,
       );
     }
+    // Before the DM is opened, as above.
+    assertSendable(text, 'Nothing was sent');
     const open = await this.web.conversations.open({ users: userId });
     const channelId = open.channel?.id;
     if (!channelId) {
