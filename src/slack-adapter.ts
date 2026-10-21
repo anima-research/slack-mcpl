@@ -1206,8 +1206,10 @@ export class SlackAdapter {
     opts: { threadTs?: string } = {},
     notDone = 'Nothing was posted',
   ): Promise<{ messageId: string }> {
-    assertSendable(text, notDone);
+    // The allow-list's refusal first, since calling again can't change it,
+    // then the text's, both before the DM check can ask Slack anything.
     this.assertWritable(channelId, notDone);
+    assertSendable(text, notDone);
     await this.assertNotDm(channelId, notDone);
     const left = (err: unknown): unknown => {
       if (err !== null && typeof err === 'object') {
@@ -1396,8 +1398,9 @@ export class SlackAdapter {
   }
 
   async editMessage(channelId: string, ts: string, text: string): Promise<void> {
-    assertSendable(text, "The message wasn't changed");
+    // In the order sendMessage's checks run.
     this.assertWritable(channelId, "The message wasn't changed");
+    assertSendable(text, "The message wasn't changed");
     await this.assertNotDm(channelId, "The message wasn't changed");
     await this.web.chat.update({ channel: channelId, ts, text });
   }

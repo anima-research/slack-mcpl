@@ -23,7 +23,7 @@ const codePoints = (s: string) => [...s].map((ch) => ch.codePointAt(0)!.toString
 /** A server over the real client, with registration done, so a test can
  *  tell every Slack call a write makes. With `disableDms`, a write to a
  *  conversation that isn't registered asks Slack whether it's a DM first. */
-async function serve(t: { after(fn: () => unknown): void }, opts: { disableDms?: boolean } = {}) {
+async function serve(t: { after(fn: () => unknown): void }, opts: { disableDms?: boolean; sendChannels?: string[] } = {}) {
   const api = await fakeSlackApi();
   t.after(() => api.close());
   api.answerFor('conversations.list', { body: { ok: true, channels: [{ id: 'C1', name: 'general', is_channel: true, is_member: true }] } });
@@ -33,7 +33,7 @@ async function serve(t: { after(fn: () => unknown): void }, opts: { disableDms?:
   api.answerFor('conversations.info', { body: { ok: true, channel: { id: 'C7', is_channel: true } } });
   const client = new SlackWebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: api.url });
   const socket = { on() {}, async start() {}, async disconnect() {} };
-  const slack = new SlackAdapter(client as unknown as SlackWebLike, socket, 'UBOT', 'acme', undefined, undefined, opts.disableDms);
+  const slack = new SlackAdapter(client as unknown as SlackWebLike, socket, 'UBOT', 'acme', undefined, opts.sendChannels, opts.disableDms);
   const h = connectHost(new SlackMcplServer(slack));
   t.after(() => h.close());
   await initialize(h, true);
@@ -86,6 +86,21 @@ for (const disableDms of [false, true]) {
     }
   });
 }
+
+test("a write the allow-list refuses says so first, though its text holds a lone surrogate", async (t) => {
+  // Calling again can't change the allow-list's refusal, while the agent can
+  // fix the text, so the agent isn't sent to fix the text for a write that
+  // could never go.
+  const { api, writes } = await serve(t, { sendChannels: ['C9'] });
+  for (const { name, opening, run } of writes('a \ud800 b', 'C1')) {
+    const before = api.calls.length;
+    const { failed, text: said } = await run();
+    assert.deepEqual(api.calls.slice(before), [], `${name}: Slack is asked nothing`);
+    assert.equal(failed, true, `${name}: the write fails`);
+    assert.ok(said.includes(`${opening}: this bot may write only to C9`), `${name}: the allow-list's refusal, and got: ${said}`);
+    assert.ok(!said.includes('surrogate'), `${name}: not the text's refusal, and got: ${said}`);
+  }
+});
 
 test('a surrogate pair reaches Slack as given', async (t) => {
   const { api, writes } = await serve(t);
