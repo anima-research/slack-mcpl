@@ -462,9 +462,11 @@ export const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\u
  *  agent or the host passed, or a publish's thread, which this server took
  *  from Slack, and they aren't checked: a pair made from a lone surrogate is
  *  outside the Basic Multilingual Plane, so an id with one inside names no
- *  conversation, message or user, whose ids are letters, digits and dots,
- *  and an id that ends with one makes the client throw before anything is
- *  sent. */
+ *  conversation, message or user, whose ids are letters, digits and dots.
+ *  Slack documents a not-found error for each of them but thread_ts. For
+ *  that one, a pair names no message, as any wrong messageId does, which
+ *  this leaves as it is. An id that ends with one makes the client throw
+ *  before anything is sent. */
 function assertSendable(text: string, notDone: string): void {
   if (LONE_SURROGATE.test(text)) {
     throw new Error(`${notDone}: the text holds a lone UTF-16 surrogate, which UTF-8 can't encode: remove it.`);
