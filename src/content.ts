@@ -11,6 +11,11 @@
 // so an over-eager fetch can't poison the agent's next turn.
 export const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
 
+/** Slack's own per-file upload limit, 1 GiB: the most an operator may let a
+ *  path upload read (SLACK_PATH_UPLOADS's maxBytes). Inline content stays at
+ *  MAX_ATTACHMENT_BYTES, since its bytes pass through the model's context. */
+export const SLACK_MAX_FILE_BYTES = 1024 * 1024 * 1024;
+
 // MIME types we decode and return as `content_text` instead of base64,
 // so the agent can read them directly (CSVs, JSON, plain text, etc).
 const TEXT_MIME_RE = /^(text\/|application\/(json|xml|x-yaml|yaml|csv|x-www-form-urlencoded)\b)/i;
