@@ -514,6 +514,11 @@ test("an upload's failed last step says which file it left and whether Slack may
   for (const [last, mayHaveShared] of [
     [{ body: { ok: false, error: 'not_in_channel' } }, false],
     [{ status: 429, headers: { 'retry-after': '30' }, body: { ok: false, error: 'ratelimited' } }, false],
+    // Without a usable Retry-After, the client's error for a 429 is a plain
+    // Error, which it doesn't classify: Slack didn't act on the request.
+    [{ status: 429, body: { ok: false } }, false],
+    // A 200 the client can't read throws a TypeError: Slack may have acted.
+    [{ body: null }, true],
     // Slack received the request only in part, so it didn't act on it.
     [{ body: { ok: false, error: 'request_timeout' } }, false],
     [{ body: { ok: false, error: 'internal_error' } }, true],
@@ -674,6 +679,8 @@ test("an upload whose answer named no sharing message says on rollback that its 
   const before = await call('send_message', { channelId: 'C1', content: 'before' });
   // Confirmed, though Slack's answer named no sharing message.
   const uploaded = await call('upload_file', { channelId: 'C1', filename: 'a.txt', content: 'a', comment: 'Here' });
+  // This server's listing found no conversations, so C1 has no label and the
+  // answer no `to`.
   assert.deepEqual(JSON.parse(uploaded.content[0].text), { fileId: 'F1' });
   const from = api.calls.length;
   const rolledBack = await rollback(before.state!.checkpoint);
@@ -687,7 +694,7 @@ test("an upload whose answer named no sharing message says on rollback that its 
 
 test("the explainer gives upload_file's messageId the thread's parent, and its own way into or out of a thread", async (t) => {
   for (const [last, says] of [
-    [{ body: { ok: false, error: 'message_not_found' } }, /Pass the thread's parent id: a reply's thread=, or the id of the message the replies are under/],
+    [{ body: { ok: false, error: 'message_not_found' } }, /Pass the thread's parent id: a reply's thread=, a message's own id= when it shows no thread=, or a message's rootTs in fetch_history or fetch_thread results/],
     [{ body: { ok: false, error: 'restricted_action_thread_only_channel' } }, /takes messages only as thread replies\. Pass messageId, the id of the message whose thread the file goes in\.$/],
     [{ body: { ok: false, error: 'restricted_action_non_threadable_channel' } }, /doesn't take thread replies\. Upload without messageId instead\.$/],
   ] as const) {

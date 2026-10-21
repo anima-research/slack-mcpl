@@ -96,8 +96,8 @@ const CALLS: Array<[tool: string, lead: string, writes: boolean]> = [
   ['edit_message', "The message wasn't changed", true],
   ['delete_message', 'Nothing was deleted', true],
   ['add_reaction', 'No reaction was added', true],
-  ['fetch_history', 'Nothing was read', false],
-  ['fetch_thread', 'Nothing was read', false],
+  ['fetch_history', 'No messages were returned', false],
+  ['fetch_thread', 'No messages were returned', false],
   ['list_channels', 'Nothing was listed', false],
   ['find_user', 'No users were listed', false],
   ['refresh_channels', 'Nothing was announced to the host', false],
@@ -139,7 +139,7 @@ test('a conversation the bot is not in: a post can be fixed by an invite or a sc
   assert.match(post, /has to invite the bot \(in Slack, \/invite and the bot's name\)/);
   assert.match(post, /chat:write\.public/);
   const read = await explain('not_in_channel', 'fetch_history', { channelId: 'C2' });
-  assert.match(read, /Nothing was read: this bot isn't a member of conversation C2, so Slack didn't let it read there/);
+  assert.match(read, /No messages were returned: this bot isn't a member of conversation C2, so Slack didn't let it read there/);
   assert.doesNotMatch(read, /chat:write\.public/, 'the scope lets a bot post, not read');
   const edit = await explain('not_in_channel', 'edit_message', { channelId: 'C2', messageId: '1.1' });
   assert.match(edit, /The message wasn't changed: this bot isn't a member of conversation C2, so Slack didn't let it do that there\. Someone in that conversation has to invite the bot/);
@@ -166,15 +166,15 @@ test('a message id Slack does not know names where real ones show', async () => 
   // reply_message's messageId and fetch_thread's threadTs name a thread's parent, so each is told how to
   // pass one; the tools that name the message itself are told to copy its id=, as above.
   const parent =
-    "Pass the thread's parent id: a reply's thread=, or the id of the message the replies are under, which fetch_history shows";
+    "Pass the thread's parent id: a reply's thread=, a message's own id= when it shows no thread=, or a message's rootTs in fetch_history or fetch_thread results";
   assert.ok(
     (await explain('bad_timestamp', 'fetch_thread', { channelId: 'C4', threadTs: 'nope' })).endsWith(
-      `Nothing was read: nope isn't a message id, which looks like 1718000000.000100. ${parent}.`,
+      `No messages were returned: nope isn't a message id, which looks like 1718000000.000100. ${parent}.`,
     ),
   );
   assert.ok(
     (await explain('message_not_found', 'fetch_thread', { channelId: 'C4', threadTs: '1.7' })).endsWith(
-      `Nothing was read: Slack has no message 1.7 in conversation C4. The id may be mistyped or remembered rather than copied, or the message was deleted or is in another conversation. ${parent}, with the conversation it's in.`,
+      `No messages were returned: Slack has no message 1.7 in conversation C4. The id may be mistyped or remembered rather than copied, or the message was deleted or is in another conversation. ${parent}, with the conversation it's in.`,
     ),
   );
   assert.ok(
@@ -196,7 +196,7 @@ test('a message id Slack does not know names where real ones show', async () => 
 test("a thread or a history bound Slack doesn't know says which value it was", async () => {
   assert.match(
     await explain('thread_not_found', 'fetch_thread', { channelId: 'C5', threadTs: '9.9' }),
-    /Nothing was read: Slack has no thread under message 9\.9 in conversation C5\..*Pass the thread's parent id: a reply's thread=, or the id of the message the replies are under, which fetch_history shows\.$/s,
+    /No messages were returned: Slack has no thread under message 9\.9 in conversation C5\..*Pass the thread's parent id: a reply's thread=, a message's own id= when it shows no thread=, or a message's rootTs in fetch_history or fetch_thread results\.$/s,
   );
   // reply_message names the thread it replies under as messageId.
   assert.match(
@@ -205,11 +205,11 @@ test("a thread or a history bound Slack doesn't know says which value it was", a
   );
   assert.match(
     await explain('invalid_ts_latest', 'fetch_history', { channelId: 'C5', latest: 'yesterday' }),
-    /Nothing was read: latest yesterday isn't a message id/,
+    /No messages were returned: latest yesterday isn't a message id/,
   );
   assert.match(
     await explain('invalid_ts_oldest', 'fetch_history', { channelId: 'C5', oldest: 'x' }),
-    /Nothing was read: oldest x isn't a message id/,
+    /No messages were returned: oldest x isn't a message id/,
   );
 });
 
@@ -312,7 +312,7 @@ test("a token Slack doesn't accept says every tool fails until the host fixes it
     const text = await explain(code, 'fetch_history', { channelId: 'C13' });
     assert.match(
       text,
-      /Nothing was read: Slack doesn't accept this server's bot token, so it refused the call\. Every Slack tool here fails the same way until whoever runs this host fixes the token/,
+      /No messages were returned: Slack doesn't accept this server's bot token, so it refused the call\. Every Slack tool here fails the same way until whoever runs this host fixes the token/,
       code,
     );
   }
@@ -321,7 +321,7 @@ test("a token Slack doesn't accept says every tool fails until the host fixes it
 test("Slack's own failure: a read is tried again, a write's outcome is unknown and named how to check", async () => {
   assert.match(
     await explain('internal_error', 'fetch_thread', { channelId: 'C14', threadTs: '1.1' }),
-    /Nothing was read: Slack failed while handling the call\. Try again shortly\./,
+    /No messages were returned: Slack failed while handling the call\. Try again shortly\./,
   );
   const post = await explain('internal_error', 'send_message', { channelId: 'C14' });
   assert.match(post, /\n\nSlack failed while handling the call, so whether the message was posted is unknown \(Slack says part of a call can take effect before this error\)\./);
@@ -385,12 +385,19 @@ test('a rate limit says nothing was done and how long Slack asks to wait', async
   );
   assert.match(
     explainSlackError(err, { tool: 'fetch_history', args: { channelId: 'C15' } }),
-    /\n\nNothing was read: Slack is rate-limiting this kind of call for the workspace, and asks to wait 7 seconds/,
+    /\n\nNo messages were returned: Slack is rate-limiting this kind of call for the workspace, and asks to wait 7 seconds/,
   );
   api.answer({ status: 429, headers: { 'retry-after': '1' }, body: { ok: false, error: 'ratelimited' } });
   assert.match(
     explainSlackError(await clientError(), { tool: 'send_message', args: { channelId: 'C15' } }),
     /asks to wait 1 second before trying again\.$/,
+  );
+  // A count below 0 isn't a wait, so it's left out, as for a ratelimited
+  // refusal.
+  api.answer({ status: 429, headers: { 'retry-after': '-1' }, body: { ok: false, error: 'ratelimited' } });
+  assert.match(
+    explainSlackError(await clientError(), { tool: 'send_message', args: { channelId: 'C15' } }),
+    /\n\nNothing was posted: Slack is rate-limiting this kind of call for the workspace\. Try again shortly\.$/,
   );
   // A listing a call pages through starts over from its first page, so calling again can stop at the same place.
   for (const [tool, lead] of [
@@ -425,7 +432,7 @@ test("a failure in transit leaves a write's outcome unknown, and a read is tried
   );
   assert.match(
     explainSlackError(unanswered, { tool: 'fetch_history', args: { channelId: 'C16' } }),
-    /\n\nNothing was read: Slack went 10 seconds without answering, or the connection to it failed\. Try again shortly\.$/,
+    /\n\nNo messages were returned: Slack went 10 seconds without answering, or the connection to it failed\. Try again shortly\.$/,
   );
   api.answer({ status: 503, body: { ok: false } });
   const unavailable = await clientError();
@@ -449,7 +456,7 @@ test("a connection that couldn't be made says nothing was done, even for a write
   );
   assert.match(
     explainSlackError(refused, { tool: 'fetch_history', args: { channelId: 'C17' } }),
-    /\n\nNothing was read: Slack couldn't be reached\. Try again shortly\. If it keeps failing, whoever runs this host has to check its connection to Slack\.$/,
+    /\n\nNo messages were returned: Slack couldn't be reached\. Try again shortly\. If it keeps failing, whoever runs this host has to check its connection to Slack\.$/,
   );
   // The other codes Node gives for a connection never made can't be produced
   // here, so each is put on the client's own error in place of ECONNREFUSED.
@@ -478,11 +485,18 @@ test('a request Slack received only in part, or rate-limited in its answer, says
   );
   assert.match(
     await explain('request_timeout', 'fetch_history', { channelId: 'C18' }),
-    /\n\nNothing was read: Slack didn't receive the whole request, so it didn't act on it\. Try again shortly\.$/,
+    /\n\nNo messages were returned: Slack didn't receive the whole request, so it didn't act on it\. Try again shortly\.$/,
   );
   assert.match(
     await explain('ratelimited', 'edit_message', { channelId: 'C18', messageId: '1.1' }),
     /\n\nThe message wasn't changed: Slack is rate-limiting this kind of call for the workspace\. Try again shortly\.$/,
+  );
+  // With a Retry-After, which the client keeps in the answer's
+  // response_metadata, it gives Slack's seconds, as a 429's text does.
+  api.answer({ headers: { 'retry-after': '12' }, body: { ok: false, error: 'ratelimited' } });
+  assert.match(
+    explainSlackError(await clientError(), { tool: 'edit_message', args: { channelId: 'C18', messageId: '1.1' } }),
+    /\n\nThe message wasn't changed: Slack is rate-limiting this kind of call for the workspace, and asks to wait 12 seconds before trying again\.$/,
   );
 });
 
@@ -497,9 +511,18 @@ test('a user id Slack does not know or show points to find_user, or says nothing
   );
 });
 
-test('other errors and other codes pass through unchanged', async () => {
+test("other errors and other codes pass through unchanged, and a read's still says that no messages were returned", async () => {
   const unlisted = await slackError('invalid_arguments');
   assert.equal(explainSlackError(unlisted, { tool: 'send_message', args: {} }), 'An API error occurred: invalid_arguments');
+  // A read that fails returns nothing, so its failure says so, unless its own
+  // text opens with it, as the read's own refusals do.
+  assert.equal(
+    explainSlackError(unlisted, { tool: 'fetch_history', args: { channelId: 'C1' } }),
+    'An API error occurred: invalid_arguments\n\nNo messages were returned.',
+  );
+  assert.equal(explainSlackError(new Error('a bug'), { tool: 'fetch_thread', args: {} }), 'a bug\n\nNo messages were returned.');
+  const own = new Error('No messages were returned: limit must be an integer from 1 to 1000.');
+  assert.equal(explainSlackError(own, { tool: 'fetch_history', args: {} }), own.message);
   const reacted = await slackError('already_reacted');
   assert.equal(
     explainSlackError(reacted, { tool: 'add_reaction', args: { channelId: 'C1', messageId: '1.1', emoji: 'eyes' } }),
@@ -543,6 +566,13 @@ test("an answer that isn't in Slack's form leaves a write's outcome unknown, and
   assert.ok(listed.endsWith(
     "\n\nNothing was listed: Slack answered in a form this server can't read. Try again shortly. If it keeps failing, " +
       'whoever runs this host has to check its connection to Slack.'), listed);
+  // A read's failure opens with what every failure of a read opens with.
+  for (const [tool, args] of [['fetch_history', { channelId: 'C1' }], ['fetch_thread', { channelId: 'C1', threadTs: '1.1' }]] as const) {
+    const read = explainSlackError(err, { tool, args });
+    assert.ok(read.endsWith(
+      "\n\nNo messages were returned: Slack answered in a form this server can't read. Try again shortly. If it keeps " +
+        'failing, whoever runs this host has to check its connection to Slack.'), read);
+  }
 });
 
 const socket: SlackSocketLike = { on() {}, async start() {}, async disconnect() {} };

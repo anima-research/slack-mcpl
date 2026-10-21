@@ -614,6 +614,8 @@ test("an acknowledgement's add counts as there, and is removed, only when it may
     ['service_unavailable', { body: { ok: false, error: 'service_unavailable' } }, true],
     ["already_reacted, this bot's reaction being there already", { body: { ok: false, error: 'already_reacted' } }, true],
     ["an answer in no form of Slack's", 'a page', true],
+    // The client throws a TypeError reading a 200 it can't read: Slack may have added it.
+    ['a JSON body of null, in an HTTP 200', { body: null }, true],
     ['a connection never made', 'unreachable', false],
     ['a rate limit', { status: 429, headers: { 'retry-after': '30' }, body: { ok: false, error: 'ratelimited' } }, false],
     ['ratelimited in an HTTP 200', { body: { ok: false, error: 'ratelimited' } }, false],

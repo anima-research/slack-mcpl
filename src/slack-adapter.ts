@@ -21,6 +21,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { WebClient, ErrorCode, LogLevel, type Logger, type WebAPICallResult, type WebClientOptions } from '@slack/web-api';
 import { SocketModeClient } from '@slack/socket-mode';
+import { NOTHING_RETURNED, SLACK_TS, readBounded, readOptions, type HistoryReadResult, type ReadStop } from './history-read.js';
 import {
   formatSlackText,
   extractSlackUserIds,
@@ -197,6 +198,30 @@ export function waitToAskAgain(err: unknown, method: string): SlackWait | undefi
   return undefined;
 }
 
+/** The seconds Slack asked a rate-limited request to wait: a 429's
+ *  Retry-After, or one that came with a ratelimited refusal in an HTTP 200,
+ *  which the client puts in its response_metadata. They're kept only as a
+ *  safe integer, at most 16 digits of JSON, which bounds a read result's own
+ *  bytes (history-read.ts), and not below 0. */
+export function retryAfterSeconds(err: unknown): number | undefined {
+  const e = err as { code?: unknown; retryAfter?: unknown; data?: { response_metadata?: { retryAfter?: unknown } } } | null;
+  const seconds = e?.code === ErrorCode.RateLimitedError ? e.retryAfter : e?.data?.response_metadata?.retryAfter;
+  return Number.isSafeInteger(seconds) && (seconds as number) >= 0 ? (seconds as number) : undefined;
+}
+
+/** Why a read tool's page failing stops the read with what it has, rather
+ *  than failing it: the call's time had no room for the page, or Slack
+ *  rate-limited it, with an HTTP 429 longer than the call could wait or with
+ *  a ratelimited refusal in an HTTP 200, which the client never waits out,
+ *  with Slack's seconds when they came (retryAfterSeconds). */
+function readStop(err: unknown): ReadStop | undefined {
+  if (err instanceof OutOfCallTime) return { reason: 'time_limit' };
+  const e = err as { code?: unknown } | null;
+  if (e?.code !== ErrorCode.RateLimitedError && slackRefusal(err) !== 'ratelimited') return undefined;
+  const seconds = retryAfterSeconds(err);
+  return { reason: 'rate_limited', ...(seconds === undefined ? {} : { retryAfter: seconds }) };
+}
+
 /** Called by a listing no call waits on before it asks Slack again: with the
  *  wait, and how many times in a row this request has needed one. Rejecting
  *  ends the listing with that error, unless it's GaveUp on a DM's name. */
@@ -294,9 +319,16 @@ export interface SlackMessageData {
 export interface HistoryMessage {
   id: string;
   authorId?: string;
+  /** The bot that posted it, when Slack names one. */
+  authorBotId?: string;
   authorName: string;
   content: string;
+  /** A reply's parent. */
   threadTs?: string;
+  /** The thread it belongs to: its parent's ts, or its own. */
+  rootTs: string;
+  /** Its replies, when Slack gives a count; missing means unknown. */
+  replyCount?: number;
   timestamp: Date;
   attachments: Array<{ name: string; mimeType?: string; url?: string }>;
 }
@@ -419,18 +451,84 @@ export function fileLeftByUpload(err: unknown): FileLeft | undefined {
   return err !== null && typeof err === 'object' ? filesLeft.get(err) : undefined;
 }
 
-/** Whether a request's failure leaves it undone: the call's time left no room
- *  to send it, the connection to Slack was never made, or Slack refused it or
- *  rate-limited it. A failure Slack says may have taken effect
- *  (MAY_HAVE_LANDED), an answer not in Slack's form, an HTTP error, a timeout
- *  or a connection that failed once made doesn't say. */
+/** Whether a request's failure is taken to leave it undone: the call's time
+ *  left no room to send it, the connection to Slack was never made, Slack
+ *  refused it or rate-limited it, or the error is neither one of the client's
+ *  request, HTTP or platform errors nor a TypeError. A failure Slack says may
+ *  have taken effect (MAY_HAVE_LANDED), an answer not in Slack's form, an HTTP
+ *  error, a timeout, a connection that failed once made, or a TypeError
+ *  doesn't say.
+ *
+ *  Taking an error the client doesn't classify as undone turns round the
+ *  messaging contract's default, "possibly done" unless it's known to come
+ *  before the write, so it rests on the client. In @slack/web-api 7.19.0's
+ *  makeRequest (dist/WebClient.js:476-518), a failure of the request itself
+ *  becomes a coded request error (:514-515), a status other than 200 a coded
+ *  HTTP error (:504-505), and apiCall makes a refusal in a 200 a coded
+ *  platform error (:231-236). Its other errors are thrown before the request
+ *  is sent, such as Node's URIError (ERR_INVALID_URI) for a lone surrogate
+ *  while the request interceptor builds the body (:606), or after a 429
+ *  (:498, and :501's "Retry header did not contain a valid timeout"), but for
+ *  the TypeErrors it throws after a 200, reading an answer not in the shape of
+ *  Slack's: a JSON body that isn't an object (:668), or response_metadata
+ *  whose warnings or messages aren't lists (:205-211), as a broken proxy might
+ *  send. So a TypeError keeps the contract's default. Taking one as undone
+ *  risks the duplicate post the default is there to prevent, while a
+ *  TypeError from a bug of this server's before a request costs the agent a
+ *  check, and, when it's thrown inside a post's request, a rollback's note of
+ *  a post that may remain. (buildResult's JSON parse at :656 is for
+ *  admin.analytics.getFile, which this server doesn't call.) Apart from
+ *  TypeErrors, in that version an error the client doesn't classify means
+ *  Slack never took the call.
+ *
+ *  It rests on SLACK_CLIENT_OPTIONS too. With retryConfig's retries: 0, the
+ *  client sends a request once, so the error read here never follows an
+ *  earlier attempt Slack may have taken: SlackWebClient sends one again only
+ *  after a 429, which Slack didn't take. With rejectRateLimitedCalls, a 429
+ *  with a usable Retry-After is the coded rate-limited error (:483), so of the
+ *  plain errors after a 429 only :501's is reached here; :498's needs it off.
+ *  Check this again when the client or SLACK_CLIENT_OPTIONS change. */
 function cannotHaveLanded(err: unknown): boolean {
-  if (err instanceof OutOfCallTime) return true;
   const e = err as { code?: unknown; original?: { code?: unknown } } | null;
-  if (e?.code === ErrorCode.RequestError) return connectionNeverMade(e.original?.code);
-  if (e?.code === ErrorCode.RateLimitedError) return true;
-  const refused = slackRefusal(err);
-  return refused !== undefined && !MAY_HAVE_LANDED.has(refused);
+  switch (e?.code) {
+    case ErrorCode.RequestError:
+      return connectionNeverMade(e.original?.code);
+    case ErrorCode.HTTPError:
+      return false;
+    case ErrorCode.PlatformError: {
+      const refused = slackRefusal(err);
+      return refused !== undefined && !MAY_HAVE_LANDED.has(refused);
+    }
+    default:
+      // A rate limit, this server's OutOfCallTime, or an error the client
+      // doesn't classify, but for a TypeError.
+      return !(err instanceof TypeError);
+  }
+}
+
+/** A post this server can't name: chat.postMessage answered without the
+ *  message's ts, or failed in a way that may have posted it. */
+export interface PostLeft {
+  channelId: string;
+  /** The thread it was posted into, for a reply. */
+  threadTs?: string;
+}
+const postsLeft = new WeakMap<object, PostLeft>();
+
+/** The post a failed sendMessage may have left, which a rollback says may
+ *  remain; undefined for any other error, such as a refusal or one from a
+ *  request before the post. */
+export function postLeftBy(err: unknown): PostLeft | undefined {
+  return err !== null && typeof err === 'object' ? postsLeft.get(err) : undefined;
+}
+
+/** chat.postMessage answered without the message's ts: whether it posted
+ *  can't be told, and if it did, the message can't be named. */
+export class PostNotConfirmed extends Error {
+  constructor(readonly channelId: string) {
+    super(`chat.postMessage: the answer named no message in ${channelId}`);
+    this.name = 'PostNotConfirmed';
+  }
 }
 
 /** An upload's last step answered without the file: whether Slack shared it
@@ -633,8 +731,8 @@ export interface SlackWebLike {
     list(args: Record<string, unknown>): Promise<{ channels?: unknown[]; response_metadata?: { next_cursor?: string; scopes?: string[] } }>;
     info(args: { channel: string }): Promise<{ channel?: unknown }>;
     open(args: { users: string }): Promise<{ channel?: { id?: string } }>;
-    history(args: Record<string, unknown>): Promise<{ messages?: unknown[]; response_metadata?: { next_cursor?: string } }>;
-    replies(args: Record<string, unknown>): Promise<{ messages?: unknown[]; response_metadata?: { next_cursor?: string } }>;
+    history(args: Record<string, unknown>): Promise<{ messages?: unknown[]; has_more?: boolean; response_metadata?: { next_cursor?: string } }>;
+    replies(args: Record<string, unknown>): Promise<{ messages?: unknown[]; has_more?: boolean; response_metadata?: { next_cursor?: string } }>;
   };
   auth: {
     test(): Promise<{ response_metadata?: { scopes?: string[] } }>;
@@ -666,6 +764,9 @@ export interface SlackSocketLike {
 }
 
 export class SlackAdapter {
+  /** Each conversation's last event's turn, which the next event's delivery
+   *  waits for. */
+  private inbound = new Map<string, Promise<void>>();
   private userNameCache = new Map<string, string>();
   private messageHandlers: Array<(msg: SlackMessageData) => void> = [];
   private socketStarted = false;
@@ -707,17 +808,34 @@ export class SlackAdapter {
     const omitted = this.leftOutTypes();
     if (omitted.length) this.logLeftOut(omitted, '');
     // Register the handler at construction so start() ordering can't race
-    // an early event past an unregistered listener.
+    // an early event past an unregistered listener. Each event is prepared as
+    // it arrives, its author's and mentions' names looked up, and delivered
+    // after the event before it in its conversation: the lookups take
+    // different times, and a later message must not reach the host before an
+    // earlier one. Preparing at arrival keeps one conversation's lookups side
+    // by side, so a run of slow or failing ones costs the slowest, not their
+    // sum, within the Web API client's 100 requests at once, which every
+    // conversation's lookups share. From delivery on, the server keeps the
+    // same order with its own chain per conversation (setupSlackForwarding).
     this.socket.on('message', ({ event, ack }) => {
-      void (async () => {
-        // Always ack first — Slack redelivers unacked envelopes.
-        try { await ack(); } catch { /* ignore */ }
-        try {
-          await this.handleMessageEvent(event);
-        } catch (error) {
-          console.error('[slack-mcpl] Failed to handle Slack message event:', error);
-        }
-      })();
+      // Always ack first — Slack redelivers unacked envelopes.
+      void Promise.resolve().then(() => ack()).catch(() => { /* ignore */ });
+      // Settled into a value at once, so a preparation that fails before its
+      // turn is never a rejection nothing handles.
+      const prepared = this.prepareMessageEvent(event).then(
+        (msg) => ({ ok: true as const, msg }),
+        (error: unknown) => ({ ok: false as const, error }),
+      );
+      const key = typeof event?.channel === 'string' ? event.channel : '';
+      const turn = (this.inbound.get(key) ?? Promise.resolve())
+        .then(() => prepared)
+        .then((done) => {
+          if (!done.ok) throw done.error;
+          if (done.msg) for (const handler of this.messageHandlers) handler(done.msg);
+        })
+        .catch((error) => console.error('[slack-mcpl] Failed to handle Slack message event:', error));
+      this.inbound.set(key, turn);
+      void turn.then(() => { if (this.inbound.get(key) === turn) this.inbound.delete(key); });
     });
   }
 
@@ -961,8 +1079,9 @@ export class SlackAdapter {
 
   // ── Acknowledgement reaction ──
   // Slack has no typing indicator for bots, so "received" is shown as a
-  // reaction on the message that addressed the bot, removed when the bot next
-  // posts in that conversation or after ACK_TTL_MS, whichever comes first.
+  // reaction on the message that addressed the bot, removed at the bot's next
+  // post in that conversation that Slack confirms, or after ACK_TTL_MS,
+  // whichever comes first.
 
   /** `added` settles once reactions.add is answered or its request fails, so a
    *  removal never overtakes an add Slack has answered. An add whose request
@@ -991,27 +1110,25 @@ export class SlackAdapter {
     const added = this.addReaction(channelId, ts, this.ackReaction).then(
       () => true,
       // The add counts as there, and is removed like an added one, when it may
-      // have landed: already_reacted says it's there; Slack's failure while
-      // handling it leaves it unknown, as the explainer says (internal_error
-      // and fatal_error can take effect in part); and so does an HTTP error,
-      // an answer not in Slack's form, or a request that failed after it may
-      // have reached Slack. Slack's other refusals, its rate limits (a 429, or
-      // ratelimited in a 200) and request_timeout say it didn't act, a
-      // connection never made reached nothing, and this server's own refusal,
-      // such as the write allow-list's, sent nothing. So did a failure of a
-      // request before the add, such as the DM check's conversations.info.
-      // Slack answers a removal of one that isn't there with no_reaction.
-      (err: { code?: unknown; original?: { code?: unknown } } | null) => {
+      // have landed, by the rule that reads a post's failure
+      // (cannotHaveLanded): already_reacted says it's there; Slack's failure
+      // while handling it leaves it unknown, as the explainer says
+      // (internal_error and fatal_error can take effect in part); and so does
+      // an HTTP error, an answer not in Slack's form or one the client can't
+      // read (a TypeError), or a request that failed after it may have reached
+      // Slack. Slack's other refusals, its rate limits (a 429, or ratelimited
+      // in a 200) and request_timeout say it didn't act, a connection never
+      // made reached nothing, and this server's own refusal, such as the write
+      // allow-list's, sent nothing. So did a failure of a request before the
+      // add, such as the DM check's conversations.info. Slack answers a
+      // removal of one that isn't there with no_reaction.
+      (err: unknown) => {
         const failed = failedRequest(err);
         if (failed !== undefined && failed !== 'reactions.add') return false;
-        if (err?.code === ErrorCode.RequestError) return !connectionNeverMade(err.original?.code);
-        if (err?.code === ErrorCode.HTTPError) return true;
-        const answer = slackRefusal(err);
-        if (answer === undefined) return err?.code === ErrorCode.PlatformError;
-        return MAY_HAVE_LANDED.has(answer);
+        return !cannotHaveLanded(err);
       },
     );
-    // Recorded before the add resolves, so a reply that lands first still removes it.
+    // Recorded before the add resolves, so a reply Slack confirms first still removes it.
     let pending = this.ackPending.get(channelId);
     if (!pending) this.ackPending.set(channelId, (pending = new Map()));
     const entry: AckEntry = { timer: this.armAck(channelId, ts, ACK_TTL_MS), added, tries: 0 };
@@ -1056,7 +1173,10 @@ export class SlackAdapter {
   }
 
   /** `notDone` opens this server's own refusals: send_dm's reads "Nothing was
-   *  sent". */
+   *  sent". A post that fails in a way that may have posted it (one
+   *  cannotHaveLanded doesn't rule out), or whose answer names no message
+   *  (PostNotConfirmed), marks its error with what it may have left
+   *  (postLeftBy), for rollback. */
   async sendMessage(
     channelId: string,
     text: string,
@@ -1065,13 +1185,29 @@ export class SlackAdapter {
   ): Promise<{ messageId: string }> {
     this.assertWritable(channelId, notDone);
     await this.assertNotDm(channelId, notDone);
-    const result = await this.web.chat.postMessage({
-      channel: channelId,
-      text,
-      ...(opts.threadTs ? { thread_ts: opts.threadTs } : {}),
-    });
+    const left = (err: unknown): unknown => {
+      if (err !== null && typeof err === 'object') {
+        postsLeft.set(err, { channelId, ...(opts.threadTs ? { threadTs: opts.threadTs } : {}) });
+      }
+      return err;
+    };
+    let result: { ts?: string };
+    try {
+      result = await this.web.chat.postMessage({
+        channel: channelId,
+        text,
+        ...(opts.threadTs ? { thread_ts: opts.threadTs } : {}),
+      });
+    } catch (err) {
+      throw cannotHaveLanded(err) ? err : left(err);
+    }
+    // An answer whose ts isn't a message's id, a string with something in it,
+    // names nothing the agent or a rollback could edit, reply to or delete,
+    // and can't show the post went through, so it reads as an unknown
+    // outcome, as a failure that may have posted does.
+    if (typeof result.ts !== 'string' || !result.ts) throw left(new PostNotConfirmed(channelId));
     void outsideCallTime(() => this.clearAck(channelId));
-    return { messageId: result.ts ? String(result.ts) : '' };
+    return { messageId: result.ts };
   }
 
   /** An upload's write checks, the same as sendMessage's. A path upload makes
@@ -1271,8 +1407,52 @@ export class SlackAdapter {
 
   // ── History ──
 
-  /** Channel-level history, oldest-first. Thread replies are NOT included
-   *  (Slack requires conversations.replies per thread — see fetchThread). */
+  /** fetch_history's read: bounded and filtered, saying whether it covered
+   *  its range, with a cursor to continue (history-read.ts). Its pages go
+   *  through this adapter's client, after the same DM check as every read.
+   *  Backscroll keeps fetchHistory, its own pager, and both shape messages
+   *  with shapeHistory. */
+  async readHistory(channelId: string, args: Record<string, unknown>): Promise<HistoryReadResult> {
+    const opts = readOptions(args, 'history', channelId);
+    await this.assertNotDm(channelId, NOTHING_RETURNED);
+    return readBounded(opts, {
+      page: (at, limit) => this.web.conversations.history({
+        channel: channelId, limit, inclusive: false,
+        // Each page sends latest alone, the position or the read's latest, or
+        // else no bound, for Slack's own now. Slack's reference says such a
+        // page holds the newest messages before latest, which backscroll's
+        // requests, sent with latest alone, rely on too. oldest is never sent:
+        // readBounded ends the range at the first message at or before it, so
+        // coverage rests neither on the host's clock nor on how Slack anchors
+        // a page when oldest is sent, which a live run reported on #32 found
+        // to differ from Slack's reference.
+        ...(at ? { latest: at } : {}),
+      }),
+      shape: (messages) => this.shapeHistory(messages),
+      writable: this.canWrite(channelId),
+      stopped: readStop,
+    });
+  }
+
+  /** fetch_thread's read, as readHistory's, paging forward through one
+   *  thread from its parent. */
+  async readThread(channelId: string, threadTs: string, args: Record<string, unknown>): Promise<HistoryReadResult> {
+    const opts = readOptions(args, 'thread', channelId, threadTs);
+    await this.assertNotDm(channelId, NOTHING_RETURNED);
+    return readBounded(opts, {
+      page: (at, limit) => this.web.conversations.replies({
+        channel: channelId, ts: threadTs, limit, inclusive: false,
+        ...(at ? { oldest: at } : {}), ...(opts.latest ? { latest: opts.latest } : {}),
+      }),
+      shape: (messages) => this.shapeHistory(messages),
+      writable: this.canWrite(channelId),
+      stopped: readStop,
+    });
+  }
+
+  /** Channel-level history, oldest-first, for backscroll. Thread replies
+   *  are NOT included (Slack requires conversations.replies per thread, as
+   *  readThread asks). */
   async fetchHistory(
     channelId: string,
     opts: { limit?: number; oldest?: string; latest?: string } = {},
@@ -1287,34 +1467,6 @@ export class SlackAdapter {
     return { messages: await this.shapeHistory(messages), truncated };
   }
 
-  /** All replies in a thread (the parent message is included first). */
-  async fetchThread(
-    channelId: string,
-    threadTs: string,
-    limit = 100,
-  ): Promise<{ messages: HistoryMessage[]; truncated: boolean }> {
-    await this.assertNotDm(channelId, 'Nothing was read');
-    const collected: SlackHistoryMessage[] = [];
-    let cursor: string | undefined;
-    let truncated = false;
-    do {
-      const result = await this.web.conversations.replies({
-        channel: channelId,
-        ts: threadTs,
-        limit: Math.min(200, limit - collected.length),
-        cursor,
-      });
-      collected.push(...((result.messages ?? []) as SlackHistoryMessage[]));
-      cursor = result.response_metadata?.next_cursor || undefined;
-      if (cursor && collected.length >= limit) {
-        truncated = true;
-        cursor = undefined;
-      }
-    } while (cursor);
-    // conversations.replies returns oldest-first already.
-    return { messages: await this.shapeHistory(collected), truncated };
-  }
-
   private async shapeHistory(messages: SlackHistoryMessage[]): Promise<HistoryMessage[]> {
     // Pre-resolve author + mentioned user names in one pass.
     const ids = new Set<string>();
@@ -1324,19 +1476,30 @@ export class SlackAdapter {
     }
     await this.resolveUserNames(Array.from(ids));
 
-    return messages.map((msg) => ({
-      id: String(msg.ts ?? ''),
+    return messages.map((msg) => {
+      const id = String(msg.ts ?? '');
+      // The thread a message belongs to: the one its parent's ts names, as
+      // Slack reports it, or the message's own.
+      const reported = [msg.thread_ts, msg.root?.thread_ts, msg.root?.ts].find((ts) => typeof ts === 'string' && SLACK_TS.test(ts));
+      const count = msg.reply_count;
+      return {
+      id,
       authorId: msg.user,
+      ...(msg.bot_id ? { authorBotId: msg.bot_id } : {}),
       authorName: msg.user ? (this.userNameCache.get(msg.user) ?? msg.user) : (msg.username ?? 'bot'),
       content: formatSlackText(msg.text ?? '', this.userNameCache),
       threadTs: msg.thread_ts && msg.thread_ts !== msg.ts ? msg.thread_ts : undefined,
+      rootTs: reported ?? id,
+      // Missing means unknown, not none.
+      ...(typeof count === 'number' && Number.isSafeInteger(count) && count >= 0 ? { replyCount: count } : {}),
       timestamp: new Date(parseFloat(msg.ts ?? '0') * 1000),
       attachments: (msg.files ?? []).map((f) => ({
         name: f.name ?? 'attachment',
         mimeType: f.mimetype,
         url: f.url_private,
       })),
-    }));
+      };
+    });
   }
 
   // ── Users ──
@@ -1375,7 +1538,9 @@ export class SlackAdapter {
 
   // ── Incoming events ──
 
-  private async handleMessageEvent(event: SlackMessageEvent): Promise<void> {
+  /** An event's checks and its author's and mentions' names, and the message
+   *  they make, or undefined for an event that isn't delivered. */
+  private async prepareMessageEvent(event: SlackMessageEvent): Promise<SlackMessageData | undefined> {
     if (!event || event.type !== 'message') return;
     if (!CONTENT_SUBTYPES.has(event.subtype)) return;
     // Self-filter: skip our own messages and other bots' (bot_id covers
@@ -1430,8 +1595,7 @@ export class SlackAdapter {
       timestamp: new Date(parseFloat(event.ts) * 1000),
       attachments,
     };
-
-    for (const handler of this.messageHandlers) handler(msg);
+    return msg;
   }
 
   /** Resolve user IDs into this adapter's cache (shared logic in content.ts).

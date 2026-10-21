@@ -20,8 +20,9 @@
  *   SLACK_DISABLE_DMS - Optional: 'true' drops incoming DMs and refuses DM sends
  *                       and DM history reads.
  *   SLACK_ACK_REACTION - Optional: emoji name (e.g. eyes) put on a message that
- *                       addresses the bot, removed at the bot's next post in that
- *                       conversation, or after 10 minutes.
+ *                       addresses the bot, removed at the bot's next post in
+ *                       that conversation that Slack confirms, or after 10
+ *                       minutes.
  *   SLACK_SUBSCRIPTIONS_FILE - Optional: JSON file persisting ambient-channel
  *                       subscriptions across restarts
  *   SLACK_BACKSCROLL_LIMIT   - Optional: messages fetched on first interaction
