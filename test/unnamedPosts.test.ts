@@ -187,7 +187,15 @@ test('a failed post is marked as one that may have posted exactly when the expla
     { what: 'not_in_channel', unknown: false, send: () => post({ body: { ok: false, error: 'not_in_channel' } }) },
     { what: 'a rate limit', unknown: false, send: () => post({ status: 429, headers: { 'retry-after': '30' }, body: { ok: false } }) },
     { what: 'a 429 without Retry-After', unknown: false, send: () => post({ status: 429, body: { ok: false } }) },
-    { what: 'a lone surrogate in the text', unknown: false, send: () => slack.sendMessage('C1', '\ud800') },
+    // The client's URIError while it builds the body, before the request: a
+    // lone surrogate that ends a field. A message's text never carries one to
+    // it (assertSendable), so this one ends the channel id.
+    {
+      what: 'a lone surrogate ending the channel id',
+      unknown: false,
+      call: { tool: 'send_message', args: { channelId: 'C1\ud800', content: 'x' } },
+      send: () => slack.sendMessage('C1\ud800', 'x'),
+    },
     // The client's TypeError for a JSON body that isn't an object, after a
     // 200: Slack may have acted, so it keeps the default.
     {

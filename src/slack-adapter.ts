@@ -450,6 +450,24 @@ export function fileLeftByUpload(err: unknown): FileLeft | undefined {
   return err !== null && typeof err === 'object' ? filesLeft.get(err) : undefined;
 }
 
+/** A UTF-16 surrogate without its pair. */
+export const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+/** Refuses a message's text that the client can't send as it is. In
+ *  @slack/web-api 7.19.0 the request interceptor builds the form body with
+ *  node:querystring (dist/WebClient.js:606), which takes a lone surrogate and
+ *  the code unit after it as one pair, so Slack would post a different
+ *  character, and throws "URI malformed" for one that ends the text. The
+ *  other fields a post or an edit sends are the agent's ids, which this
+ *  leaves to Slack: a pair made from a lone surrogate is outside the Basic
+ *  Multilingual Plane, so a changed id can't be another conversation's or
+ *  message's, whose ids are letters, digits and dots. */
+function assertSendable(text: string, notDone: string): void {
+  if (LONE_SURROGATE.test(text)) {
+    throw new Error(`${notDone}: the text holds a lone UTF-16 surrogate, which UTF-8 can't encode: remove it.`);
+  }
+}
+
 /** Whether a request's failure is taken to leave it undone: the call's time
  *  left no room to send it, the connection to Slack was never made, Slack
  *  refused it or rate-limited it, or the error is neither one of the client's
@@ -466,7 +484,8 @@ export function fileLeftByUpload(err: unknown): FileLeft | undefined {
  *  HTTP error (:504-505), and apiCall makes a refusal in a 200 a coded
  *  platform error (:231-236). Its other errors are thrown before the request
  *  is sent, such as Node's URIError (ERR_INVALID_URI) for a lone surrogate
- *  while the request interceptor builds the body (:606), or after a 429
+ *  that ends a field while the request interceptor builds the body (:606;
+ *  assertSendable keeps one out of a message's text), or after a 429
  *  (:498, and :501's "Retry header did not contain a valid timeout"), but for
  *  the TypeErrors it throws after a 200, reading an answer not in the shape of
  *  Slack's: a JSON body that isn't an object (:668), or response_metadata
@@ -1182,6 +1201,7 @@ export class SlackAdapter {
     opts: { threadTs?: string } = {},
     notDone = 'Nothing was posted',
   ): Promise<{ messageId: string }> {
+    assertSendable(text, notDone);
     this.assertWritable(channelId, notDone);
     await this.assertNotDm(channelId, notDone);
     const left = (err: unknown): unknown => {
@@ -1367,6 +1387,7 @@ export class SlackAdapter {
   }
 
   async editMessage(channelId: string, ts: string, text: string): Promise<void> {
+    assertSendable(text, "The message wasn't changed");
     this.assertWritable(channelId, "The message wasn't changed");
     await this.assertNotDm(channelId, "The message wasn't changed");
     await this.web.chat.update({ channel: channelId, ts, text });
