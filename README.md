@@ -85,7 +85,8 @@ the whole file out as the tool's arguments, so the content goes through the
 model's own output, and `contentBase64` suits small binary files.
 
 Optional `messageId` selects the thread root (the message's `thread=` value,
-or its `id=` when it has no `thread=`). `title` names the
+or its `id=` when it has no `thread=`; in `fetch_history` and `fetch_thread`
+results, its `rootTs`). `title` names the
 file in Slack (defaulting to `filename`), and `comment` adds an initial
 comment. An optional argument given as JSON null or an empty string counts as
 not given. `SLACK_SEND_CHANNELS` and `SLACK_DISABLE_DMS` apply to uploads just
@@ -129,7 +130,7 @@ uploads with `missing_scope`.
 When answering a particular message, use `reply_message` to select its thread explicitly. Automatic prose delivery through `channels/publish` carries no thread or triggering message ID. The server uses the thread of the last message from that Slack conversation the host took instead, so another message can redirect the reply to a different thread, or to the channel's top level ([#6](https://github.com/anima-research/slack-mcpl/issues/6)). The server keeps that in memory only: after a restart, a publish goes to the top level until the host takes a message from the conversation.
 
 1. Select the Slack conversation ID, such as `C123`, rather than its MCPL ID, `slack:C123`. Every incoming message's header gives it as `channelId=`; copy it from there, a DM's included, rather than from memory.
-2. For `messageId`, use the target message's displayed `thread=` value. If it has no `thread=`, use its `id=`: the reply goes into that message's own thread, which starts one if it has none. History results call these fields `threadTs` and `id`.
+2. For `messageId`, use the target message's displayed `thread=` value. If it has no `thread=`, use its `id=`: the reply goes into that message's own thread, which starts one if it has none. In `fetch_history` and `fetch_thread` results, use the message's `rootTs`, which names the thread it's in, or the message itself.
 3. Send the reply through `reply_message`.
 
 For example, to answer `[channelId=C123 thread=1718000000.000100 id=1718000000.000200] Ann: Can you check this?`, call `reply_message` with:
@@ -208,6 +209,114 @@ npm run build
 SLACK_BOT_TOKEN=xoxb-... SLACK_APP_TOKEN=xapp-... slack-mcpl --stdio
 # or: slack-mcpl --tcp 9040
 ```
+
+## Bounded history and thread reads
+
+`fetch_history` searches one conversation's **channel-level messages**. It does
+not search ordinary thread replies; an incidental broadcast reply does not make
+it a complete thread search. Use `fetch_thread(channelId, threadTs)` for one
+known root. No automatic thread expansion or workspace search occurs.
+
+Both tools return `messages`, each with `id`, `author`, `timestamp`, `content`,
+optional `threadTs` and attachment hints, as before, and add:
+
+- `authorId` when Slack supplies a user ID, and `authorBotId` when supplied.
+  Authors' and mentioned users' names are looked up as before, and an author
+  whose name can't be had is shown by their ID.
+- `rootTs`, the thread a message belongs to: its parent's ts, as Slack reports
+  it on a reply or a broadcast reply, or the message's own. `threadTs`
+  continues to identify a reply's parent. `replyCount` is included only when
+  Slack supplies a valid nonnegative integer; missing means unknown, not zero.
+- `channel`: the conversation's `id`, and `writable`, with
+  `list_channels.writable`'s meaning.
+
+`SLACK_DISABLE_DMS` checks a read's conversation as every read is checked, and
+Slack's own refusal of a read is passed on as the other tools' are.
+
+`fetch_history` also accepts `textContains`, `caseSensitive` (default `false`)
+and `authorIds`. The literal substring is matched against each message's
+`content` as the tools return it, Slack's escapes decoded and links shown by
+their labels, except that a mentioned user appears only by their user ID, as
+`@U… (uid:U…)`: neither a name nor a label Slack sent with the mention is
+matched, so a match never depends on a lookup. Case-insensitive
+matching uses JavaScript Unicode `toLowerCase`, without locale rules or
+normalization. Author IDs are exact: a user's ID, matched against `authorId`,
+or a bot's, matched against `authorBotId`. They're ORed within the list and
+ANDed with the substring. Missing authors do not match an author filter. Regex
+is not supported. Filtering reduces returned context; it still retrieves
+candidate messages from Slack.
+
+All numeric inputs are bounded integers, applied **per call**:
+
+| Input | Default | Inclusive range | Meaning |
+|---|---:|---:|---|
+| `limit` | 50 history / 100 thread | 1–1,000 | Returned matches/messages; thread parent counts when present |
+| `maxScanned` | 1,000 | 1–10,000 | Candidate messages examined |
+| `maxBytes` | 65,536 | 2,048–1,048,576 | UTF-8 bytes of the complete result JSON, before MCP text-block wrapping |
+
+Each page is a Slack request, made like every other request this server
+makes: it goes out only if its 10-second timeout fits in what is left of the
+call's 25 seconds, and a rate limit that fits the call's 5-second budget for
+waiting is waited out and the request sent once more. A page that doesn't fit, a longer rate limit, or Slack's
+`ratelimited` refusal in an HTTP 200, which isn't waited out, ends the read with what it found and a cursor.
+
+Every call either covers its range, moves past where it started, or fails,
+saying why. A call that
+stops before it has moved fails instead of returning nothing: the call's time,
+a rate limit, an empty page that says more remain, or a first message too big
+for `maxBytes`, whose failure names the `maxBytes` that fits it and how to read
+past it. Any other failure fails the call too, before or after its first pages,
+and calling again is safe.
+
+`pagination` reports `scanned`, `matched`, `returned`, `pages`, `scanComplete`,
+`stopReason`, `scope` and `threadRepliesSearched`. `scanned` and `matched`
+count the messages the cursor moved past, so a chain of calls counts each
+message once; a match held back by the byte budget is counted by the call that
+returns it. `pages` counts the pages Slack answered for this call. Stop reasons are
+`exhausted`, `match_limit`, `scan_limit`, `byte_limit`, `time_limit`,
+`rate_limited` and `pagination_stalled`. A rate limit includes
+`retryAfterSeconds` when Slack gave a count of seconds, unless it's negative
+or past `Number.MAX_SAFE_INTEGER`; the caller chooses whether and when to
+resume. A stalled pagination response is incomplete, never silently exhausted.
+
+**Zero matches in an incomplete scan does not mean no matching message exists.**
+`scanComplete` describes only the selected channel-message range or single
+thread, never all channel threads. `oldest` and `latest` are exclusive bounds
+on both tools; without `latest`, the first page reads up to Slack's own now.
+`fetch_history` doesn't send `oldest` to Slack: it pages back and stops at the
+first message at or before `oldest`, so its last page may run past it.
+History continues toward older messages from the cursor, so its continuations
+never return a message posted after the first call; a thread read's
+continuations go toward newer replies and include ones posted since. Slack history remains
+live: edits and deletions can affect later pages; this is not an immutable
+export.
+
+For incomplete reads, pass `pagination.nextCursor` as `cursor` and repeat the
+original channel, thread, time bounds and filters. Budget values may change
+within their bounds. History traverses newest toward older messages, returning
+each batch oldest-first; thread traversal proceeds oldest toward newer replies.
+Append thread batches, but prepend later history batches when building a
+chronological list. A match that doesn't fit `maxBytes` beside the ones before
+it is held back, never skipped, and the next call starts at it.
+
+A cursor carries the position to continue from and a hash of its query. The
+server keeps nothing for it, so it doesn't expire and survives a restart. A
+cursor that doesn't decode as one, or one passed with another channel, thread,
+time bounds or filters, is refused before Slack is asked. Every continuation
+reads Slack again; a cursor never grants access or holds message content.
+
+Compatibility: the former truncation `note` is replaced by structured
+`pagination`; clients must check it and resume rather than assuming a complete
+range. Previously unbounded or invalid numeric limits and unknown arguments now
+refuse; an unknown argument's refusal names the arguments the tool takes, and
+any it looks like a slip for. The default `maxBytes` of 64 KiB can end a default read before its
+match count, with `byte_limit` and a cursor. A failed read's explanation now
+leads with "No messages were returned", as do the read's own failures, and a
+failure the explanation doesn't cover is followed by it. The host's refusals
+every tool shares, such as a feature set it hasn't enabled, keep their own
+words, which say nothing ran. Existing tool names, default match counts and
+`list_channels.writable` remain stable. No new scopes, regex, bulk expansion,
+native search or interaction-token handling are included.
 
 ## Environment
 

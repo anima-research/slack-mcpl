@@ -694,7 +694,7 @@ test("an upload whose answer named no sharing message says on rollback that its 
 
 test("the explainer gives upload_file's messageId the thread's parent, and its own way into or out of a thread", async (t) => {
   for (const [last, says] of [
-    [{ body: { ok: false, error: 'message_not_found' } }, /Pass the thread's parent id: a reply's thread=, or the id of the message the replies are under/],
+    [{ body: { ok: false, error: 'message_not_found' } }, /Pass the thread's parent id: a reply's thread=, a message's own id= when it shows no thread=, or a message's rootTs in fetch_history or fetch_thread results/],
     [{ body: { ok: false, error: 'restricted_action_thread_only_channel' } }, /takes messages only as thread replies\. Pass messageId, the id of the message whose thread the file goes in\.$/],
     [{ body: { ok: false, error: 'restricted_action_non_threadable_channel' } }, /doesn't take thread replies\. Upload without messageId instead\.$/],
   ] as const) {

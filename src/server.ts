@@ -62,6 +62,7 @@ import { StateTracker, type UploadedFile } from './state.js';
 import { CapabilityGrant } from './grant.js';
 import { McplRpcError, capabilityDenied } from './errors.js';
 import { explainSlackError } from './slack-errors.js';
+import { CHANNEL_IDS, NOTHING_RETURNED, PARENT_IDS, refuseUnknownArguments } from './history-read.js';
 import {
   fetchAttachmentBytes,
   parseSlackAttachmentUrl,
@@ -121,12 +122,11 @@ function dbg(tag: string, info: Record<string, unknown> = {}): void {
 
 /** Where the value of each argument a tool requires comes from, for a call that didn't give it. */
 const ARGUMENT_SOURCES = {
-  channelId: "Take it from the message's channelId=, or list_channels shows each conversation's id.",
+  channelId: `${CHANNEL_IDS}.`,
   messageId:
-    "Take it from the message: its id= (reply_message takes its thread= when it shows one), or from fetch_history's ids.",
-  threadTs:
-    "Pass the thread's parent id: a reply's thread=, or the id of the message the replies are under, which " +
-    'fetch_history shows.',
+    "Take it from the message: its id= (reply_message takes its thread= when it shows one, or its rootTs in " +
+    "fetch_history and fetch_thread results), or from fetch_history's ids.",
+  threadTs: `${PARENT_IDS}.`,
   userId: "find_user returns each person's userId.",
   emoji: 'Pass an emoji name, such as thumbsup.',
   url: ATTACHMENT_URL_SOURCE,
@@ -840,43 +840,19 @@ export class SlackMcplServer {
       case 'refresh_channels':
         return await this.refreshChannels();
 
+      // A read's argument names are checked first, so a slip for one it
+      // requires, such as channelID, is named as one.
       case 'fetch_history': {
-        const channelId = this.requireString(args, 'channelId');
-        const { messages, truncated } = await this.slack.fetchHistory(channelId, {
-          limit: (args.limit as number) ?? 50,
-          ...(args.oldest ? { oldest: args.oldest as string } : {}),
-          ...(args.latest ? { latest: args.latest as string } : {}),
-        });
-        return {
-          messages: messages.map((m) => this.renderHistoryMessage(m)),
-          ...(truncated
-            ? {
-                note:
-                  'The range holds more messages than the limit, so the oldest were left out. To get them, call ' +
-                  'again with latest set to the id of the oldest message shown, or with a higher limit.',
-              }
-            : {}),
-        };
+        refuseUnknownArguments(args, 'history');
+        const channelId = this.requireString(args, 'channelId', NOTHING_RETURNED);
+        return await this.slack.readHistory(channelId, args);
       }
 
       case 'fetch_thread': {
-        const channelId = this.requireString(args, 'channelId');
-        const threadTs = this.requireString(args, 'threadTs');
-        const { messages, truncated } = await this.slack.fetchThread(
-          channelId,
-          threadTs,
-          (args.limit as number) ?? 100,
-        );
-        return {
-          messages: messages.map((m) => this.renderHistoryMessage(m)),
-          ...(truncated
-            ? {
-                note:
-                  'The thread holds more messages than the limit, so the newest were left out. Call again with a ' +
-                  'higher limit to get them.',
-              }
-            : {}),
-        };
+        refuseUnknownArguments(args, 'thread');
+        const channelId = this.requireString(args, 'channelId', NOTHING_RETURNED);
+        const threadTs = this.requireString(args, 'threadTs', NOTHING_RETURNED);
+        return await this.slack.readThread(channelId, threadTs, args);
       }
 
       case 'find_user': {
@@ -988,7 +964,14 @@ export class SlackMcplServer {
     }
   }
 
-  private requireString(args: Record<string, unknown>, key: keyof typeof ARGUMENT_SOURCES): string {
+  /** A string argument a tool requires, refused when it's missing or empty.
+   *  The refusal opens with `notDone`; the reads pass their own lead, since
+   *  every failure of a read opens with it once the read runs. */
+  private requireString(
+    args: Record<string, unknown>,
+    key: keyof typeof ARGUMENT_SOURCES,
+    notDone = 'Nothing was done',
+  ): string {
     const v = args[key];
     if (typeof v !== 'string' || v.length === 0) {
       const passed =
@@ -998,29 +981,9 @@ export class SlackMcplServer {
         : Array.isArray(v) ? 'passed an array'
         : typeof v === 'object' ? 'passed an object'
         : `passed a ${typeof v}`;
-      throw new Error(`Nothing was done: ${key} must be a non-empty string, and this call ${passed}. ${ARGUMENT_SOURCES[key]}`);
+      throw new Error(`${notDone}: ${key} must be a non-empty string, and this call ${passed}. ${ARGUMENT_SOURCES[key]}`);
     }
     return v;
-  }
-
-  private renderHistoryMessage(m: {
-    id: string; authorName: string; content: string; threadTs?: string;
-    timestamp: Date; attachments: Array<{ name: string; mimeType?: string; url?: string }>;
-  }): Record<string, unknown> {
-    return {
-      id: m.id,
-      author: m.authorName,
-      timestamp: m.timestamp.toISOString(),
-      ...(m.threadTs ? { threadTs: m.threadTs } : {}),
-      content: m.content,
-      ...(m.attachments.length > 0
-        ? {
-            attachments: m.attachments.map((a) =>
-              `${a.name}${a.mimeType ? ` (${a.mimeType})` : ''}${a.url ? ` — fetchable via fetch_attachment: ${a.url}` : ''}`,
-            ),
-          }
-        : {}),
-    };
   }
 
   /** Who a write went to, as `to`: the conversation's label in this server's

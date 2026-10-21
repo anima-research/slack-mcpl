@@ -1,0 +1,1 @@
+- For every tool, Slack's `ratelimited` refusal in an HTTP 200, which the client never waits out, now gives the seconds Slack asks to wait when a Retry-After came with it, as the explanation of an HTTP 429 already did. Without one, it still says to try again shortly, and so does a Retry-After below 0 or past `Number.MAX_SAFE_INTEGER`, for a 429 too.

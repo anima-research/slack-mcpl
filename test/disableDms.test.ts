@@ -55,7 +55,9 @@ test('DM sends and DM history reads are refused before reaching Slack', async ()
       'channel with send_message; list_channels marks where this bot may write with writable: true.',
   });
   await assert.rejects(adapter.fetchHistory('D1'), { message: `Nothing was read: D1 is a direct message or group DM, ${offHere}` });
-  await assert.rejects(adapter.fetchThread('D1', '1.0'), { message: `Nothing was read: D1 is a direct message or group DM, ${offHere}` });
+  await assert.rejects(adapter.readThread('D1', '1.0', { channelId: 'D1', threadTs: '1.0' }), {
+    message: `No messages were returned: D1 is a direct message or group DM, ${offHere}`,
+  });
   assert.deepEqual(calls, []);
 });
 
@@ -105,7 +107,7 @@ test('every write path and both history reads refuse a DM, before any Slack writ
 test('a group DM is told from a private channel by asking Slack, and unknown means refused', async () => {
   const { adapter, calls } = makeStrictAdapter();
   await assert.rejects(adapter.fetchHistory('G1'), /direct messages are turned off/);
-  await assert.rejects(adapter.fetchThread('G1', '1.0'), /direct messages are turned off/);
+  await assert.rejects(adapter.readThread('G1', '1.0', { channelId: 'G1', threadTs: '1.0' }), /direct messages are turned off/);
   await assert.rejects(adapter.sendMessage('G1', 'hi'), /direct messages are turned off/);
   assert.ok(!calls.some((c) => /^(history|replies|post):G1/.test(c)));
 

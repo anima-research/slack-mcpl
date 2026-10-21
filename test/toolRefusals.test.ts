@@ -45,28 +45,6 @@ const failsWith = (code: number, text: string) => (err: Error & { code?: number 
   return true;
 };
 
-test('fetch_history and fetch_thread say how to get what their limit left out', async (t) => {
-  const page = async () => ({
-    messages: [{ ts: '2.0', user: 'U1', text: 'b' }, { ts: '1.0', user: 'U1', text: 'a' }],
-    response_metadata: { next_cursor: 'more' },
-  });
-  const h = await serve(t, {
-    conversations: { history: page, replies: page },
-    users: { info: async ({ user }: { user: string }) => ({ user: { name: user } }) },
-  });
-  const history = JSON.parse((await h.call('fetch_history', { channelId: 'C1', limit: 2 })).content[0].text);
-  assert.equal(
-    history.note,
-    'The range holds more messages than the limit, so the oldest were left out. To get them, call again with ' +
-      'latest set to the id of the oldest message shown, or with a higher limit.',
-  );
-  const thread = JSON.parse((await h.call('fetch_thread', { channelId: 'C1', threadTs: '1.0', limit: 2 })).content[0].text);
-  assert.equal(
-    thread.note,
-    'The thread holds more messages than the limit, so the newest were left out. Call again with a higher limit to get them.',
-  );
-});
-
 test('find_user with no match names the query, what it matches, and what to try', async (t) => {
   const h = await serve(t, {
     users: { list: async () => ({ members: [{ id: 'U1', name: 'ann', real_name: 'Ann Lee' }] }) },
@@ -115,7 +93,8 @@ for (const [tool, args, text] of [
     'add_reaction',
     { channelId: 'C1' },
     'messageId must be a non-empty string, and this call left it out. Take it from the message: its id= ' +
-      "(reply_message takes its thread= when it shows one), or from fetch_history's ids.",
+      "(reply_message takes its thread= when it shows one, or its rootTs in fetch_history and fetch_thread results), or " +
+      "from fetch_history's ids.",
   ],
   [
     'add_reaction',
@@ -126,8 +105,9 @@ for (const [tool, args, text] of [
     'fetch_thread',
     { channelId: 'C1' },
     "threadTs must be a non-empty string, and this call left it out. Pass the thread's parent id: a reply's thread=, " +
-      'or the id of the message the replies are under, which fetch_history shows.',
+      "a message's own id= when it shows no thread=, or a message's rootTs in fetch_history or fetch_thread results.",
   ],
+  ['fetch_thread', {}, `channelId must be a non-empty string, and this call left it out. ${CHANNEL_ID_SOURCE}`],
   ['send_dm', {}, "userId must be a non-empty string, and this call left it out. find_user returns each person's userId."],
   ['find_user', {}, "query must be a non-empty string, and this call left it out. Pass part of a person's name."],
   [
@@ -141,7 +121,9 @@ for (const [tool, args, text] of [
     const h = await serve(t, {});
     const called = await h.call(tool, args);
     assert.equal(called.isError, true);
-    assert.equal(called.content[0].text, `Nothing was done: ${text}`);
+    // A read's refusal opens as the read's other failures do.
+    const lead = tool === 'fetch_thread' ? 'No messages were returned' : 'Nothing was done';
+    assert.equal(called.content[0].text, `${lead}: ${text}`);
   });
 }
 

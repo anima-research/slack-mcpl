@@ -9,8 +9,9 @@ import http from 'node:http';
 export interface SlackApiAnswer {
   status?: number;
   headers?: Record<string, string>;
-  /** Sent as JSON. null sends the JSON body null, as a broken proxy might. */
-  body: Record<string, unknown> | null;
+  /** Sent as JSON. null sends the JSON body null, as a broken proxy might.
+   *  A function answers from the parameters the request sent. */
+  body: Record<string, unknown> | null | ((sent: URLSearchParams) => Record<string, unknown> | null);
   /** How long to take before answering, in ms. */
   delayMs?: number;
   /** Answer only once this settles, then after delayMs: for a test that
@@ -48,12 +49,13 @@ export async function fakeSlackApi(): Promise<FakeSlackApi> {
     req.on('end', () => {
       const called = (req.url ?? '').split('/').pop() ?? '';
       calls.push(called);
-      sent.push(new URLSearchParams(received));
+      const params = new URLSearchParams(received);
+      sent.push(params);
       const queue = answersFor.get(called) ?? answers;
       const { status = 200, headers = {}, body, delayMs = 0, after } = queue.length > 1 ? queue.shift()! : queue[0];
       const send = () => setTimeout(() => {
         res.writeHead(status, { 'content-type': 'application/json', ...headers });
-        res.end(JSON.stringify(body));
+        res.end(JSON.stringify(typeof body === 'function' ? body(params) : body));
       }, delayMs);
       if (after) void after.then(send, send);
       else send();
