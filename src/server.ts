@@ -41,6 +41,7 @@ import type {
 
 import {
   GaveUp,
+  LONE_SURROGATE,
   SLACK_CLIENT_OPTIONS,
   assertRequestFits,
   fileLeftByUpload,
@@ -100,9 +101,6 @@ const MAX_UPLOAD_BASE64 = Math.ceil(MAX_UPLOAD_BYTES / 3) * 4;
  *  can't see any more: Slack's own words are "already been deleted" and "does
  *  not exist, or is not visible to the calling user". */
 const FILE_GONE = ['file_deleted', 'file_not_found'];
-
-/** A UTF-16 surrogate without its pair. */
-const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 
 // Diagnostic file logger — bypasses the host's stderr capture. Set
 // SLACK_MCPL_DEBUG_LOG in the spawn env to a writable absolute path to

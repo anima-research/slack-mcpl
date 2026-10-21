@@ -450,6 +450,29 @@ export function fileLeftByUpload(err: unknown): FileLeft | undefined {
   return err !== null && typeof err === 'object' ? filesLeft.get(err) : undefined;
 }
 
+/** A UTF-16 surrogate without its pair. */
+export const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+/** Refuses a message's text that the client can't send as it is. In
+ *  @slack/web-api 7.19.0 the request interceptor builds the form body with
+ *  node:querystring (dist/WebClient.js:606), which takes a lone surrogate and
+ *  the code unit after it as one pair, so Slack would post a different
+ *  character, and throws "URI malformed" for one that ends the text. The
+ *  other fields a post, an edit or a DM's opening sends are ids, which the
+ *  agent or the host passed, or a publish's thread, which this server took
+ *  from Slack, and they aren't checked: a pair made from a lone surrogate is
+ *  outside the Basic Multilingual Plane, so an id with one inside names no
+ *  conversation, message or user, whose ids are letters, digits and dots.
+ *  Slack documents a not-found error for each of them but thread_ts. For
+ *  that one, a pair names no message, as any wrong messageId does, which
+ *  this leaves as it is. An id that ends with one makes the client throw
+ *  before anything is sent. */
+function assertSendable(text: string, notDone: string): void {
+  if (LONE_SURROGATE.test(text)) {
+    throw new Error(`${notDone}: the text holds a lone UTF-16 surrogate, which UTF-8 can't encode: remove it.`);
+  }
+}
+
 /** Whether a request's failure is taken to leave it undone: the call's time
  *  left no room to send it, the connection to Slack was never made, Slack
  *  refused it or rate-limited it, or the error is neither one of the client's
@@ -466,7 +489,8 @@ export function fileLeftByUpload(err: unknown): FileLeft | undefined {
  *  HTTP error (:504-505), and apiCall makes a refusal in a 200 a coded
  *  platform error (:231-236). Its other errors are thrown before the request
  *  is sent, such as Node's URIError (ERR_INVALID_URI) for a lone surrogate
- *  while the request interceptor builds the body (:606), or after a 429
+ *  that ends a field while the request interceptor builds the body (:606;
+ *  assertSendable keeps one out of a message's text), or after a 429
  *  (:498, and :501's "Retry header did not contain a valid timeout"), but for
  *  the TypeErrors it throws after a 200, reading an answer not in the shape of
  *  Slack's: a JSON body that isn't an object (:668), or response_metadata
@@ -1182,7 +1206,10 @@ export class SlackAdapter {
     opts: { threadTs?: string } = {},
     notDone = 'Nothing was posted',
   ): Promise<{ messageId: string }> {
+    // The allow-list's refusal first, since calling again can't change it,
+    // then the text's, both before the DM check can ask Slack anything.
     this.assertWritable(channelId, notDone);
+    assertSendable(text, notDone);
     await this.assertNotDm(channelId, notDone);
     const left = (err: unknown): unknown => {
       if (err !== null && typeof err === 'object') {
@@ -1213,7 +1240,9 @@ export class SlackAdapter {
    *  working-with-files page: files.getUploadURLExternal gives an upload URL
    *  and the file's ID, the file's bytes go to that URL, and
    *  files.completeUploadExternal shares the file. Same write checks as
-   *  sendMessage. Needs the files:write scope.
+   *  sendMessage, but for assertSendable: upload_file refuses a lone surrogate
+   *  in the file's name, content, title and comment in the server, before
+   *  this is called. Needs the files:write scope.
    *
    *  A file is shared only at the last step, so a failure before it shared
    *  nothing. Once the first step has given the file its ID, a failure leaves
@@ -1354,6 +1383,8 @@ export class SlackAdapter {
           `where it may write. ${toChannels}`,
       );
     }
+    // Before the DM is opened, as above.
+    assertSendable(text, 'Nothing was sent');
     const open = await this.web.conversations.open({ users: userId });
     const channelId = open.channel?.id;
     if (!channelId) {
@@ -1367,7 +1398,9 @@ export class SlackAdapter {
   }
 
   async editMessage(channelId: string, ts: string, text: string): Promise<void> {
+    // In the order sendMessage's checks run.
     this.assertWritable(channelId, "The message wasn't changed");
+    assertSendable(text, "The message wasn't changed");
     await this.assertNotDm(channelId, "The message wasn't changed");
     await this.web.chat.update({ channel: channelId, ts, text });
   }
