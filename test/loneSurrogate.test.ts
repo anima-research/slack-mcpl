@@ -72,8 +72,9 @@ for (const disableDms of [false, true]) {
   test(`each write refuses text with a lone surrogate before Slack is asked, wherever the surrogate is${disableDms ? ', with DMs off' : ''}`, async (t) => {
     const { api, writes } = await serve(t, { disableDms });
     // A high or low surrogate before more text, which the client would pair
-    // with the space after it, and one at the end, where it throws.
-    for (const text of ['a \ud800 b', 'a \udc00 b', 'a \ud800']) {
+    // with the character after it; one at the end, where it throws; one at
+    // the start; and a text that is only a surrogate.
+    for (const text of ['a \ud800 b', 'a \udc00 b', 'a \ud800', 'a \udc00', '\udc00 a', '\ud800']) {
       for (const { name, opening, run } of writes(text, channelId)) {
         const before = api.calls.length;
         const { failed, text: said } = await run();

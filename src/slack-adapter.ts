@@ -458,9 +458,10 @@ export const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\u
  *  node:querystring (dist/WebClient.js:606), which takes a lone surrogate and
  *  the code unit after it as one pair, so Slack would post a different
  *  character, and throws "URI malformed" for one that ends the text. The
- *  other fields a post, an edit or a DM's opening sends are ids the agent
- *  passed, which aren't checked: a pair made from a lone surrogate is outside
- *  the Basic Multilingual Plane, so an id with one inside names no
+ *  other fields a post, an edit or a DM's opening sends are ids, which the
+ *  agent or the host passed, or a publish's thread, which this server took
+ *  from Slack, and they aren't checked: a pair made from a lone surrogate is
+ *  outside the Basic Multilingual Plane, so an id with one inside names no
  *  conversation, message or user, whose ids are letters, digits and dots,
  *  and an id that ends with one makes the client throw before anything is
  *  sent. */
@@ -1235,7 +1236,9 @@ export class SlackAdapter {
    *  working-with-files page: files.getUploadURLExternal gives an upload URL
    *  and the file's ID, the file's bytes go to that URL, and
    *  files.completeUploadExternal shares the file. Same write checks as
-   *  sendMessage. Needs the files:write scope.
+   *  sendMessage, but for assertSendable: upload_file refuses a lone surrogate
+   *  in the file's name, content, title and comment in the server, before
+   *  this is called. Needs the files:write scope.
    *
    *  A file is shared only at the last step, so a failure before it shared
    *  nothing. Once the first step has given the file its ID, a failure leaves
