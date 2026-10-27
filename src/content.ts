@@ -7,6 +7,8 @@
  * Salvaged from zulip-mcp PR #8 (multi-platform branch), Slack halves only.
  */
 
+import { channelShown, mimeShown, nameShown } from './framing.js';
+
 // Anthropic refuses images larger than this; mirror their cap server-side
 // so an over-eager fetch can't poison the agent's next turn.
 export const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
@@ -124,7 +126,7 @@ export function toFetchResult({ buf, mimeType, name }: FetchedAttachment): Recor
   if (mimeType.startsWith('image/')) {
     return {
       _content: [
-        { type: 'text', text: `Fetched ${name} (${mimeType}, ${buf.byteLength} bytes):` },
+        { type: 'text', text: `Fetched ${nameShown(name)} (${mimeShown(mimeType)}, ${buf.byteLength} bytes):` },
         { type: 'image', data: buf.toString('base64'), mimeType },
       ],
     };
@@ -231,20 +233,23 @@ const slackChannelMentionRe = () => new RegExp(`<#(${SLACK_ID})(?:\\|([^>]*))?>`
 // Slack message text uses mrkdwn escapes: <@U123> user mentions,
 // <#C123|name> channel mentions, <!here>/<!channel> broadcasts, and
 // <url|label> links. Rewrite them into a readable shape
-// (`@name (uid:U123)`), resolving user IDs via the provided map
-// (best-effort: unresolved IDs keep the raw ID as the name).
+// (`@name (uid:U123)` and `#name`, with a name that isn't plain quoted),
+// resolving user IDs via the provided map (best-effort: an unresolved ID shows
+// the label Slack sent with it, else the raw ID).
 export function formatSlackText(text: string, userNames: Map<string, string>): string {
   let formatted = text;
 
-  // User mentions: <@U123> or <@U123|fallback>
+  // User mentions: <@U123> or <@U123|fallback>. The name goes in with its `&`
+  // escaped as Slack escapes it, so the unescape below gives it back as it is.
   formatted = formatted.replace(slackUserMentionRe(), (_m, id: string, fallback?: string) => {
-    const name = userNames.get(id) || fallback || id;
-    return `@${name} (uid:${id})`;
+    const name = userNames.get(id) || (fallback && unescapeSlack(fallback)) || id;
+    return `@${nameShown(name).replace(/&/g, '&amp;')} (uid:${id})`;
   });
 
-  // Channel mentions: <#C123|name> or <#C123>
+  // Channel mentions: <#C123|name> or <#C123>. The label is whatever the
+  // poster sent, so it's shown by the name rule, as a user mention's name is.
   formatted = formatted.replace(slackChannelMentionRe(), (_m, id: string, name?: string) => {
-    return name ? `#${name}` : `#${id}`;
+    return name ? channelShown(unescapeSlack(name)).replace(/&/g, '&amp;') : `#${id}`;
   });
 
   // Broadcasts: <!here>, <!channel>, <!everyone>
@@ -254,13 +259,12 @@ export function formatSlackText(text: string, userNames: Map<string, string>): s
   formatted = formatted.replace(/<(https?:\/\/[^|>]+)\|([^>]*)>/g, '$2 ($1)');
   formatted = formatted.replace(/<(https?:\/\/[^>]+)>/g, '$1');
 
-  // Unescape Slack's HTML entities
-  formatted = formatted
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&amp;/g, '&');
+  return unescapeSlack(formatted);
+}
 
-  return formatted;
+/** Slack's HTML entities, unescaped; `&amp;` last, so `&amp;lt;` gives `&lt;`. */
+function unescapeSlack(text: string): string {
+  return text.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
 }
 
 /** The name reactions.add is sent for an emoji as given: Slack wants the bare
@@ -317,7 +321,8 @@ export const connectionNeverMade = (nodeCode: unknown): boolean =>
  * restart asks again, as it does for a renamed user. A lookup that fails
  * otherwise (a rate limit, a failure in transit, Slack failing, or an answer
  * not in Slack's form) isn't cached, so the next message that names the user
- * asks again; meanwhile callers show the raw ID (best-effort). Returns the
+ * asks again; meanwhile a mention shows the label Slack sent with it, else
+ * the raw ID, and an author shows the raw ID (best-effort). Returns the
  * error of each lookup left uncached, by user ID.
  */
 export async function resolveSlackUserNames(

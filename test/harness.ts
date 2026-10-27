@@ -102,6 +102,9 @@ function fakeWeb(
   posts: unknown[], reactions: string[], uploads: unknown[], deletedMessages: unknown[], deletedFiles: string[], uploadsBegun: unknown[],
   reads: string[],
   dms: Array<{ id: string; user: string }> = [],
+  displayNames: Record<string, string> = {},
+  channelName = 'general',
+  historyMessages: Array<Record<string, unknown>> = [],
 ): SlackWebLike {
   let started = 0;
   return {
@@ -114,24 +117,24 @@ function fakeWeb(
       async list() {
         return {
           channels: [
-            { id: 'C1', name: 'general', is_member: true, is_im: false, is_mpim: false },
+            { id: 'C1', name: channelName, is_member: true, is_im: false, is_mpim: false },
             ...dms.map((dm) => ({ id: dm.id, user: dm.user, is_im: true, is_mpim: false })),
           ],
         };
       },
       async info({ channel }) {
-        return { channel: { id: channel, name: 'general', is_member: true, is_im: false, is_mpim: false } };
+        return { channel: { id: channel, name: channelName, is_member: true, is_im: false, is_mpim: false } };
       },
       async open() {
         return { channel: { id: 'D1' } };
       },
       async history({ channel }) {
         reads.push(`history:${channel}`);
-        return { messages: [] };
+        return { messages: historyMessages.filter((m) => !m.thread_ts || m.thread_ts === m.ts) };
       },
       async replies({ channel, ts }) {
         reads.push(`replies:${channel}:${ts}`);
-        return { messages: [] };
+        return { messages: historyMessages.filter((m) => m.ts === ts || m.thread_ts === ts) };
       },
     },
     chat: {
@@ -185,7 +188,7 @@ function fakeWeb(
     },
     users: {
       async info({ user }) {
-        return { user: { profile: { display_name: user }, real_name: user, name: user } };
+        return { user: { profile: { display_name: displayNames[user] ?? user }, real_name: user, name: user } };
       },
       async list() {
         return { members: [] };
@@ -203,6 +206,14 @@ export interface HarnessOptions {
   pushAccepted?: boolean;
   /** DMs conversations.list returns besides C1. */
   dms?: Array<{ id: string; user: string }>;
+  /** Display names users.info gives, by user ID; any other user's is its ID. */
+  displayNames?: Record<string, string>;
+  /** The name conversations.info and conversations.list give C1 (default general). */
+  channelName?: string;
+  /** Messages, as Slack gives them: conversations.history gives those that aren't replies, conversations.replies a thread's root and its replies (default none). */
+  historyMessages?: Array<Record<string, unknown>>;
+  /** The bot token's scopes, as auth.test would report them (default unknown). */
+  scopes?: string[];
 }
 
 export interface Harness {
@@ -238,8 +249,8 @@ export function fakeSlack(opts: HarnessOptions = {}) {
   const deletedMessages: unknown[] = [];
   const deletedFiles: string[] = [];
   const slack = new SlackAdapter(
-    fakeWeb(posts, reactions, uploads, deletedMessages, deletedFiles, uploadsBegun, reads, opts.dms), socket, 'UBOT', 'acme',
-    undefined, opts.sendChannels, opts.disableDms, opts.ackReaction,
+    fakeWeb(posts, reactions, uploads, deletedMessages, deletedFiles, uploadsBegun, reads, opts.dms, opts.displayNames, opts.channelName, opts.historyMessages), socket, 'UBOT', 'acme',
+    undefined, opts.sendChannels, opts.disableDms, opts.ackReaction, opts.scopes,
   );
   return { slack, socket, posts, reactions, reads, uploads, uploadsBegun, deletedMessages, deletedFiles };
 }

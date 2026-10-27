@@ -6,6 +6,7 @@
  */
 import { createHash } from 'node:crypto';
 import { formatSlackText, type SlackHistoryMessage } from './content.js';
+import { mimeShown, nameShown, toolResultJson, urlShown } from './framing.js';
 import { isNearMiss } from './near-miss.js';
 import type { HistoryMessage } from './slack-adapter.js';
 
@@ -229,7 +230,7 @@ export function historyRecord(m: HistoryMessage) {
     ...(m.attachments.length > 0
       ? {
           attachments: m.attachments.map((a) =>
-            `${a.name}${a.mimeType ? ` (${a.mimeType})` : ''}${a.url ? ` — fetchable via fetch_attachment: ${a.url}` : ''}`,
+            `${nameShown(a.name)}${a.mimeType ? ` (${mimeShown(a.mimeType)})` : ''}${a.url ? ` — fetchable via fetch_attachment: ${urlShown(a.url)}` : ''}`,
           ),
         }
       : {}),
@@ -351,7 +352,7 @@ export async function readBounded(opts: ReadOptions, source: ReadSource): Promis
         const record = shaped.get(m);
         if (record) {
           const returned = historyRecord(record);
-          const bytes = Buffer.byteLength(JSON.stringify(returned));
+          const bytes = Buffer.byteLength(toolResultJson(returned));
           if (skeleton + recordBytes + records.length + bytes > opts.maxBytes) {
             // Held back whole, and neither scanned nor matched here: the
             // next read starts at it.
