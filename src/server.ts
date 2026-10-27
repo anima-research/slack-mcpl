@@ -63,6 +63,7 @@ import { StateTracker, type UploadedFile } from './state.js';
 import { CapabilityGrant } from './grant.js';
 import { McplRpcError, capabilityDenied } from './errors.js';
 import { explainSlackError } from './slack-errors.js';
+import { channelShown, mimeShown, nameShown, quotedLabel, senderText, toolResultJson, urlShown } from './framing.js';
 import { CHANNEL_IDS, NOTHING_RETURNED, PARENT_IDS, refuseUnknownArguments } from './history-read.js';
 import {
   fetchAttachmentBytes,
@@ -148,7 +149,7 @@ export function locationHeader(loc: {
 }): string {
   const parts: string[] = [];
   if (loc.conversation) parts.push(loc.conversation);
-  if (loc.teamName) parts.push(`(${loc.teamName})`);
+  if (loc.teamName) parts.push(`(${nameShown(loc.teamName)})`);
   if (loc.channelId) parts.push(`channelId=${loc.channelId}`);
   if (loc.threadTs) parts.push(`thread=${loc.threadTs}`);
   parts.push(`id=${loc.messageId}`);
@@ -165,9 +166,9 @@ export function backscrollLine(m: {
   content: string;
   attachments: Array<{ name: string }>;
 }): string {
-  const att = m.attachments.length > 0 ? ` [attachments: ${m.attachments.map((a) => a.name).join(', ')}]` : '';
+  const att = m.attachments.length > 0 ? ` [attachments: ${m.attachments.map((a) => nameShown(a.name)).join(', ')}]` : '';
   const thread = m.threadTs ? ` thread=${m.threadTs}` : '';
-  return `[${m.timestamp.toISOString()}${thread} id=${m.id}] ${m.authorName}: ${m.content}${att}`;
+  return `[${m.timestamp.toISOString()}${thread} id=${m.id}] ${nameShown(m.authorName)}${att}: ${senderText(m.content)}`;
 }
 
 /** The `<backscroll>` block given with the first message from a conversation. */
@@ -176,7 +177,7 @@ export function backscrollBlock(
   where: { channelName?: string; isDM: boolean },
 ): string {
   const attrs: string[] = [];
-  if (where.channelName && !where.isDM) attrs.push(`channel="#${where.channelName}"`);
+  if (where.channelName && !where.isDM) attrs.push(`channel=${quotedLabel(`#${where.channelName}`)}`);
   if (where.isDM) attrs.push('dm="true"');
   attrs.push(`count="${messages.length}"`);
   return [`<backscroll ${attrs.join(' ')}>`, ...messages.map(backscrollLine), '</backscroll>'].join('\n');
@@ -624,21 +625,17 @@ export class SlackMcplServer {
         return { content: (result as { _content: ContentBlock[] })._content };
       }
 
+      const content = [textContent(typeof result === 'string' ? result : toolResultJson(result))];
       // Track checkpoints for rollback-enabled tools. The result names the new
       // checkpoint and its parent, the checkpoint before it (MCPL §8.2), so a
       // rollback to the parent deletes what this call posted or uploaded, a
       // process's first call included.
       if (fs === MESSAGING_FEATURE_SET) {
         this.stateTracker.createCheckpoint();
-        return {
-          content: [textContent(typeof result === 'string' ? result : JSON.stringify(result))],
-          state: this.stateTracker.getCheckpointState(),
-        };
+        return { content, state: this.stateTracker.getCheckpointState() };
       }
 
-      return {
-        content: [textContent(typeof result === 'string' ? result : JSON.stringify(result))],
-      };
+      return { content };
     } catch (err) {
       return {
         content: [textContent(explainSlackError(err, { tool: name, args }))],
@@ -832,7 +829,7 @@ export class SlackMcplServer {
         // with the list alone. Types the host has turned off aren't listed
         // or noted, as the tool's description says.
         if (leftOut.length === 0) return listed;
-        return { _content: [textContent(JSON.stringify(listed)), textContent(leftOutNote(leftOut))] };
+        return { _content: [textContent(toolResultJson(listed)), textContent(leftOutNote(leftOut))] };
       }
 
       case 'refresh_channels':
@@ -1574,7 +1571,7 @@ export class SlackMcplServer {
    *  fetch_attachment rather than inlined here. */
   private attachmentNote(attachments: AttachmentRef[]): string {
     const lines = attachments.map((a) =>
-      `- ${a.name} (${a.mimeType})${a.isImage ? ' — image' : ''}, fetchable via fetch_attachment: ${a.path}`,
+      `- ${nameShown(a.name)} (${mimeShown(a.mimeType)})${a.isImage ? ' — image' : ''}, fetchable via fetch_attachment: ${urlShown(a.path)}`,
     );
     return `[attachments: ${attachments.length}]\n${lines.join('\n')}`;
   }
@@ -1704,7 +1701,7 @@ export class SlackMcplServer {
       !this.unsubscribedByAgent.has(msg.channelId) && !this.isChannelSubscribed(msg.channelId);
     const blocks: string[] = [];
     if (autoSubscribe) {
-      const where = meta?.name ? `#${meta.name}` : `conversation ${msg.channelId}`;
+      const where = meta?.name ? channelShown(meta.name) : `conversation ${msg.channelId}`;
       blocks.push(
         `<system>Auto-subscribed to ${where} because you were mentioned. ` +
           `Ambient (non-mention) messages from this conversation will now arrive in your context. ` +
@@ -1729,7 +1726,7 @@ export class SlackMcplServer {
     const channelMcplId = mcplChannelId(msg.channelId);
     const channelIsOpen = this.channelManager.isOpen(channelMcplId);
     // A conversation whose name Slack didn't give is named by its ID.
-    const conversation = !contextChanged ? undefined : msg.isDM ? 'DM' : meta?.name ? `#${meta.name}` : msg.channelId;
+    const conversation = !contextChanged ? undefined : msg.isDM ? 'DM' : meta?.name ? channelShown(meta.name) : msg.channelId;
     const location = locationHeader({
       conversation,
       teamName: contextChanged ? this.slack.teamName : undefined,
@@ -1740,7 +1737,7 @@ export class SlackMcplServer {
     // The context is recorded as the message goes out, so the next message
     // is compared with what this peer was sent last.
     this.lastChannelId = msg.channelId;
-    const renderedContent = `${prefixBlock}${location}${msg.authorName}: ${msg.cleanContent}`;
+    const renderedContent = `${prefixBlock}${location}${nameShown(msg.authorName)}: ${senderText(msg.cleanContent)}`;
 
     const contentBlocks: ContentBlock[] = [textContent(renderedContent)];
     if (msg.attachments.length > 0) {

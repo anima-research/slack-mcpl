@@ -4,6 +4,7 @@
 
 import type { ChannelDescriptor } from '@animalabs/mcpl-core';
 import type { SlackConversationInfo } from './slack-adapter.js';
+import { nameShown } from './framing.js';
 
 /** MCPL channel ID format: slack:<conversationId>. Slack conversation IDs are
  *  workspace-unique and immutable, so no second component is needed. */
@@ -22,8 +23,8 @@ export function parseMcplChannelId(id: string): { conversationId: string } | nul
 /** Convert a Slack conversation to an MCPL ChannelDescriptor. */
 export function toDescriptor(conv: SlackConversationInfo, teamName: string, writable = true): ChannelDescriptor {
   const label =
-    conv.kind === 'dm' ? `DM: @${conv.name} (${teamName})` :
-    conv.kind === 'group_dm' ? `Group DM: ${conv.name} (${teamName})` :
+    conv.kind === 'dm' ? `DM: @${nameShown(conv.name)} (${teamName})` :
+    conv.kind === 'group_dm' ? `Group DM: ${nameShown(conv.name)} (${teamName})` :
     `#${conv.name} (${teamName})`;
   return {
     id: mcplChannelId(conv.id),
