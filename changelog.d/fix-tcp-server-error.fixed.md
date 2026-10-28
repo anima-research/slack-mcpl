@@ -4,9 +4,7 @@
   failure to listen still ends the process. A client that leaves before
   `initialize`, or whose serving fails, ends only its own connection, and
   the next client is served. Before, a server error could end the process,
-  and a client leaving before `initialize` did. A read error on the served
-  client's own socket, such as a reset, still ends it, through mcpl-core's
-  readline interface, which has no listener for it.
+  and a client leaving before `initialize` did.
 - With `--tcp`, a client that connects while another is being served is
   refused at once. Before, it was left connected and never read, holding its
   connection open until the process exited.

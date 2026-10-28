@@ -24,9 +24,9 @@ import { McplConnection } from '@animalabs/mcpl-core';
  * - An 'error' the server emits (an accept that fails, say) is logged
  *   whenever it comes, and serving goes on: Node's server keeps listening.
  *
- * A read error on the served client's own socket (a reset, say) still ends
- * the process: it also reaches mcpl-core's readline interface, which listens
- * for none (see SlackMcplServer.serve).
+ * A read error on the served client's own socket (a reset, say) closes its
+ * connection, and SlackMcplServer.serve logs it and settles, so the next
+ * client can be served.
  *
  * The server must be listening already, or this throws: a failure to listen
  * (a port already taken) belongs to the caller, and with the 'error'

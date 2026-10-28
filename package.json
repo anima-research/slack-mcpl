@@ -16,7 +16,7 @@
     "version": "node scripts/release-changelog.mjs && git add CHANGELOG.md changelog.d"
   },
   "dependencies": {
-    "@animalabs/mcpl-core": "^0.3.0",
+    "@animalabs/mcpl-core": "^0.4.0",
     "@slack/socket-mode": "^2.0.7",
     "@slack/web-api": "^7.16.0"
   },
