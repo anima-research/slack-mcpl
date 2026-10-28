@@ -148,11 +148,14 @@ npm test              # node --test via tsx, straight from the sources
 npm run build         # tsc into dist/, which is what the bin runs
 ```
 
-Push-time CI (`ci.yml`) typechecks, builds and tests every push to `main`
-and every pull request on ubuntu and macos, on Node 22.12.0 (the `engines`
-floor) and the newest release, and on ubuntu also on each maintained Node
-line between them (24 today). It installs with `npm ci`, so a
-`package-lock.json` that is out of sync with `package.json`, or that only
-carries one platform's native packages, fails the build.
+Push-time CI (`ci.yml`) runs on every push to `main` and every pull
+request, on ubuntu at Node 22.12.0 (the `engines` floor), the newest
+release and 24, and on macos at 22.12.0 and the newest release. Every leg
+installs with `npm ci`, builds (the build typechecks the sources and the
+tests), and starts the built bin without credentials, which must exit 1
+with the missing-token line as all of its stderr and nothing on stdout.
+Ubuntu at 22.12.0 also runs the whole suite. Since every leg installs with
+`npm ci`, a `package-lock.json` that is out of sync with `package.json`,
+or that only carries one platform's native packages, fails the build.
 Regenerate the lock from a clean tree (`rm -rf node_modules
 package-lock.json && npm install`), not over an existing `node_modules`.
