@@ -125,11 +125,9 @@ test("fetch_attachment's download has the client's timeout, and one that runs ou
 });
 
 test("a download its call's time has no room for isn't started, and says calling again is safe", { timeout: 10_000 }, async (t) => {
-  // The first call's post goes to a Slack that never answers, and its 1 s
-  // timeout holds the server while the download's call waits behind it.
   const silent = await silentSlackApi();
   t.after(() => silent.close());
-  const slow = new SlackWebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, timeout: 1000, slackApiUrl: silent.url });
+  const slow = new SlackWebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: silent.url });
   let downloads = 0;
   t.mock.method(globalThis, 'fetch', async () => {
     downloads++;
@@ -150,6 +148,7 @@ test("a download its call's time has no room for isn't started, and says calling
   // than the download's timeout is left of its time.
   const used = CALL_SECONDS - SLACK_CLIENT_OPTIONS.timeout / 1000 + 1;
   t.mock.timers.tick(used * 1000);
+  silent.end();
   const [, result] = await Promise.all([post, fetchCall]);
   assert.equal(result.isError, true);
   assert.equal(

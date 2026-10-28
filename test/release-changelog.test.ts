@@ -1,7 +1,3 @@
-// Black-box coverage of scripts/release-changelog.mjs: each case runs the
-// real script in a throwaway directory, so assembly, validation, and the
-// deletion of consumed fragments are all exercised exactly as `npm version`
-// would run them.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -10,11 +6,13 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { release, ReleaseError } from "../scripts/release-changelog.mjs";
 
 const SCRIPT = fileURLToPath(
   new URL("../scripts/release-changelog.mjs", import.meta.url),
@@ -60,7 +58,16 @@ function setup(f: Fixture): string {
 
 function run(dir: string): { status: number; stdout: string; stderr: string } {
   try {
-    const stdout = execFileSync(process.execPath, [SCRIPT], {
+    return { status: 0, stdout: `${release(dir)}\n`, stderr: "" };
+  } catch (e) {
+    if (!(e instanceof ReleaseError)) throw e;
+    return { status: 1, stdout: "", stderr: `release-changelog: ${e.message}\n` };
+  }
+}
+
+function runCli(dir: string, script = SCRIPT): { status: number; stdout: string; stderr: string } {
+  try {
+    const stdout = execFileSync(process.execPath, [script], {
       cwd: dir,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
@@ -200,3 +207,39 @@ for (const [name, fixture, message] of refusals) {
     assert.deepEqual(pending(dir), before.pending, "no fragment may be deleted on refusal");
   });
 }
+
+test("the CLI releases from the directory it runs in, also when run through a symlink", () => {
+  const dir = setup({ fragments: { "a.fixed.md": "- Fixed thing.\n" } });
+  const linked = join(dir, "release-changelog.mjs");
+  symlinkSync(SCRIPT, linked);
+  const r = runCli(dir, linked);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^CHANGELOG\.md: released '## 1\.1\.0 — \d{4}-\d{2}-\d{2}' from 1 fragment\(s\) plus the Unreleased section\.\n$/);
+  assert.equal(section(changelog(dir), "1.1.0"), "### Fixed\n\n- Fixed thing.");
+  assert.deepEqual(pending(dir), ["README.md"]);
+});
+
+test("the CLI refuses with exit status 1 and its reason on stderr, touching nothing", () => {
+  const dir = setup({ version: "1.0.0", fragments: { "a.fixed.md": "- x\n" } });
+  const before = { changelog: changelog(dir), pending: pending(dir) };
+  const r = runCli(dir);
+  assert.equal(r.status, 1, `expected refusal, got exit ${r.status}:\n${r.stdout}${r.stderr}`);
+  assert.equal(r.stdout, "");
+  assert.match(r.stderr, /^release-changelog: .*'## 1\.0\.0' section already exists/);
+  assert.equal(changelog(dir), before.changelog, "CHANGELOG.md must be untouched");
+  assert.deepEqual(pending(dir), before.pending, "no fragment may be deleted on refusal");
+});
+
+test("importing the script runs nothing, whatever argv[1] names", () => {
+  const dir = setup({ fragments: { "a.fixed.md": "- x\n" } });
+  const before = { changelog: changelog(dir), pending: pending(dir) };
+  const code = `process.argv[1] = "test/*.test.ts"; await import(${JSON.stringify(pathToFileURL(SCRIPT).href)});`;
+  const stdout = execFileSync(process.execPath, ["--input-type=module", "-e", code], {
+    cwd: dir,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  assert.equal(stdout, "");
+  assert.equal(changelog(dir), before.changelog);
+  assert.deepEqual(pending(dir), before.pending);
+});

@@ -76,6 +76,7 @@ import {
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createRequire } from 'node:module';
+import { clock } from './clock.js';
 
 // tsx runs from src/; the built executable runs from dist/src/. Read the
 // release metadata from the package root in either layout, independent of cwd.
@@ -299,14 +300,14 @@ export class SlackMcplServer {
     // read, before this loop takes it up from nextMessage() (mcpl-core's
     // routeIncoming).
     const arrivals = new WeakMap<JsonRpcRequest, number>();
-    conn.on('request', (req: JsonRpcRequest) => arrivals.set(req, Date.now()));
+    conn.on('request', (req: JsonRpcRequest) => arrivals.set(req, clock.now()));
 
     try {
       await this.handleInitialize();
       while (!conn.isClosed) {
         const msg = await conn.nextMessage();
         if (msg.type === 'request') {
-          await withCallTime(arrivals.get(msg.request) ?? Date.now(), () => this.handleRequest(msg.request));
+          await withCallTime(arrivals.get(msg.request) ?? clock.now(), () => this.handleRequest(msg.request));
         } else {
           this.handleNotification(msg.notification);
         }
@@ -1143,7 +1144,7 @@ export class SlackMcplServer {
     }
     const what = wait.why === 'limited' ? `Slack rate-limited ${wait.method}` : `${wait.method} failed`;
     console.error(`[slack-mcpl] ${what} (try ${inARow} of ${REGISTRATION_TRIES}); registration asks again in ${wait.seconds} s`);
-    await new Promise<void>((resolve) => { setTimeout(resolve, wait.seconds * 1000).unref(); });
+    await clock.sleep(wait.seconds * 1000, { unref: true });
     if (!isCurrent()) throw superseded();
   }
 

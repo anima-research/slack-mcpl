@@ -9,6 +9,7 @@ import { SlackMcplServer } from '../src/server.js';
 import { GaveUp } from '../src/slack-adapter.js';
 import type { SlackAdapter, SlackConversationInfo, SlackWait, SlackWaitOut } from '../src/slack-adapter.js';
 import { FULL_GRANT, until } from './harness.js';
+import { clock } from '../src/clock.js';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -776,6 +777,12 @@ test('refresh_channels answers at once while registration runs, whether it lists
 
 test('a registration superseded during its wait logs that wait, then stops without another line', async (t) => {
   const log = serverLog(t);
+  const slept: number[] = [];
+  let endWait = () => {};
+  t.mock.method(clock, 'sleep', (ms: number) => {
+    slept.push(ms);
+    return new Promise<void>((resolve) => { endWait = resolve; });
+  });
   let waited: 'went on' | 'stopped' | undefined;
   const { slack } = fakeSlack(async (_all?: boolean, waitOut?: SlackWaitOut) => {
     try {
@@ -791,9 +798,12 @@ test('a registration superseded during its wait logs that wait, then stops witho
   t.after(() => h.close());
   await h.initialize();
   await h.grant();
+  await until(() => slept.length === 1, "registration's wait");
   // Revoking channels.register during the wait supersedes the registration.
   await h.grant(['tools']);
+  endWait();
   await until(() => waited !== undefined, 'the end of the wait', 3000);
+  assert.deepEqual(slept, [1000], "the wait went through the server's clock");
   assert.equal(waited, 'stopped');
   await settle();
   // Every line but the connection's own.
