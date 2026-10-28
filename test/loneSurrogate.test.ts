@@ -62,8 +62,8 @@ async function serve(t: { after(fn: () => unknown): void }, opts: { disableDms?:
 
 /** What a write answers for text with a lone surrogate: a tool's whole result
  *  text, or the error a host's publish gets. */
-const refusal = (name: string, opening: string) =>
-  `${name === 'channels/publish' ? 'RPC error -32603: ' : ''}${opening}: the text holds a lone UTF-16 surrogate, which UTF-8 can't encode: remove it.`;
+const refusal = (opening: string) =>
+  `${opening}: the text holds a lone UTF-16 surrogate, which UTF-8 can't encode: remove it.`;
 
 for (const disableDms of [false, true]) {
   // With DMs off, the conversation isn't registered, so a check placed after
@@ -81,7 +81,7 @@ for (const disableDms of [false, true]) {
         const what = `${name} given [${codePoints(text)}]`;
         assert.deepEqual(api.calls.slice(before), [], `${what}: Slack is asked nothing`);
         assert.equal(failed, true, `${what}: the write fails`);
-        assert.equal(said, refusal(name, opening), `${what}: the refusal says what's wrong and what to do, and nothing more`);
+        assert.equal(said, refusal(opening), `${what}: the refusal says what's wrong and what to do, and nothing more`);
       }
     }
   });

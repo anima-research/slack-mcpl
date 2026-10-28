@@ -110,7 +110,7 @@ async function main(): Promise<void> {
     console.error('[slack-mcpl] Starting on stdio');
     const conn = McplConnection.fromStreams(process.stdin, process.stdout);
     await server.serve(conn);
-    shutdown(); // the host closed stdin
+    shutdown(); // the host closed stdin, or stdin or stdout failed
   } else if (tcpPort) {
     // TCP transport — single client
     console.error(`[slack-mcpl] Listening on TCP port ${tcpPort}`);

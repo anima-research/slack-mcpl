@@ -286,18 +286,18 @@ export class SlackMcplServer {
     this.lastChannelId = null;
     this.forwarding.clear();
 
-    // The connection emits 'error' for a line that isn't JSON. Unheard,
-    // EventEmitter throws it from the stream's callback, where nothing here
-    // can catch it, and the process exits. Logged instead, so a bad line
-    // costs only itself. (A stream's own error, such as a client's reset,
-    // also reaches mcpl-core's readline interface, which hears none, so it
-    // still ends the process: mcpl-core-ts#11 is that fix.)
+    // The connection emits 'error' for a line that isn't JSON, and for the
+    // stream error that closes it, such as a client's reset. Unheard,
+    // EventEmitter throws it where nothing here can catch it, and the process
+    // exits. Logged instead, so a bad line costs only itself, and a failed
+    // stream only its connection.
     conn.on('error', (err: unknown) => console.error('[slack-mcpl] Connection error:', err));
 
     // A call's time counts from when it reaches this server, not from when
     // this loop takes it up, so a call queued behind others answers in time
-    // too. The connection emits each request as it parses it, before
-    // queueing it for nextMessage() (mcpl-core's routeIncoming).
+    // too. The connection's 'request' listeners hear each request as it's
+    // read, before this loop takes it up from nextMessage() (mcpl-core's
+    // routeIncoming).
     const arrivals = new WeakMap<JsonRpcRequest, number>();
     conn.on('request', (req: JsonRpcRequest) => arrivals.set(req, Date.now()));
 
