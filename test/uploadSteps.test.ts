@@ -24,6 +24,8 @@ import { explainSlackError } from '../src/slack-errors.js';
 import { MESSAGING_FEATURE_SET } from '../src/feature-sets.js';
 import { FULL_GRANT, connectHost, nonJsonSlackApiUrl, initialize, until, uploadEndpoint } from './harness.js';
 import { fakeSlackApi, silentSlackApi, unreachableSlackApiUrl, type FakeSlackApi, type SlackApiAnswer } from './slackApi.js';
+import { virtualClock } from './virtualClock.js';
+import { clock } from '../src/clock.js';
 
 let api: FakeSlackApi;
 let client: SlackWebClient;
@@ -169,11 +171,13 @@ test("a first answer with no file ID uploads nothing, and one with no upload URL
 
 test("bytes the call's time leaves no room for aren't sent, nothing is uploaded, and the file's ID is left for rollback", { timeout: 10_000 }, async (t) => {
   // 12.5 s are left, and the first step takes 3 s of them.
-  await steps(t, { first: { ...target(`${api.url}file-upload`, 'F1'), delayMs: 3000 } });
+  virtualClock(t);
+  await steps(t, { first: { ...target(`${api.url}file-upload`, 'F1'), elapseMs: 3000 } });
   const from = api.calls.length;
-  const err = await withCallTime(Date.now() - 12_500, () => adapter().uploadFile('C1', { filename: 'a.txt', data: Buffer.from('a') }))
+  const err = await withCallTime(clock.now() - 12_500, () => adapter().uploadFile('C1', { filename: 'a.txt', data: Buffer.from('a') }))
     .then(() => null, (e: unknown) => e);
   assert.ok(err instanceof OutOfCallTime, String(err));
+  assert.equal(err.usedSeconds, 16, "the first step's 3 s count among the 15.5 used");
   assert.match(explainSlackError(err, { tool: 'upload_file', args: { channelId: 'C1' } }),
     /^The upload of the file's bytes: out of this call's time\n\nNothing was uploaded: this server gives each call 25 seconds/);
   assert.deepEqual(called(from), ['files.getUploadURLExternal']);
@@ -255,9 +259,10 @@ test("a last step the call's time leaves no room for isn't sent, shares nothing,
   // 12.5 s of the call's 25 are left: enough for the first two steps, each
   // of whose 10 s fits, and the bytes take 3 s, after which the last step's
   // 10 s don't.
-  await steps(t, { bytes: { body: { ok: true }, delayMs: 3000 } });
+  virtualClock(t);
+  await steps(t, { bytes: { body: { ok: true }, elapseMs: 3000 } });
   const from = api.calls.length;
-  const err = await withCallTime(Date.now() - 12_500, () => adapter().uploadFile('C1', { filename: 'a.txt', data: Buffer.from('a') }))
+  const err = await withCallTime(clock.now() - 12_500, () => adapter().uploadFile('C1', { filename: 'a.txt', data: Buffer.from('a') }))
     .then(() => null, (e: unknown) => e);
   assert.ok(err instanceof OutOfCallTime, String(err));
   assert.match(explainSlackError(err, { tool: 'upload_file', args: { channelId: 'C1' } }),

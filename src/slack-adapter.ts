@@ -21,6 +21,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { WebClient, ErrorCode, LogLevel, type Logger, type WebAPICallResult, type WebClientOptions } from '@slack/web-api';
 import { SocketModeClient } from '@slack/socket-mode';
+import { clock } from './clock.js';
 import { NOTHING_RETURNED, SLACK_TS, readBounded, readOptions, type HistoryReadResult, type ReadStop } from './history-read.js';
 import {
   formatSlackText,
@@ -591,8 +592,8 @@ function sharingTs(file: SlackUploadedFile, channelId: string): string | undefin
  *  no deadline. */
 export function assertRequestFits(method: string, requestMs: number): void {
   const call = callTime.getStore();
-  if (call && Date.now() + requestMs > call.deadline) {
-    throw new OutOfCallTime(method, Math.min(CALL_SECONDS, Math.ceil((Date.now() - call.arrived) / 1000)));
+  if (call && clock.now() + requestMs > call.deadline) {
+    throw new OutOfCallTime(method, Math.min(CALL_SECONDS, Math.ceil((clock.now() - call.arrived) / 1000)));
   }
 }
 
@@ -656,12 +657,12 @@ export class SlackWebClient extends WebClient {
       const wait = waitToAskAgain(err, method);
       if (
         !mayWait || !call || wait?.why !== 'limited' || !(wait.seconds >= 0 && wait.seconds <= call.secondsLeft) ||
-        Date.now() + wait.seconds * 1000 + this.requestMs > call.deadline
+        clock.now() + wait.seconds * 1000 + this.requestMs > call.deadline
       ) {
         throw err;
       }
       call.secondsLeft -= wait.seconds;
-      await new Promise((resolve) => setTimeout(resolve, wait.seconds * 1000));
+      await clock.sleep(wait.seconds * 1000);
       return this.send(method, options, false);
     }
   }

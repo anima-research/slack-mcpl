@@ -5,6 +5,7 @@
  */
 
 import http from 'node:http';
+import { elapse } from './virtualClock.js';
 
 export interface SlackApiAnswer {
   status?: number;
@@ -14,6 +15,7 @@ export interface SlackApiAnswer {
   body: Record<string, unknown> | null | ((sent: URLSearchParams) => Record<string, unknown> | null);
   /** How long to take before answering, in ms. */
   delayMs?: number;
+  elapseMs?: number;
   /** Answer only once this settles, then after delayMs: for a test that
    *  orders an answer after an event rather than after a length of time. */
   after?: Promise<unknown>;
@@ -52,8 +54,9 @@ export async function fakeSlackApi(): Promise<FakeSlackApi> {
       const params = new URLSearchParams(received);
       sent.push(params);
       const queue = answersFor.get(called) ?? answers;
-      const { status = 200, headers = {}, body, delayMs = 0, after } = queue.length > 1 ? queue.shift()! : queue[0];
+      const { status = 200, headers = {}, body, delayMs = 0, elapseMs, after } = queue.length > 1 ? queue.shift()! : queue[0];
       const send = () => setTimeout(() => {
+        if (elapseMs !== undefined) elapse(elapseMs);
         res.writeHead(status, { 'content-type': 'application/json', ...headers });
         res.end(JSON.stringify(typeof body === 'function' ? body(params) : body));
       }, delayMs);
@@ -83,14 +86,21 @@ export async function fakeSlackApi(): Promise<FakeSlackApi> {
 }
 
 /** A `slackApiUrl` that takes each request and never answers it. */
-export async function silentSlackApi(): Promise<{ url: string; requests(): number; close(): Promise<void> }> {
+export async function silentSlackApi(): Promise<{ url: string; requests(): number; connections(): number; end(): void; close(): Promise<void> }> {
   let requests = 0;
-  const server = http.createServer(() => { requests++; });
+  let connections = 0;
+  const held: http.ServerResponse[] = [];
+  const server = http.createServer((_req, res) => { requests++; held.push(res); });
+  server.on('connection', () => { connections++; });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
   const { port } = server.address() as { port: number };
   return {
     url: `http://127.0.0.1:${port}/api/`,
     requests: () => requests,
+    connections: () => connections,
+    end() {
+      for (const res of held.splice(0)) res.socket?.destroy();
+    },
     async close() {
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));

@@ -33,51 +33,20 @@ import * as net from 'node:net';
 import { McplConnection } from '@animalabs/mcpl-core';
 import { connectSlack } from './slack-adapter.js';
 import { SlackMcplServer } from './server.js';
-import { booleanFlag } from './config.js';
+import { startupSettings } from './config.js';
 import { serveTcp } from './tcp.js';
 
-/** A yes/no switch from the environment. A bad value stops the server with
- *  one line naming it: it is the operator's to fix, not a crash to trace. */
-function flag(name: string): boolean {
-  try {
-    return booleanFlag(name, process.env[name]);
-  } catch (err) {
-    console.error((err as Error).message);
-    process.exit(1);
-  }
-}
-
 async function main(): Promise<void> {
-  const args = process.argv.slice(2);
-  const useStdio = args.includes('--stdio');
-  const tcpIdx = args.indexOf('--tcp');
-  const tcpPort = tcpIdx >= 0 ? parseInt(args[tcpIdx + 1], 10) : undefined;
-
-  if (!useStdio && !tcpPort) {
-    console.error('Usage: slack-mcpl --stdio | --tcp <port>');
+  const startup = startupSettings(process.argv.slice(2), process.env);
+  if ('refusal' in startup) {
+    console.error(startup.refusal);
     process.exit(1);
   }
-
-  const botToken = process.env.SLACK_BOT_TOKEN;
-  const appToken = process.env.SLACK_APP_TOKEN;
-  if (!botToken || !appToken) {
-    console.error('SLACK_BOT_TOKEN and SLACK_APP_TOKEN environment variables are required');
-    process.exit(1);
-  }
-
-  const dmUsers = process.env.SLACK_DM_USERS?.split(',').map((s) => s.trim()).filter(Boolean);
+  const { useStdio, tcpPort, botToken, appToken, dmUsers, sendChannels, disableDms, subscribeMemberChannels, ackReaction } =
+    startup.settings;
 
   // Connect Slack first: auth.test resolves the bot's identity, then Socket
   // Mode comes up so no events are missed once the host attaches.
-  const sendChannels = process.env.SLACK_SEND_CHANNELS?.split(',').map((s) => s.trim()).filter(Boolean);
-  // Set but empty would mean "write anywhere": most likely a broken template.
-  if (process.env.SLACK_SEND_CHANNELS !== undefined && sendChannels!.length === 0) {
-    console.error('SLACK_SEND_CHANNELS is set but names no conversation; unset it to allow writing anywhere');
-    process.exit(1);
-  }
-  const disableDms = flag('SLACK_DISABLE_DMS');
-  const subscribeMemberChannels = flag('SLACK_SUBSCRIBE_MEMBER_CHANNELS');
-  const ackReaction = process.env.SLACK_ACK_REACTION?.replace(/:/g, '').trim() || undefined;
   const slack = await connectSlack({ botToken, appToken, dmUsers, sendChannels, disableDms, ackReaction });
   const server = new SlackMcplServer(slack, {
     subscribeMemberChannels,
