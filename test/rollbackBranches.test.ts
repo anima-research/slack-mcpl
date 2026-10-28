@@ -42,9 +42,9 @@ async function server(t: { after(fn: () => unknown): void }) {
   const rollback = (checkpoint: string) => h.host.sendRequest(method.STATE_ROLLBACK, {
     featureSet: MESSAGING_FEATURE_SET, checkpoint,
   }) as Promise<{ success: boolean; reason?: string }>;
-  /** The ts of each chat.delete from `from` on. */
+  /** The ts of each chat.delete from `from` on, sorted. */
   const deleted = (from: number) =>
-    api.calls.flatMap((called, i) => (i >= from && called === 'chat.delete' ? [api.sent[i].get('ts')] : []));
+    api.calls.flatMap((called, i) => (i >= from && called === 'chat.delete' ? [api.sent[i].get('ts')] : [])).sort();
   return { h, send, rollback, deleted };
 }
 
@@ -145,8 +145,8 @@ test('delete_message forgets only its message, in its own conversation', { timeo
   const from = api.calls.length;
   await rollback(zero);
   const deletes = api.calls.flatMap((called, i) =>
-    (i >= from && called === 'chat.delete' ? [[api.sent[i].get('channel'), api.sent[i].get('ts')]] : []));
-  assert.deepEqual(deletes, [['C2', '7.7'], ['C1', '7.8']]);
+    (i >= from && called === 'chat.delete' ? [`${api.sent[i].get('channel')} ${api.sent[i].get('ts')}`] : []));
+  assert.deepEqual(deletes.sort(), ['C1 7.8', 'C2 7.7']);
 });
 
 test('a message published after the last checkpoint, which no checkpoint covers yet, is deleted by a rollback to it', { timeout: 5000 }, async (t) => {

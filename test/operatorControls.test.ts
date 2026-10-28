@@ -87,9 +87,16 @@ test('unsubscribe_channel silences a member channel for real', async () => {
   await h.socket.emitMessage(ambient('1.2'));
   assert.equal(pushes(h).length, 1, 'muted: nothing new arrives');
 
+  const pushed = (eventId: string) => pushes(h).some((r) => (r.params as { eventId?: string }).eventId === eventId);
+  await h.socket.emitMessage({ ...ambient('1.3'), channel: 'C2' });
+  await until(() => pushed('slack_msg_C2_1.3'), 'the other channel');
+  assert.equal(pushes(h).length, 2);
+
   // A mention still comes through.
-  await h.socket.emitMessage({ ...MENTION_EVENT, ts: '1.3' });
-  await until(() => pushes(h).length === 2, 'the mention');
+  await h.socket.emitMessage({ ...MENTION_EVENT, ts: '1.4' });
+  await until(() => pushed('slack_msg_C1_1.4'), 'the mention');
+  assert.equal(pushes(h).length, 3);
+  assert.equal(pushed('slack_msg_C1_1.2'), false, 'the muted message never arrived');
 
   await h.close();
 });
