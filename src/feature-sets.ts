@@ -5,6 +5,7 @@
  * (`experimental.mcpl`) presented at `initialize`.
  *
  *   slack.messaging     — real-time delivery + channel management
+ *   slack.typing        — optional thread status
  *   slack.history       — reading back through conversations (tools)
  *   slack.subscriptions — ambient-message subscription management (tools)
  *
@@ -19,18 +20,19 @@
  *   channels.incoming  — handleSlackMessage sends channels/incoming for open channels
  *   pushEvents         — handleSlackMessage sends push/event for addressed
  *                        messages on channels the host has not opened
+ *   channels.typing    — server.ts handles channels/typing (a thread status)
  *   tools              — the MCP tool surface of this server
  *
  * Deliberately NOT declared: channels.streaming (the host delivers each reply
  * once, through channels/publish; a streamed copy would post it twice),
  * channels.acknowledge (no handler for
- * channels/acknowledge), channels.typing (the adapter has no typing
- * indicator — Slack's Web API exposes none for bots).
+ * channels/acknowledge).
  */
 
 import type { CapabilityPath, FeatureSetDeclaration, McplManifest, TagOntology } from '@animalabs/mcpl-core';
 
 export const MESSAGING_FEATURE_SET = 'slack.messaging';
+export const TYPING_FEATURE_SET = 'slack.typing';
 export const HISTORY_FEATURE_SET = 'slack.history';
 export const SUBSCRIPTIONS_FEATURE_SET = 'slack.subscriptions';
 
@@ -70,6 +72,10 @@ export function buildFeatureSets(): Record<string, FeatureSetDeclaration> {
       rollback: true,
       tagOntology: SLACK_TAG_ONTOLOGY,
     },
+    [TYPING_FEATURE_SET]: {
+      description: 'Show typing as a status on a pending addressed thread',
+      uses: ['channels.typing'],
+    },
     [HISTORY_FEATURE_SET]: {
       description: 'Fetch message and thread history from Slack conversations',
       uses: ['tools'],
@@ -93,6 +99,7 @@ export function buildServerCapabilities(): McplManifest {
       lifecycle: true,
       publish: true,
       incoming: true,
+      typing: true,
     },
     featureSets: buildFeatureSets(),
   };
