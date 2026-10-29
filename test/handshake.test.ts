@@ -45,7 +45,7 @@ test('a plain-MCP client gets no MCPL manifest, and tool calls are ungated', asy
 
 // --- MCPL handshake -----------------------------------------------------------
 
-test('featureSets/update is answered with a full-grant receipt, and registration follows it', async () => {
+test('featureSets/update keeps messaging with only optional typing degraded, and registration follows it', async () => {
   const h = harness();
   await initialize(h, true);
 
@@ -61,8 +61,10 @@ test('featureSets/update is answered with a full-grant receipt, and registration
     effectiveCapabilities: FULL_GRANT,
   })) as { accepted: boolean; mode?: string; unavailableFeatures: unknown[] };
   assert.equal(receipt.accepted, true);
-  assert.equal(receipt.mode, undefined, 'mode is omitted when nothing degraded (§6.7)');
-  assert.deepEqual(receipt.unavailableFeatures, []);
+  assert.equal(receipt.mode, 'degraded');
+  assert.deepEqual(receipt.unavailableFeatures, [
+    { featureSet: 'slack.typing', missingCapabilities: ['channels.typing'], effect: 'disabled' },
+  ]);
 
   await until(() => h.hostSaw.some((r) => r.method === method.CHANNELS_REGISTER), 'channels/register');
   const registered = h.hostSaw.find((r) => r.method === method.CHANNELS_REGISTER)!.params as {
