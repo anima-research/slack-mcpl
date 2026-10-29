@@ -175,11 +175,12 @@ export function backscrollLine(m: {
 /** The `<backscroll>` block given with the first message from a conversation. */
 export function backscrollBlock(
   messages: Parameters<typeof backscrollLine>[0][],
-  where: { channelName?: string; isDM: boolean },
+  where: { channelName?: string; isDM: boolean; isGroupDM?: boolean },
 ): string {
   const attrs: string[] = [];
-  if (where.channelName && !where.isDM) attrs.push(`channel=${quotedLabel(`#${where.channelName}`)}`);
+  if (where.channelName && !where.isDM) attrs.push(`channel=${quotedLabel(where.isGroupDM ? where.channelName : `#${where.channelName}`)}`);
   if (where.isDM) attrs.push('dm="true"');
+  if (where.isGroupDM) attrs.push('group_dm="true"');
   attrs.push(`count="${messages.length}"`);
   return [`<backscroll ${attrs.join(' ')}>`, ...messages.map(backscrollLine), '</backscroll>'].join('\n');
 }
@@ -819,7 +820,7 @@ export class SlackMcplServer {
         const listed = conversations.map((c) => ({
           id: c.id,
           kind: c.kind,
-          name: c.kind === 'dm' ? `DM: @${c.name}` : c.name,
+          name: c.kind === 'dm' ? `DM: @${c.name}` : c.policyGroupDm ? `Group DM: ${c.name}` : c.name,
           ...(c.topic ? { topic: c.topic } : {}),
           ...(c.kind === 'channel' || c.kind === 'private_channel' ? { isMember: c.isMember } : {}),
           writable: this.slack.canWrite(c.id),
@@ -1702,7 +1703,9 @@ export class SlackMcplServer {
       !this.unsubscribedByAgent.has(msg.channelId) && !this.isChannelSubscribed(msg.channelId);
     const blocks: string[] = [];
     if (autoSubscribe) {
-      const where = meta?.name ? channelShown(meta.name) : `conversation ${msg.channelId}`;
+      const where = meta?.name
+        ? (meta.policyGroupDm ? `Group DM: ${nameShown(meta.name)}` : channelShown(meta.name))
+        : `conversation ${msg.channelId}`;
       blocks.push(
         `<system>Auto-subscribed to ${where} because you were mentioned. ` +
           `Ambient (non-mention) messages from this conversation will now arrive in your context. ` +
@@ -1711,7 +1714,7 @@ export class SlackMcplServer {
       );
     }
     if (backscroll.length > 0) {
-      blocks.push(backscrollBlock(backscroll, { channelName: meta?.name, isDM: msg.isDM }));
+      blocks.push(backscrollBlock(backscroll, { channelName: meta?.name, isDM: msg.isDM, isGroupDM: meta?.policyGroupDm }));
     }
     // Told with the first message the agent gets from here, addressed or not.
     // Counted as told only once the host has taken that message.
@@ -1727,7 +1730,9 @@ export class SlackMcplServer {
     const channelMcplId = mcplChannelId(msg.channelId);
     const channelIsOpen = this.channelManager.isOpen(channelMcplId);
     // A conversation whose name Slack didn't give is named by its ID.
-    const conversation = !contextChanged ? undefined : msg.isDM ? 'DM' : meta?.name ? channelShown(meta.name) : msg.channelId;
+    const conversation = !contextChanged ? undefined : msg.isDM ? 'DM'
+      : meta?.policyGroupDm ? `Group DM: ${nameShown(meta.name || msg.channelId)}`
+      : meta?.name ? channelShown(meta.name) : msg.channelId;
     const location = locationHeader({
       conversation,
       teamName: contextChanged ? this.slack.teamName : undefined,

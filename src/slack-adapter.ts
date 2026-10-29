@@ -281,6 +281,8 @@ export type ConversationKind = 'channel' | 'private_channel' | 'dm' | 'group_dm'
 export interface SlackConversationInfo {
   id: string;
   kind: ConversationKind;
+  /** Label group DMs distinctly only on the dormant explicit-policy path. */
+  policyGroupDm?: true;
   /** Channel name, group-DM name, or the DM counterpart's display name. */
   name: string;
   /** DM counterpart user ID (dm only). */
@@ -898,7 +900,8 @@ export class SlackAdapter {
   // ── Conversations ──
 
   private conversationTypes(): string[] {
-    if (this.accessPolicy) return ['public_channel', 'private_channel', ...(this.accessPolicy.dmsWritable ? ['im'] : [])]; // group DMs come later
+    if (this.accessPolicy) return ['public_channel', 'private_channel', ...(this.accessPolicy.dmsWritable ? ['im'] : []),
+      ...(this.accessPolicy.groupDmsReadable ? ['mpim'] : [])];
     return this.disableDms ? ['public_channel', 'private_channel'] : Object.keys(TYPE_SCOPE);
   }
 
@@ -1060,7 +1063,7 @@ export class SlackAdapter {
   private async requireHistoryConversation(channelId: string, notDone: string): Promise<SlackApiConversation | undefined> {
     if (!this.accessPolicy) { await this.assertNotDm(channelId, notDone); return; }
     const conversation = await this.readAccessConversation(channelId);
-    this.accessPolicy.requireScope(this.scopes, conversation.is_im ? 'im:history'
+    this.accessPolicy.requireScope(this.scopes, conversation.is_mpim ? 'mpim:history' : conversation.is_im ? 'im:history'
       : conversation.is_private ? 'groups:history' : 'channels:history');
     return conversation;
   }
@@ -1114,7 +1117,8 @@ export class SlackAdapter {
     }
     if (conv.is_mpim) {
       this.dmIds.add(conv.id);
-      return { id: conv.id, kind: 'group_dm', name: conv.name ?? conv.id, isMember: true };
+      return { id: conv.id, kind: 'group_dm', name: conv.name ?? conv.id, isMember: true,
+        ...(this.accessPolicy ? { policyGroupDm: true as const } : {}) };
     }
     // Cached as a channel only when Slack says outright it is neither kind of DM.
     if (conv.is_im === false && conv.is_mpim === false) this.channelIds.add(conv.id);

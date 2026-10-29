@@ -39,7 +39,7 @@ test('validation and construction reject missing, unknown and null fields identi
     invalid.push(missing, { ...config(), [key]: null }, { ...config(), [key]: undefined });
   }
   // These extensions are deliberately unsupported in A1, even empty or null.
-  for (const key of ['groupDms', 'historyMembershipFallbackChannels']) {
+  for (const key of ['historyMembershipFallbackChannels']) {
     for (const value of [null, [], ['G1']]) invalid.push({ ...config(), [key]: value });
   }
   invalid.push({ ...config(), readJoinedChannels: 'true' });
@@ -141,7 +141,7 @@ test('DM identity and kind cannot be inferred from a prefix or mismatched metada
   }
 });
 
-test('group DMs are unsupported even with membership, a write pin and mpim scopes', () => {
+test('unnamed group DMs are unsupported even with membership, a write pin and mpim scopes', () => {
   const policy = new SlackAccessPolicy(config());
   for (const id of ['C1', 'G1']) {
     for (const isIm of [undefined, false, true]) {
