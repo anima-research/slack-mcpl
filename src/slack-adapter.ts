@@ -21,7 +21,9 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { WebClient, ErrorCode, LogLevel, type Logger, type WebAPICallResult, type WebClientOptions } from '@slack/web-api';
 import { SocketModeClient } from '@slack/socket-mode';
+import { associatedFile, FILE_ID, policyFileRefs, privateFileUrl, type PolicyFileRef } from './file-access.js';
 import { clock } from './clock.js';
+import { SlackAccessPolicy, type SlackAccessPolicyConfig } from './access-policy.js';
 import { NOTHING_RETURNED, SLACK_TS, readBounded, readOptions, type HistoryReadResult, type ReadStop } from './history-read.js';
 import {
   formatSlackText,
@@ -257,7 +259,7 @@ interface SlackMessageEvent {
   bot_id?: string;
   channel_type?: string;
   team?: string;
-  files?: Array<{ url_private?: string; name?: string; mimetype?: string }>;
+  files?: Array<{ id?: string; url_private?: string; name?: string; mimetype?: string }>;
 }
 
 /** The fields of a conversations.list/info entry this adapter dereferences —
@@ -280,6 +282,8 @@ export type ConversationKind = 'channel' | 'private_channel' | 'dm' | 'group_dm'
 export interface SlackConversationInfo {
   id: string;
   kind: ConversationKind;
+  /** Label group DMs distinctly only on the dormant explicit-policy path. */
+  policyGroupDm?: true;
   /** Channel name, group-DM name, or the DM counterpart's display name. */
   name: string;
   /** DM counterpart user ID (dm only). */
@@ -330,7 +334,7 @@ export interface HistoryMessage {
   /** Its replies, when Slack gives a count; missing means unknown. */
   replyCount?: number;
   timestamp: Date;
-  attachments: Array<{ name: string; mimeType?: string; url?: string }>;
+  attachments: Array<PolicyFileRef | { name: string; mimeType?: string; url?: string; channelId?: never }>;
 }
 
 export interface SlackUserMatch {
@@ -341,6 +345,7 @@ export interface SlackUserMatch {
 }
 
 export interface SlackAdapterConfig {
+  accessPolicy?: SlackAccessPolicyConfig;
   botToken: string;
   appToken: string;
   /** When set, DMs from anyone not in this user-ID list are dropped. */
@@ -723,8 +728,11 @@ export function slackClients(
  * slackClients' is.
  */
 export async function connectSlack(config: SlackAdapterConfig, slackApiUrl?: string): Promise<SlackAdapter> {
+  const policy = config.accessPolicy === undefined ? undefined : new SlackAccessPolicy(config.accessPolicy);
   const clients = slackClients(config.botToken, config.appToken, slackApiUrl);
   const auth = await clients.auth.auth.test();
+  const scopes = reportedScopes(auth.response_metadata);
+  if (policy && !scopes) throw new Error('SLACK_ACCESS_POLICY requires reported Slack scope metadata at startup');
   return new SlackAdapter(
     // WebClient satisfies SlackWebLike at runtime; the cast bridges the
     // parameter-width gap (SlackWebLike takes loose records so tests can
@@ -738,7 +746,8 @@ export async function connectSlack(config: SlackAdapterConfig, slackApiUrl?: str
     config.disableDms,
     config.ackReaction,
     // Granted scopes, from the x-oauth-scopes header of auth.test.
-    reportedScopes(auth.response_metadata),
+    scopes,
+    policy,
   );
 }
 
@@ -754,6 +763,9 @@ export interface SlackWebLike {
   conversations: {
     list(args: Record<string, unknown>): Promise<{ channels?: unknown[]; response_metadata?: { next_cursor?: string; scopes?: string[] } }>;
     info(args: { channel: string }): Promise<{ channel?: unknown }>;
+    members?(args: { channel: string; limit: number; cursor?: string }): Promise<{
+      members?: unknown; response_metadata?: { next_cursor?: unknown };
+    }>;
     open(args: { users: string }): Promise<{ channel?: { id?: string } }>;
     history(args: Record<string, unknown>): Promise<{ messages?: unknown[]; has_more?: boolean; response_metadata?: { next_cursor?: string } }>;
     replies(args: Record<string, unknown>): Promise<{ messages?: unknown[]; has_more?: boolean; response_metadata?: { next_cursor?: string } }>;
@@ -771,6 +783,7 @@ export interface SlackWebLike {
     remove(args: { channel: string; timestamp: string; name: string }): Promise<unknown>;
   };
   files: {
+    info?(args: { file: string }): Promise<{ file?: unknown }>;
     getUploadURLExternal(args: { filename: string; length: number }): Promise<{ upload_url?: string; file_id?: string }>;
     completeUploadExternal(args: Record<string, unknown>): Promise<{ files?: SlackUploadedFile[] }>;
     delete(args: { file: string }): Promise<unknown>;
@@ -800,11 +813,13 @@ export class SlackAdapter {
   private channelIds = new Set<string>();
 
   get dmsDisabled(): boolean {
+    if (this.accessPolicy) return !this.accessPolicy.dmsWritable;
     return this.disableDms;
   }
 
   /** Can send_dm succeed at all? A DM ID starts with D. */
   get dmsWritable(): boolean {
+    if (this.accessPolicy) return this.accessPolicy.dmsWritable;
     return !this.disableDms && (!this.sendChannels?.length || this.sendChannels.some((id) => id.startsWith('D')));
   }
 
@@ -827,8 +842,13 @@ export class SlackAdapter {
     /** The bot token's scopes, as auth.test reported them; undefined, or an
      *  empty list, is unknown, so a listing asks for every type. */
     scopes?: string[],
+    private readonly accessPolicy?: SlackAccessPolicy,
   ) {
     this.scopes = reportedScopes({ scopes });
+    if (this.accessPolicy) {
+      const missing = this.accessPolicy.diagnosticScopes().filter((scope) => !this.scopes?.includes(scope));
+      if (missing.length) console.error(`[slack-mcpl] Access policy: unavailable scopes: ${missing.join(', ')}. Affected operations are denied.`);
+    }
     const omitted = this.leftOutTypes();
     if (omitted.length) this.logLeftOut(omitted, '');
     // Register the handler at construction so start() ordering can't race
@@ -893,13 +913,15 @@ export class SlackAdapter {
   // ── Conversations ──
 
   private conversationTypes(): string[] {
+    if (this.accessPolicy) return [...(this.accessPolicy.joinedChannelsReadable ? ['public_channel', 'private_channel'] : []), ...(this.accessPolicy.dmsWritable ? ['im'] : []),
+      ...(this.accessPolicy.groupDmsReadable ? ['mpim'] : [])];
     return this.disableDms ? ['public_channel', 'private_channel'] : Object.keys(TYPE_SCOPE);
   }
 
   /** The enabled types the token's scopes can read: every one while they're
    *  unknown. */
   private readableTypes(): string[] {
-    return this.conversationTypes().filter((type) => !this.scopes || this.scopes.includes(TYPE_SCOPE[type]));
+    return this.conversationTypes().filter((type) => this.scopes ? this.scopes.includes(TYPE_SCOPE[type]) : !this.accessPolicy);
   }
 
   /** The enabled types the token's scopes can't read: none while they're
@@ -951,9 +973,13 @@ export class SlackAdapter {
   async listConversations(includeNonMember = false, waitOut?: SlackWaitOut): Promise<SlackListing> {
     const noneReadable = () => new NoReadableConversations(this.conversationTypes().map((type) => TYPE_SCOPE[type]));
     let types = this.readableTypes();
+    // Unknown scopes cannot authorize a listing or an auth.test probe.
+    if (this.accessPolicy && types.length === 0) return { conversations: [], leftOut: this.conversationTypes() };
     let out: SlackConversationInfo[] = [];
     let cursor: string | undefined;
     let limited = 0;
+    const checked = new Set<string>();
+    const cursors = new Set<string>();
     const names = { waitOut };
     // A listing keeps its types while it pages, so a cursor keeps its meaning,
     // and starts over whenever the types the token can read change. Once
@@ -967,6 +993,8 @@ export class SlackAdapter {
       out = [];
       cursor = undefined;
       limited = 0;
+      checked.clear();
+      cursors.clear();
       return true;
     };
     for (;;) {
@@ -1010,13 +1038,36 @@ export class SlackAdapter {
       limited = 0;
       this.takeScopes(reportedScopes(result.response_metadata));
       if (startOver()) continue;
-      for (const raw of (result.channels ?? []) as SlackApiConversation[]) {
+      for (let raw of (result.channels ?? []) as SlackApiConversation[]) {
+        if (this.accessPolicy) {
+          if (!raw.id || checked.has(raw.id)) continue;
+          // Avoid a metadata request for every unjoined public workspace channel.
+          if (!raw.is_im && !raw.is_mpim && raw.is_member === false) continue;
+          checked.add(raw.id);
+          let admitted: SlackApiConversation | undefined;
+          for (let attempts = 0; ; attempts++) {
+            try { admitted = await this.readAccessConversation(raw.id); break; }
+            catch (err) {
+              const method = failedRequest(err) ?? 'conversations.info';
+              const wait = waitToAskAgain(err, method) ?? (slackRefusal(err) === 'ratelimited'
+                ? { method, seconds: retryAfterSeconds(err) ?? FAILED_WAIT_SECONDS, why: 'limited' as const } : undefined);
+              if (wait && waitOut && attempts < 4) { await waitOut(wait, attempts + 1); continue; }
+              if (wait || err instanceof OutOfCallTime) throw err;
+              this.noteAdmissionFailure('listing');
+              break;
+            }
+          }
+          if (!admitted) continue;
+          raw = admitted;
+        }
         const info = await this.describeConversation(raw, names);
         if (!info) continue;
         if (!includeNonMember && info.kind === 'channel' && !info.isMember) continue;
         out.push(info);
       }
       cursor = result.response_metadata?.next_cursor || undefined;
+      if (cursor && cursors.has(cursor)) throw new Error('Slack conversation listing cursor cycle');
+      if (cursor) cursors.add(cursor);
       // Another listing's answer may have changed the scopes while this page's
       // DM names were looked up, so they're checked once more before it ends.
       if (!cursor && !startOver()) {
@@ -1026,8 +1077,76 @@ export class SlackAdapter {
   }
 
   async getConversationMeta(channelId: string): Promise<SlackConversationInfo | null> {
+    if (this.accessPolicy) return this.describeConversation(await this.readAccessConversation(channelId));
     const info = await this.web.conversations.info({ channel: channelId });
     return this.describeConversation((info.channel ?? {}) as SlackApiConversation);
+  }
+
+  /** Only fresh exact metadata authorizes access; cached labels/kinds never do. */
+  private async readAccessConversation(channelId: string): Promise<SlackApiConversation> {
+    if (!this.accessPolicy) throw new Error('Slack access policy is not configured');
+    if (!/^[CGD][A-Z0-9]+$/.test(channelId)) throw new Error('Invalid Slack conversation ID');
+    if (!Array.isArray(this.scopes)) throw new Error('Slack scope metadata is unavailable');
+    const result = await this.web.conversations.info({ channel: channelId });
+    let conversation = result.channel as SlackApiConversation | undefined;
+    if (conversation?.id === channelId && conversation.is_mpim === true && conversation.is_member === undefined
+        && (conversation.is_im === undefined || conversation.is_im === false) && this.accessPolicy.allowsGroupDm(channelId)) {
+      this.accessPolicy.requireScope(this.scopes, 'mpim:read');
+      if (await this.isGroupMember(channelId)) conversation = { ...conversation, is_member: true };
+    }
+    this.accessPolicy.requireReadable(channelId, conversation, this.scopes);
+    return conversation!;
+  }
+
+  /** A missing info membership flag is not proof. Never cache this evidence. */
+  private async isGroupMember(channel: string): Promise<boolean> {
+    if (!this.botUserId || !this.web.conversations.members) return false;
+    let cursor: string | undefined;
+    const seen = new Set<string>();
+    for (let page = 0; page < 5; page++) {
+      const result = await this.web.conversations.members({ channel, limit: 200, ...(cursor ? { cursor } : {}) });
+      const members = result?.members;
+      const next = result?.response_metadata?.next_cursor;
+      if (!Array.isArray(members) || !Array.from(members).every((id) => typeof id === 'string' && /^[UW][A-Z0-9]+$/.test(id))
+          || (next !== undefined && (typeof next !== 'string' || next.trim() !== next))) return false;
+      if (members.includes(this.botUserId)) return true;
+      if (!next || seen.has(next)) return false;
+      seen.add(next);
+      cursor = next;
+    }
+    return false;
+  }
+
+  private admissionFailures = 0;
+  private nextAdmissionLog = -Infinity;
+  /** At most one aggregate per minute; never log conversation names or content. */
+  private noteAdmissionFailure(kind: 'event' | 'listing'): void {
+    this.admissionFailures++;
+    if (clock.now() < this.nextAdmissionLog) return;
+    console.error(`[slack-mcpl] Access admission denied ${this.admissionFailures} event/listing candidates since the last notice (${kind}); no content delivered for them.`);
+    this.admissionFailures = 0;
+    this.nextAdmissionLog = clock.now() + 60_000;
+  }
+
+  /** One check per call, including cursor continuation, not per history page. */
+  private async requireHistoryConversation(channelId: string, notDone: string): Promise<SlackApiConversation | undefined> {
+    if (!this.accessPolicy) { await this.assertNotDm(channelId, notDone); return; }
+    const conversation = await this.readAccessConversation(channelId);
+    this.accessPolicy.requireScope(this.scopes, conversation.is_mpim ? 'mpim:history' : conversation.is_im ? 'im:history'
+      : conversation.is_private ? 'groups:history' : 'channels:history');
+    return conversation;
+  }
+
+  /** Fresh policy admission and effect scope, or the legacy send list, never both. */
+  private async requireWritableConversation(channelId: string, scope: string, notDone: string): Promise<SlackApiConversation | undefined> {
+    let conversation: SlackApiConversation | undefined;
+    if (this.accessPolicy) {
+      conversation = await this.readAccessConversation(channelId);
+      this.accessPolicy.requireWritable(channelId, conversation, this.scopes, scope);
+      return conversation;
+    }
+    this.assertWritable(channelId, notDone);
+    return conversation;
   }
 
   /** `names.waitOut`, in a listing that runs in the background, waits out a
@@ -1068,7 +1187,8 @@ export class SlackAdapter {
     }
     if (conv.is_mpim) {
       this.dmIds.add(conv.id);
-      return { id: conv.id, kind: 'group_dm', name: conv.name ?? conv.id, isMember: true };
+      return { id: conv.id, kind: 'group_dm', name: conv.name ?? conv.id, isMember: true,
+        ...(this.accessPolicy ? { policyGroupDm: true as const } : {}) };
     }
     // Cached as a channel only when Slack says outright it is neither kind of DM.
     if (conv.is_im === false && conv.is_mpim === false) this.channelIds.add(conv.id);
@@ -1087,6 +1207,7 @@ export class SlackAdapter {
   /** Slack scopes are workspace-wide, so "speak only here" is enforced here:
    *  the one place every write passes through. */
   canWrite(channelId: string): boolean {
+    if (this.accessPolicy) return this.accessPolicy.mayWrite(channelId);
     return !this.sendChannels?.length || this.sendChannels.includes(channelId);
   }
 
@@ -1185,6 +1306,7 @@ export class SlackAdapter {
     if (!(await entry.added)) return this.dropAck(channelId, ts, entry);
     entry.tries++;
     try {
+      if (this.accessPolicy) await this.requireWritableConversation(channelId, 'reactions:write', 'No reaction was removed');
       await this.web.reactions.remove({ channel: channelId, timestamp: ts, name: this.ackReaction! });
       this.dropAck(channelId, ts, entry);
     } catch (err) {
@@ -1207,11 +1329,16 @@ export class SlackAdapter {
     opts: { threadTs?: string } = {},
     notDone = 'Nothing was posted',
   ): Promise<{ messageId: string }> {
-    // The allow-list's refusal first, since calling again can't change it,
-    // then the text's, both before the DM check can ask Slack anything.
-    this.assertWritable(channelId, notDone);
+    // Policy admission precedes text validation. Without policy, preserve the
+    // legacy allow-list, text, then DM-check refusal order.
+    await this.requireWritableConversation(channelId, 'chat:write', notDone);
     assertSendable(text, notDone);
     await this.assertNotDm(channelId, notDone);
+    return this.postValidatedMessage(channelId, text, opts);
+  }
+
+  /** Called only after write admission, including sendDM's exact peer check. */
+  private async postValidatedMessage(channelId: string, text: string, opts: { threadTs?: string } = {}): Promise<{ messageId: string }> {
     const left = (err: unknown): unknown => {
       if (err !== null && typeof err === 'object') {
         postsLeft.set(err, { channelId, ...(opts.threadTs ? { threadTs: opts.threadTs } : {}) });
@@ -1237,6 +1364,37 @@ export class SlackAdapter {
     return { messageId: result.ts };
   }
 
+  /** File argument/provenance mode follows the construction-time policy. */
+  get hasAccessPolicy(): boolean { return this.accessPolicy !== undefined; }
+  /** Provenance originates only in this adapter's upload ticket response, never caller pairs. */
+  private policyUploads = new Map<string, string>();
+
+  private async readAssociatedFile(channelId: string, fileId: string): Promise<Record<string, unknown>> {
+    this.accessPolicy!.requireScope(this.scopes, 'files:read');
+    if (!FILE_ID.test(fileId) || !this.web.files.info) throw new Error('Slack file metadata is unavailable');
+    // A metadata refusal is not a successful deletion: in particular, do not let
+    // files.info's file_not_found be counted as files.delete's already-gone answer.
+    let result: { file?: unknown };
+    try { result = await this.web.files.info({ file: fileId }); }
+    catch (err) { throw new Error('Slack file metadata could not be verified', { cause: err }); }
+    return associatedFile(result?.file, fileId, channelId);
+  }
+
+  /** Fresh admission and file evidence on every call; no raw metadata leaves the adapter. */
+  async resolveFileDownload(channelId: string, fileId: string): Promise<URL> {
+    if (!this.accessPolicy) throw new Error('Slack access policy is not configured');
+    if (!FILE_ID.test(fileId)) throw new Error('Invalid Slack file ID');
+    this.accessPolicy.requireScope(this.scopes, 'files:read');
+    await this.readAccessConversation(channelId);
+    return privateFileUrl(await this.readAssociatedFile(channelId, fileId));
+  }
+
+  private messageFileRefs(files: unknown, channelId: string): PolicyFileRef[] {
+    try { this.accessPolicy!.requireScope(this.scopes, 'files:read'); }
+    catch { return []; }
+    return policyFileRefs(files, channelId);
+  }
+
   /** Upload a file into a conversation, in the three steps of Slack's
    *  working-with-files page: files.getUploadURLExternal gives an upload URL
    *  and the file's ID, the file's bytes go to that URL, and
@@ -1257,7 +1415,7 @@ export class SlackAdapter {
     channelId: string,
     file: { filename: string; data: Buffer; title?: string; comment?: string; threadTs?: string },
   ): Promise<{ fileId: string; shareTs?: string }> {
-    this.assertWritable(channelId, 'Nothing was uploaded');
+    await this.requireWritableConversation(channelId, 'files:write', 'Nothing was uploaded');
     await this.assertNotDm(channelId, 'Nothing was uploaded');
     const target = await this.web.files.getUploadURLExternal({ filename: file.filename, length: file.data.byteLength });
     const url = target.upload_url;
@@ -1272,13 +1430,33 @@ export class SlackAdapter {
       if (err !== null && typeof err === 'object') filesLeft.set(err, { fileId, mayHaveShared });
       return err;
     };
+    if (this.accessPolicy) {
+      if (!FILE_ID.test(fileId)) throw left(new Error('Slack upload returned an invalid file ID'), false);
+      this.policyUploads.set(fileId, channelId);
+      // Fixed insertion-order cap: evicted uploads fail closed at rollback and
+      // may need manual cleanup. Checking an entry does not refresh its age.
+      if (this.policyUploads.size > 1000) {
+        this.policyUploads.delete(this.policyUploads.keys().next().value!);
+      }
+    }
     if (typeof url !== 'string' || !url) {
       throw left(new Error("files.getUploadURLExternal: Slack's answer gave no upload URL, so nothing was uploaded"), false);
     }
     try {
+      if (this.accessPolicy) {
+        const targetUrl = new URL(url);
+        if (targetUrl.protocol !== 'https:' || targetUrl.username || targetUrl.password) throw new Error('Invalid Slack upload URL');
+      }
       await this.postFileBytes(url, file.data);
     } catch (err) {
       throw left(err, false);
+    }
+    // Bytes may have taken time; a revoked destination must not be shared into.
+    if (this.accessPolicy) {
+      try { await this.requireWritableConversation(channelId, 'files:write', 'Nothing was shared'); }
+      catch (err) {
+        throw left(new Error('Nothing was shared: the upload target could not be reauthorized after uploading bytes; the unshared file may remain.', { cause: err }), false);
+      }
     }
     let answer: Awaited<ReturnType<SlackWebLike['files']['completeUploadExternal']>>;
     try {
@@ -1315,6 +1493,7 @@ export class SlackAdapter {
     try {
       const answer = await fetch(url, {
         method: 'POST',
+        ...(this.accessPolicy ? { redirect: 'error' as const } : {}),
         body: data,
         headers: { 'content-type': 'application/octet-stream' },
         signal: timeout,
@@ -1338,6 +1517,8 @@ export class SlackAdapter {
    *  ID, and a user ID (U…) posts into that user's DM. An unknown ID is asked
    *  about until Slack confirms it; if Slack cannot say, it is refused. */
   private async assertNotDm(channelId: string, notDone: string): Promise<void> {
+    // Policy callers have already checked fresh admission; legacy DM switches do not intersect it.
+    if (this.accessPolicy) return;
     if (!this.disableDms || this.channelIds.has(channelId)) return;
     const refuse = (why: string) =>
       new Error(
@@ -1369,7 +1550,7 @@ export class SlackAdapter {
     const toChannels =
       'To reach people, post in a channel with send_message; list_channels marks where this bot may write with ' +
       'writable: true.';
-    if (this.disableDms) {
+    if (!this.accessPolicy && this.disableDms) {
       throw new Error(
         "Nothing was sent: direct messages are turned off on this host, so send_dm can't reach anyone. Calling " +
           `again won't change that; whoever runs this host decides whether this bot may send DMs. ${toChannels}`,
@@ -1377,12 +1558,26 @@ export class SlackAdapter {
     }
     // A DM ID starts with D. If the allow-list names none, no DM can be written,
     // so don't open one just to find that out.
-    if (this.sendChannels?.length && !this.sendChannels.some((id) => id.startsWith('D'))) {
+    if (!this.accessPolicy && this.sendChannels?.length && !this.sendChannels.some((id) => id.startsWith('D'))) {
       throw new Error(
         `Nothing was sent: this bot may write only to ${this.sendChannels.join(', ')}, none of them a direct ` +
           "message, so send_dm can't reach anyone. Calling again won't change that; whoever runs this host decides " +
           `where it may write. ${toChannels}`,
       );
+    }
+    if (this.accessPolicy) {
+      this.accessPolicy.requireDmUser(userId);
+      this.accessPolicy.requireScope(this.scopes, 'im:write');
+      this.accessPolicy.requireScope(this.scopes, 'im:read');
+      this.accessPolicy.requireScope(this.scopes, 'chat:write');
+      assertSendable(text, 'Nothing was sent');
+      const open = await this.web.conversations.open({ users: userId });
+      const channelId = open.channel?.id;
+      if (!channelId) throw new Error(`Could not open a DM with user ${userId}`);
+      const conversation = await this.requireWritableConversation(channelId, 'chat:write', 'Nothing was sent');
+      if (conversation?.is_im !== true || conversation.user !== userId) throw new Error('Opened DM does not match the allowed peer');
+      const { messageId } = await this.postValidatedMessage(channelId, text);
+      return { messageId, channelId };
     }
     // Before the DM is opened, as above.
     assertSendable(text, 'Nothing was sent');
@@ -1400,14 +1595,14 @@ export class SlackAdapter {
 
   async editMessage(channelId: string, ts: string, text: string): Promise<void> {
     // In the order sendMessage's checks run.
-    this.assertWritable(channelId, "The message wasn't changed");
+    await this.requireWritableConversation(channelId, 'chat:write', "The message wasn't changed");
     assertSendable(text, "The message wasn't changed");
     await this.assertNotDm(channelId, "The message wasn't changed");
     await this.web.chat.update({ channel: channelId, ts, text });
   }
 
   async deleteMessage(channelId: string, ts: string): Promise<void> {
-    this.assertWritable(channelId, 'Nothing was deleted');
+    await this.requireWritableConversation(channelId, 'chat:write', 'Nothing was deleted');
     await this.assertNotDm(channelId, 'Nothing was deleted');
     await this.web.chat.delete({ channel: channelId, ts });
   }
@@ -1415,13 +1610,19 @@ export class SlackAdapter {
   /** Deletes a file this bot uploaded, with the same write checks as a
    *  message's delete. */
   async deleteFile(channelId: string, fileId: string): Promise<void> {
-    this.assertWritable(channelId, 'Nothing was deleted');
+    await this.requireWritableConversation(channelId, 'files:write', 'Nothing was deleted');
     await this.assertNotDm(channelId, 'Nothing was deleted');
+    if (this.accessPolicy) {
+      if (this.policyUploads.get(fileId) !== channelId) throw new Error('File deletion requires a recorded upload to this conversation');
+      await this.readAssociatedFile(channelId, fileId);
+    }
+    // Global deletion: other shares are affected too, even when this target is authorized.
     await this.web.files.delete({ file: fileId });
+    this.policyUploads.delete(fileId);
   }
 
   async addReaction(channelId: string, ts: string, emoji: string): Promise<void> {
-    this.assertWritable(channelId, 'No reaction was added');
+    await this.requireWritableConversation(channelId, 'reactions:write', 'No reaction was added');
     await this.assertNotDm(channelId, 'No reaction was added');
     await this.web.reactions.add({ channel: channelId, timestamp: ts, name: reactionName(emoji) });
   }
@@ -1435,7 +1636,7 @@ export class SlackAdapter {
    *  with shapeHistory. */
   async readHistory(channelId: string, args: Record<string, unknown>): Promise<HistoryReadResult> {
     const opts = readOptions(args, 'history', channelId);
-    await this.assertNotDm(channelId, NOTHING_RETURNED);
+    await this.requireHistoryConversation(channelId, NOTHING_RETURNED);
     return readBounded(opts, {
       page: (at, limit) => this.web.conversations.history({
         channel: channelId, limit, inclusive: false,
@@ -1449,7 +1650,7 @@ export class SlackAdapter {
         // to differ from Slack's reference.
         ...(at ? { latest: at } : {}),
       }),
-      shape: (messages) => this.shapeHistory(messages),
+      shape: (messages) => this.shapeHistory(messages, channelId),
       writable: this.canWrite(channelId),
       stopped: readStop,
     });
@@ -1459,13 +1660,13 @@ export class SlackAdapter {
    *  thread from its parent. */
   async readThread(channelId: string, threadTs: string, args: Record<string, unknown>): Promise<HistoryReadResult> {
     const opts = readOptions(args, 'thread', channelId, threadTs);
-    await this.assertNotDm(channelId, NOTHING_RETURNED);
+    await this.requireHistoryConversation(channelId, NOTHING_RETURNED);
     return readBounded(opts, {
       page: (at, limit) => this.web.conversations.replies({
         channel: channelId, ts: threadTs, limit, inclusive: false,
         ...(at ? { oldest: at } : {}), ...(opts.latest ? { latest: opts.latest } : {}),
       }),
-      shape: (messages) => this.shapeHistory(messages),
+      shape: (messages) => this.shapeHistory(messages, channelId),
       writable: this.canWrite(channelId),
       stopped: readStop,
     });
@@ -1478,17 +1679,17 @@ export class SlackAdapter {
     channelId: string,
     opts: { limit?: number; oldest?: string; latest?: string } = {},
   ): Promise<{ messages: HistoryMessage[]; truncated: boolean }> {
-    await this.assertNotDm(channelId, 'Nothing was read');
+    await this.requireHistoryConversation(channelId, 'Nothing was read');
     const { messages, truncated } = await fetchSlackHistory(this.web, {
       channel: channelId,
       ...(opts.oldest !== undefined ? { oldest: opts.oldest } : {}),
       ...(opts.latest !== undefined ? { latest: opts.latest } : {}),
       maxMessages: opts.limit ?? 50,
     });
-    return { messages: await this.shapeHistory(messages), truncated };
+    return { messages: await this.shapeHistory(messages, channelId), truncated };
   }
 
-  private async shapeHistory(messages: SlackHistoryMessage[]): Promise<HistoryMessage[]> {
+  private async shapeHistory(messages: SlackHistoryMessage[], channelId: string): Promise<HistoryMessage[]> {
     // Pre-resolve author + mentioned user names in one pass.
     const ids = new Set<string>();
     for (const msg of messages) {
@@ -1514,7 +1715,8 @@ export class SlackAdapter {
       // Missing means unknown, not none.
       ...(typeof count === 'number' && Number.isSafeInteger(count) && count >= 0 ? { replyCount: count } : {}),
       timestamp: new Date(parseFloat(msg.ts ?? '0') * 1000),
-      attachments: (msg.files ?? []).map((f) => ({
+      // References carry message provenance, not download authority.
+      attachments: this.accessPolicy ? this.messageFileRefs(msg.files, channelId) : (msg.files ?? []).map((f) => ({
         name: f.name ?? 'attachment',
         mimeType: f.mimetype,
         url: f.url_private,
@@ -1526,10 +1728,12 @@ export class SlackAdapter {
   // ── Users ──
 
   async findUsers(query: string, max = 25): Promise<SlackUserMatch[]> {
+    this.accessPolicy?.requireScope(this.scopes, 'users:read');
     const q = query.toLowerCase();
     if (!q) throw new Error('query is required');
     const matches: SlackUserMatch[] = [];
     let cursor: string | undefined;
+    const cursors = new Set<string>();
     do {
       const result = await this.web.users.list({ limit: 200, cursor });
       for (const raw of (result.members ?? []) as Array<{
@@ -1553,6 +1757,8 @@ export class SlackAdapter {
       cursor = matches.length >= max
         ? undefined
         : (result.response_metadata?.next_cursor || undefined);
+      if (cursor && cursors.has(cursor)) throw new Error('Slack directory cursor cycle');
+      if (cursor) cursors.add(cursor);
     } while (cursor);
     return matches;
   }
@@ -1573,10 +1779,17 @@ export class SlackAdapter {
     // (parseFloat(undefined) → NaN → toISOString() throws).
     if (!event.channel || !event.user || !event.ts) return;
 
-    const isDM = event.channel_type === 'im' || event.channel.startsWith('D');
+    let isDM = event.channel_type === 'im' || event.channel.startsWith('D');
+    if (this.accessPolicy) {
+      try {
+        const conversation = await this.requireHistoryConversation(event.channel, 'Nothing was delivered');
+        isDM = conversation?.is_im === true;
+        if (isDM && conversation?.user !== event.user) return;
+      } catch { this.noteAdmissionFailure('event'); return; }
+    }
     // Only what Slack marks as a channel gets through, not merely what isn't marked a DM.
-    if (this.disableDms && event.channel_type !== 'channel' && event.channel_type !== 'group') return;
-    if (isDM && this.dmUsers && this.dmUsers.length > 0 && !this.dmUsers.includes(event.user)) {
+    if (!this.accessPolicy && this.disableDms && event.channel_type !== 'channel' && event.channel_type !== 'group') return;
+    if (!this.accessPolicy && isDM && this.dmUsers && this.dmUsers.length > 0 && !this.dmUsers.includes(event.user)) {
       return; // DM whitelist active and this sender isn't on it
     }
 
@@ -1585,7 +1798,8 @@ export class SlackAdapter {
     await this.resolveUserNames([event.user, ...mentionIds]);
     const authorName = this.userNameCache.get(event.user) ?? event.user;
 
-    const attachments: AttachmentRef[] = (event.files ?? [])
+    // No private URLs in policy references, including ID-only Slack Connect stubs.
+    const attachments: AttachmentRef[] = this.accessPolicy ? this.messageFileRefs(event.files, event.channel) : (event.files ?? [])
       .filter((f): f is { url_private: string; name?: string; mimetype?: string } => !!f.url_private)
       .map((f) => {
         const name = f.name ?? 'attachment';

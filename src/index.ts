@@ -7,17 +7,21 @@
  *   slack-mcpl --tcp <port>      # TCP transport for MCPL hosts
  *
  * Environment:
+ *   SLACK_ACCESS_POLICY - Optional complete JSON policy; replaces legacy DM/write controls.
  *   SLACK_BOT_TOKEN   - Required: bot token (xoxb-…) for Web API calls
  *   SLACK_APP_TOKEN   - Required: app-level token (xapp-…) with connections:write,
  *                       for Socket Mode events (no public webhook URL needed)
- *   SLACK_DM_USERS    - Optional: comma-separated user-ID whitelist for DMs.
+ *   SLACK_DM_USERS    - Ignored under SLACK_ACCESS_POLICY. Otherwise optional:
+ *                       comma-separated user-ID whitelist for DMs.
  *                       When set, DMs from anyone else are dropped.
- *   SLACK_SEND_CHANNELS - Optional: comma-separated conversation-ID allow-list
+ *   SLACK_SEND_CHANNELS - Ignored under SLACK_ACCESS_POLICY. Otherwise optional:
+ *                       comma-separated conversation-ID allow-list
  *                       for writes. When set, writes elsewhere are refused.
  *   SLACK_SUBSCRIBE_MEMBER_CHANNELS - Optional: 'true' delivers ambient messages from
  *                       every channel the bot is a member of; unsubscribe_channel
  *                       then mutes one
- *   SLACK_DISABLE_DMS - Optional: 'true' drops incoming DMs and refuses DM sends
+ *   SLACK_DISABLE_DMS - Ignored under SLACK_ACCESS_POLICY. Otherwise optional:
+ *                       'true' drops incoming DMs and refuses DM sends
  *                       and DM history reads.
  *   SLACK_ACK_REACTION - Optional: emoji name (e.g. eyes) put on a message that
  *                       addresses the bot, removed at the bot's next post in
@@ -42,12 +46,19 @@ async function main(): Promise<void> {
     console.error(startup.refusal);
     process.exit(1);
   }
-  const { useStdio, tcpPort, botToken, appToken, dmUsers, sendChannels, disableDms, subscribeMemberChannels, ackReaction } =
+  const { useStdio, tcpPort, botToken, appToken, dmUsers, sendChannels, disableDms, subscribeMemberChannels, ackReaction,
+    accessPolicy, ignoredLegacySettings } =
     startup.settings;
+
+  if (ignoredLegacySettings?.length) console.error(
+    `[slack-mcpl] SLACK_ACCESS_POLICY is active; ignoring legacy settings: ${ignoredLegacySettings.join(', ')}. ` +
+    'The explicit policy replaces them; remove these variables to avoid confusion.',
+  );
 
   // Connect Slack first: auth.test resolves the bot's identity, then Socket
   // Mode comes up so no events are missed once the host attaches.
-  const slack = await connectSlack({ botToken, appToken, dmUsers, sendChannels, disableDms, ackReaction });
+  const slack = await connectSlack({ botToken, appToken, ackReaction,
+    ...(accessPolicy ? { accessPolicy } : { dmUsers, sendChannels, disableDms }) });
   const server = new SlackMcplServer(slack, {
     subscribeMemberChannels,
   });
@@ -55,7 +66,12 @@ async function main(): Promise<void> {
   console.error(
     `[slack-mcpl] Slack connected as bot ${slack.botUserId} in workspace "${slack.teamName}"`,
   );
-  console.error(
+  if (accessPolicy) console.error(
+    `[slack-mcpl] access policy: explicit; channel writes: ${accessPolicy.writeChannels.join(', ') || 'none'}; ` +
+    `DM peers: ${accessPolicy.dmUsers.length}; group DMs: ${accessPolicy.groupDms?.length ?? 0}. ` +
+    'find_user searches the workspace directory with users:read, outside conversation confinement.',
+  );
+  else console.error(
     `[slack-mcpl] writes: ${sendChannels?.length ? `only ${sendChannels.join(', ')}` : 'anywhere'}; ` +
       `DMs: ${disableDms ? 'off' : 'on'}`,
   );
