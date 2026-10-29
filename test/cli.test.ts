@@ -55,6 +55,7 @@ test('startup reads every setting from the command line and the environment', ()
   };
   assert.deepEqual(startupSettings(['--tcp', '4100'], env), {
     settings: {
+      pagination: { conversations: 1000, users: 1000, backscroll: 100 },
       useStdio: false,
       tcpPort: 4100,
       botToken: 'xoxb-1',

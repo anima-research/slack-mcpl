@@ -325,15 +325,137 @@ Switches take `true`/`false` (also `1`/`0`, `yes`/`no`); any other value stops t
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `SLACK_BOT_TOKEN` | yes | Bot token (`xoxb-…`) for Web API calls |
+| `SLACK_ACCESS_POLICY` | no | Complete JSON conversation/file policy; see below. Absent preserves legacy; empty or invalid stops startup |
 | `SLACK_APP_TOKEN` | yes | App-level token (`xapp-…`, `connections:write`) for Socket Mode |
-| `SLACK_DM_USERS` | no | Comma-separated user-ID whitelist for DMs; others' DMs are dropped |
-| `SLACK_SEND_CHANNELS` | no | Comma-separated conversation-ID allow-list for writes (send, upload, DM, edit, delete, reaction, and the host's `channels/publish`); writes elsewhere are refused before the call reaches Slack. Other conversations are registered `inbound`, `list_channels` shows `writable: false`, and the first message the agent gets from one, addressed or not, carries a read-only note. A mention there still reaches the agent; whether it wakes is the host's policy. `send_dm` is refused before a DM is opened, and not offered, unless the list names a DM. Set but empty is refused at startup; the effective list is logged |
+| `SLACK_DM_USERS` | no | Legacy mode only; ignored when `SLACK_ACCESS_POLICY` is set. Comma-separated user-ID whitelist for DMs; others' DMs are dropped |
+| `SLACK_SEND_CHANNELS` | no | Legacy mode only; ignored when `SLACK_ACCESS_POLICY` is set. Comma-separated conversation-ID allow-list for writes (send, upload, DM, edit, delete, reaction, and the host's `channels/publish`); writes elsewhere are refused before the call reaches Slack. Other conversations are registered `inbound`, `list_channels` shows `writable: false`, and the first message the agent gets from one, addressed or not, carries a read-only note. A mention there still reaches the agent; whether it wakes is the host's policy. `send_dm` is refused before a DM is opened, and not offered, unless the list names a DM. Set but empty is refused at startup; the effective list is logged |
 | `SLACK_SUBSCRIBE_MEMBER_CHANNELS` | no | `true` delivers ambient messages from every channel the bot is a member of, so inviting the bot is the subscription. `unsubscribe_channel` then mutes a conversation (`subscribe_channel` unmutes it) and `list_subscriptions` lists the muted ones. Takes `true` or `false` (also `1`/`0`, `yes`/`no`); unset is off, and any other value, empty included, stops startup |
-| `SLACK_DISABLE_DMS` | no | `true` drops incoming DMs and group DMs, refuses every write to them and both history reads on them, and leaves them out of `conversations.list`, so they are neither listed nor registered; `send_dm` is not offered. Only a conversation Slack confirms as a channel passes: a group DM ID looks like a channel ID, and a user ID posts into that user's DM. An unknown ID is asked about until Slack confirms it. One Slack won't describe is refused; when the question can't be answered just now (a rate limit, a failure on the way or on Slack's side, or too little of the call's time), nothing is written, and the error says why and that the call can be made again. Incoming events pass only when Slack marks them `channel` or `group`. Takes `true` or `false` (also `1`/`0`, `yes`/`no`); unset is off, and any other value, empty included, stops startup |
+| `SLACK_DISABLE_DMS` | no | Legacy mode only; ignored when `SLACK_ACCESS_POLICY` is set. `true` drops incoming DMs and group DMs, refuses every write to them and both history reads on them, and leaves them out of `conversations.list`, so they are neither listed nor registered; `send_dm` is not offered. Only a conversation Slack confirms as a channel passes: a group DM ID looks like a channel ID, and a user ID posts into that user's DM. An unknown ID is asked about until Slack confirms it. One Slack won't describe is refused; when the question can't be answered just now (a rate limit, a failure on the way or on Slack's side, or too little of the call's time), nothing is written, and the error says why and that the call can be made again. Incoming events pass only when Slack marks them `channel` or `group`. Takes `true` or `false` (also `1`/`0`, `yes`/`no`); unset is off, and any other value, empty included, stops startup |
 | `SLACK_ACK_REACTION` | no | Emoji name (e.g. `eyes`) put on a message that addresses the bot. It means "received": it is removed at the bot's next post in that conversation that Slack confirms, after 10 minutes, or at once if the host does not accept the message. A removal that fails in a way that can pass (a rate limit, an HTTP error, a network failure, or Slack's own failure such as `internal_error`) is tried again every minute, up to 5 tries in all; one Slack refuses is dropped. An add that fails isn't tried again. One that may have landed is removed as usual: `already_reacted` says it's there, and Slack's failure while handling it (`internal_error`, `fatal_error`, `service_unavailable`), an HTTP error, an answer not in Slack's form or one the client can't read, or a failure in transit after the request may have reached Slack leaves it unknown. One Slack refused, rate-limited or received only in part (`request_timeout`), one whose connection was never made, and one this server refused itself, such as outside `SLACK_SEND_CHANNELS`, isn't there. On SIGTERM, SIGINT or the host closing stdin, pending reactions are removed (5 s at most); a crash cannot, so removal is best-effort. Slack has no typing indicator for bots |
 | `SLACK_SUBSCRIPTIONS_FILE` | no | JSON file persisting ambient subscriptions across restarts: an array of IDs, or `{subscribed, muted}` while anything is muted (older versions read the object form as empty) |
 | `SLACK_BACKSCROLL_LIMIT` | no | Messages fetched on first interaction with a conversation (default 50) |
+| `SLACK_CONVERSATION_PAGE_LIMIT` | no | Maximum Slack pages per conversation listing (default 1000; range 1–10000). An invalid value stops startup; see [Bounded pagination](#bounded-pagination) |
+| `SLACK_USER_PAGE_LIMIT` | no | Maximum Slack pages per user-directory search (default 1000; range 1–10000). An invalid value stops startup; see [Bounded pagination](#bounded-pagination) |
+| `SLACK_BACKSCROLL_PAGE_LIMIT` | no | Maximum Slack pages per backscroll fetch (default 100; range 1–10000). An invalid value stops startup; see [Bounded pagination](#bounded-pagination) |
 | `SLACK_MCPL_DEBUG_LOG` | no | Absolute path for a diagnostic file log |
+
+### Explicit access policy (opt-in, restart-only)
+
+`SLACK_ACCESS_POLICY` replaces `SLACK_DISABLE_DMS`, `SLACK_DM_USERS` and
+`SLACK_SEND_CHANNELS`, not their intersection. Remove those legacy variables;
+remaining names produce one warning without their values. Only absence selects
+legacy mode. Empty/invalid JSON stops startup; no fallback or hot reload.
+
+```sh
+SLACK_ACCESS_POLICY='{"readJoinedChannels":true,"writeChannels":["CEXAMPLE"],"dmUsers":["UEXAMPLE","WEXAMPLE"]}'
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `readJoinedChannels` | yes | Boolean; read joined ordinary channels |
+| `writeChannels` | yes | Exact uppercase C/G IDs; writable pins, not membership proof |
+| `dmUsers` | yes | Exact uppercase U/W peer IDs; deliberate read **and write** grant |
+| `groupDms` | no | Exact uppercase G IDs; omission/empty denies group DMs |
+
+Empty lists deny; IDs are exact uppercase. Joined ordinary channels require
+fresh membership and enabled joined reads; writes also need a pin. DMs require
+an allowed peer for reads and writes, not a D-ID pin. Groups need explicit
+naming and current membership; writes also need a pin. With joined reads off,
+every write pin must also be named in groupDms. No auto-join.
+
+Scope grants still apply. Unknown scope metadata refuses startup; known
+limited grants diagnose missing capabilities and deny affected operations.
+Policy file reads and rollback deletion need `files:read`. File references
+use channelId/fileId, fresh association and known hosted/snippet/post modes;
+unreadable state offers no download hint, and downloads refuse redirects.
+Deletion needs recorded upload provenance and deletes globally across all
+shares. Restart/1000-entry eviction or incomplete uploads can leave residue.
+
+`find_user` remains workspace-wide with users:read (ID, username, real name,
+display name), outside conversation confinement. Even conversation-deny-all
+does not confine the directory. Independent tool disabling requires #53,
+not implemented on this base. Subscriptions and acknowledgements cannot
+broaden admission, nor does policy sandbox unrelated host filesystem access.
+Fresh admission, including bounded MPIM members fallback, adds API demand;
+throttling/outages can drop acknowledged events, with aggregate diagnostics.
+
+Startup reports `access policy: explicit`, configured write pins, peer/group
+counts and the directory boundary, not legacy “writes: anywhere”. Bad values
+(such as `{}`) produce a one-line setting/value refusal; policy configuration
+is non-secret and may appear in errors. See the [migration guide](docs/access-policy-migration.md)
+for the read/write matrix, scopes, examples, deployment and deliberate rollback.
+
+Example startup notice and malformed-value refusal (stderr):
+
+```text
+[slack-mcpl] access policy: explicit; channel writes: CEXAMPLE; DM peers: 1; group DMs: 0. find_user searches the workspace directory with users:read, outside conversation confinement.
+SLACK_ACCESS_POLICY must be valid JSON, got "{"
+```
+
+Policy-mode background admission makes at most five attempts per candidate
+(four retries); each candidate has its own retry counter. DM-name lookup keeps
+the existing registration give-up behavior: one failed name can exhaust the
+wait budget, then later DMs are labelled immediately without further waits.
+In conversation listings, directory lookups and backscroll, including legacy
+mode, a repeated pagination cursor now fails instead of looping forever.
+
+## Bounded pagination
+
+Listings and directory searches default to **1,000 successful Slack pages** per
+operation; backscroll defaults to **100 pages**, in addition to its existing
+message limit. These bounds apply in both legacy and explicit-policy mode.
+
+| Optional environment variable | Default |
+| --- | ---: |
+| `SLACK_CONVERSATION_PAGE_LIMIT` | 1000 |
+| `SLACK_USER_PAGE_LIMIT` | 1000 |
+| `SLACK_BACKSCROLL_PAGE_LIMIT` | 100 |
+
+Values must be canonical decimal integers from **1 to 10000**. Empty values,
+whitespace, signs, fractions, leading zeros and out-of-range values refuse
+startup before connecting; there is no unlimited sentinel. Library overrides
+use the same range. `SLACK_BACKSCROLL_LIMIT` still controls message count.
+
+Pages include empty responses and responses discarded when token scopes change.
+Membership, access-policy and query filtering happen after page selection: a
+large workspace may have many public channels but few joined channels in the
+portion scanned. A small or empty partial result does not prove absence.
+
+`list_channels` adds an incomplete-listing text block. `find_user` marks partial
+results with `truncated: true`, `stopReason` and a note, including its existing
+25-match stop when unexamined results remain. Backscroll carries
+`truncated="true"` and a visible note when either its page or message limit stops
+it, even if filtering leaves no displayed messages. History/thread tools retain
+`pagination.scanComplete`, their existing stop reasons and continuation cursors.
+
+Background registration announces the eligible subset and logs incomplete
+enumeration, separately from host acceptance. `refresh_channels` marks partial
+scans with `truncated: true` and reports unresolved background enumeration in
+`registration.enumerationIncomplete`; a subsequent complete scan clears that
+status. `visible` counts only eligible conversations observed in that scan.
+A repeated listing or refresh starts over, **not** at a continuation cursor, and
+may repeatedly return the same subset. Review the limits with the operator;
+increasing them cannot guarantee complete discovery or bypass rate limits.
+
+The code requests up to 200 rows/page. At full pages, 1,000 pages offer 200,000
+raw rows; 10,000 offer two million. These are page-count bounds, **not** response
+byte or total-duration bounds. Candidate metadata, retries, response duration
+and rate-limit waits add cost. Existing deadlines, retry/give-up behavior,
+cursor-cycle errors and the fail-closed five-page MPIM membership proof remain
+unchanged. Complete results below all limits retain their API, tool-text and log
+bytes; existing message/match-limit hits now explicitly identify incompleteness.
+
+Slack recommends [100–200 rows per cursor page](https://docs.slack.dev/apis/web-api/pagination/).
+[Conversation listings](https://docs.slack.dev/reference/methods/conversations.list/)
+and [user listings](https://docs.slack.dev/reference/methods/users.list/) are Tier 2
+(20+ calls/minute): 1,000 pages represent roughly 50 minutes at 20/minute, not a
+latency guarantee. [History](https://docs.slack.dev/reference/methods/conversations.history/)
+is normally Tier 3 (50+ calls/minute), with
+[distribution-specific limits](https://docs.slack.dev/changelog/2025/05/29/rate-limit-changes-for-non-marketplace-apps/)
+of 15 objects/request and one request/minute for affected installations. A
+1,000-message backscroll takes five full 200-row pages or 67 full 15-row pages;
+the 100-page default also bounds sparse/empty-page traversal. These defaults are
+server safety choices, not Slack guarantees of workspace coverage.
 
 ## Tests
 
