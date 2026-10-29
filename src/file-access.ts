@@ -8,14 +8,20 @@ const record = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
 const denied = () => new Error('Slack file access could not be verified for this conversation');
 
+/** Shared by hints and authenticated metadata gates; sparse/unknown state cannot authorize bytes. */
+function readableFileState(file: Record<string, unknown>): boolean {
+  return typeof file.mode === 'string' && ['hosted', 'snippet', 'post'].includes(file.mode)
+    && (file.is_external === undefined || file.is_external === false)
+    && (file.deleted === undefined || file.deleted === false)
+    && (file.is_tombstoned === undefined || file.is_tombstoned === false)
+    && (file.file_access === undefined || file.file_access === 'visible');
+}
+
 /** No raw metadata escapes this check, including the names of other shares.
  * Positive association is sufficient for reading, not proof of exclusive sharing. */
 export function associatedFile(value: unknown, fileId: string, channelId: string): Record<string, unknown> {
   if (!FILE_ID.test(fileId) || !CONVERSATION_ID.test(channelId) || !record(value) || value.id !== fileId) throw denied();
-  if ((value.is_external !== undefined && value.is_external !== false)
-      || (value.mode !== undefined && !['hosted', 'snippet', 'post'].includes(String(value.mode)))) throw denied();
-  if (value.deleted === true || value.is_tombstoned === true || value.mode === 'tombstone'
-      || value.mode === 'file_access' || (value.file_access !== undefined && value.file_access !== 'visible')) throw denied();
+  if (!readableFileState(value)) throw denied();
   let associated = false;
   for (const key of ['channels', 'groups', 'ims']) {
     const list = value[key];
@@ -42,8 +48,7 @@ export function associatedFile(value: unknown, fileId: string, channelId: string
 
 /** Only an authenticated files.info answer may supply the URL. Never echo it on failure. */
 export function privateFileUrl(file: Record<string, unknown>): URL {
-  if ((file.is_external !== undefined && file.is_external !== false)
-      || (file.mode !== undefined && !['hosted', 'snippet', 'post'].includes(String(file.mode)))) throw denied();
+  if (!readableFileState(file)) throw denied();
   const raw = Object.hasOwn(file, 'url_private_download') ? file.url_private_download : file.url_private;
   if (typeof raw !== 'string' || !raw) throw denied();
   try { return parseSlackAttachmentUrl(raw); } catch { throw denied(); }
@@ -64,7 +69,7 @@ export function policyFileRefs(files: unknown, channelId: string): PolicyFileRef
   if (!Array.isArray(files)) return [];
   return files.filter(record).map((file) => ({
     channelId,
-    ...((file.file_access === undefined || file.file_access === 'visible') && typeof file.id === 'string' && FILE_ID.test(file.id) ? { fileId: file.id } : {}),
+    ...(readableFileState(file) && typeof file.id === 'string' && FILE_ID.test(file.id) ? { fileId: file.id } : {}),
     name: typeof file.name === 'string' ? file.name : 'attachment',
     ...(typeof file.mimetype === 'string' ? { mimeType: file.mimetype } : {}),
     isImage: typeof file.mimetype === 'string' && file.mimetype.startsWith('image/'),
@@ -74,5 +79,5 @@ export function policyFileRefs(files: unknown, channelId: string): PolicyFileRef
 export function policyFileNote(ref: PolicyFileRef): string {
   return `${nameShown(ref.name)}${ref.mimeType ? ` (${mimeShown(ref.mimeType)})` : ''}` + (ref.fileId
     ? ` — fetch_attachment(${JSON.stringify({ channelId: ref.channelId, fileId: ref.fileId })})`
-    : ' — not downloadable: Slack file ID is missing or access is not visible');
+    : ' — not downloadable: Slack file ID or readable file state is missing');
 }

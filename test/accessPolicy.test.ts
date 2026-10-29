@@ -75,6 +75,10 @@ test('ordinary channel read/write matrix requires joined reads, membership and a
       for (const readJoinedChannels of [false, true]) {
         for (const isMember of [false, true]) {
           for (const pinned of [false, true]) {
+            if (!readJoinedChannels && pinned) {
+              assert.throws(() => new SlackAccessPolicy(config({ readJoinedChannels, writeChannels: [id] })), /readJoinedChannels/);
+              continue;
+            }
             const policy = new SlackAccessPolicy(config({ readJoinedChannels, writeChannels: pinned ? [id] : [] }));
             const metadata = { ...channel(id, isPrivate), is_member: isMember };
             const read = () => policy.requireReadable(id, metadata, scopes);
@@ -200,12 +204,12 @@ test('duplicate IDs are harmless and construction snapshots both lists and the r
 });
 
 test('synchronous write hints are not authorization decisions', () => {
-  const policy = new SlackAccessPolicy(config({ readJoinedChannels: false }));
+  const policy = new SlackAccessPolicy(config());
   assert.equal(policy.dmsWritable, true);
   assert.equal(policy.mayWrite('C1'), true);
   assert.equal(policy.mayWrite('C2'), false);
   assert.equal(policy.mayWrite('D2'), true);
-  assert.throws(() => policy.requireWritable('C1', channel(), scopes, 'chat:write'));
+  assert.throws(() => policy.requireWritable('C1', { ...channel(), is_member: false }, scopes, 'chat:write'));
   assert.throws(() => policy.requireWritable('D2', { ...dm('U2'), id: 'D2' }, scopes, 'chat:write'));
 });
 

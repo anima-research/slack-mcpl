@@ -1,4 +1,4 @@
-/** Internal preparation only: no connector setting installs this policy yet. */
+/** Explicit, restart-only operator policy. */
 export interface SlackAccessPolicyConfig {
   readonly readJoinedChannels: boolean;
   readonly writeChannels: readonly string[];
@@ -40,6 +40,9 @@ export function parseAccessPolicy(value: unknown): SlackAccessPolicyConfig {
   const groups = Array.isArray(groupDms) ? Array.from(groupDms) : groupDms;
   if (typeof readJoinedChannels !== 'boolean' || !idList(channels, CHANNEL_ID)
       || !idList(users, USER_ID) || (keys.has('groupDms') && !idList(groups, GROUP_DM_ID))) throw new Error('Invalid Slack access policy');
+  if (!readJoinedChannels && channels.some((id) => !(groups as string[] | undefined)?.includes(id))) {
+    throw new Error('readJoinedChannels:false requires every writeChannels entry to also be in groupDms');
+  }
   return Object.freeze({ readJoinedChannels, writeChannels: Object.freeze(channels), dmUsers: Object.freeze(users),
     ...(keys.has('groupDms') ? { groupDms: Object.freeze(groups as string[]) } : {}) });
 }
@@ -47,8 +50,7 @@ export function parseAccessPolicy(value: unknown): SlackAccessPolicyConfig {
 /** Pure decisions over supplied metadata: no Slack calls or cached membership.
  * The user directory is outside this policy's confinement: find_user is gated
  * only on users:read and searches the whole workspace directory, not just
- * admitted DM peers or conversation members. Directory filtering remains a
- * decision for the later activation PR. */
+ * admitted DM peers or conversation members. */
 export class SlackAccessPolicy {
   private readonly writeChannels: ReadonlySet<string>;
   private readonly dmUsers: ReadonlySet<string>;
@@ -64,6 +66,22 @@ export class SlackAccessPolicy {
   }
 
   get groupDmsReadable(): boolean { return this.groupDms.size > 0; }
+
+  get joinedChannelsReadable(): boolean { return this.readJoinedChannels; }
+
+  allowsGroupDm(id: string): boolean { return this.groupDms.has(id); }
+
+  /** Diagnostics only; operation gates remain authoritative. */
+  diagnosticScopes(): string[] {
+    return [...new Set([
+      ...(this.readJoinedChannels ? ['channels:read', 'groups:read', 'channels:history', 'groups:history'] : []),
+      ...(this.dmsWritable ? ['im:read', 'im:history', 'im:write'] : []),
+      ...(this.groupDmsReadable ? ['mpim:read', 'mpim:history'] : []),
+      ...([...this.groupDms].some((id) => this.writeChannels.has(id)) ? ['mpim:write'] : []),
+      ...(this.writeChannels.size || this.dmsWritable ? ['chat:write', 'files:write', 'reactions:write'] : []),
+      'files:read', 'users:read',
+    ])];
+  }
 
   get dmsWritable(): boolean { return this.dmUsers.size > 0; }
 

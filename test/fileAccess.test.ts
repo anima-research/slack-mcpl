@@ -7,12 +7,12 @@ import { fileLeftByUpload, SlackAdapter, SlackWebClient, SLACK_CLIENT_OPTIONS, w
 import { fakeSlackApi } from './slackApi.js';
 import { SlackMcplServer } from '../src/server.js';
 import { connectHost, initialize, FULL_GRANT } from './harness.js';
-import { accessTest as test, accessFixture, accessScopes, joined, installPolicy } from './adapterAccessFixture.js';
+import { accessTest as test, accessFixture, accessScopes, joined, fixturePolicy } from './adapterAccessFixture.js';
 
 const url = 'https://files.slack.com/files-pri/T1-F1/canonical.txt';
 async function fixture(t: Parameters<Parameters<typeof test>[1]>[0], options: Parameters<typeof accessFixture>[0] = {}) {
   const f = accessFixture(options);
-  const state = { file: { id: 'F1', channels: ['C1'], url_private: url } as unknown };
+  const state = { file: { mode: 'hosted', id: 'F1', channels: ['C1'], url_private: url } as unknown };
   Object.assign(f.web.files, { info: async () => { f.calls.push({ method: 'fileInfo', args: {} }); return { file: state.file }; } });
   const downloads: Array<{ url: string; init?: RequestInit }> = [];
   const fetchMock = t.mock.method(globalThis, 'fetch', async (input: string | URL | Request, init?: RequestInit) => {
@@ -41,7 +41,7 @@ test('policy canonical file fetch rechecks association and refuses all redirects
   assert.deepEqual(f.methods(), ['info', 'fileInfo']);
   assert.equal(f.downloads[0].url, url);
   assert.equal(f.downloads[0].init?.redirect, 'error');
-  f.fileState.file = { id: 'F1', channels: ['C2'], url_private: url };
+  f.fileState.file = { mode: 'hosted', id: 'F1', channels: ['C2'], url_private: url };
   assert.equal((await f.call({ channelId: 'C1', fileId: 'F1' })).isError, true);
   assert.equal(f.downloads.length, 1);
 });
@@ -68,16 +68,16 @@ for (const association of [
   { shares: { public: { C1: [{ ts: '1.0' }] } } }, { shares: { private: { C1: [{ ts: '1.0' }] } } },
 ]) test(`association accepts exact positive evidence: ${JSON.stringify(association)}`, () => {
   const channel = 'ims' in association ? 'D1' : 'C1';
-  assert.ok(associatedFile({ id: 'F1', ...association }, 'F1', channel));
+  assert.ok(associatedFile({ mode: 'hosted', id: 'F1', ...association }, 'F1', channel));
 });
 
-const invalidFiles: unknown[] = [undefined, null, [], {}, { id: 'F2', channels: ['C1'] },
-  { id: 'F1' }, { id: 'F1', channels: ['C11'] }, { id: 'F1', channels: 'C1' },
-  { id: 'F1', shares: { public: { C1: [] } } }, { id: 'F1', shares: { public: { C1: [null] } } },
-  { id: 'F1', shares: { public: { C1: [{}] } } }, { id: 'F1', shares: [] },
+const invalidFiles: unknown[] = [undefined, null, [], {}, { mode: 'hosted', id: 'F2', channels: ['C1'] },
+  { mode: 'hosted', id: 'F1' }, { mode: 'hosted', id: 'F1', channels: ['C11'] }, { mode: 'hosted', id: 'F1', channels: 'C1' },
+  { mode: 'hosted', id: 'F1', shares: { public: { C1: [] } } }, { mode: 'hosted', id: 'F1', shares: { public: { C1: [null] } } },
+  { mode: 'hosted', id: 'F1', shares: { public: { C1: [{}] } } }, { mode: 'hosted', id: 'F1', shares: [] },
   ...[{ groups: [null] }, { shares: { public: { C1: [{ ts: 'bad' }] } } }, { deleted: true },
     { mode: 'tombstone' }, { file_access: 'check_file_info' }, { is_external: true }, { mode: 'external' },
-  ].map((fields) => ({ id: 'F1', channels: ['C1'], ...fields })),
+  ].map((fields) => ({ mode: 'hosted', id: 'F1', channels: ['C1'], ...fields })),
 ];
 for (const [i, file] of invalidFiles.entries()) test(`file evidence denial ${i} makes no byte request`, async (t) => {
   const f = await fixture(t);
@@ -93,7 +93,7 @@ for (const raw of [undefined, '', 'http://files.slack.com/f', 'https://files.sla
   'https://workspace.slack.com/f', 'https://files.slack.com:8443/f', 'https://secret@files.slack.com/f']) {
   test(`private URL denial: ${raw ?? 'absent'}`, async (t) => {
     const f = await fixture(t);
-    f.fileState.file = { id: 'F1', channels: ['C1'], url_private: raw };
+    f.fileState.file = { mode: 'hosted', id: 'F1', channels: ['C1'], url_private: raw };
     const result = await f.call({ channelId: 'C1', fileId: 'F1' });
     assert.equal(result.isError, true);
     assert.equal(f.downloads.length, 0);
@@ -102,8 +102,8 @@ for (const raw of [undefined, '', 'http://files.slack.com/f', 'https://files.sla
 }
 
 test('private download URL is preferred; invalid preferred URL never falls back', () => {
-  assert.equal(privateFileUrl({ url_private_download: url, url_private: 'https://invalid.example' }).href, url);
-  for (const preferred of ['', null, 1]) assert.throws(() => privateFileUrl({ url_private_download: preferred, url_private: url }));
+  assert.equal(privateFileUrl({ mode: 'hosted', url_private_download: url, url_private: 'https://invalid.example' }).href, url);
+  for (const preferred of ['', null, 1]) assert.throws(() => privateFileUrl({ mode: 'hosted', url_private_download: preferred, url_private: url }));
 });
 
 for (const args of [{ url }, {}, { channelId: 'C1' }, { channelId: 'C1', fileId: 'bad' },
@@ -144,7 +144,7 @@ test('read admission is not a write pin; private channels and admitted DMs work 
   f.state.conversation = { ...joined(), is_private: true };
   assert.notEqual((await f.call({ channelId: 'C1', fileId: 'F1' })).isError, true);
   f.state.conversation = { id: 'D1', is_im: true, user: 'U1' };
-  f.fileState.file = { id: 'F1', ims: ['D1'], url_private: url };
+  f.fileState.file = { mode: 'hosted', id: 'F1', ims: ['D1'], url_private: url };
   assert.notEqual((await f.call({ channelId: 'D1', fileId: 'F1' })).isError, true);
   f.state.conversation.user = 'U2';
   assert.equal((await f.call({ channelId: 'D1', fileId: 'F1' })).isError, true);
@@ -202,11 +202,10 @@ test('production server/client path uses canonical URL and real bounded bytes, n
   const api = await fakeSlackApi();
   t.after(() => api.close());
   api.answerFor('conversations.info', { body: { ok: true, channel: joined() } });
-  api.answerFor('files.info', { body: { ok: true, file: { id: 'F1', channels: ['C1'], url_private: url } } });
+  api.answerFor('files.info', { body: { ok: true, file: { mode: 'hosted', id: 'F1', channels: ['C1'], url_private: url } } });
   const client = new SlackWebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: api.url });
   const adapter = new SlackAdapter(client as unknown as SlackWebLike, { on() {}, async start() {}, async disconnect() {} }, 'UBOT', 'test',
-    undefined, undefined, false, undefined, accessScopes);
-  installPolicy(adapter);
+    undefined, undefined, false, undefined, accessScopes, fixturePolicy());
   const h = connectHost(new SlackMcplServer(adapter));
   t.after(() => h.close());
   await initialize(h, false);
@@ -222,7 +221,7 @@ test('production server/client path uses canonical URL and real bounded bytes, n
   assert.match((await call()).content[0].text, /actual bytes/);
   assert.deepEqual(api.calls, ['conversations.info', 'files.info']);
   assert.equal(api.sent[1].get('file'), 'F1');
-  api.answerFor('files.info', { body: { ok: true, file: { id: 'F1', channels: ['COTHER'], url_private: url } } });
+  api.answerFor('files.info', { body: { ok: true, file: { mode: 'hosted', id: 'F1', channels: ['COTHER'], url_private: url } } });
   assert.equal((await call()).isError, true);
   assert.equal(gets, 1);
   for (const answer of [{ body: { ok: false, error: 'missing_scope' } }, { body: { ok: false, error: 'file_not_found' } },
@@ -250,8 +249,7 @@ test('policy fetch retains streaming cap and exhausted-call start rule', async (
   assert.equal((await f.call({ channelId: 'C1', fileId: 'F1' })).isError, true);
   const client = new SlackWebClient('xoxb-test', SLACK_CLIENT_OPTIONS);
   const adapter = new SlackAdapter(client as unknown as SlackWebLike, { on() {}, async start() {}, async disconnect() {} }, 'UBOT', 'test',
-    undefined, undefined, false, undefined, accessScopes);
-  installPolicy(adapter);
+    undefined, undefined, false, undefined, accessScopes, fixturePolicy());
   await assert.rejects(withCallTime(Date.now() - CALL_SECONDS * 1000, () => adapter.resolveFileDownload('C1', 'F1')), /out of this call/);
 });
 
@@ -260,12 +258,12 @@ test('policy deletion requires upload provenance plus current matching associate
   f.state.uploadUrl = url;
   await f.adapter.uploadFile('C1', { filename: 'x', data: Buffer.from('x') });
   f.calls.length = 0;
-  for (const file of [{ id: 'F1', channels: [] }, { id: 'F2', channels: ['C1'] }, { id: 'F1', channels: ['COTHER'] }]) {
+  for (const file of [{ mode: 'hosted', id: 'F1', channels: [] }, { mode: 'hosted', id: 'F2', channels: ['C1'] }, { mode: 'hosted', id: 'F1', channels: ['COTHER'] }]) {
     f.fileState.file = file;
     await assert.rejects(f.adapter.deleteFile('C1', 'F1'));
   }
   assert.ok(!f.methods().includes('deleteFile'));
-  f.fileState.file = { id: 'F1', channels: ['C1', 'COTHER'] };
+  f.fileState.file = { mode: 'hosted', id: 'F1', channels: ['C1', 'COTHER'] };
   await f.adapter.deleteFile('C1', 'F1');
   assert.deepEqual(f.methods().slice(-3), ['info', 'fileInfo', 'deleteFile']);
   await assert.rejects(f.adapter.deleteFile('C1', 'F1'), /recorded upload/);
@@ -275,7 +273,7 @@ test('upload-to-rollback through server keeps deletion but refuses an unshared o
   const f = accessFixture();
   f.state.uploadUrl = url;
   let associated = true;
-  f.web.files.info = async () => ({ file: { id: 'F1', channels: associated ? ['C1'] : [] } });
+  f.web.files.info = async () => ({ file: { mode: 'hosted', id: 'F1', channels: associated ? ['C1'] : [] } });
   t.mock.method(globalThis, 'fetch', async () => new Response('OK'));
   const h = connectHost(new SlackMcplServer(f.adapter));
   t.after(() => h.close());
@@ -307,7 +305,7 @@ for (const scope of ['files:read', 'files:write']) test(`delete requires ${scope
 test('metadata file_not_found is not counted as deletion; sharing-message cleanup is independent', async (t) => {
   const f = accessFixture();
   f.state.uploadUrl = url;
-  f.web.files.completeUploadExternal = async () => ({ files: [{ id: 'F1', shares: { public: { C1: [{ ts: '5.0' }] } } }] });
+  f.web.files.completeUploadExternal = async () => ({ files: [{ mode: 'hosted', id: 'F1', shares: { public: { C1: [{ ts: '5.0' }] } } }] });
   f.web.files.info = async () => { throw Object.assign(new Error('no file'), { code: 'slack_webapi_platform_error', data: { error: 'file_not_found' } }); };
   t.mock.method(globalThis, 'fetch', async () => new Response('OK'));
   const h = connectHost(new SlackMcplServer(f.adapter));
@@ -357,7 +355,7 @@ for (const restricted of [{ mode: 'tombstone' }, { file_access: 'check_file_info
     const f = await fixture(t);
     f.state.uploadUrl = url;
     await f.adapter.uploadFile('C1', { filename: 'x', data: Buffer.from('x') });
-    f.fileState.file = { id: 'F1', channels: ['C1'], ...restricted };
+    f.fileState.file = { mode: 'hosted', id: 'F1', channels: ['C1'], ...restricted };
     f.calls.length = 0;
     await assert.rejects(f.adapter.deleteFile('C1', 'F1'));
     assert.deepEqual(f.methods(), ['info', 'fileInfo']);
@@ -386,16 +384,16 @@ test('upload provenance evicts the oldest insertion at 1000, not recently checke
     id = `F${i}`;
     await f.adapter.uploadFile('C1', { filename: 'x', data: Buffer.from('x') });
     if (i === 999) {
-      f.fileState.file = { id: 'F0', channels: [] };
+      f.fileState.file = { mode: 'hosted', id: 'F0', channels: [] };
       await assert.rejects(f.adapter.deleteFile('C1', 'F0'));
     }
   }
   f.calls.length = 0;
-  f.fileState.file = { id: 'F0', channels: ['C1'] };
+  f.fileState.file = { mode: 'hosted', id: 'F0', channels: ['C1'] };
   await assert.rejects(f.adapter.deleteFile('C1', 'F0'), /recorded upload/);
   assert.deepEqual(f.methods(), ['info']);
   for (const retained of ['F1', 'F1000']) {
-    f.fileState.file = { id: retained, channels: ['C1'] };
+    f.fileState.file = { mode: 'hosted', id: retained, channels: ['C1'] };
     await f.adapter.deleteFile('C1', retained);
   }
   assert.equal(f.methods().filter((m) => m === 'deleteFile').length, 2);
@@ -411,11 +409,11 @@ test('policy tool description retains the inline return shapes', async (t) => {
 for (const scenario of ['admitted', 'unrelated', 'unnamed', 'missing mpim:read'] as const) {
   test(`real group file download inherits admission: ${scenario}`, async (t) => {
     const f = await fixture(t, {
-      config: { readJoinedChannels: false, writeChannels: ['G1'], dmUsers: [], groupDms: scenario === 'unnamed' ? [] : ['G1'] },
+      config: { readJoinedChannels: false, writeChannels: [], dmUsers: [], groupDms: scenario === 'unnamed' ? [] : ['G1'] },
       scopes: [...accessScopes, ...(scenario === 'missing mpim:read' ? [] : ['mpim:read'])],
     });
     f.state.conversation = { ...joined('G1'), is_mpim: true, is_private: true };
-    f.fileState.file = { id: 'F1', groups: [scenario === 'unrelated' ? 'G2' : 'G1'], url_private: url };
+    f.fileState.file = { mode: 'hosted', id: 'F1', groups: [scenario === 'unrelated' ? 'G2' : 'G1'], url_private: url };
     const result = await f.call({ channelId: 'G1', fileId: 'F1' });
     if (scenario === 'admitted') {
       assert.notEqual(result.isError, true);

@@ -6,10 +6,10 @@ import { FULL_GRANT, connectHost, initialize, until } from './harness.js';
 import { accessTest as test, accessFixture, accessScopes, joined } from './adapterAccessFixture.js';
 
 const files = [
-  { id: 'F1', name: 'note.txt', mimetype: 'text/plain', url_private: 'https://files.slack.com/do-not-use' },
-  { id: 'FSTUB', file_access: 'check_file_info' },
+  { mode: 'hosted', id: 'F1', name: 'note.txt', mimetype: 'text/plain', url_private: 'https://files.slack.com/do-not-use' },
+  { mode: 'hosted', id: 'FSTUB', file_access: 'check_file_info' },
   { name: 'FINVENTED.txt', url_private: 'https://files.slack.com/no-id' },
-  { id: 'FIMAGE', name: 'picture.png', mimetype: 'image/png' },
+  { mode: 'hosted', id: 'FIMAGE', name: 'picture.png', mimetype: 'image/png' },
 ];
 const message = { ts: '1.0', user: 'U1', text: 'prior', files };
 
@@ -102,12 +102,12 @@ test('legacy references retain URLs and no new file metadata requests', async ()
 
 test('explicit non-visible file access never offers a download ID or lookup', () => {
   for (const file_access of ['check_file_info', 'hidden', '', null, false]) {
-    const [ref] = policyFileRefs([{ id: 'F1', file_access }], 'C1');
+    const [ref] = policyFileRefs([{ mode: 'hosted', id: 'F1', file_access }], 'C1');
     assert.equal(ref.fileId, undefined);
     assert.match(policyFileNote(ref), /not downloadable/);
     assert.ok(!policyFileNote(ref).includes('fetch_attachment'));
   }
-  for (const file of [{ id: 'F1' }, { id: 'F1', file_access: 'visible' }]) {
+  for (const file of [{ mode: 'hosted', id: 'F1' }, { mode: 'hosted', id: 'F1', file_access: 'visible' }]) {
     assert.equal(policyFileRefs([file], 'C1')[0].fileId, 'F1');
   }
 });
