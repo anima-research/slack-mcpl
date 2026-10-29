@@ -37,12 +37,17 @@ that grant arrives; plain MCP tool calls are unaffected.
   status because publish replies top-level. The server clears it on
   an `op: 'stop'` extension, a confirmed post in that conversation, peer
   disconnect or shutdown (best-effort, within the existing 5-second shutdown
-  budget). `ChannelsTypingParams` declares only `{channelId}`, not `op`:
+  budget). A stop forgets the thread the host's last typing start was for; if the
+  conversation's latest addressed message was taken after that start, it
+  stays pending and shows at the next start. `ChannelsTypingParams` declares only `{channelId}`, not `op`:
   hosts sending only that shape clear via post, disconnect, shutdown or expiry.
   Successful statuses refresh at most once a minute; Slack expires them
   after 2 minutes. Lasting API refusals disable status in that conversation
-  until the peer changes; transient failures may retry on the next refresh.
-  A failed clear is not retried, so that status stays until Slack expires it.
+  until the peer changes, except `invalid_thread_ts`, which disables it in
+  that thread only; transient failures may retry on the next refresh.
+  A failed clear is not retried: that status stays until Slack expires it
+  or the bot replies in that thread, unless a later status there replaces
+  it.
   This uses `assistant.threads.setStatus` with `chat:write`;
   Slack recommends migrating to
   [`agents.sessions.setStatus`](https://docs.slack.dev/reference/methods/agents.sessions.setStatus/).
@@ -72,7 +77,8 @@ Feature sets: `slack.messaging` (rollback-capable; `send_message`,
 plus push events and `channels/incoming` delivery),
 `slack.history` (`fetch_history`, `fetch_thread`, `fetch_attachment`),
 `slack.subscriptions` (`subscribe_channel`, `unsubscribe_channel`,
-`list_subscriptions`). `list_channels`, `refresh_channels` and `find_user`
+`list_subscriptions`), `slack.typing` (`channels/typing` as a thread status;
+see **Typing** above). `list_channels`, `refresh_channels` and `find_user`
 belong to no feature set, so disabling a feature set does not switch them
 off. In MCPL mode they still need the `tools` grant: every tool is refused
 until the host has granted `tools`. Channel registration and

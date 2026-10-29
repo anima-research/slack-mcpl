@@ -223,9 +223,7 @@ export class SlackMcplServer {
    *  here — a publish goes into the last incoming message's thread, or
    *  top-level when the conversation isn't threaded. */
   private lastIncomingThreadTs = new Map<string, string | undefined>();
-  /** Accepted addressed threads still waiting for an answer on this peer.
-   *  Top-level messages are excluded: publish replies outside their thread. */
-  private lastIncomingRoot = new Map<string, string>();
+  private lastIncomingRoot = new Map<string, { ts: string; started: boolean }>();
 
   /** The conversation this peer was last sent a message from, or the bot last
    *  posted in: an incoming message from any other conversation names its
@@ -330,8 +328,6 @@ export class SlackMcplServer {
       // client isn't left on a socket nobody serves.
       conn.close();
       this.lastIncomingRoot.clear();
-      // Queue the old peer's clear before any new peer can enqueue a set,
-      // without holding the transport's single-client slot on Slack I/O.
       void this.slack.resetThreadStatuses();
     }
   }
@@ -585,7 +581,6 @@ export class SlackMcplServer {
       case method.CHANNELS_OUTGOING_COMPLETE:
         break;
 
-      // Only accepted addressed threads still waiting for an answer.
       case method.CHANNELS_TYPING:
       case 'notifications/typing': {
         if (!this.mcplEnabled || !this.grant.isFeatureSetActive(TYPING_FEATURE_SET)) break;
@@ -593,8 +588,13 @@ export class SlackMcplServer {
         if (typeof p.channelId !== 'string') break;
         const id = parseMcplChannelId(p.channelId)?.conversationId ?? p.channelId;
         const root = this.lastIncomingRoot.get(id);
-        if (p.op === 'stop') this.lastIncomingRoot.delete(id);
-        void this.slack.setThreadStatus(id, p.op === 'stop' ? undefined : root);
+        if (p.op === 'stop') {
+          if (root?.started) this.lastIncomingRoot.delete(id);
+          void this.slack.setThreadStatus(id, undefined);
+          break;
+        }
+        if (root) root.started = true;
+        void this.slack.setThreadStatus(id, root?.ts);
         break;
       }
 
@@ -1807,7 +1807,7 @@ export class SlackMcplServer {
       if (this.conn !== conn) return;
       this.lastIncomingThreadTs.set(msg.channelId, msg.threadTs);
       if (isAddressed) {
-        if (msg.threadTs) this.lastIncomingRoot.set(msg.channelId, msg.threadTs);
+        if (msg.threadTs) this.lastIncomingRoot.set(msg.channelId, { ts: msg.threadTs, started: false });
         else this.lastIncomingRoot.delete(msg.channelId);
       }
       this.forwardedWatermark.set(msg.channelId, msg.id);

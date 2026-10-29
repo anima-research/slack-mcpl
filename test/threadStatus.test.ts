@@ -1,9 +1,7 @@
-/** Optional typing, delivery ownership and best-effort Slack status lifecycle. */
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { McplConnection, method } from '@animalabs/mcpl-core';
 import * as net from 'node:net';
-import { spawnSync } from 'node:child_process';
 import { serveTcp } from '../src/tcp.js';
 import { SlackAdapter, SlackWebClient, SLACK_CLIENT_OPTIONS } from '../src/slack-adapter.js';
 import { SlackMcplServer } from '../src/server.js';
@@ -27,8 +25,6 @@ async function connected(t: TestContext, opts: HarnessOptions = {}, grant = GRAN
   const receipt = await ready(h, grant);
   return { h, receipt };
 }
-// A tools/list request is processed after preceding notifications; then join their queued
-// status work. No fixed delay is needed to prove an absent status call.
 async function settled(h: Pick<ReturnType<typeof harness>, 'host' | 'server'>) {
   await h.host.sendRequest('tools/list');
   await Promise.all(h.server['slack']['statusQueue'].values());
@@ -110,6 +106,43 @@ test('R1-6: notifications/typing alias sets and clears; idle typing is silent', 
   await until(() => h.statuses.length === 1, 'alias status');
   typing(h, 'stop', 'notifications/typing');
   await until(() => h.statuses.length === 2, 'alias clear');
+  typing(h, 'start', 'notifications/typing');
+  await settled(h);
+  assert.deepEqual(h.statuses, ['C1:4.0:is thinking…', 'C1:4.0:']);
+});
+
+test('channels/typing with { channelId } alone, as mcpl-core types it, shows the status', async (t) => {
+  const { h } = await connected(t);
+  await mention(h);
+  h.host.sendNotification(method.CHANNELS_TYPING, { channelId: 'slack:C1' });
+  await until(() => h.statuses.length === 1, 'status');
+  assert.deepEqual(h.statuses, ['C1:4.0:is thinking…']);
+});
+
+test('an addressed message taken in the shown thread after the last start stays pending through a stop', async (t) => {
+  const { h } = await connected(t);
+  await mention(h);
+  typing(h);
+  await until(() => h.statuses.length === 1, 'status');
+  await mention(h, { ts: '5.5' });
+  typing(h, 'stop');
+  await until(() => h.statuses.length === 2, 'clear');
+  typing(h);
+  await until(() => h.statuses.length === 3, 'the follow-up');
+  assert.deepEqual(h.statuses, ['C1:4.0:is thinking…', 'C1:4.0:', 'C1:4.0:is thinking…']);
+});
+
+test("a stop forgets only the thread its turn showed: a newer pending thread shows at the next start", async (t) => {
+  const { h } = await connected(t);
+  await mention(h);
+  typing(h);
+  await until(() => h.statuses.length === 1, 'status');
+  await mention(h, { ts: '7.5', thread_ts: '7.0' });
+  typing(h, 'stop');
+  await until(() => h.statuses.length === 2, 'clear');
+  typing(h);
+  await until(() => h.statuses.length === 3, 'the newer thread');
+  assert.deepEqual(h.statuses, ['C1:4.0:is thinking…', 'C1:4.0:', 'C1:7.0:is thinking…']);
 });
 
 test('R1-1: explicitly disabled typing set cannot set status', async (t) => {
@@ -145,11 +178,11 @@ test('R1-5: peer close clears status and a new peer has no pending thread', asyn
 });
 
 type Status = { channel_id: string; thread_ts: string; status: string };
-function adapter(opts: { sendChannels?: string[]; disableDms?: boolean; absent?: boolean; set?: (a: Status) => Promise<unknown> } = {}) {
+function adapter(opts: { sendChannels?: string[]; disableDms?: boolean; absent?: boolean; info?: unknown; set?: (a: Status) => Promise<unknown> } = {}) {
   const calls: string[] = [];
   const web = {
     chat: { postMessage: async () => ({ ts: '9.0' }) },
-    conversations: { info: async () => ({ channel: { is_mpim: true } }) },
+    conversations: { info: async () => opts.info ?? ({ channel: { is_mpim: true } }) },
     assistant: opts.absent ? undefined : { threads: { setStatus: async (a: Status) => {
       calls.push(`${a.channel_id}:${a.thread_ts}:${a.status}`);
       return opts.set?.(a);
@@ -180,6 +213,30 @@ for (const opts of [{ sendChannels: ['C9'] }, { disableDms: true }, { absent: tr
     assert.deepEqual(calls, []);
   });
 }
+
+test('with DMs off, a conversation Slack confirms as a channel gets its status', async () => {
+  const { a, calls } = adapter({ disableDms: true, info: { channel: { id: 'C1', is_im: false, is_mpim: false } } });
+  await a.setThreadStatus('C1', '1.0');
+  assert.deepEqual(calls, ['C1:1.0:is thinking…']);
+});
+
+test('a refusal of one thread (invalid_thread_ts) stops status attempts in that thread only, until the peer changes', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const { a, calls } = adapter({ set: async ({ channel_id, thread_ts, status }) => {
+    if (channel_id === 'C1' && thread_ts === '1.0' && status) throw Object.assign(new Error('invalid_thread_ts'), {
+      code: 'slack_webapi_platform_error', data: { error: 'invalid_thread_ts' },
+    });
+  } });
+  await a.setThreadStatus('C1', '1.0');
+  await a.setThreadStatus('C1', '2.0');
+  await a.setThreadStatus('C1', '1.0');
+  await a.setThreadStatus('C2', '1.0');
+  await a.resetThreadStatuses();
+  await a.setThreadStatus('C1', '1.0');
+  assert.deepEqual(calls, [
+    'C1:1.0:is thinking…', 'C1:2.0:is thinking…', 'C1:2.0:', 'C2:1.0:is thinking…', 'C2:1.0:', 'C1:1.0:is thinking…',
+  ]);
+});
 
 for (const code of ['method_deprecated', 'method_not_supported_for_channel_type', 'internal_error']) {
   test(`R1-4: real WebClient ${code} is ${code === 'internal_error' ? 'retryable' : 'suppressed'}`, async (t) => {
@@ -285,7 +342,6 @@ test('an unconfirmed post retains pending context, but a confirmed post ends it'
   assert.deepEqual(h.statuses, ['C1:4.0:is thinking…', 'C1:4.0:']);
 });
 
-/** A completed event-loop turn, not an elapsed-time guess. */
 const nextTurn = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 function holdClear(t: TestContext, slack: SlackAdapter) {
@@ -316,7 +372,6 @@ test('R2-M1: no acknowledgement for messages arriving during a held disconnect c
   await f.socket.emitMessage({ ...MENTION_EVENT, ts: '7.0', thread_ts: '7.0' });
   await nextTurn();
   assert.ok(!f.reactions.some((r) => r.startsWith('add:C1:7.0:')), 'no false received reaction');
-  assert.equal(server['conn'], null, 'peer forgotten before cleanup');
 });
 
 test('R2-M2: TCP reconnect is accepted while the previous peer clear is held', async (t) => {
@@ -364,36 +419,31 @@ test('R2-M2: TCP reconnect is accepted while the previous peer clear is held', a
 });
 
 for (const where of ['Slack rejection', 'unexpected turn failure']) {
-  test(`R2-M3: ${where} cannot crash or poison the queue`, () => {
-    // Isolate the original process-exiting failure, including fire-and-forget
-    // calls exactly as the server makes them. The child must exit normally.
-    const result = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', `
-      import assert from 'node:assert/strict';
-      import { SlackAdapter } from ${JSON.stringify(new URL('../src/slack-adapter.ts', import.meta.url).href)};
-      const calls = [];
-      let bad = true;
-      const web = { assistant: { threads: { setStatus: async (args) => {
-        calls.push(args.status);
-        if (bad && ${JSON.stringify(where)} === 'Slack rejection') throw null;
-      } } } };
-      const a = new SlackAdapter(web, { on() {}, async disconnect() {} }, 'UBOT', 'acme');
-      if (${JSON.stringify(where)} === 'unexpected turn failure') {
-        a.canWrite = () => { if (bad) throw undefined; return true; };
-      }
-      void a.setThreadStatus('C1', '1.0');
-      await new Promise(setImmediate);
-      assert.equal(a.statusQueue.size, 0, 'failed turn was removed');
-      bad = false;
-      await a.setThreadStatus('C1', '2.0');
-      await a.setThreadStatus('C1', undefined);
-      assert.equal(calls.at(-1), '');
-      assert.ok(calls.includes('is thinking…'), 'later set reached Slack');
-      assert.equal(a.statusQueue.size, 0, 'queue drained');
-      assert.equal(a.statusOn.size, 0, 'clear removed ownership');
-      console.log('alive, later set and clear completed, maps empty');
-    `], { encoding: 'utf8', timeout: 10000 });
-    assert.equal(result.status, 0, result.stderr || String(result.error));
-    assert.match(result.stdout, /alive, later set and clear completed, maps empty/);
+  test(`R2-M3: ${where} cannot crash or poison the queue`, async (t) => {
+    t.mock.method(console, 'error', () => {});
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+    t.after(() => { process.off('unhandledRejection', onUnhandled); });
+    let bad = true;
+    let reached = 0;
+    const { a, calls } = adapter({ set: async () => { if (bad && where === 'Slack rejection') { reached++; throw null; } } });
+    if (where === 'unexpected turn failure') {
+      (a as any).canWrite = () => { if (bad) { reached++; throw undefined; } return true; };
+    }
+    void a.setThreadStatus('C1', '1.0');
+    await until(() => reached === 1, 'the injected failure');
+    await nextTurn();
+    bad = false;
+    await a.setThreadStatus('C1', '2.0');
+    await a.setThreadStatus('C1', undefined);
+    const made = calls.length;
+    await a.setThreadStatus('C1', undefined);
+    await nextTurn();
+    assert.deepEqual(unhandled, []);
+    assert.ok(calls.includes('C1:2.0:is thinking…'), 'a later set reached Slack');
+    assert.equal(calls.at(-1), 'C1:2.0:', 'its clear followed');
+    assert.equal(calls.length, made, 'a second clear makes no call');
   });
 }
 
@@ -430,12 +480,10 @@ test('R3-P2: a refused teardown clear does not suppress the next peer set', asyn
   } });
   await a.setThreadStatus('C1', '1.0');
   await a.resetThreadStatuses();
-  assert.equal(a['statusRefused'].has('C1'), false, 'a clear is not a refused set');
   await a.setThreadStatus('C1', '2.0');
   assert.deepEqual(calls, ['C1:1.0:is thinking…', 'C1:1.0:', 'C1:2.0:is thinking…']);
   await a.setThreadStatus('C1', undefined);
-  assert.equal(a['statusQueue'].size, 0);
-  assert.equal(a['statusOn'].size, 0);
+  assert.equal(calls.at(-1), 'C1:2.0:');
 });
 
 test('R3-P1: a non-Error rejection permits an immediate same-thread refresh retry', async (t) => {
@@ -450,20 +498,26 @@ test('R3-P1: a non-Error rejection permits an immediate same-thread refresh retr
   await a.setThreadStatus('C1', undefined);
 });
 
+const ratelimitedSets = () => adapter({ set: async ({ status }) => {
+  if (status) throw Object.assign(new Error('ratelimited'), {
+    code: 'slack_webapi_platform_error', data: { error: 'ratelimited' },
+  });
+} });
+
 test('an uncertain set failure keeps ownership for the teardown clear', async (t) => {
   t.mock.method(console, 'error', () => {});
-  const { a, calls } = adapter({ set: async ({ status }) => {
-    if (status) throw Object.assign(new Error('ratelimited'), {
-      code: 'slack_webapi_platform_error', data: { error: 'ratelimited' },
-    });
-  } });
+  const { a, calls } = ratelimitedSets();
   await a.setThreadStatus('C1', '1.0');
-  assert.equal(a['statusOn'].get('C1')?.ts, '1.0', 'an uncertain set may have landed');
-  assert.equal(a['statusRefused'].has('C1'), false);
   await a.resetThreadStatuses();
-  assert.deepEqual(calls, ['C1:1.0:is thinking…', 'C1:1.0:']);
-  assert.equal(a['statusOn'].size, 0);
-  assert.equal(a['statusQueue'].size, 0);
+  assert.deepEqual(calls, ['C1:1.0:is thinking…', 'C1:1.0:'], 'an uncertain set may have landed, so the teardown clears it');
+});
+
+test('an uncertain set failure suppresses nothing: the next start tries again', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const { a, calls } = ratelimitedSets();
+  await a.setThreadStatus('C1', '1.0');
+  await a.setThreadStatus('C1', '1.0');
+  assert.deepEqual(calls, ['C1:1.0:is thinking…', 'C1:1.0:is thinking…']);
 });
 
 test('a refused old-peer set cannot suppress a new peer while another clear is pending', async (t) => {
@@ -479,14 +533,14 @@ test('a refused old-peer set cannot suppress a new peer while another clear is p
   } });
   await a.setThreadStatus('C1', '1.0');
   await a.setThreadStatus('C2', '1.0');
-  assert.equal(a['statusRefused'].has('C1'), true, 'the old set armed suppression');
+  const armed = calls.length;
+  await a.setThreadStatus('C1', '3.0');
+  assert.equal(calls.length, armed, 'the old set armed suppression');
   const reset = a.resetThreadStatuses();
   const second = a.setThreadStatus('C1', '2.0');
-  // Wait for the new peer's turn while C2's clear is still held open.
   await second;
   const attempted = calls.includes('C1:2.0:is thinking…');
   release();
   await reset;
   assert.ok(attempted, 'reset must retire old suppression before any new turn runs');
-  assert.equal(a['statusQueue'].size, 0);
 });

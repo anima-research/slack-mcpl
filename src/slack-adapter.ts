@@ -53,6 +53,7 @@ const MAY_HAVE_LANDED = new Set(['already_reacted', 'internal_error', 'fatal_err
  *  for 2 minutes, so it is set again only after this. */
 const STATUS_REFRESH_MS = 60 * 1000;
 const STATUS_TEXT = 'is thinking…';
+const STATUS_THREAD_REFUSALS = new Set(['invalid_thread_ts']);
 
 /** Slack's code, when Slack refused the call; undefined for any other error,
  *  an answer with no code in Slack's form (SLACK_CODE) included. */
@@ -776,7 +777,6 @@ export interface SlackWebLike {
     add(args: { channel: string; timestamp: string; name: string }): Promise<unknown>;
     remove(args: { channel: string; timestamp: string; name: string }): Promise<unknown>;
   };
-  /** Optional so test fakes need not carry it; the real WebClient has it. */
   assistant?: {
     threads: { setStatus(args: { channel_id: string; thread_ts: string; status: string }): Promise<unknown> };
   };
@@ -1137,13 +1137,14 @@ export class SlackAdapter {
     if (pending.size === 0) this.ackPending.delete(channelId);
   }
 
-  // ── Thread status ──
-
-  /** Calls are ordered per conversation, including clears after an in-flight set. */
   private statusOn = new Map<string, { ts: string; at: number }>();
   private statusQueue = new Map<string, Promise<void>>();
   private statusRefused = new Set<string>();
   private statusEpoch = 0;
+
+  private statusRefusedFor(channelId: string, threadTs: string): boolean {
+    return this.statusRefused.has(channelId) || this.statusRefused.has(`${channelId} ${threadTs}`);
+  }
 
   /** Best effort, only in writable conversations. Undefined explicitly clears. */
   setThreadStatus(channelId: string, threadTs: string | undefined): Promise<void> {
@@ -1156,7 +1157,7 @@ export class SlackAdapter {
         await this.callStatus(channelId, cur.ts, '');
         this.statusOn.delete(channelId);
       }
-      if (!threadTs || !this.canWrite(channelId) || !this.web.assistant || this.statusRefused.has(channelId)) return;
+      if (!threadTs || !this.canWrite(channelId) || !this.web.assistant || this.statusRefusedFor(channelId, threadTs)) return;
       try {
         await this.assertNotDm(channelId, 'No thread status was set');
       } catch (err) {
@@ -1168,14 +1169,10 @@ export class SlackAdapter {
       this.statusOn.set(channelId, entry);
       const outcome = await this.callStatus(channelId, threadTs, STATUS_TEXT);
       if (outcome !== 'ok') {
-        // A definitive refusal set nothing, even if its peer has retired.
-        // An uncertain failure may have landed: retain ownership for a clear.
         if (outcome === 'refused') this.statusOn.delete(channelId);
         else entry.at = -Infinity;
       }
     }).catch((err: unknown) => {
-      // This is a fire-and-forget API. Even an unexpected local failure
-      // must settle the turn, so subsequent work and queue cleanup can run.
       try { console.error(`[slack-mcpl] thread status on ${channelId} failed:`, err); } catch { /* best effort */ }
     });
     this.statusQueue.set(channelId, turn);
@@ -1198,12 +1195,13 @@ export class SlackAdapter {
       await this.web.assistant.threads.setStatus({ channel_id: channelId, thread_ts: threadTs, status });
       return 'ok';
     } catch (err) {
-      if (!this.statusRefused.has(channelId)) {
+      if (!this.statusRefusedFor(channelId, threadTs)) {
         console.error(`[slack-mcpl] thread status on ${channelId} failed:`, err instanceof Error ? err.message : err);
       }
       const refused = refusedForGood(err);
-      // A failed clear must not suppress this peer's future set attempts.
-      if (status && epoch === this.statusEpoch && refused) this.statusRefused.add(channelId);
+      if (status && epoch === this.statusEpoch && refused) {
+        this.statusRefused.add(STATUS_THREAD_REFUSALS.has(slackRefusal(err) ?? '') ? `${channelId} ${threadTs}` : channelId);
+      }
       return refused ? 'refused' : 'uncertain';
     }
   }
