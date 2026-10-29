@@ -74,15 +74,16 @@ does not declare `channels.streaming`.
 
 ## Upload a file
 
-Use `upload_file` with a Slack `channelId`, a required `filename`, and exactly
+By default, use `upload_file` with a Slack `channelId`, a required `filename`, and exactly
 one of `content` (UTF-8 text) or `contentBase64` (canonical RFC 4648 base64,
 with padding where required, and no whitespace or data-URI prefix). The
 content must be nonempty. This server limits inline content to 5 MiB
 (5,242,880 bytes), measured after UTF-8 encoding or base64 decoding; this is
 the server's inline limit, not Slack's file-size limit. The tool accepts
-inline content only; it does not read a path on the server. An agent writes
-the whole file out as the tool's arguments, so the content goes through the
-model's own output, and `contentBase64` suits small binary files.
+inline content only. An agent writes the whole file out as the tool's
+arguments, so the content goes through the model's own output, and
+`contentBase64` suits small binary files. Operators can separately enable the
+path modes below, whose bytes never pass through the model.
 
 Optional `messageId` selects the thread root (the message's `thread=` value,
 or its `id=` when it has no `thread=`; in `fetch_history` and `fetch_thread`
@@ -124,6 +125,113 @@ an existing Slack app, reinstall the app to the workspace through Slack's
 OAuth flow so the installed token receives the new scope. Editing the app's
 scope list alone does not update the token. Without the scope, Slack refuses
 uploads with `missing_scope`.
+
+### Optional path uploads
+
+Path uploads let an agent hand off an existing report, log or binary without
+reproducing its contents as text or base64 in the model's context. A `path` names
+a file on the **connector process's machine and filesystem**, which may differ
+from the host agent's machine. It does not upload a file from the agent's machine
+across a remote connector connection automatically.
+
+Path access is off unless the operator supplies `SLACK_PATH_UPLOADS` as JSON.
+There is no implicit boolean opt-in. Invalid policies, unreadable roots and
+missing platform/runtime support stop CLI startup with a sanitized refusal
+before Slack authentication. Both enabled modes require Linux or macOS;
+Windows is refused, with no fallback. Inline-only uploads are unchanged.
+
+| Policy key | Meaning |
+|------------|---------|
+| `mode` | Required: `restricted` or explicitly `unrestricted`; there is no default path mode |
+| `directories` | Required only for restricted mode: a nonempty array of existing absolute directory roots; multiple roots and root aliases are supported |
+| `maxBytes` | Optional in either mode: integer bytes from 1 to 1,073,741,824; default 5,242,880 (5 MiB) |
+
+Unknown policy keys are refused. Choose one mode explicitly:
+
+```sh
+# Read only through these directory capabilities.
+SLACK_PATH_UPLOADS='{"mode":"restricted","directories":["/srv/reports"]}' slack-mcpl --stdio
+
+# Explicitly permit any regular file the connector account can read.
+SLACK_PATH_UPLOADS='{"mode":"unrestricted"}' slack-mcpl --stdio
+```
+
+Path uploads are capped at 5 MiB, as inline content is, unless the policy names
+`maxBytes`, a whole number of bytes from 1 to 1073741824 (1 GiB, Slack's own
+per-file limit), in either mode:
+
+```sh
+SLACK_PATH_UPLOADS='{"mode":"restricted","directories":["/srv/reports"],"maxBytes":104857600}' slack-mcpl --stdio
+SLACK_PATH_UPLOADS='{"mode":"unrestricted","maxBytes":1073741824}' slack-mcpl --stdio
+```
+
+`maxBytes` changes the cap for path uploads only. Inline content stays at 5 MiB:
+its bytes pass through the model's context, as text or base64 in the tool call,
+and that cap protects the context. A path's bytes never do; the model sends only
+the path. The tool's description states both limits. The whole file is held in
+memory during upload, potentially in multiple copies in Node and the Python
+worker. Budget memory accordingly for each concurrent upload; `maxBytes` is a
+per-file byte cap, not a total process-memory or concurrency limit.
+Each upload still runs under the call's time (25 s, and 10 s for the POST of the
+bytes), and restricted mode's reader has 5 s to read the file, so how large a
+file can go in practice also depends on the disk and the link to Slack.
+
+For an embedded server, the corresponding `SlackMcplServer` option is
+`pathUploads: {mode: 'restricted', directories: ['/srv/reports']}` or
+`pathUploads: {mode: 'unrestricted'}`. Leave the option unset to retain the
+inline-only tool. Both enabled modes add `path` to `upload_file`: pass exactly
+one of `path`, `content` or `contentBase64`. `path` must be absolute; `filename`
+is optional for a path and defaults to its basename when omitted. An explicitly
+empty `filename` is refused, not defaulted. Inline content still needs an explicit
+`filename`. The tool is advertised as both `comms` and `files` when
+path access is enabled, and remains `comms` when inline-only.
+
+In **restricted** mode, configured roots must be existing absolute directories.
+The connector canonicalizes them and pins directory descriptors at startup; a
+configured root may itself be an alias to its canonical directory. This mode
+requires **Python 3.9 or newer** and supported descriptor-path facilities on
+Linux or macOS. A static Python standard-library worker runs with `-I -S` in a
+clean environment, without a shell or connector credentials. It opens each
+component relative to a directory descriptor with `O_NOFOLLOW`. All symlinks
+below a configured root are refused, including ones that point back inside it.
+The parent connector never changes its working directory.
+
+The worker checks the actual final file descriptor's path against the pinned
+root at admission, before reading, and again before returning any bytes. It uses
+Linux `/proc` descriptor paths or macOS `F_GETPATH`; directory names or a cwd
+ancestry check alone do not establish the final file's containment. No content
+is returned unless the checks pass. Missing Python, unsupported platform/path
+facilities or verification failure refuses the restricted read, with no downgrade
+to unrestricted access.
+
+In **unrestricted** mode, ordinary connector-account permissions determine which
+files can be read. Symlinks to regular files are allowed and there is no
+configured-directory boundary. On Linux this includes the connector process's
+own `/proc/self/environ`, and therefore its Slack tokens and any other secret
+in its environment. Enable unrestricted mode only where the agent is already
+trusted with those credentials. Both modes refuse non-regular files, use a
+nonblocking open so a FIFO cannot wait for a writer, and enforce the policy's
+limit (5 MiB unless `maxBytes` says otherwise) on the opened descriptor,
+including a bounded read if the file grows.
+Only the resulting bytes go to Slack, through the same three upload steps as
+inline content (`files.getUploadURLExternal`, a POST of the bytes to the URL it
+gives, `files.completeUploadExternal`); Slack never sees the path. Inline-only
+and unrestricted modes remain Node-only and require no Python runtime.
+
+The existing send-channel and DM guards run before the local read and are checked
+again by the adapter before upload. They restrict the Slack destination, while
+the selected path mode governs local reads. Existing `files:write`, checkpoint
+and rollback behavior still applies; enabling paths does not grant a new Slack
+scope or bypass a denied destination.
+
+Pinned roots are directory capabilities, not immutable snapshots or an OS
+sandbox. Descriptor-path checks observe containment at the stated check points;
+they do not create an atomic, perpetual boundary during concurrent filesystem
+changes. File contents may change while being read. Restricted mode does not
+isolate hard links, privileged mounts or administrative renames. It also does
+not constrain a shell or another process with equivalent account/sudo access.
+Use OS account/filesystem permissions for those boundaries, and choose
+unrestricted mode only when that broader local-file access is intended.
 
 ## Reply to a specific thread
 
@@ -320,12 +428,13 @@ native search or interaction-token handling are included.
 
 ## Environment
 
-Switches take `true`/`false` (also `1`/`0`, `yes`/`no`); any other value stops the server, so a typo cannot leave a guard off.
+Boolean switches take `true`/`false` (also `1`/`0`, `yes`/`no`); any other value stops the server, so a typo cannot leave a guard off. `SLACK_PATH_UPLOADS` is a JSON policy, not a boolean switch.
 
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `SLACK_BOT_TOKEN` | yes | Bot token (`xoxb-…`) for Web API calls |
 | `SLACK_APP_TOKEN` | yes | App-level token (`xapp-…`, `connections:write`) for Socket Mode |
+| `SLACK_PATH_UPLOADS` | no | Explicit JSON path policy: `{"mode":"restricted","directories":["/absolute/reports"]}` or `{"mode":"unrestricted"}`, either with an optional `maxBytes` (default 5 MiB, at most 1 GiB) for path uploads only. Unset keeps inline-only uploads; both enabled modes refuse Windows. Restricted mode needs Python 3.9+ and Linux/macOS descriptor-path support, pins roots and refuses below-root symlinks; unrestricted uses ordinary connector-account file access and needs no Python. See [Optional path uploads](#optional-path-uploads) |
 | `SLACK_DM_USERS` | no | Comma-separated user-ID whitelist for DMs; others' DMs are dropped |
 | `SLACK_SEND_CHANNELS` | no | Comma-separated conversation-ID allow-list for writes (send, upload, DM, edit, delete, reaction, and the host's `channels/publish`); writes elsewhere are refused before the call reaches Slack. Other conversations are registered `inbound`, `list_channels` shows `writable: false`, and the first message the agent gets from one, addressed or not, carries a read-only note. A mention there still reaches the agent; whether it wakes is the host's policy. `send_dm` is refused before a DM is opened, and not offered, unless the list names a DM. Set but empty is refused at startup; the effective list is logged |
 | `SLACK_SUBSCRIBE_MEMBER_CHANNELS` | no | `true` delivers ambient messages from every channel the bot is a member of, so inviting the bot is the subscription. `unsubscribe_channel` then mutes a conversation (`subscribe_channel` unmutes it) and `list_subscriptions` lists the muted ones. Takes `true` or `false` (also `1`/`0`, `yes`/`no`); unset is off, and any other value, empty included, stops startup |

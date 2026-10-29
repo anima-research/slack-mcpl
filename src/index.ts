@@ -25,6 +25,8 @@
  *                       minutes.
  *   SLACK_SUBSCRIPTIONS_FILE - Optional: JSON file persisting ambient-channel
  *                       subscriptions across restarts
+ *   SLACK_PATH_UPLOADS - Optional: explicit JSON policy for local path inputs:
+ *                       restricted directories or trusted unrestricted mode
  *   SLACK_BACKSCROLL_LIMIT   - Optional: messages fetched on first interaction
  *                       with a conversation (default 50)
  */
@@ -42,7 +44,7 @@ async function main(): Promise<void> {
     console.error(startup.refusal);
     process.exit(1);
   }
-  const { useStdio, tcpPort, botToken, appToken, dmUsers, sendChannels, disableDms, subscribeMemberChannels, ackReaction } =
+  const { useStdio, tcpPort, botToken, appToken, dmUsers, sendChannels, disableDms, subscribeMemberChannels, ackReaction, pathUploads } =
     startup.settings;
 
   // Connect Slack first: auth.test resolves the bot's identity, then Socket
@@ -50,6 +52,7 @@ async function main(): Promise<void> {
   const slack = await connectSlack({ botToken, appToken, dmUsers, sendChannels, disableDms, ackReaction });
   const server = new SlackMcplServer(slack, {
     subscribeMemberChannels,
+    pathUploads,
   });
   await slack.start();
   console.error(
@@ -68,6 +71,7 @@ async function main(): Promise<void> {
     if (stopping) return;
     stopping = true;
     setTimeout(() => process.exit(0), 5000).unref();
+    server.close();
     void slack.stop().finally(() => process.exit(0));
   };
   process.once('SIGTERM', shutdown);
