@@ -82,14 +82,14 @@ for (const [name, scope, run] of [
   });
 }
 
-test('write pin and legacy send-list are intersections, while reads need no write pin', async () => {
+test('policy replaces the legacy send-list, while reads need no write pin', async () => {
   const f = accessFixture({ config: { readJoinedChannels: true, writeChannels: [], dmUsers: [] } });
   await f.adapter.readHistory('C1', {});
   await assert.rejects(f.adapter.sendMessage('C1', 'hi'), /not allowed/);
   assert.equal(f.adapter.canWrite('C1'), false);
   const g = accessFixture({ sendChannels: ['C2'] });
-  await assert.rejects(g.adapter.sendMessage('C1', 'hi'), /may write only to C2/);
-  assert.deepEqual(g.methods(), ['info']);
+  await g.adapter.sendMessage('C1', 'hi');
+  assert.deepEqual(g.methods(), ['info', 'post']);
 });
 
 test('history continuation rechecks admission, not just the first page', async () => {
@@ -126,15 +126,16 @@ test('DM preflight: peer and all three scopes precede text and open', async () =
   assert.deepEqual(f.calls, []);
 });
 
-test('DM early no-D-ID veto is retained under policy; exact returned D ID is also intersected', async () => {
+test('policy DM writes ignore both legacy early and exact-D-ID vetoes', async () => {
   const f = accessFixture({ sendChannels: ['C1'] });
-  assert.equal(f.adapter.dmsWritable, false);
-  await assert.rejects(f.adapter.sendDM('U1', 'hi'), /none of them a direct message/);
-  assert.deepEqual(f.calls, []);
+  assert.equal(f.adapter.dmsWritable, true);
+  f.state.conversation = { id: 'D1', is_im: true, user: 'U1' };
+  await f.adapter.sendDM('U1', 'hi');
+  assert.deepEqual(f.methods(), ['open', 'info', 'post']);
   const g = accessFixture({ sendChannels: ['D2'] });
   g.state.conversation = { id: 'D1', is_im: true, user: 'U1' };
-  await assert.rejects(g.adapter.sendDM('U1', 'hi'), /may write only to D2/);
-  assert.deepEqual(g.methods(), ['open', 'info']);
+  await g.adapter.sendDM('U1', 'hi');
+  assert.deepEqual(g.methods(), ['open', 'info', 'post']);
 });
 
 test('DM fresh exact peer check rejects another allowed peer and an ordinary channel returned by open', async () => {
@@ -246,7 +247,7 @@ test('invalid conversation IDs refuse before metadata; readJoinedChannels=false 
     await assert.rejects(f.adapter.sendMessage(id, 'hi'), /Invalid Slack conversation ID/);
   }
   assert.deepEqual(f.calls, []);
-  const g = accessFixture({ config: { readJoinedChannels: false, writeChannels: ['C1'], dmUsers: ['U1'] } });
+  const g = accessFixture({ config: { readJoinedChannels: false, writeChannels: [], dmUsers: ['U1'] } });
   await assert.rejects(g.adapter.getConversationMeta('C1'), /not a confirmed joined/);
   g.state.conversation = { id: 'D1', is_im: true, user: 'U1' };
   await g.adapter.readThread('D1', '1.0', {});
@@ -308,6 +309,6 @@ test('dmsDisabled reflects policy peers, not legacy switches or the write-only s
     assert.equal(accessFixture({ legacy: true, disableDms }).adapter.dmsDisabled, disableDms);
   }
   const f = accessFixture({ sendChannels: ['C1'] });
-  assert.equal(f.adapter.dmsWritable, false);
-  assert.equal(f.adapter.dmsDisabled, false, 'allowed DM peers remain readable/listable despite the send-list veto');
+  assert.equal(f.adapter.dmsWritable, true);
+  assert.equal(f.adapter.dmsDisabled, false, 'allowed DM peers replace the send-list veto');
 });

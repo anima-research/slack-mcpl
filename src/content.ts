@@ -416,6 +416,7 @@ export async function fetchSlackHistory(
   const collected: SlackHistoryMessage[] = [];
   let cursor: string | undefined;
   let truncated = false;
+  const cursors = new Set<string>();
   do {
     const result = await client.conversations.history({
       channel: params.channel,
@@ -431,6 +432,8 @@ export async function fetchSlackHistory(
       truncated = true;
       cursor = undefined;
     }
+    if (cursor && cursors.has(cursor)) throw new Error('Slack history cursor cycle');
+    if (cursor) cursors.add(cursor);
   } while (cursor);
   return { messages: collected.reverse(), truncated };
 }

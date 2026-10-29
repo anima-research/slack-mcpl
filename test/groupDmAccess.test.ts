@@ -5,7 +5,7 @@ import { SlackMcplServer } from '../src/server.js';
 import { MESSAGING_FEATURE_SET } from '../src/feature-sets.js';
 import { method } from '@animalabs/mcpl-core';
 import { FULL_GRANT, connectHost, initialize, until, uploadEndpoint } from './harness.js';
-import { accessTest as test, accessFixture, accessScopes, joined, installPolicy } from './adapterAccessFixture.js';
+import { accessTest as test, accessFixture, accessScopes, joined } from './adapterAccessFixture.js';
 
 const config = (overrides = {}) => ({ readJoinedChannels: false, writeChannels: ['G1'], dmUsers: [], groupDms: ['G1'], ...overrides });
 const scopes = [...accessScopes, 'mpim:read', 'mpim:history', 'mpim:write'];
@@ -83,9 +83,9 @@ for (const [name, effect, run] of operations) {
     assert.equal(f.methods()[0], 'info');
     assert.equal(f.methods().length, 2);
     for (const options of [
-      { config: config({ groupDms: [] }) },
+      { config: config({ groupDms: [], writeChannels: [] }) },
       ...['mpim:read', effect, ...(writes ? ['mpim:write'] : [])].map((scope) => ({ scopes: scopes.filter((s) => s !== scope) })),
-      ...(writes ? [{ config: config({ writeChannels: [] }) }, { sendChannels: ['G2'] }] : []),
+      ...(writes ? [{ config: config({ writeChannels: [] }) }] : []),
     ]) {
       const denied = fixture(options);
       await assert.rejects(run(denied.adapter));
@@ -115,14 +115,14 @@ test('group listing asks for mpim only when named and filters fresh membership a
   const missing = fixture({ scopes: scopes.filter((s) => s !== 'mpim:read') });
   missing.state.listed = [group()];
   assert.deepEqual((await missing.adapter.listConversations()).conversations, []);
-  assert.doesNotMatch(JSON.stringify(missing.calls[0].args), /mpim/);
-  const none = fixture({ config: config({ groupDms: [] }) });
+  assert.deepEqual(missing.calls, []);
+  const none = fixture({ config: config({ groupDms: [], writeChannels: [] }) });
   await none.adapter.listConversations();
-  assert.doesNotMatch(JSON.stringify(none.calls[0].args), /mpim/);
+  assert.deepEqual(none.calls, []);
 });
 
 test('group inbound uses fresh admission and mpim history, not event labels or joined-channel setting', async () => {
-  for (const options of [{}, { config: config({ groupDms: [] }) }, { scopes: scopes.filter((s) => s !== 'mpim:history') },
+  for (const options of [{}, { config: config({ groupDms: [], writeChannels: [] }) }, { scopes: scopes.filter((s) => s !== 'mpim:history') },
     { scopes: scopes.filter((s) => s !== 'mpim:read') }]) {
     const f = fixture(options);
     const delivered: unknown[] = [];
@@ -209,7 +209,7 @@ for (const legacy of [false, true]) {
         });
         f.web.files.info = async () => {
           f.calls.push({ method: 'fileInfo', args: { file: 'F1' } });
-          return { file: { id: 'F1', groups: ['G1'] } };
+          return { file: { mode: 'hosted', id: 'F1', groups: ['G1'] } };
         };
       }
       const h = connectHost(new SlackMcplServer(f.adapter));
@@ -224,7 +224,7 @@ for (const legacy of [false, true]) {
       assert.ok(uploaded.state.parent);
       assert.equal(endpoint.bytes.get('F1')?.toString(), 'hello');
       assert.deepEqual(f.methods(), legacy ? ['upload', 'complete'] : ['info', 'upload', 'info', 'complete']);
-      if (revoke && !legacy) installPolicy(f.adapter, config({ groupDms: [] }));
+      if (revoke && !legacy) f.state.conversation = { ...group(), is_member: false };
       // With no policy, changing membership does not change legacy file writes.
       if (revoke && legacy) f.state.conversation = { ...group(), is_member: false };
       f.calls.length = 0;

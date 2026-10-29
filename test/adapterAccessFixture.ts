@@ -8,10 +8,7 @@ export const joined = (id = 'C1'): AccessConversation =>
   ({ id, is_im: false, is_mpim: false, is_private: false, is_member: true });
 export const accessConfig: SlackAccessPolicyConfig = { readJoinedChannels: true, writeChannels: ['C1', 'G1'], dmUsers: ['U1', 'W1'] };
 
-/** Deliberately test-local: this change provides no supported way to install policy. */
-export function installPolicy(adapter: SlackAdapter, config = accessConfig): void {
-  (adapter as unknown as { accessPolicy: SlackAccessPolicy }).accessPolicy = new SlackAccessPolicy(parseAccessPolicy(config));
-}
+export const fixturePolicy = (config = accessConfig) => new SlackAccessPolicy(parseAccessPolicy(config));
 
 export function accessFixture(options: { legacy?: boolean; scopes?: string[]; config?: SlackAccessPolicyConfig;
   sendChannels?: string[]; disableDms?: boolean; dmUsers?: string[]; ack?: string } = {}) {
@@ -47,8 +44,8 @@ export function accessFixture(options: { legacy?: boolean; scopes?: string[]; co
   let message: Parameters<SlackSocketLike['on']>[1];
   const socket: SlackSocketLike = { on(_event, handler) { message = handler; }, async start() {}, async disconnect() {} };
   const adapter = new SlackAdapter(web, socket, 'UBOT', 'test', options.dmUsers, options.sendChannels,
-    options.disableDms, options.ack, options.scopes ?? accessScopes);
-  if (!options.legacy) installPolicy(adapter, options.config);
+    options.disableDms, options.ack, options.scopes ?? accessScopes,
+    options.legacy ? undefined : fixturePolicy(options.config));
   return { adapter, web, calls, state, methods: () => calls.map((c) => c.method),
     async emit(event: Record<string, unknown>) {
       let acked = false;
