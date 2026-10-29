@@ -18,6 +18,7 @@
  * Event handling salvaged from zulip-mcp PR #8's SlackAdapter.
  */
 
+import { paginationLimits, type PaginationLimits, type PageTruncation } from './pagination.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { WebClient, ErrorCode, LogLevel, type Logger, type WebAPICallResult, type WebClientOptions } from '@slack/web-api';
 import { SocketModeClient } from '@slack/socket-mode';
@@ -128,6 +129,7 @@ function reportedScopes(metadata: unknown): string[] | undefined {
 /** A listing's conversations, and the enabled types it left out because the
  *  token's scopes can't read them. */
 export interface SlackListing {
+  truncation?: PageTruncation;
   conversations: SlackConversationInfo[];
   leftOut: string[];
 }
@@ -344,7 +346,13 @@ export interface SlackUserMatch {
   displayName?: string;
 }
 
+/** Complete searches retain the legacy array; partial searches must be handled explicitly. */
+export type SlackUserSearchResult = SlackUserMatch[] | {
+  matches: SlackUserMatch[]; truncated: true; reason: 'page_limit' | 'match_limit'; pages: number; limit: number;
+};
+
 export interface SlackAdapterConfig {
+  pagination?: Partial<PaginationLimits>;
   accessPolicy?: SlackAccessPolicyConfig;
   botToken: string;
   appToken: string;
@@ -728,6 +736,7 @@ export function slackClients(
  * slackClients' is.
  */
 export async function connectSlack(config: SlackAdapterConfig, slackApiUrl?: string): Promise<SlackAdapter> {
+  const pagination = paginationLimits(config.pagination);
   const policy = config.accessPolicy === undefined ? undefined : new SlackAccessPolicy(config.accessPolicy);
   const clients = slackClients(config.botToken, config.appToken, slackApiUrl);
   const auth = await clients.auth.auth.test();
@@ -748,6 +757,7 @@ export async function connectSlack(config: SlackAdapterConfig, slackApiUrl?: str
     // Granted scopes, from the x-oauth-scopes header of auth.test.
     scopes,
     policy,
+    pagination,
   );
 }
 
@@ -829,6 +839,7 @@ export class SlackAdapter {
    *  answers and with the listings' answers and refusals, each added to those
    *  before; undefined while Slack hasn't. */
   private scopes: string[] | undefined;
+  private readonly pagination: Readonly<PaginationLimits>;
 
   constructor(
     private web: SlackWebLike,
@@ -843,7 +854,9 @@ export class SlackAdapter {
      *  empty list, is unknown, so a listing asks for every type. */
     scopes?: string[],
     private readonly accessPolicy?: SlackAccessPolicy,
+    pagination?: Partial<PaginationLimits>,
   ) {
+    this.pagination = paginationLimits(pagination);
     this.scopes = reportedScopes({ scopes });
     if (this.accessPolicy) {
       const missing = this.accessPolicy.diagnosticScopes().filter((scope) => !this.scopes?.includes(scope));
@@ -981,6 +994,11 @@ export class SlackAdapter {
     const checked = new Set<string>();
     const cursors = new Set<string>();
     const names = { waitOut };
+    let pages = 0;
+    const listing = (truncation?: PageTruncation): SlackListing => ({
+      conversations: out, leftOut: this.conversationTypes().filter((type) => !types.includes(type)),
+      ...(truncation ? { truncation } : {}),
+    });
     // A listing keeps its types while it pages, so a cursor keeps its meaning,
     // and starts over whenever the types the token can read change. Once
     // Slack has reported the scopes, they only grow, so a listing starts over
@@ -998,6 +1016,9 @@ export class SlackAdapter {
       return true;
     };
     for (;;) {
+      if (pages >= this.pagination.conversations) {
+        return listing({ reason: 'page_limit', pages, limit: this.pagination.conversations });
+      }
       let result: Awaited<ReturnType<SlackWebLike['conversations']['list']>>;
       try {
         // Slack refuses the whole call when one type lacks its read scope, and
@@ -1035,6 +1056,7 @@ export class SlackAdapter {
         if (changed) continue;
         throw err;
       }
+      pages++; // Count even empty pages and responses discarded by a scope restart.
       limited = 0;
       this.takeScopes(reportedScopes(result.response_metadata));
       if (startOver()) continue;
@@ -1071,7 +1093,7 @@ export class SlackAdapter {
       // Another listing's answer may have changed the scopes while this page's
       // DM names were looked up, so they're checked once more before it ends.
       if (!cursor && !startOver()) {
-        return { conversations: out, leftOut: this.conversationTypes().filter((type) => !types.includes(type)) };
+        return listing();
       }
     }
   }
@@ -1685,6 +1707,7 @@ export class SlackAdapter {
       ...(opts.oldest !== undefined ? { oldest: opts.oldest } : {}),
       ...(opts.latest !== undefined ? { latest: opts.latest } : {}),
       maxMessages: opts.limit ?? 50,
+      maxPages: this.pagination.backscroll,
     });
     return { messages: await this.shapeHistory(messages, channelId), truncated };
   }
@@ -1727,19 +1750,23 @@ export class SlackAdapter {
 
   // ── Users ──
 
-  async findUsers(query: string, max = 25): Promise<SlackUserMatch[]> {
+  async findUsers(query: string, max = 25): Promise<SlackUserSearchResult> {
     this.accessPolicy?.requireScope(this.scopes, 'users:read');
     const q = query.toLowerCase();
     if (!q) throw new Error('query is required');
     const matches: SlackUserMatch[] = [];
     let cursor: string | undefined;
     const cursors = new Set<string>();
+    let pages = 0;
     do {
       const result = await this.web.users.list({ limit: 200, cursor });
-      for (const raw of (result.members ?? []) as Array<{
+      pages++;
+      const members = (result.members ?? []) as Array<{
         id?: string; name?: string; real_name?: string; deleted?: boolean; is_bot?: boolean;
         profile?: { display_name?: string };
-      }>) {
+      }>;
+      let unexamined = false;
+      for (const [index, raw] of members.entries()) {
         if (!raw.id || raw.deleted || raw.is_bot) continue;
         const name = raw.name?.toLowerCase() ?? '';
         const realName = raw.real_name?.toLowerCase() ?? '';
@@ -1751,14 +1778,20 @@ export class SlackAdapter {
             realName: raw.real_name,
             displayName: raw.profile?.display_name,
           });
-          if (matches.length >= max) break;
+          if (matches.length >= max) { unexamined = index < members.length - 1; break; }
         }
+      }
+      if (matches.length >= max && (unexamined || result.response_metadata?.next_cursor)) {
+        return { matches, truncated: true, reason: 'match_limit', pages, limit: max };
       }
       cursor = matches.length >= max
         ? undefined
         : (result.response_metadata?.next_cursor || undefined);
       if (cursor && cursors.has(cursor)) throw new Error('Slack directory cursor cycle');
       if (cursor) cursors.add(cursor);
+      if (cursor && pages >= this.pagination.users) {
+        return { matches, truncated: true, reason: 'page_limit', pages, limit: this.pagination.users };
+      }
     } while (cursor);
     return matches;
   }

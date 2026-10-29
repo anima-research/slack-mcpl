@@ -1,3 +1,4 @@
+import { paginationSettings, type PaginationLimits } from './pagination.js';
 import { parseAccessPolicy, type SlackAccessPolicyConfig } from './access-policy.js';
 
 /** Parse an operator switch. An absent value is off; a present value must
@@ -17,6 +18,7 @@ function policyValue(raw: string): string {
 }
 
 export interface StartupSettings {
+  pagination: Readonly<PaginationLimits>;
   accessPolicy?: SlackAccessPolicyConfig;
   ignoredLegacySettings?: string[];
   useStdio: boolean;
@@ -43,6 +45,9 @@ export function startupSettings(
   const appToken = env.SLACK_APP_TOKEN;
   if (!botToken || !appToken) return { refusal: 'SLACK_BOT_TOKEN and SLACK_APP_TOKEN environment variables are required' };
 
+  let pagination: Readonly<PaginationLimits>;
+  try { pagination = paginationSettings(env); }
+  catch (err) { return { refusal: (err as Error).message }; }
   let accessPolicy: SlackAccessPolicyConfig | undefined;
   if (env.SLACK_ACCESS_POLICY !== undefined) {
     let value: unknown;
@@ -67,7 +72,7 @@ export function startupSettings(
   }
   const ackReaction = env.SLACK_ACK_REACTION?.replace(/:/g, '').trim() || undefined;
   return {
-    settings: { useStdio, tcpPort, botToken, appToken, dmUsers, sendChannels, disableDms, subscribeMemberChannels, ackReaction,
+    settings: { pagination, useStdio, tcpPort, botToken, appToken, dmUsers, sendChannels, disableDms, subscribeMemberChannels, ackReaction,
       ...(accessPolicy ? { accessPolicy, ignoredLegacySettings: ['SLACK_DISABLE_DMS', 'SLACK_DM_USERS', 'SLACK_SEND_CHANNELS']
         .filter((name) => env[name] !== undefined) } : {}) },
   };

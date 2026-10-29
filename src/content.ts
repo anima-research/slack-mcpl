@@ -7,6 +7,7 @@
  * Salvaged from zulip-mcp PR #8 (multi-platform branch), Slack halves only.
  */
 
+import { DEFAULT_PAGINATION, pageLimit } from './pagination.js';
 import type { PolicyFileRef } from './file-access.js';
 import { channelShown, mimeShown, nameShown } from './framing.js';
 
@@ -411,8 +412,11 @@ export async function fetchSlackHistory(
     latest?: string;
     inclusive?: boolean;
     maxMessages: number;
+    maxPages?: number;
   },
 ): Promise<{ messages: SlackHistoryMessage[]; truncated: boolean }> {
+  const maxPages = pageLimit(params.maxPages === undefined ? DEFAULT_PAGINATION.backscroll : params.maxPages, 'SLACK_BACKSCROLL_PAGE_LIMIT');
+  let pages = 0;
   const collected: SlackHistoryMessage[] = [];
   let cursor: string | undefined;
   let truncated = false;
@@ -426,6 +430,7 @@ export async function fetchSlackHistory(
       limit: Math.min(200, params.maxMessages - collected.length),
       cursor,
     });
+    pages++;
     collected.push(...((result.messages ?? []) as SlackHistoryMessage[]));
     cursor = result.response_metadata?.next_cursor || undefined;
     if (cursor && collected.length >= params.maxMessages) {
@@ -434,6 +439,7 @@ export async function fetchSlackHistory(
     }
     if (cursor && cursors.has(cursor)) throw new Error('Slack history cursor cycle');
     if (cursor) cursors.add(cursor);
+    if (cursor && pages >= maxPages) { truncated = true; break; }
   } while (cursor);
   return { messages: collected.reverse(), truncated };
 }

@@ -11,11 +11,18 @@ const grants = ['channels:read', 'groups:read', 'im:read', 'mpim:read', 'channel
 const channel = (id: string) => id.startsWith('D') ? { id, is_im: true, user: 'W1' }
   : id.startsWith('G') ? { id, is_mpim: true, ...(scenario.membership === 'absent' ? {} : { is_member: scenario.membership !== false }) }
   : { id, name: 'room', is_im: false, is_mpim: false, is_private: false, is_member: id === 'C1' };
+const paginationCalls = new Map<string, number>();
 WebClient.prototype.apiCall = async function (name: string, args?: Record<string, unknown>): Promise<any> {
   // Do not record credentials, URLs or the full SDK options.
   console.error('A4_CALL ' + JSON.stringify({ name, ...(args ? { args } : {}) }));
   if (name === 'auth.test') return { ok: true, user_id: 'UBOT', team: 'test',
     ...(scenario.scopes === null ? {} : { response_metadata: { scopes: scenario.scopes ?? grants } }) };
+  if (scenario.pagination && ['conversations.list','users.list','conversations.history'].includes(name)) {
+    const n = (paginationCalls.get(name) ?? 0) + 1;
+    paginationCalls.set(name, n);
+    if (n > 4) throw new Error('Pagination fixture emergency ceiling');
+    return { ok: true, channels: [], members: [], messages: [], response_metadata: { next_cursor: String(n) } };
+  }
   if (name === 'conversations.info') return { ok: true, channel: channel(String(args?.channel)) };
   if (name === 'conversations.list') return { ok: true, channels: ['C1', 'C2', 'D1', 'G1'].map(channel) };
   if (name === 'conversations.members') return { ok: true, members: ['UBOT', 'W1'] };

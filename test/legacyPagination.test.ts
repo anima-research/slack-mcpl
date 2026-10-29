@@ -4,7 +4,7 @@ import { accessFixture, joined } from './adapterAccessFixture.js';
 
 for (const kind of ['listing', 'directory', 'history'] as const) {
   for (const cyclic of [true, false]) test(`legacy ${kind}: ${cyclic ? 'repeated cursor refuses' : '1002 distinct pages complete'}`, async () => {
-    const f = accessFixture({ legacy: true });
+    const f = accessFixture({ legacy: true, pagination: { conversations: 1002, users: 1002, backscroll: 1002 } });
     let pages = 0;
     const metadata = () => {
       if (++pages > 1003) throw new Error('test safety ceiling');

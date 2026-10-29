@@ -334,6 +334,9 @@ Switches take `true`/`false` (also `1`/`0`, `yes`/`no`); any other value stops t
 | `SLACK_ACK_REACTION` | no | Emoji name (e.g. `eyes`) put on a message that addresses the bot. It means "received": it is removed at the bot's next post in that conversation that Slack confirms, after 10 minutes, or at once if the host does not accept the message. A removal that fails in a way that can pass (a rate limit, an HTTP error, a network failure, or Slack's own failure such as `internal_error`) is tried again every minute, up to 5 tries in all; one Slack refuses is dropped. An add that fails isn't tried again. One that may have landed is removed as usual: `already_reacted` says it's there, and Slack's failure while handling it (`internal_error`, `fatal_error`, `service_unavailable`), an HTTP error, an answer not in Slack's form or one the client can't read, or a failure in transit after the request may have reached Slack leaves it unknown. One Slack refused, rate-limited or received only in part (`request_timeout`), one whose connection was never made, and one this server refused itself, such as outside `SLACK_SEND_CHANNELS`, isn't there. On SIGTERM, SIGINT or the host closing stdin, pending reactions are removed (5 s at most); a crash cannot, so removal is best-effort. Slack has no typing indicator for bots |
 | `SLACK_SUBSCRIPTIONS_FILE` | no | JSON file persisting ambient subscriptions across restarts: an array of IDs, or `{subscribed, muted}` while anything is muted (older versions read the object form as empty) |
 | `SLACK_BACKSCROLL_LIMIT` | no | Messages fetched on first interaction with a conversation (default 50) |
+| `SLACK_CONVERSATION_PAGE_LIMIT` | no | Maximum Slack pages per conversation listing (default 1000; range 1–10000). An invalid value stops startup; see [Bounded pagination](#bounded-pagination) |
+| `SLACK_USER_PAGE_LIMIT` | no | Maximum Slack pages per user-directory search (default 1000; range 1–10000). An invalid value stops startup; see [Bounded pagination](#bounded-pagination) |
+| `SLACK_BACKSCROLL_PAGE_LIMIT` | no | Maximum Slack pages per backscroll fetch (default 100; range 1–10000). An invalid value stops startup; see [Bounded pagination](#bounded-pagination) |
 | `SLACK_MCPL_DEBUG_LOG` | no | Absolute path for a diagnostic file log |
 
 ### Explicit access policy (opt-in, restart-only)
@@ -395,6 +398,64 @@ the existing registration give-up behavior: one failed name can exhaust the
 wait budget, then later DMs are labelled immediately without further waits.
 In conversation listings, directory lookups and backscroll, including legacy
 mode, a repeated pagination cursor now fails instead of looping forever.
+
+## Bounded pagination
+
+Listings and directory searches default to **1,000 successful Slack pages** per
+operation; backscroll defaults to **100 pages**, in addition to its existing
+message limit. These bounds apply in both legacy and explicit-policy mode.
+
+| Optional environment variable | Default |
+| --- | ---: |
+| `SLACK_CONVERSATION_PAGE_LIMIT` | 1000 |
+| `SLACK_USER_PAGE_LIMIT` | 1000 |
+| `SLACK_BACKSCROLL_PAGE_LIMIT` | 100 |
+
+Values must be canonical decimal integers from **1 to 10000**. Empty values,
+whitespace, signs, fractions, leading zeros and out-of-range values refuse
+startup before connecting; there is no unlimited sentinel. Library overrides
+use the same range. `SLACK_BACKSCROLL_LIMIT` still controls message count.
+
+Pages include empty responses and responses discarded when token scopes change.
+Membership, access-policy and query filtering happen after page selection: a
+large workspace may have many public channels but few joined channels in the
+portion scanned. A small or empty partial result does not prove absence.
+
+`list_channels` adds an incomplete-listing text block. `find_user` marks partial
+results with `truncated: true`, `stopReason` and a note, including its existing
+25-match stop when unexamined results remain. Backscroll carries
+`truncated="true"` and a visible note when either its page or message limit stops
+it, even if filtering leaves no displayed messages. History/thread tools retain
+`pagination.scanComplete`, their existing stop reasons and continuation cursors.
+
+Background registration announces the eligible subset and logs incomplete
+enumeration, separately from host acceptance. `refresh_channels` marks partial
+scans with `truncated: true` and reports unresolved background enumeration in
+`registration.enumerationIncomplete`; a subsequent complete scan clears that
+status. `visible` counts only eligible conversations observed in that scan.
+A repeated listing or refresh starts over, **not** at a continuation cursor, and
+may repeatedly return the same subset. Review the limits with the operator;
+increasing them cannot guarantee complete discovery or bypass rate limits.
+
+The code requests up to 200 rows/page. At full pages, 1,000 pages offer 200,000
+raw rows; 10,000 offer two million. These are page-count bounds, **not** response
+byte or total-duration bounds. Candidate metadata, retries, response duration
+and rate-limit waits add cost. Existing deadlines, retry/give-up behavior,
+cursor-cycle errors and the fail-closed five-page MPIM membership proof remain
+unchanged. Complete results below all limits retain their API, tool-text and log
+bytes; existing message/match-limit hits now explicitly identify incompleteness.
+
+Slack recommends [100–200 rows per cursor page](https://docs.slack.dev/apis/web-api/pagination/).
+[Conversation listings](https://docs.slack.dev/reference/methods/conversations.list/)
+and [user listings](https://docs.slack.dev/reference/methods/users.list/) are Tier 2
+(20+ calls/minute): 1,000 pages represent roughly 50 minutes at 20/minute, not a
+latency guarantee. [History](https://docs.slack.dev/reference/methods/conversations.history/)
+is normally Tier 3 (50+ calls/minute), with
+[distribution-specific limits](https://docs.slack.dev/changelog/2025/05/29/rate-limit-changes-for-non-marketplace-apps/)
+of 15 objects/request and one request/minute for affected installations. A
+1,000-message backscroll takes five full 200-row pages or 67 full 15-row pages;
+the 100-page default also bounds sparse/empty-page traversal. These defaults are
+server safety choices, not Slack guarantees of workspace coverage.
 
 ## Tests
 

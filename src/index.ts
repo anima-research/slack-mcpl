@@ -47,7 +47,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
   const { useStdio, tcpPort, botToken, appToken, dmUsers, sendChannels, disableDms, subscribeMemberChannels, ackReaction,
-    accessPolicy, ignoredLegacySettings } =
+    accessPolicy, ignoredLegacySettings, pagination } =
     startup.settings;
 
   if (ignoredLegacySettings?.length) console.error(
@@ -57,7 +57,7 @@ async function main(): Promise<void> {
 
   // Connect Slack first: auth.test resolves the bot's identity, then Socket
   // Mode comes up so no events are missed once the host attaches.
-  const slack = await connectSlack({ botToken, appToken, ackReaction,
+  const slack = await connectSlack({ botToken, appToken, ackReaction, pagination,
     ...(accessPolicy ? { accessPolicy } : { dmUsers, sendChannels, disableDms }) });
   const server = new SlackMcplServer(slack, {
     subscribeMemberChannels,

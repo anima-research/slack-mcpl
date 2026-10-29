@@ -109,3 +109,18 @@ for (const tcp of [false, true]) {
     await until(() => h.stderr().includes('chat.delete'), 'rollback');
   });
 }
+
+for (const built of [false, true]) test(`pagination real startup ${built ? 'built' : 'source'} wires caps and refuses without echo`, async (t) => {
+  const h = await running(t, false, { ...(built ? { A4_BUILT: '1' } : {}), SLACK_CONVERSATION_PAGE_LIMIT: '2', SLACK_USER_PAGE_LIMIT: '2', SLACK_BACKSCROLL_PAGE_LIMIT: '2' }, { pagination: true });
+  await initialize(h, false);
+  const listing = await h.host.sendRequest('tools/call', { name: 'list_channels', arguments: {} });
+  assert.match(JSON.stringify(listing), /Incomplete conversation listing/);
+  const directory = await h.host.sendRequest('tools/call', { name: 'find_user', arguments: { query: 'absent' } });
+  assert.match(JSON.stringify(directory), /directory search is incomplete/);
+  assert.equal((h.stderr().match(/"name":"conversations.list"/g) ?? []).length, 2);
+  assert.equal((h.stderr().match(/"name":"users.list"/g) ?? []).length, 2);
+  const call = invocation({ ...(built ? { A4_BUILT: '1' } : {}), SLACK_USER_PAGE_LIMIT: 'do-not-echo' }, ['--stdio']);
+  const refused = spawnSync(process.execPath, call.args, { ...call.options, input: '', encoding: 'utf8', timeout: 15000 });
+  assert.equal(refused.status, 1); assert.equal(refused.stdout, '');
+  assert.equal(refused.stderr, 'SLACK_USER_PAGE_LIMIT must be a decimal integer from 1 to 10000\n');
+});
