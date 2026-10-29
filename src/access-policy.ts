@@ -18,7 +18,7 @@ const CHANNEL_ID = /^[CG][A-Z0-9]+$/;
 const USER_ID = /^[UW][A-Z0-9]+$/;
 const DM_ID = /^D[A-Z0-9]+$/;
 const idList = (value: unknown, pattern: RegExp): value is string[] =>
-  Array.isArray(value) && value.every((id) => typeof id === 'string' && pattern.test(id));
+  Array.isArray(value) && Array.from(value).every((id) => typeof id === 'string' && pattern.test(id));
 
 const REQUIRED_KEYS = new Set<string | symbol>(['readJoinedChannels', 'writeChannels', 'dmUsers']);
 const ALLOWED_KEYS = new Set(REQUIRED_KEYS);
@@ -39,7 +39,11 @@ export function parseAccessPolicy(value: unknown): SlackAccessPolicyConfig {
   return Object.freeze({ readJoinedChannels, writeChannels: Object.freeze(channels), dmUsers: Object.freeze(users) });
 }
 
-/** Pure decisions over supplied metadata: no Slack calls or cached membership. */
+/** Pure decisions over supplied metadata: no Slack calls or cached membership.
+ * The user directory is outside this policy's confinement: find_user is gated
+ * only on users:read and searches the whole workspace directory, not just
+ * admitted DM peers or conversation members. Directory filtering remains a
+ * decision for the later activation PR. */
 export class SlackAccessPolicy {
   private readonly writeChannels: ReadonlySet<string>;
   private readonly dmUsers: ReadonlySet<string>;
