@@ -3,7 +3,7 @@ import { SlackAccessPolicy, parseAccessPolicy, type AccessConversation, type Sla
 import { SlackAdapter, type SlackSocketLike, type SlackWebLike } from '../src/slack-adapter.js';
 
 export const accessScopes = ['channels:read', 'groups:read', 'im:read', 'channels:history', 'groups:history',
-  'im:history', 'chat:write', 'im:write', 'files:write', 'reactions:write', 'users:read'];
+  'im:history', 'files:read', 'chat:write', 'im:write', 'files:write', 'reactions:write', 'users:read'];
 export const joined = (id = 'C1'): AccessConversation =>
   ({ id, is_im: false, is_mpim: false, is_private: false, is_member: true });
 export const accessConfig: SlackAccessPolicyConfig = { readJoinedChannels: true, writeChannels: ['C1', 'G1'], dmUsers: ['U1', 'W1'] };

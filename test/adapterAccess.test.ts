@@ -217,17 +217,17 @@ test('legacy mode preserves calls, payloads, outputs and exact refusal text', as
   assert.deepEqual(h.calls, []);
 });
 
-test('policy attachment references are dormant no-ops until attachment enforcement, but legacy URLs remain unchanged', async () => {
+test('policy attachment references carry message provenance, but legacy URLs remain unchanged', async () => {
   const file = { name: 'note', mimetype: 'text/plain', url_private: 'https://files.slack.com/note' };
   for (const legacy of [false, true]) {
     const f = accessFixture({ legacy });
     f.state.messages = [{ ts: '1.0', text: 'file', files: [file] }];
     const history = await f.adapter.fetchHistory('C1');
-    assert.deepEqual(history.messages[0].attachments, legacy ? [{ name: 'note', mimeType: 'text/plain', url: file.url_private }] : []);
+    assert.deepEqual(history.messages[0].attachments, legacy ? [{ name: 'note', mimeType: 'text/plain', url: file.url_private }] : [{ channelId: 'C1', name: 'note', mimeType: 'text/plain', isImage: false }]);
     const delivered: Array<{ attachments: unknown[] }> = [];
     f.adapter.onMessage((m) => delivered.push(m));
     await f.emit({ type: 'message', channel: 'C1', user: 'U1', ts: '1.0', text: 'file', files: [file] });
-    assert.equal(delivered[0].attachments.length, legacy ? 1 : 0);
+    assert.equal(delivered[0].attachments.length, 1);
   }
 });
 
@@ -259,23 +259,28 @@ test('positive write/read paths make a fresh info call before each effect, prese
   await f.adapter.editMessage('C1', '1.0', 'new');
   await f.adapter.deleteMessage('C1', '1.0');
   await f.adapter.addReaction('C1', '1.0', ':eyes:');
-  await f.adapter.deleteFile('C1', 'F1');
+  await assert.rejects(f.adapter.deleteFile('C1', 'F1'), /recorded upload/);
   await f.adapter.readHistory('C1', {});
   await f.adapter.readThread('C1', '1.0', {});
   await f.adapter.fetchHistory('C1');
   await f.adapter.findUsers('human');
-  assert.deepEqual(f.methods(), ['info', 'post', 'info', 'edit', 'info', 'delete', 'info', 'react', 'info', 'deleteFile',
+  assert.deepEqual(f.methods(), ['info', 'post', 'info', 'edit', 'info', 'delete', 'info', 'react', 'info',
     'info', 'history', 'info', 'replies', 'info', 'history', 'users']);
   assert.deepEqual(f.calls[1].args, { channel: 'C1', text: 'hi', thread_ts: '1.0' });
 });
 
 
-test('policy upload gates the real byte transfer before sharing, without mocking fetch', async () => {
+test('policy upload gates the real byte transfer and rechecks before sharing', async (t) => {
   const endpoint = await uploadEndpoint();
   const f = accessFixture();
-  f.state.uploadUrl = `${endpoint.url}/policy-upload`;
+  f.state.uploadUrl = 'https://files.slack.com/upload/policy-upload';
+  const realFetch = globalThis.fetch;
+  t.mock.method(globalThis, 'fetch', async (url: string | URL | Request, init?: RequestInit) => {
+    assert.equal(url, f.state.uploadUrl);
+    return realFetch(`${endpoint.url}/policy-upload`, init);
+  });
   assert.deepEqual(await f.adapter.uploadFile('C1', { filename: 'x', data: Buffer.from('policy bytes') }), { fileId: 'F1', shareTs: undefined });
-  assert.deepEqual(f.methods(), ['info', 'upload', 'complete']);
+  assert.deepEqual(f.methods(), ['info', 'upload', 'info', 'complete']);
   assert.equal(endpoint.bytes.get('policy-upload')?.toString(), 'policy bytes');
 });
 
