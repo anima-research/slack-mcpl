@@ -200,7 +200,18 @@ for (const legacy of [false, true]) {
     test(`real upload tool and rollback file delete: legacy=${legacy}, revoke group=${revoke}`, async (t) => {
       const f = fixture({ legacy });
       const endpoint = await uploadEndpoint();
-      f.state.uploadUrl = `${endpoint.url}/F1`;
+      f.state.uploadUrl = legacy ? `${endpoint.url}/F1` : 'https://files.slack.com/upload/F1';
+      if (!legacy) {
+        const realFetch = globalThis.fetch;
+        t.mock.method(globalThis, 'fetch', async (url: string | URL | Request, init?: RequestInit) => {
+          assert.equal(url, f.state.uploadUrl);
+          return realFetch(`${endpoint.url}/F1`, init);
+        });
+        f.web.files.info = async () => {
+          f.calls.push({ method: 'fileInfo', args: { file: 'F1' } });
+          return { file: { id: 'F1', groups: ['G1'] } };
+        };
+      }
       const h = connectHost(new SlackMcplServer(f.adapter));
       t.after(() => h.close());
       await initialize(h, true);
@@ -212,7 +223,7 @@ for (const legacy of [false, true]) {
       assert.notEqual(uploaded.isError, true);
       assert.ok(uploaded.state.parent);
       assert.equal(endpoint.bytes.get('F1')?.toString(), 'hello');
-      assert.deepEqual(f.methods(), legacy ? ['upload', 'complete'] : ['info', 'upload', 'complete']);
+      assert.deepEqual(f.methods(), legacy ? ['upload', 'complete'] : ['info', 'upload', 'info', 'complete']);
       if (revoke && !legacy) installPolicy(f.adapter, config({ groupDms: [] }));
       // With no policy, changing membership does not change legacy file writes.
       if (revoke && legacy) f.state.conversation = { ...group(), is_member: false };
@@ -221,11 +232,13 @@ for (const legacy of [false, true]) {
         featureSet: MESSAGING_FEATURE_SET, checkpoint: uploaded.state.parent,
       }) as { success: boolean; reason?: string };
       assert.equal(rollback.success, true);
+      if (legacy) assert.equal(rollback.reason, undefined);
+      else assert.match(rollback.reason ?? '', /deletion removes the file from every conversation it is shared in/);
       if (!legacy && revoke) {
         assert.deepEqual(f.methods(), ['info']);
         assert.match(rollback.reason ?? '', /0\/1 files deleted/);
       } else {
-        assert.deepEqual(f.methods(), legacy ? ['deleteFile'] : ['info', 'deleteFile']);
+        assert.deepEqual(f.methods(), legacy ? ['deleteFile'] : ['info', 'fileInfo', 'deleteFile']);
         assert.equal(JSON.stringify(f.calls.at(-1)), '{"method":"deleteFile","args":{"file":"F1"}}');
       }
     });
