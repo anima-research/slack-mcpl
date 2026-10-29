@@ -48,7 +48,7 @@ test('a client that leaves before initialize ends only its own connection', asyn
   await h.close();
 });
 
-test("a line that isn't JSON costs only itself, and is logged", async (t) => {
+test("a line that isn't JSON costs only itself, and is logged", { timeout: 5000 }, async (t) => {
   const errors = t.mock.method(console, 'error', () => {});
   const { slack } = fakeSlack();
   const server = new SlackMcplServer(slack);
@@ -56,6 +56,12 @@ test("a line that isn't JSON costs only itself, and is logged", async (t) => {
   const toHost = new PassThrough();
   const host = McplConnection.fromStreams(toHost, toServer);
   const served = server.serve(McplConnection.fromStreams(toServer, toHost));
+  const lone = new PassThrough();
+  const parsing = McplConnection.fromStreams(lone, new PassThrough());
+  const parseError = new Promise<Error>((resolve) => parsing.on('error', resolve));
+  lone.write('this is not JSON\n');
+  const expected = (await parseError).message;
+  parsing.close();
   toServer.write('this is not JSON\n');
   // Were the connection's 'error' unheard, the write above would have thrown
   // out of the stream's callback and ended the process; it is still served.
@@ -64,7 +70,7 @@ test("a line that isn't JSON costs only itself, and is logged", async (t) => {
   })) as { capabilities: Record<string, unknown> };
   assert.ok(result.capabilities);
   assert.ok(errors.mock.calls.some((call) => call.arguments[0] === '[slack-mcpl] Connection error:'
-    && String((call.arguments[1] as Error | undefined)?.message).startsWith('Malformed JSON-RPC message')));
+    && call.arguments[1] instanceof Error && call.arguments[1].message === expected));
   toServer.end();
   await served;
   host.close();

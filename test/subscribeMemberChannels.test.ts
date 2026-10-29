@@ -15,29 +15,26 @@ import { SlackMcplServer } from '../src/server.js';
 const text = (r: unknown) => JSON.stringify(r);
 const call = (server: SlackMcplServer, name: string, args: Record<string, unknown> = {}) =>
   (server as any).handleToolCall(name, args);
+const listed = async (server: SlackMcplServer) => JSON.parse((await call(server, 'list_subscriptions')).content[0].text);
 
 test('without the switch, a channel is subscribed only after subscribe_channel', async () => {
   delete process.env.SLACK_SUBSCRIPTIONS_FILE;
   const server = new SlackMcplServer({ onMessage() {} } as any);
-  assert.equal((server as any).isChannelSubscribed('C1'), false);
+  assert.deepEqual((await listed(server)).channels, []);
   await call(server, 'subscribe_channel', { channelId: 'C1' });
-  assert.equal((server as any).isChannelSubscribed('C1'), true);
+  assert.deepEqual((await listed(server)).channels, ['C1']);
 });
 
 test('with the switch, unsubscribe_channel mutes and subscribe_channel unmutes', async () => {
   delete process.env.SLACK_SUBSCRIPTIONS_FILE;
   const server = new SlackMcplServer({ onMessage() {} } as any, { subscribeMemberChannels: true });
-  const is = (id: string) => (server as any).isChannelSubscribed(id);
-  assert.equal(is('C1'), true);
+  assert.deepEqual((await listed(server)).muted, []);
 
   assert.match(text(await call(server, 'unsubscribe_channel', { channelId: 'C1' })), /Muted/);
-  assert.equal(is('C1'), false, 'muted');
-  assert.equal(is('C2'), true, 'others are unaffected');
-  const listed = await call(server, 'list_subscriptions');
-  assert.deepEqual(JSON.parse(listed.content[0].text).muted, ['C1']);
+  assert.deepEqual((await listed(server)).muted, ['C1'], 'only C1 is muted');
 
   assert.match(text(await call(server, 'subscribe_channel', { channelId: 'C1' })), /Unmuted/);
-  assert.equal(is('C1'), true);
+  assert.deepEqual((await listed(server)).muted, []);
 });
 
 test('a mute survives a restart when SLACK_SUBSCRIPTIONS_FILE is set', async () => {
@@ -49,7 +46,7 @@ test('a mute survives a restart when SLACK_SUBSCRIPTIONS_FILE is set', async () 
     assert.deepEqual(JSON.parse(readFileSync(file, 'utf-8')), { subscribed: [], muted: ['C1'] });
 
     const second = new SlackMcplServer({ onMessage() {} } as any, { subscribeMemberChannels: true });
-    assert.equal((second as any).isChannelSubscribed('C1'), false);
+    assert.deepEqual((await listed(second)).muted, ['C1']);
 
     // Nothing muted: the file is a plain array again, as older versions write it.
     await call(second, 'subscribe_channel', { channelId: 'C1' });

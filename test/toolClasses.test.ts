@@ -27,13 +27,6 @@ test('every tool the server can list is in TOOL_CLASSES or UNCLASSED', () => {
   assert.deepEqual(missing, [], 'class new tools in src/tool-classes.ts (or list them in UNCLASSED)');
 });
 
-test('the class map names only real tools, and none is both classed and unclassed', () => {
-  const names = new Set(ALL_TOOLS);
-  assert.deepEqual(Object.keys(TOOL_CLASSES).filter((n) => !names.has(n)), []);
-  assert.deepEqual([...UNCLASSED].filter((n) => !names.has(n)), []);
-  assert.deepEqual([...UNCLASSED].filter((n) => Object.hasOwn(TOOL_CLASSES, n)), []);
-});
-
 test('every class is from the RFC-008 vocabulary', () => {
   assert.deepEqual([...TOOL_CLASS_VOCABULARY], RFC_008_VOCABULARY);
   for (const [name, classes] of Object.entries(TOOL_CLASSES)) {

@@ -5,6 +5,8 @@
  */
 
 import http from 'node:http';
+import { WebClient } from '@slack/web-api';
+import { SLACK_CLIENT_OPTIONS } from '../src/slack-adapter.js';
 import { elapse } from './virtualClock.js';
 
 export interface SlackApiAnswer {
@@ -115,3 +117,20 @@ export async function silentSlackApi(): Promise<{ url: string; requests(): numbe
 export async function unreachableSlackApiUrl(): Promise<string> {
   return 'http://127.0.0.1:2/api/';
 }
+
+export async function clientError(answer: SlackApiAnswer, method = 'chat.postMessage'): Promise<Error & { code?: string }> {
+  const api = await fakeSlackApi();
+  try {
+    api.answer(answer);
+    const client = new WebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: api.url });
+    const err = await client.apiCall(method, {}).then(() => undefined, (e: unknown) => e);
+    if (!(err instanceof Error)) throw new Error(`the client didn't throw for ${method}`);
+    return err;
+  } finally {
+    await api.close();
+  }
+}
+
+export const clientSays = async (answer: SlackApiAnswer, method?: string) => (await clientError(answer, method)).message;
+
+export const anyPort = (text: string) => text.replace(/127\.0\.0\.1:\d+/g, '127.0.0.1:PORT');

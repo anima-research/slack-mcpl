@@ -19,7 +19,7 @@ import {
 import { PARENT_IDS, READ_ARGUMENTS, readOptions } from '../src/history-read.js';
 import { explainSlackError } from '../src/slack-errors.js';
 import { toolDefinitions } from '../src/tools.js';
-import { fakeSlackApi, type FakeSlackApi, type SlackApiAnswer } from './slackApi.js';
+import { anyPort, clientSays, fakeSlackApi, type FakeSlackApi, type SlackApiAnswer } from './slackApi.js';
 import { until } from './harness.js';
 
 let api: FakeSlackApi;
@@ -551,13 +551,14 @@ test("a read Slack fails before it moves says that no messages were returned, wi
       /\n\nNo messages were returned: Slack is rate-limiting this kind of call for the workspace\. Try again shortly\.$/],
     // A code the explainer doesn't know, and the client's own error for a 429
     // without a Retry-After it can read, still say what the read returned.
-    [{ body: { ok: false, error: 'invalid_arguments' } }, /^An API error occurred: invalid_arguments\n\nNo messages were returned\.$/],
-    [{ status: 429, headers: { 'retry-after': 'soon' }, body: { ok: false, error: 'ratelimited' } },
-      /^Retry header did not contain a valid timeout .*\n\nNo messages were returned\.$/s],
+    [{ body: { ok: false, error: 'invalid_arguments' } }, null],
+    [{ status: 429, headers: { 'retry-after': 'soon' }, body: { ok: false, error: 'ratelimited' } }, null],
   ] as const) {
     answers(t, { 'conversations.history': [answer] });
     const err = await withCallTime(Date.now(), () => adapter().readHistory('C1', { channelId: 'C1' })).then(() => null, (e: unknown) => e);
-    assert.match(explainSlackError(err, { tool: 'fetch_history', args: { channelId: 'C1' } }), said, JSON.stringify(answer));
+    const text = explainSlackError(err, { tool: 'fetch_history', args: { channelId: 'C1' } });
+    if (said) assert.match(text, said, JSON.stringify(answer));
+    else assert.equal(anyPort(text), anyPort(`${await clientSays(answer, 'conversations.history')}\n\nNo messages were returned.`), JSON.stringify(answer));
   }
 });
 

@@ -24,7 +24,7 @@ import {
 import { SlackMcplServer } from '../src/server.js';
 import { toolDefinitions } from '../src/tools.js';
 import { connectHost, nonJsonSlackApiUrl, initialize, FULL_GRANT } from './harness.js';
-import { fakeSlackApi, silentSlackApi, unreachableSlackApiUrl, type FakeSlackApi } from './slackApi.js';
+import { clientSays, fakeSlackApi, silentSlackApi, unreachableSlackApiUrl, type FakeSlackApi } from './slackApi.js';
 
 let api: FakeSlackApi;
 let client: WebClient;
@@ -65,11 +65,13 @@ async function explain(
   return explainSlackError(await slackError(error, extra), { tool, args });
 }
 
+const said = (error: string) => clientSays({ body: { ok: false, error } });
+
 test("the client's own text stays first, and the explanation follows it", async () => {
   const text = await explain('channel_not_found', 'send_message', { channelId: 'C0NOPE', content: 'hi' });
-  assert.match(
+  assert.ok(
+    text.startsWith(`${await said('channel_not_found')}\n\nNothing was posted: Slack doesn't know conversation C0NOPE, or this bot can't see it. `),
     text,
-    /^An API error occurred: channel_not_found\n\nNothing was posted: Slack doesn't know conversation C0NOPE, or this bot can't see it\. /,
   );
   assert.match(text, /mistyped or remembered rather than copied, or it's a private conversation this bot isn't in/);
   assert.match(text, /list_channels shows the conversations this bot can use, with their ids\.$/);
@@ -189,7 +191,7 @@ test('a message id Slack does not know names where real ones show', async () => 
   );
   // A call that named no message can't have named a wrong one, so nothing is added.
   for (const code of ['message_not_found', 'bad_timestamp', 'thread_not_found']) {
-    assert.equal(await explain(code, 'send_message', { channelId: 'C4', content: 'hi' }), `An API error occurred: ${code}`);
+    assert.equal(await explain(code, 'send_message', { channelId: 'C4', content: 'hi' }), await said(code));
   }
 });
 
@@ -356,7 +358,7 @@ test("Slack's own failure: a read is tried again, a write's outcome is unknown a
       ),
       code,
     );
-    assert.equal(await explain(code, 'channels/publish', { channelId: 'C14' }), `An API error occurred: ${code}`);
+    assert.equal(await explain(code, 'channels/publish', { channelId: 'C14' }), await said(code));
   }
   assert.match(
     await explain('internal_error', 'edit_message', { channelId: 'C14', messageId: '1.2' }),
@@ -380,7 +382,7 @@ test('a rate limit says nothing was done and how long Slack asks to wait', async
   const err = await clientError();
   assert.equal(
     explainSlackError(err, { tool: 'send_message', args: { channelId: 'C15' } }),
-    'A rate-limit has been reached, you may retry this request in 7 seconds\n\nNothing was posted: Slack is ' +
+    `${(err as Error).message}\n\nNothing was posted: Slack is ` +
       'rate-limiting this kind of call for the workspace, and asks to wait 7 seconds before trying again.',
   );
   assert.match(
@@ -426,9 +428,10 @@ test("a failure in transit leaves a write's outcome unknown, and a read is tried
   const unanswered = await clientError(
     new WebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, timeout: 300, slackApiUrl: silent.url }),
   ).finally(() => silent.close());
-  assert.match(
+  assert.equal(
     explainSlackError(unanswered, { tool: 'send_message', args: { channelId: 'C16' } }),
-    /^A request error occurred: .*\n\nSlack went 10 seconds without answering, or the connection to it failed, so whether the message was posted is unknown\. Check fetch_history for conversation C16 before posting again, so it isn't posted twice\.$/s,
+    `${(unanswered as Error).message}\n\nSlack went 10 seconds without answering, or the connection to it failed, so whether the ` +
+      "message was posted is unknown. Check fetch_history for conversation C16 before posting again, so it isn't posted twice.",
   );
   assert.match(
     explainSlackError(unanswered, { tool: 'fetch_history', args: { channelId: 'C16' } }),
@@ -436,9 +439,10 @@ test("a failure in transit leaves a write's outcome unknown, and a read is tried
   );
   api.answer({ status: 503, body: { ok: false } });
   const unavailable = await clientError();
-  assert.match(
+  assert.equal(
     explainSlackError(unavailable, { tool: 'edit_message', args: { channelId: 'C16', messageId: '1.3' } }),
-    /^An HTTP protocol error occurred: statusCode = 503\n\nSlack answered with HTTP 503, so whether the edit took is unknown\. fetch_history shows message 1\.3 as it is now if it's in the channel itself, and fetch_thread does, with its thread's id, if it's a thread reply\.$/,
+    `${(unavailable as Error).message}\n\nSlack answered with HTTP 503, so whether the edit took is unknown. fetch_history shows ` +
+      "message 1.3 as it is now if it's in the channel itself, and fetch_thread does, with its thread's id, if it's a thread reply.",
   );
   assert.match(
     explainSlackError(unavailable, { tool: 'find_user', args: { query: 'ann' } }),
@@ -450,9 +454,11 @@ test("a connection that couldn't be made says nothing was done, even for a write
   const refused = await clientError(
     new WebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: await unreachableSlackApiUrl() }),
   );
-  assert.match(
+  assert.equal((refused as { original?: { code?: string } }).original?.code, 'ECONNREFUSED');
+  assert.equal(
     explainSlackError(refused, { tool: 'send_message', args: { channelId: 'C17' } }),
-    /^A request error occurred: connect ECONNREFUSED .*\n\nNothing was posted: Slack couldn't be reached\. Try again shortly\. If it keeps failing, whoever runs this host has to check its connection to Slack\.$/s,
+    `${(refused as Error).message}\n\nNothing was posted: Slack couldn't be reached. Try again shortly. If it keeps failing, ` +
+      'whoever runs this host has to check its connection to Slack.',
   );
   assert.match(
     explainSlackError(refused, { tool: 'fetch_history', args: { channelId: 'C17' } }),
@@ -513,12 +519,12 @@ test('a user id Slack does not know or show points to find_user, or says nothing
 
 test("other errors and other codes pass through unchanged, and a read's still says that no messages were returned", async () => {
   const unlisted = await slackError('invalid_arguments');
-  assert.equal(explainSlackError(unlisted, { tool: 'send_message', args: {} }), 'An API error occurred: invalid_arguments');
+  assert.equal(explainSlackError(unlisted, { tool: 'send_message', args: {} }), (unlisted as Error).message);
   // A read that fails returns nothing, so its failure says so, unless its own
   // text opens with it, as the read's own refusals do.
   assert.equal(
     explainSlackError(unlisted, { tool: 'fetch_history', args: { channelId: 'C1' } }),
-    'An API error occurred: invalid_arguments\n\nNo messages were returned.',
+    `${(unlisted as Error).message}\n\nNo messages were returned.`,
   );
   assert.equal(explainSlackError(new Error('a bug'), { tool: 'fetch_thread', args: {} }), 'a bug\n\nNo messages were returned.');
   const own = new Error('No messages were returned: limit must be an integer from 1 to 1000.');
@@ -526,17 +532,17 @@ test("other errors and other codes pass through unchanged, and a read's still sa
   const reacted = await slackError('already_reacted');
   assert.equal(
     explainSlackError(reacted, { tool: 'add_reaction', args: { channelId: 'C1', messageId: '1.1', emoji: 'eyes' } }),
-    'An API error occurred: already_reacted',
+    (reacted as Error).message,
   );
   // file_not_found is explained for an upload's last step alone; chat.update's
   // passes through.
   assert.equal(
     await explain('file_not_found', 'edit_message', { channelId: 'C1', messageId: '1.1', content: 'hi' }),
-    'An API error occurred: file_not_found',
+    await said('file_not_found'),
   );
   // So are a workspace's refusals of an upload, which no other tool gets.
   for (const code of ['file_uploads_disabled', 'storage_limit_reached']) {
-    assert.equal(await explain(code, 'send_message', { channelId: 'C1', content: 'hi' }), `An API error occurred: ${code}`);
+    assert.equal(await explain(code, 'send_message', { channelId: 'C1', content: 'hi' }), await said(code));
   }
   const local = new Error('channelId is required');
   assert.equal(explainSlackError(local, { tool: 'send_message', args: {} }), 'channelId is required');
@@ -551,7 +557,7 @@ test("a body that is one lowercase word reads as Slack's refusal, as the shape r
     ...SLACK_CLIENT_OPTIONS, slackApiUrl: await nonJsonSlackApiUrl(t, 'upstream_error'),
   }));
   assert.equal(slackRefusal(err), 'upstream_error');
-  assert.equal(explainSlackError(err, { tool: 'send_message', args: { channelId: 'C1', content: 'hi' } }), 'An API error occurred: upstream_error');
+  assert.equal(explainSlackError(err, { tool: 'send_message', args: { channelId: 'C1', content: 'hi' } }), (err as Error).message);
 });
 
 test("an answer that isn't in Slack's form leaves a write's outcome unknown, and another call says to try again", async (t) => {
@@ -605,9 +611,9 @@ test("a tool's refusal reaches the agent explained, still marked as an error", a
     arguments: { channelId: 'C0NOPE', content: 'hi' },
   })) as { isError?: boolean; content: { text: string }[] };
   assert.equal(result.isError, true);
-  assert.match(
+  assert.ok(
+    result.content[0].text.startsWith(`${await said('channel_not_found')}\n\nNothing was posted: Slack doesn't know conversation C0NOPE`),
     result.content[0].text,
-    /^An API error occurred: channel_not_found\n\nNothing was posted: Slack doesn't know conversation C0NOPE/,
   );
   await h.close();
 });
@@ -634,7 +640,7 @@ test("an upload refusal reaches the agent with an upload-specific explanation", 
       assert.equal(result.isError, true);
       assert.equal(api.calls.at(-1), 'files.completeUploadExternal');
       const text = result.content[0].text;
-      assert.ok(text.startsWith(`An API error occurred: ${error}\n\n`), text);
+      assert.ok(text.startsWith(`${await said(error)}\n\n`), text);
       assert.doesNotMatch(text, /Nothing was done|Nothing was sent|the message was posted/);
       if (error === 'internal_error') {
         assert.match(text, /whether the file was shared is unknown/);
@@ -681,13 +687,18 @@ test("the host's channels/publish gets the same explanation in its error", async
   api.answer({ body: { ok: true } });
   await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
   api.answer({ body: { ok: false, error: 'not_in_channel' } });
+  const explained = `${await said('not_in_channel')}\n\nNothing was posted: this bot isn't a member of conversation C0OUT, ` +
+    "so Slack didn't let it post there";
   await assert.rejects(
     h.host.sendRequest(method.CHANNELS_PUBLISH, {
       conversationId: 'conv-1',
       channelId: 'slack:C0OUT',
       content: [{ type: 'text', text: 'hello' }],
     }),
-    /An API error occurred: not_in_channel\n\nNothing was posted: this bot isn't a member of conversation C0OUT, so Slack didn't let it post there/,
+    (err: Error) => {
+      assert.ok(err.message.includes(explained), err.message);
+      return true;
+    },
   );
   await h.close();
 });

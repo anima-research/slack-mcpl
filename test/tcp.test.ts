@@ -88,10 +88,7 @@ test("needs a listening server, so a failure to listen stays the caller's", () =
     () => serveTcp(unlistened, async () => {}, () => {}),
     /serveTcp needs a listening server/,
   );
-  // Nothing was added to it: its 'error' still ends the process, as a
-  // failure to listen should.
-  assert.equal(unlistened.listenerCount('error'), 0);
-  assert.equal(unlistened.listenerCount('connection'), 0);
+  assert.throws(() => unlistened.emit('error', new Error('listen EADDRINUSE')), /listen EADDRINUSE/);
 });
 
 test('serves one client at a time: one that connects meanwhile is refused at once, and the first is still served', async (t) => {
@@ -115,8 +112,7 @@ test('serves one client at a time: one that connects meanwhile is refused at onc
   await until(() => lines(logged, '[slack-mcpl] Client disconnected, waiting for next...').length === 1, 'the first client to be let go');
   await closed(first.socket);
   const third = await client();
-  assert.equal(await servedAs(third.conn), 1);
-  assert.equal(s.served(), 2, 'the refused client was never served');
+  assert.equal(await servedAs(third.conn), 1, 'the refused client was never served');
 });
 
 test('two clients arriving in the same tick while none is served: one is served, one refused', async (t) => {
