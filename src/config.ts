@@ -1,3 +1,5 @@
+import { PathUploadReader, validatePathUploadPolicy, type PathUploadPolicy } from './upload-path.js';
+
 /** Parse an operator switch. An absent value is off; a present value must
  *  say yes or no so a broken environment template cannot disable a guard. */
 export function booleanFlag(name: string, raw: string | undefined): boolean {
@@ -18,6 +20,7 @@ export interface StartupSettings {
   disableDms: boolean;
   subscribeMemberChannels: boolean;
   ackReaction: string | undefined;
+  pathUploads?: PathUploadPolicy;
 }
 
 export function startupSettings(
@@ -47,8 +50,24 @@ export function startupSettings(
   } catch (err) {
     return { refusal: (err as Error).message };
   }
+  let pathUploads: PathUploadPolicy | undefined;
+  if (env.SLACK_PATH_UPLOADS !== undefined) {
+    // Neither JSON errors nor filesystem diagnostics may echo operator input.
+    try { pathUploads = validatePathUploadPolicy(JSON.parse(env.SLACK_PATH_UPLOADS)); }
+    catch {
+      return { refusal: 'SLACK_PATH_UPLOADS must configure restricted directories or explicit unrestricted mode, with optional maxBytes from 1 to 1073741824, as JSON' };
+    }
+    try {
+      // Check roots and runtime support before connectSlack can authenticate.
+      // The server owns its own pinned roots for its lifetime, not this probe.
+      new PathUploadReader(pathUploads).close();
+    } catch {
+      return { refusal: 'SLACK_PATH_UPLOADS requires Linux/macOS; restricted mode also requires Python 3.9+, descriptor-path support and readable directory roots' };
+    }
+  }
   const ackReaction = env.SLACK_ACK_REACTION?.replace(/:/g, '').trim() || undefined;
   return {
-    settings: { useStdio, tcpPort, botToken, appToken, dmUsers, sendChannels, disableDms, subscribeMemberChannels, ackReaction },
+    settings: { useStdio, tcpPort, botToken, appToken, dmUsers, sendChannels, disableDms, subscribeMemberChannels, ackReaction,
+      ...(pathUploads === undefined ? {} : { pathUploads }) },
   };
 }

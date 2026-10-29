@@ -2,6 +2,7 @@
  * MCP tool definitions and input types for Slack operations.
  * These tools work in both MCP and MCPL mode.
  */
+import { mebibytes, type PathUploadPolicy } from './upload-path.js';
 import {AUTHOR_ID, PARENT_IDS, READ_LIMITS} from './history-read.js';
 
 const readProperties = {
@@ -263,3 +264,29 @@ export const toolDefinitions: ToolDefinition[] = [
     },
   },
 ];
+
+/** Inline-only remains the default; path capability is operator configuration. */
+export function toolDefinitionsForPathUploads(policy?: PathUploadPolicy): ToolDefinition[] {
+  if (!policy) return toolDefinitions;
+  const boundary = policy.mode === 'restricted'
+    ? 'Only configured directories on the connector filesystem are admitted; symlinks below roots are refused.'
+    : 'The operator explicitly permits any regular file readable by the connector account; symlinks are allowed.';
+  return toolDefinitions.map(tool => tool.name !== 'upload_file' ? tool : {
+    ...tool,
+    description:
+      'Upload a file to a Slack conversation, optionally into a thread and with a message. ' +
+      'Pass exactly one of path (a file on this server\'s filesystem), content (text) or contentBase64 (base64). ' +
+      'Inline content is capped at 5 MiB of file bytes, after base64 is decoded or text is encoded as UTF-8; ' +
+      `path files up to ${mebibytes(policy.maxBytes)} (${policy.maxBytes} bytes), the operator's limit. ` +
+      'Same write rules as send_message. ' + boundary,
+    inputSchema: {
+      ...tool.inputSchema,
+      properties: {
+        ...tool.inputSchema.properties,
+        path: {type: 'string', description: 'Absolute regular-file path on the connector filesystem/account, not necessarily the agent host. ' + boundary},
+        filename: {type: 'string', description: 'Slack filename; required for inline data, defaults to basename for path uploads'},
+      },
+      required: ['channelId'],
+    },
+  });
+}

@@ -55,7 +55,8 @@ import {
   type SlackMessageData,
   type SlackWait,
 } from './slack-adapter.js';
-import { toolDefinitions } from './tools.js';
+import { toolDefinitionsForPathUploads } from './tools.js';
+import { PathUploadReader, type PathUploadConfig } from './upload-path.js';
 import { withToolClasses } from './tool-classes.js';
 import { buildFeatureSets, buildServerCapabilities, featureSetForTool, MESSAGING_FEATURE_SET } from './feature-sets.js';
 import { ChannelManager, mcplChannelId, parseMcplChannelId, toDescriptor } from './channels.js';
@@ -74,7 +75,7 @@ import {
   type AttachmentRef,
 } from './content.js';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { basename, dirname } from 'node:path';
 import { createRequire } from 'node:module';
 import { clock } from './clock.js';
 
@@ -185,6 +186,7 @@ export function backscrollBlock(
 }
 
 export class SlackMcplServer {
+  private readonly pathReader?: PathUploadReader;
   private conn: McplConnection | null = null;
   private mcplEnabled = false;
   private grant = new CapabilityGrant(buildFeatureSets());
@@ -253,13 +255,17 @@ export class SlackMcplServer {
    */
   constructor(
     private slack: SlackAdapter,
-    private opts: { subscribeMemberChannels?: boolean } = {},
+    private opts: { subscribeMemberChannels?: boolean; pathUploads?: PathUploadConfig } = {},
   ) {
     // Once for the server's life: the adapter keeps every handler it's
     // given, and each forwards to whichever connection is being served, so
     // one per connection forwarded each message once per connection served.
+    if (opts.pathUploads !== undefined) this.pathReader = new PathUploadReader(opts.pathUploads);
     this.setupSlackForwarding();
   }
+
+  /** Release pinned upload roots and cancel local readers at process shutdown. */
+  close(): void { this.pathReader?.close(); }
 
   /**
    * Serve a single connection. Blocks until the connection closes, and
@@ -389,7 +395,7 @@ export class SlackMcplServer {
    *  connection has no host to register conversations with. Neither changes
    *  during a connection, as a grant can. */
   private offeredTools() {
-    return toolDefinitions.filter((t) =>
+    return toolDefinitionsForPathUploads(this.pathReader?.policy).filter((t) =>
       (t.name !== 'send_dm' || this.slack.dmsWritable) && (t.name !== 'refresh_channels' || this.mcplEnabled));
   }
 
@@ -412,7 +418,7 @@ export class SlackMcplServer {
       switch (req.method) {
         case 'tools/list': {
           // MCPL RFC-008: each tool carries its class in _meta['mcpl/class'].
-          conn.sendResponse(req.id, { tools: withToolClasses(this.offeredTools()) });
+          conn.sendResponse(req.id, { tools: withToolClasses(this.offeredTools(), { pathUploads: this.pathReader?.policy }) });
           break;
         }
 
@@ -686,7 +692,6 @@ export class SlackMcplServer {
 
       case 'upload_file': {
         const channelId = this.requireString(args, 'channelId');
-        const filename = this.requireString(args, 'filename');
         // An argument given as JSON null is not given, and an optional one
         // given as an empty string names nothing, so it isn't given either.
         // An optional one given as anything but a string is refused, rather
@@ -700,11 +705,6 @@ export class SlackMcplServer {
           if (typeof args[k] !== 'string') throw refuse(`${k} must be a string`);
           return args[k] as string;
         };
-        if (given('content') === given('contentBase64')) throw refuse('pass exactly one of content or contentBase64');
-        const key = given('content') ? 'content' : 'contentBase64';
-        const input = args[key];
-        if (typeof input !== 'string') throw refuse(`${key} must be a string`);
-        if (input.length === 0) throw refuse(`${key} is empty: give the file's content, at least one byte`);
         // UTF-8 can't hold a lone surrogate: Buffer.from would write U+FFFD in
         // its place, so the file or its name would differ from what was given,
         // and the client can't encode one into its request to Slack.
@@ -713,45 +713,83 @@ export class SlackMcplServer {
             throw refuse(`${k} holds a lone UTF-16 surrogate, which UTF-8 can't encode: ${remedy}`);
           }
         };
-        loneSurrogate('filename', filename, 'remove it from the name');
-        const tooLarge = (size: string) => refuse(
-          `inline file too large: ${size}, past this server's inline limit of ${MAX_UPLOAD_BYTES} bytes, so upload_file ` +
-            'can\'t send it. A smaller file can go, such as this one split into parts.',
-        );
-        let data: Buffer;
-        if (key === 'content') {
-          loneSurrogate('content', input, 'remove it, or pass the file\'s bytes as contentBase64');
-          // Measured before the bytes are made, so content past the cap isn't
-          // copied (R1-1).
-          const length = Buffer.byteLength(input, 'utf8');
-          if (length > MAX_UPLOAD_BYTES) throw tooLarge(`${length} bytes`);
-          data = Buffer.from(input, 'utf8');
-        } else {
-          // Longer than the cap's canonical base64, it's refused before it's
-          // decoded and encoded again (R1-1).
-          if (input.length > MAX_UPLOAD_BASE64) {
-            throw refuse(
-              `inline file too large: contentBase64 is ${input.length} characters, and canonical base64 longer than ` +
-                `${MAX_UPLOAD_BASE64} characters holds more than this server's inline limit of ${MAX_UPLOAD_BYTES} bytes, ` +
-                'so upload_file can\'t send it. A smaller file can go, such as this one split into parts.',
-            );
-          }
-          // Buffer.from skips what isn't base64 and reads a data URI's prefix
-          // as bytes, so only base64 that it writes back the same is taken:
-          // canonical RFC 4648, with padding and zero unused bits.
-          data = Buffer.from(input, 'base64');
-          if (data.toString('base64') !== input) {
-            throw refuse('contentBase64 must be canonical RFC 4648 base64 with padding, on one line: no line breaks, spaces or data URI');
-          }
+        if (given('path') && !this.pathReader) {
+          throw refuse(
+            "this host doesn't take file paths, so upload_file can't read path. Pass the " +
+              "file's bytes as content or contentBase64 instead.",
+          );
         }
-        if (data.byteLength > MAX_UPLOAD_BYTES) throw tooLarge(`${data.byteLength} bytes`);
-        const comment = optional('comment');
-        const title = optional('title');
-        loneSurrogate('comment', comment, 'remove it from the comment');
-        loneSurrogate('title', title, 'remove it from the title');
+        // The optional arguments, checked before anything is read or sent.
+        const extras = () => {
+          const comment = optional('comment');
+          const title = optional('title');
+          loneSurrogate('comment', comment, 'remove it from the comment');
+          loneSurrogate('title', title, 'remove it from the title');
+          return { comment, title, threadTs: optional('messageId') };
+        };
+        let filename: string;
+        let data: Buffer;
+        let rest: ReturnType<typeof extras>;
+        if (given('path')) {
+          if (['path', 'content', 'contentBase64'].filter(given).length !== 1) {
+            throw refuse('pass exactly one of path, content or contentBase64');
+          }
+          const path = args.path;
+          if (typeof path !== 'string') throw refuse('path must be a string');
+          filename = given('filename') ? this.requireString(args, 'filename') : basename(path);
+          loneSurrogate('filename', filename, 'remove it from the name');
+          rest = extras();
+          // The write checks come before the local read; uploadFile makes them
+          // again before its first step, so the file's bytes go to Slack the
+          // same way inline bytes do.
+          await this.slack.requireUploadDestination(channelId);
+          try { data = await this.pathReader!.read(path); }
+          catch (err) { throw refuse((err as Error).message); }
+          if (data.byteLength === 0) throw refuse('path names an empty file: give a file with at least one byte');
+        } else {
+          filename = this.requireString(args, 'filename');
+          if (given('content') === given('contentBase64')) throw refuse('pass exactly one of content or contentBase64');
+          const key = given('content') ? 'content' : 'contentBase64';
+          const input = args[key];
+          if (typeof input !== 'string') throw refuse(`${key} must be a string`);
+          if (input.length === 0) throw refuse(`${key} is empty: give the file's content, at least one byte`);
+          loneSurrogate('filename', filename, 'remove it from the name');
+          const tooLarge = (size: string) => refuse(
+            `inline file too large: ${size}, past this server's inline limit of ${MAX_UPLOAD_BYTES} bytes, so upload_file ` +
+              'can\'t send it. A smaller file can go, such as this one split into parts.',
+          );
+          if (key === 'content') {
+            loneSurrogate('content', input, 'remove it, or pass the file\'s bytes as contentBase64');
+            // Measured before the bytes are made, so content past the cap isn't
+            // copied (R1-1).
+            const length = Buffer.byteLength(input, 'utf8');
+            if (length > MAX_UPLOAD_BYTES) throw tooLarge(`${length} bytes`);
+            data = Buffer.from(input, 'utf8');
+          } else {
+            // Longer than the cap's canonical base64, it's refused before it's
+            // decoded and encoded again (R1-1).
+            if (input.length > MAX_UPLOAD_BASE64) {
+              throw refuse(
+                `inline file too large: contentBase64 is ${input.length} characters, and canonical base64 longer than ` +
+                  `${MAX_UPLOAD_BASE64} characters holds more than this server's inline limit of ${MAX_UPLOAD_BYTES} bytes, ` +
+                  'so upload_file can\'t send it. A smaller file can go, such as this one split into parts.',
+              );
+            }
+            // Buffer.from skips what isn't base64 and reads a data URI's prefix
+            // as bytes, so only base64 that it writes back the same is taken:
+            // canonical RFC 4648, with padding and zero unused bits.
+            data = Buffer.from(input, 'base64');
+            if (data.toString('base64') !== input) {
+              throw refuse('contentBase64 must be canonical RFC 4648 base64 with padding, on one line: no line breaks, spaces or data URI');
+            }
+          }
+          if (data.byteLength > MAX_UPLOAD_BYTES) throw tooLarge(`${data.byteLength} bytes`);
+          rest = extras();
+        }
+        const { comment, title, threadTs } = rest;
         let result: { fileId: string; shareTs?: string };
         try {
-          result = await this.slack.uploadFile(channelId, { filename, data, title, comment, threadTs: optional('messageId') });
+          result = await this.slack.uploadFile(channelId, { filename, data, title, comment, threadTs });
         } catch (err) {
           // An upload that failed after its first step leaves its file for
           // rollback, and its comment only if Slack may have shared the file
