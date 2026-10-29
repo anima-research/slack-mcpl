@@ -92,6 +92,16 @@ use their user IDs without further waits. Conversation listings, directory
 lookups and backscroll, including legacy mode, fail on a repeated pagination
 cursor instead of looping forever.
 
+Page-count limits apply equally in legacy and explicit-policy mode. A normal
+limit stop returns eligible partial results with an explicit incomplete signal;
+it is not a cursor-cycle, rate-limit or authorization error. Fresh admission,
+per-candidate retries and the five-page MPIM membership proof remain unchanged.
+Incomplete registration is reported in logs and refresh status; a repeated
+refresh starts over and need not reach missing conversations. Truncated
+backscroll may omit older context and is not a complete archive. Complete
+responses below all limits are unchanged. See README's **Bounded pagination**
+section for the three validated operator settings and result fields.
+
 ## Troubleshooting and rollback
 
 Fix invalid/empty JSON, unknown keys or contradictory pins and restart.
