@@ -7,8 +7,13 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { method } from '@animalabs/mcpl-core';
-import { FULL_GRANT, MENTION_EVENT, harness, initialize, until, type Harness } from './harness.js';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { cliInvocation } from './cliHarness.js';
+import { SlackMcplServer } from '../src/server.js';
+import { toolDefinitions } from '../src/tools.js';
+import { McplConnection, method } from '@animalabs/mcpl-core';
+import { FULL_GRANT, MENTION_EVENT, connectHost, fakeSlack, harness, initialize, until, type Harness } from './harness.js';
 
 const pushes = (h: Harness) => h.hostSaw.filter((r) => r.method === method.PUSH_EVENT);
 const pushText = (h: Harness, i: number) =>
@@ -169,4 +174,130 @@ test('send_dm is not offered when the write list names no DM', async () => {
   const { tools } = (await h.host.sendRequest('tools/list')) as { tools: { name: string }[] };
   assert.equal(tools.some((t) => t.name === 'send_dm'), false);
   await h.close();
+});
+
+for (const mcpl of [false, true]) {
+  test(`disabled tools are hidden and refused without changing other tools (${mcpl ? 'MCPL' : 'MCP'})`, async t => {
+    const fake = fakeSlack();
+    const disabledTools = ['send_message', 'fetch_history', 'subscribe_channel'];
+    const server = new SlackMcplServer(fake.slack, { disabledTools });
+    const h = connectHost(server);
+    t.after(() => h.close());
+    await initialize(h, mcpl);
+    if (mcpl) await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+    const control = connectHost(new SlackMcplServer(fakeSlack().slack));
+    t.after(() => control.close());
+    await initialize(control, mcpl);
+    if (mcpl) await control.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+    const baseline = await control.host.sendRequest('tools/list') as { tools: { name: string }[] };
+    const listed = await h.host.sendRequest('tools/list') as typeof baseline;
+    assert.deepEqual(listed.tools, baseline.tools.filter(tool => !disabledTools.includes(tool.name)));
+
+    for (const name of disabledTools) {
+      const result = await h.host.sendRequest('tools/call', {
+        name, arguments: { channelId: 'C1', content: 'must not post' },
+      }) as { isError?: boolean; content: { text: string }[] };
+      assert.equal(result.isError, true);
+      assert.equal(result.content[0].text, `Tool '${name}' is disabled by operator configuration`);
+    }
+    assert.deepEqual(fake.posts, []);
+    assert.deepEqual(fake.reads, []);
+    const subscriptions = await h.host.sendRequest('tools/call', { name: 'list_subscriptions', arguments: {} });
+    assert.deepEqual(subscriptions, await control.host.sendRequest('tools/call', { name: 'list_subscriptions', arguments: {} }));
+    const reply = await h.host.sendRequest('tools/call', {
+      name: 'reply_message', arguments: { channelId: 'C1', messageId: '1.1', content: 'enabled' },
+    }) as { isError?: boolean };
+    assert.notEqual(reply.isError, true);
+    assert.equal(fake.posts.length, 1);
+    if (mcpl) {
+      // Disabling a tool is not an operation-wide ban or a new feature-set grant.
+      await h.host.sendRequest(method.CHANNELS_PUBLISH, { channelId: 'slack:C1', content: [{ type: 'text', text: 'publish' }] });
+      assert.equal(fake.posts.length, 2);
+      await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: [] });
+      await assert.rejects(h.host.sendRequest('tools/call', { name: 'send_message', arguments: {} }), /capability/i);
+    }
+  });
+
+  test(`every tool can be disabled, including always-available tools (${mcpl ? 'MCPL' : 'MCP'})`, async t => {
+    const h = connectHost(new SlackMcplServer(fakeSlack().slack, { disabledTools: toolDefinitions.map(tool => tool.name) }));
+    t.after(() => h.close());
+    await initialize(h, mcpl);
+    if (mcpl) await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+    assert.deepEqual(await h.host.sendRequest('tools/list'), { tools: [] });
+    for (const { name } of toolDefinitions) {
+      const result = await h.host.sendRequest('tools/call', { name, arguments: {} }) as { isError?: boolean; content: { text: string }[] };
+      assert.equal(result.isError, true);
+      assert.equal(result.content[0].text, `Tool '${name}' is disabled by operator configuration`);
+    }
+  });
+}
+
+test('disabled-tool options are validated and copied at construction', async t => {
+  for (const name of ['misspelled', 'bad\nname']) {
+    assert.throws(() => new SlackMcplServer(fakeSlack().slack, { disabledTools: [name] }), {
+      message: `Unknown disabled tool: ${JSON.stringify(name)}`,
+    });
+  }
+  const opts = { disabledTools: ['send_message'] };
+  const h = connectHost(new SlackMcplServer(fakeSlack().slack, opts));
+  t.after(() => h.close());
+  opts.disabledTools.splice(0, 1, 'reply_message');
+  opts.disabledTools = ['fetch_history'];
+  await initialize(h, false);
+  const { tools } = await h.host.sendRequest('tools/list') as { tools: { name: string }[] };
+  assert.equal(tools.some(tool => tool.name === 'send_message'), false);
+  assert.equal(tools.some(tool => tool.name === 'reply_message'), true);
+  assert.equal(tools.some(tool => tool.name === 'fetch_history'), true);
+  const result = await h.host.sendRequest('tools/call', { name: 'send_message', arguments: {} }) as { isError?: boolean; content: { text: string }[] };
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /disabled by operator configuration/);
+});
+
+test('index wires SLACK_DISABLED_TOOLS through to the stdio server', { timeout: 30_000 }, async t => {
+  const { args, options } = cliInvocation({ SLACK_DISABLED_TOOLS: 'send_message, fetch_history,send_message' }, true);
+  const child = spawn(process.execPath, args, { ...options, stdio: ['pipe', 'pipe', 'pipe'] });
+  const exited = once(child, 'exit');
+  let stderr = '';
+  child.stderr.setEncoding('utf8').on('data', chunk => { stderr += chunk; });
+  const host = McplConnection.fromStreams(child.stdout, child.stdin);
+  t.after(async () => { host.close(); child.kill(); await exited; });
+  await initialize({ host }, false);
+  const { tools } = await host.sendRequest('tools/list') as { tools: { name: string }[] };
+  assert.equal(tools.some(tool => tool.name === 'send_message'), false);
+  assert.equal(tools.some(tool => tool.name === 'find_user'), true);
+  assert.equal(tools.some(tool => tool.name === 'fetch_history'), false);
+  const denied = await host.sendRequest('tools/call', { name: 'send_message', arguments: {} }) as { isError?: boolean; content: { text: string }[] };
+  assert.equal(denied.isError, true);
+  assert.match(denied.content[0].text, /disabled by operator configuration/);
+  const allowed = await host.sendRequest('tools/call', { name: 'find_user', arguments: { query: 'nobody' } }) as { isError?: boolean };
+  assert.notEqual(allowed.isError, true);
+  child.stdin.end();
+  assert.deepEqual(await exited, [0, null], stderr);
+  assert.match(stderr, /writes: anywhere; DMs: on; tools off: send_message, fetch_history\n/);
+});
+
+test('disabled reaction and deletion tools do not block automatic acknowledgements or host rollback', async t => {
+  const fake = fakeSlack({ ackReaction: 'eyes' });
+  const h = connectHost(new SlackMcplServer(fake.slack, { disabledTools: ['add_reaction', 'delete_message'] }));
+  t.after(async () => { await h.close(); await fake.slack.stop(); });
+  await initialize(h, true);
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  for (const name of ['add_reaction', 'delete_message']) {
+    const result = await h.host.sendRequest('tools/call', {
+      name, arguments: { channelId: 'C1', messageId: '111.1', emoji: 'eyes' },
+    }) as { isError?: boolean; content: { text: string }[] };
+    assert.equal(result.isError, true);
+    assert.equal(result.content[0].text, `Tool '${name}' is disabled by operator configuration`);
+  }
+  assert.deepEqual(fake.reactions, []);
+  assert.deepEqual(fake.deletedMessages, []);
+  await fake.socket.emitMessage(MENTION_EVENT);
+  await until(() => fake.reactions.includes('add:C1:111.1:eyes'), 'automatic acknowledgement');
+  const sent = await h.host.sendRequest('tools/call', {
+    name: 'send_message', arguments: { channelId: 'C1', content: 'to roll back' },
+  }) as { state: { parent: string } };
+  assert.deepEqual(await h.host.sendRequest(method.STATE_ROLLBACK, {
+    featureSet: 'slack.messaging', checkpoint: sent.state.parent,
+  }), { checkpoint: sent.state.parent, success: true });
+  assert.deepEqual(fake.deletedMessages, [{ channel: 'C1', ts: '100.1' }]);
 });
