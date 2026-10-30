@@ -64,6 +64,7 @@ const NOT_DONE: Record<string, string> = {
   edit_message: "The message wasn't changed",
   delete_message: 'Nothing was deleted',
   add_reaction: 'No reaction was added',
+  remove_reaction: 'No reaction was removed',
   // A read can fail after its first pages, so its lead is what the caller
   // didn't get.
   fetch_history: NOTHING_RETURNED,
@@ -83,7 +84,7 @@ const POSTS = new Set(['send_message', 'reply_message', 'channels/publish', 'sen
  *  where one missing from a list of writes would say nothing was written when
  *  something may have been. */
 const BEFORE_WRITE = new Set(['conversations.info', 'conversations.open', 'files.getUploadURLExternal']);
-const WRITES = new Set([...POSTS, 'edit_message', 'delete_message', 'add_reaction']);
+const WRITES = new Set([...POSTS, 'edit_message', 'delete_message', 'add_reaction', 'remove_reaction']);
 /** Tools whose listing pages through Slack inside the call, from the first
  *  page each time, so in a workspace too large to list within Slack's rate
  *  limit, calling again stops near the same page. */
@@ -210,6 +211,10 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
         `${cause}, so whether ${theMessage} was deleted is unknown${note}. fetch_history shows whether it's still ` +
         `there ${where}. Deleting it again is safe: once it's gone, Slack answers message_not_found.`
       );
+    }
+    if (call.tool === 'remove_reaction') {
+      return `${cause}, so whether the reaction was removed is unknown${note}. Removing it again is safe: ` +
+        'if it is already gone, remove_reaction reports no_reaction and changes nothing.';
     }
     return (
       `${cause}, so whether the reaction was added is unknown${note}. Adding it again is safe: if it's there, ` +
@@ -398,6 +403,10 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
         ? `${lead}: Slack takes at most 4,000 characters of text in an edit, and this text is longer. Shorten ` +
             'it, or edit in a shorter version and post the rest with reply_message.'
         : `${lead}: Slack refused the text as too long. Split it into shorter messages and send them in order.`;
+    case 'no_reaction':
+      return call.tool === 'remove_reaction'
+        ? "No reaction was removed: this bot has no such reaction on that message. Only this bot's own reactions can be removed."
+        : undefined;
     case 'invalid_name': {
       const emoji = given('emoji');
       // Slack judged the name add_reaction sent: the one given, with every colon
@@ -414,7 +423,7 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
         `${lead}: this workspace has no emoji ${named}.` +
         (inside
           ? " This server removes every colon from a name, so a name with a colon inside, such as a skin tone's, " +
-            "can't be added here. Pass a name Slack's emoji picker shows, such as thumbsup, white_check_mark or eyes."
+            `can't be ${call.tool === 'remove_reaction' ? 'removed' : 'added'} here. Pass a name Slack's emoji picker shows, such as thumbsup, white_check_mark or eyes.`
           : " Pass a name Slack's emoji picker shows, such as thumbsup, white_check_mark or eyes; a custom emoji " +
             'has to be added to the workspace first.')
       );

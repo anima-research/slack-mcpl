@@ -226,6 +226,8 @@ export function historyRecord(m: HistoryMessage) {
     content: m.content,
     ...(m.threadTs ? { threadTs: m.threadTs } : {}),
     rootTs: m.rootTs,
+    ...(m.reactions?.length ? { reactions: m.reactions } : {}),
+    ...(m.reactionsOmitted ? { reactionsOmitted: m.reactionsOmitted } : {}),
     ...(m.replyCount !== undefined ? { replyCount: m.replyCount } : {}),
     ...(m.attachments.length > 0
       ? {

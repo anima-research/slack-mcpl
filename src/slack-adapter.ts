@@ -157,6 +157,8 @@ type AckEntry = {
   added: Promise<boolean>;
   tries: number;
   removing?: Promise<void>;
+  /** Slack confirmed removal or answered no_reaction; dropping cleanup alone proves neither. */
+  gone?: boolean;
 };
 
 /** How long work no call waits on waits before asking Slack again after a
@@ -329,6 +331,8 @@ export interface HistoryMessage {
   rootTs: string;
   /** Its replies, when Slack gives a count; missing means unknown. */
   replyCount?: number;
+  reactions?: Array<{ name: string; count?: number; own?: boolean }>;
+  reactionsOmitted?: number;
   timestamp: Date;
   attachments: Array<{ name: string; mimeType?: string; url?: string }>;
 }
@@ -1186,8 +1190,10 @@ export class SlackAdapter {
     entry.tries++;
     try {
       await this.web.reactions.remove({ channel: channelId, timestamp: ts, name: this.ackReaction! });
+      entry.gone = true;
       this.dropAck(channelId, ts, entry);
     } catch (err) {
+      if (slackRefusal(err) === 'no_reaction') entry.gone = true;
       // Slack's refusal will be the same next time. A rate limit, an HTTP
       // error, a failure in transit or Slack's own failure can pass. The fifth
       // failure drops the entry, so no sixth attempt can start.
@@ -1426,6 +1432,59 @@ export class SlackAdapter {
     await this.web.reactions.add({ channel: channelId, timestamp: ts, name: reactionName(emoji) });
   }
 
+  /** Manual removal shares a pending ACK's ordering and cleanup, but unlike
+   *  best-effort ACK cleanup, reports Slack's refusal to the caller. Returns
+   *  false when a joined cleanup confirmed absence, without another API call. */
+  async removeReaction(channelId: string, ts: string, emoji: string): Promise<boolean> {
+    this.assertWritable(channelId, 'No reaction was removed');
+    await this.assertNotDm(channelId, 'No reaction was removed');
+    const name = reactionName(emoji);
+    const entry = name === this.ackReaction ? this.ackPending.get(channelId)?.get(ts) : undefined;
+    // Let an already-running automatic cleanup finish before the explicit call.
+    if (entry?.removing) {
+      await entry.removing;
+      // A terminal failure also drops cleanup. Only Slack-confirmed absence
+      // makes another removal redundant; otherwise ask and report its answer.
+      if (entry.gone) return false;
+    }
+    const remove = async () => {
+      if (entry) {
+        await entry.added;
+        entry.tries++;
+      }
+      try {
+        await this.web.reactions.remove({ channel: channelId, timestamp: ts, name });
+        if (entry) {
+          entry.gone = true;
+          this.dropAck(channelId, ts, entry);
+        }
+        return true;
+      } catch (err) {
+        if (entry && slackRefusal(err) === 'no_reaction') entry.gone = true;
+        // Use the automatic cleanup's retry budget and terminal refusals.
+        if (entry && (refusedForGood(err) || this.stopping || entry.tries >= ACK_MAX_TRIES)) {
+          this.dropAck(channelId, ts, entry);
+        }
+        throw err;
+      }
+    };
+    if (!entry) return remove();
+    clearTimeout(entry.timer);
+    const removed = remove();
+    // clearAck must stay best-effort even when it joins a manual removal.
+    entry.removing = removed.then(() => {}, () => {}).finally(() => {
+      entry.removing = undefined;
+      if (this.ackPending.get(channelId)?.get(ts) === entry) {
+        entry.timer = this.armAck(channelId, ts, ACK_RETRY_MS);
+      }
+    });
+    try {
+      return await removed;
+    } finally {
+      await entry.removing;
+    }
+  }
+
   // ── History ──
 
   /** fetch_history's read: bounded and filtered, saying whether it covered
@@ -1503,12 +1562,31 @@ export class SlackAdapter {
       // Slack reports it, or the message's own.
       const reported = [msg.thread_ts, msg.root?.thread_ts, msg.root?.ts].find((ts) => typeof ts === 'string' && SLACK_TS.test(ts));
       const count = msg.reply_count;
+      // Slack metadata is untrusted. Bad entries do not fail the whole read
+      // or consume the 20-entry cap; unknown counts and ownership stay absent.
+      const reactions = Array.isArray(msg.reactions) ? msg.reactions.filter(
+        (r): r is { name: string; count?: unknown; users?: unknown } =>
+          r !== null && typeof r === 'object' && !Array.isArray(r) && typeof r.name === 'string',
+      ) : [];
       return {
       id,
       authorId: msg.user,
       ...(msg.bot_id ? { authorBotId: msg.bot_id } : {}),
       authorName: msg.user ? (this.userNameCache.get(msg.user) ?? msg.user) : (msg.username ?? 'bot'),
       content: formatSlackText(msg.text ?? '', this.userNameCache),
+      // Bound metadata per message; historyRecord includes it in maxBytes.
+      ...(reactions.length ? {
+        reactions: reactions.slice(0, 20).map((r) => {
+          const count = typeof r.count === 'number' && Number.isSafeInteger(r.count) && r.count >= 0 ? r.count : undefined;
+          const users = Array.isArray(r.users) ? r.users : undefined;
+          const own = this.botUserId === null || !users ? undefined
+            : users.includes(this.botUserId) ? true
+            : count !== undefined && users.length === count && users.every((u) => typeof u === 'string') ? false
+            : undefined;
+          return { name: r.name, ...(count !== undefined ? { count } : {}), ...(own !== undefined ? { own } : {}) };
+        }),
+        ...(reactions.length > 20 ? { reactionsOmitted: reactions.length - 20 } : {}),
+      } : {}),
       threadTs: msg.thread_ts && msg.thread_ts !== msg.ts ? msg.thread_ts : undefined,
       rootTs: reported ?? id,
       // Missing means unknown, not none.

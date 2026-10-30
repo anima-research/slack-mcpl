@@ -104,6 +104,19 @@ export const toolDefinitions: ToolDefinition[] = [
     },
   },
   {
+    name: 'remove_reaction',
+    description: 'Remove this bot\'s own emoji reaction from a Slack message',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        channelId: { type: 'string', description: 'Slack conversation ID' },
+        messageId: { type: 'string', description: 'Message ID (ts) to remove the reaction from' },
+        emoji: { type: 'string', description: 'Emoji name, with or without colons (e.g. thumbsup or :thumbsup:)' },
+      },
+      required: ['channelId', 'messageId', 'emoji'],
+    },
+  },
+  {
     name: 'edit_message',
     description: 'Edit a message sent by this bot',
     inputSchema: {
@@ -165,7 +178,9 @@ export const toolDefinitions: ToolDefinition[] = [
       'so an active thread can look quiet here. Use `oldest`/`latest` (message IDs / ts values) ' +
       'to bound the range. Substring and exact author-ID predicates are ANDed. Check pagination.scanComplete ' +
       'and stopReason: zero bounded matches does not prove absence. To go on to older messages, call again with ' +
-      'the same arguments and cursor set to pagination.nextCursor.',
+      'the same arguments and cursor set to pagination.nextCursor. ' +
+      'Messages may include up to 20 reactions (name and available Slack count), reactionsOmitted for the rest, and own ' +
+      '(true when the bot is listed, false when absent from a complete user list, omitted when membership is unknown from truncated or missing data).',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -185,7 +200,9 @@ export const toolDefinitions: ToolDefinition[] = [
     description:
       'Fetch a bounded part of one Slack thread, oldest-first (parent first on a call without oldest or cursor). ' +
       `${PARENT_IDS}. Check pagination.scanComplete and stopReason. To go on to newer replies, call again with the ` +
-      'same arguments and cursor set to pagination.nextCursor.',
+      'same arguments and cursor set to pagination.nextCursor. ' +
+      'Messages may include up to 20 reactions (name and available Slack count), reactionsOmitted for the rest, and own ' +
+      '(true when the bot is listed, false when absent from a complete user list, omitted when membership is unknown from truncated or missing data).',
     inputSchema: {
       type: 'object',
       additionalProperties: false,

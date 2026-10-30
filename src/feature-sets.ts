@@ -106,6 +106,7 @@ export function featureSetForTool(toolName: string): string | undefined {
     case 'upload_file':
     case 'send_dm':
     case 'add_reaction':
+    case 'remove_reaction':
     case 'edit_message':
     case 'delete_message':
       return MESSAGING_FEATURE_SET;

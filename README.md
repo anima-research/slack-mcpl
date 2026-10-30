@@ -44,13 +44,13 @@ that grant arrives; plain MCP tool calls are unaffected.
 
 ## Tools
 
-`send_message`, `reply_message`, `upload_file`, `send_dm`, `add_reaction`,
+`send_message`, `reply_message`, `upload_file`, `send_dm`, `add_reaction`, `remove_reaction`,
 `edit_message`, `delete_message`, `list_channels`, `refresh_channels`, `fetch_history`,
 `fetch_thread`, `find_user`, `fetch_attachment`, `subscribe_channel`,
 `unsubscribe_channel`, `list_subscriptions`.
 
 Feature sets: `slack.messaging` (rollback-capable; `send_message`,
-`reply_message`, `upload_file`, `send_dm`, `add_reaction`, `edit_message`, `delete_message`,
+`reply_message`, `upload_file`, `send_dm`, `add_reaction`, `remove_reaction`, `edit_message`, `delete_message`,
 plus push events and `channels/incoming` delivery),
 `slack.history` (`fetch_history`, `fetch_thread`, `fetch_attachment`),
 `slack.subscriptions` (`subscribe_channel`, `unsubscribe_channel`,
@@ -71,6 +71,45 @@ capabilities, not feature-set selection.
 
 The host receives each reply once, through `channels/publish`. The server
 does not declare `channels.streaming`.
+
+## Reactions
+
+| Tool | Arguments | Effect |
+| --- | --- | --- |
+| `add_reaction` | `channelId`, `messageId`, `emoji` | Add this bot's reaction; an existing own reaction changes nothing. |
+| `remove_reaction` | `channelId`, `messageId`, `emoji` | Remove only this bot's reaction; `no_reaction` is an error saying the bot has no such reaction. |
+
+Both belong to `slack.messaging`, use `reactions:write`, accept emoji names
+with or without colons, and enforce the same send-list and DM restrictions.
+Like additions, removals are not undone by rollback. Removing the configured
+ACK emoji waits for a pending ACK add; success or `no_reaction` retires that
+message's pending cleanup. If an automatic cleanup already in progress confirms
+removal (or `no_reaction`) while the tool waits, it returns a successful
+"Nothing changed" without another Slack call. If cleanup instead gives up after
+a failure, the tool makes its own removal attempt and reports Slack's answer.
+Manual ACK removals share automatic cleanup's five-attempt budget: transient
+failures retry after one minute; terminal refusals, shutdown and the fifth
+failure retire cleanup. Other emojis and other messages' ACKs are unchanged.
+
+`fetch_history` and `fetch_thread` include `reactions` on messages with reactions:
+`[{"name":"eyes","count":2,"own":true}]`. `count` is Slack's count, not the
+length of its potentially partial user list. `own: true` means that list includes
+this bot's user ID; `own: false` is emitted only when the bot is absent from a
+complete list. `own` is omitted when membership is unknown (a truncated or
+missing list without the bot, insufficient valid metadata, or unknown bot ID).
+Malformed reaction entries are skipped; invalid counts are omitted. Only the first 20 valid reactions in
+Slack's order are listed per message; `reactionsOmitted` gives the number of
+valid reactions left out, when any.
+These fields count against `maxBytes`. Messages without reactions have no
+new fields. Live incoming messages and first-interaction backscroll stay unchanged.
+
+No `reactions:read` scope or extra API call is needed: the existing
+[history response includes reactions](https://docs.slack.dev/reference/methods/conversations.history/#message-types),
+and [history](https://docs.slack.dev/reference/methods/conversations.history/) and
+[thread replies](https://docs.slack.dev/reference/methods/conversations.replies/)
+use the conversation's `*:history` scope. The manifest already grants
+`reactions:write`, the scope required by
+[reactions.remove](https://docs.slack.dev/reference/methods/reactions.remove/).
 
 ## Upload a file
 

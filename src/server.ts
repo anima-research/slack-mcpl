@@ -790,6 +790,14 @@ export class SlackMcplServer {
         return 'Reaction added';
       }
 
+      case 'remove_reaction': {
+        const channelId = this.requireString(args, 'channelId');
+        const messageId = this.requireString(args, 'messageId');
+        const emoji = this.requireString(args, 'emoji');
+        const removed = await this.slack.removeReaction(channelId, messageId, emoji);
+        return removed ? 'Reaction removed' : `Nothing changed: ACK cleanup for message ${messageId} already finished.`;
+      }
+
       case 'edit_message':
         await this.slack.editMessage(
           this.requireString(args, 'channelId'),
