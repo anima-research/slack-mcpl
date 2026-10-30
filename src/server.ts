@@ -231,12 +231,13 @@ export class SlackMcplServer {
   private lastChannelId: string | null = null;
 
   /** How many backscroll messages to fetch on first interaction. Tunable via
-   *  SLACK_BACKSCROLL_LIMIT; clamped to [1, 1000], default 50. */
+   *  SLACK_BACKSCROLL_LIMIT; zero disables automatic backscroll. Accepts
+   *  [0, 1000], otherwise defaults to 50. */
   private get backscrollLimit(): number {
     const raw = process.env.SLACK_BACKSCROLL_LIMIT;
     if (!raw) return 50;
     const n = parseInt(raw, 10);
-    return Number.isFinite(n) && n > 0 && n <= 1000 ? n : 50;
+    return Number.isFinite(n) && n >= 0 && n <= 1000 ? n : 50;
   }
 
   /** Conversations muted with unsubscribe_channel while every member channel
@@ -1661,19 +1662,22 @@ export class SlackMcplServer {
     // A DM's header says DM and a DM gets no note, so a DM looks up none.
     let meta: Awaited<ReturnType<typeof this.slack.getConversationMeta>> | undefined;
     let backscroll: Awaited<ReturnType<typeof this.slack.fetchHistory>>['messages'] = [];
+    const backscrollLimit = this.backscrollLimit;
     if (isFirstInteraction && isAddressed) {
-      try {
-        const res = await this.deliveryLookup(this.slack.fetchHistory(msg.channelId, {
-          limit: this.backscrollLimit,
-          latest: msg.id, // never include the triggering message itself
-        }), `the backscroll for message ${msg.id} in ${msg.channelId}`);
-        // Drop the bot's own past messages — already in the agent's
-        // chronicle as assistant turns, no need to re-echo.
-        backscroll = res.messages.filter((m) => m.authorId !== this.slack.botUserId);
-      } catch (err) {
-        dbg('backscroll:fetch-failed', { channelId: msg.channelId, error: (err as Error).message });
+      if (backscrollLimit > 0) {
+        try {
+          const res = await this.deliveryLookup(this.slack.fetchHistory(msg.channelId, {
+            limit: backscrollLimit,
+            latest: msg.id, // never include the triggering message itself
+          }), `the backscroll for message ${msg.id} in ${msg.channelId}`);
+          // Drop the bot's own past messages — already in the agent's
+          // chronicle as assistant turns, no need to re-echo.
+          backscroll = res.messages.filter((m) => m.authorId !== this.slack.botUserId);
+        } catch (err) {
+          dbg('backscroll:fetch-failed', { channelId: msg.channelId, error: (err as Error).message });
+        }
+        if (!isCurrent()) return abandon();
       }
-      if (!isCurrent()) return abandon();
       if (!msg.isDM) {
         meta = await this.lookUpMeta(msg);
         if (!isCurrent()) return abandon();
