@@ -1576,7 +1576,7 @@ export class SlackAdapter {
     const isDM = event.channel_type === 'im' || event.channel.startsWith('D');
     // Only what Slack marks as a channel gets through, not merely what isn't marked a DM.
     if (this.disableDms && event.channel_type !== 'channel' && event.channel_type !== 'group') return;
-    if (isDM && this.dmUsers && this.dmUsers.length > 0 && !this.dmUsers.includes(event.user)) {
+    if (isDM && this.dmUsers && !this.dmUsers.includes(event.user)) {
       return; // DM whitelist active and this sender isn't on it
     }
 

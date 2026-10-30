@@ -35,6 +35,13 @@ export function startupSettings(
 
   const list = (raw: string | undefined) => raw?.split(',').map((s) => s.trim()).filter(Boolean);
   const dmUsers = list(env.SLACK_DM_USERS);
+  if (env.SLACK_DM_USERS !== undefined && dmUsers!.length === 0) {
+    return {
+      refusal:
+        'SLACK_DM_USERS is set but names no user; set it to the user IDs whose DMs it lets through, or unset it so it ' +
+        'filters none (SLACK_DISABLE_DMS=true drops every DM)',
+    };
+  }
   const sendChannels = list(env.SLACK_SEND_CHANNELS);
   if (env.SLACK_SEND_CHANNELS !== undefined && sendChannels!.length === 0) {
     return { refusal: 'SLACK_SEND_CHANNELS is set but names no conversation; unset it to allow writing anywhere' };
