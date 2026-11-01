@@ -35,7 +35,8 @@ that grant arrives; plain MCP tool calls are unaffected.
   Hosts pinning `enabledFeatureSets` must add `slack.typing` to enable it.
   Ambient and refused messages do not move it; top-level messages get no
   status because publish replies top-level. The server clears it on
-  an `op: 'stop'` extension, a confirmed post in that conversation, peer
+  an `op: 'stop'` extension (even while typing is disabled), a typing-policy
+  reduction, a confirmed post in that conversation, peer
   disconnect or shutdown (best-effort, within the existing 5-second shutdown
   budget). A stop clears the status but keeps the pending thread, so a retry or
   overlapping inference can show it again. The root is forgotten on a confirmed

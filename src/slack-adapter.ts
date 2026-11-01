@@ -1180,10 +1180,15 @@ export class SlackAdapter {
     return turn;
   }
 
-  /** Retire old starts and queue clears before the next peer's sets. */
+  /** A peer change also releases lasting refusals. */
   async resetThreadStatuses(): Promise<void> {
-    this.statusEpoch++;
     this.statusRefused.clear();
+    await this.clearThreadStatuses();
+  }
+
+  /** Retire queued starts and clear owned statuses without releasing refusals. */
+  async clearThreadStatuses(): Promise<void> {
+    this.statusEpoch++;
     const channels = new Set([...this.statusQueue.keys(), ...this.statusOn.keys()]);
     await Promise.all([...channels].map((id) => this.setThreadStatus(id, undefined)));
   }

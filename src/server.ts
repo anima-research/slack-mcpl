@@ -405,6 +405,19 @@ export class SlackMcplServer {
     }
   }
 
+  private applyFeatureSetsUpdate(params: FeatureSetsUpdateParams, form: 'request' | 'notification') {
+    const wasTyping = this.grant.isFeatureSetActive(TYPING_FEATURE_SET);
+    try {
+      return this.grant.apply(params, form);
+    } finally {
+      // Reductions (including a malformed policy's fail-closed grant) retire
+      // queued starts and clear owned statuses, without forgetting refusals.
+      if (wasTyping && !this.grant.isFeatureSetActive(TYPING_FEATURE_SET)) {
+        void this.slack.clearThreadStatuses();
+      }
+    }
+  }
+
   // ── Request Dispatch ──
 
   private async handleRequest(req: JsonRpcRequest): Promise<void> {
@@ -439,7 +452,7 @@ export class SlackMcplServer {
           // establish a ready state (§5.3).
           this.requireMcpl();
           const couldRegister = this.grant.has('channels.register');
-          const receipt = this.grant.apply(params as unknown as FeatureSetsUpdateParams, 'request');
+          const receipt = this.applyFeatureSetsUpdate(params as unknown as FeatureSetsUpdateParams, 'request');
           conn.sendResponse(req.id, receipt);
           // channels/register needs the channels.register capability. Register
           // when the grant first allows it, and again if a later policy turns
@@ -572,7 +585,7 @@ export class SlackMcplServer {
         // §6.7 Notification form: descriptive metadata only. Grant-bearing
         // updates (including the §5.3 initial policy) arrive as a Request.
         if (this.mcplEnabled) {
-          this.grant.apply(notif.params as unknown as FeatureSetsUpdateParams, 'notification');
+          this.applyFeatureSetsUpdate(notif.params as unknown as FeatureSetsUpdateParams, 'notification');
         }
         break;
       }
@@ -585,7 +598,7 @@ export class SlackMcplServer {
 
       case method.CHANNELS_TYPING:
       case 'notifications/typing': {
-        if (!this.mcplEnabled || !this.grant.isFeatureSetActive(TYPING_FEATURE_SET)) break;
+        if (!this.mcplEnabled) break;
         const p = (notif.params ?? {}) as { channelId?: unknown; op?: unknown };
         if (typeof p.channelId !== 'string') break;
         const id = parseMcplChannelId(p.channelId)?.conversationId ?? p.channelId;
@@ -593,6 +606,7 @@ export class SlackMcplServer {
           void this.slack.setThreadStatus(id, undefined);
           break;
         }
+        if (!this.grant.isFeatureSetActive(TYPING_FEATURE_SET)) break;
         let root = this.lastIncomingRoot.get(id);
         if (root && clock.now() - root.at >= ACK_TTL_MS) {
           this.lastIncomingRoot.delete(id);

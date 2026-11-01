@@ -213,6 +213,52 @@ test('R1-1: explicitly disabled typing set cannot set status', async (t) => {
   assert.deepEqual(h.statuses, []);
 });
 
+for (const reduction of ['disabled request', 'capability revoked', 'disabled notification', 'malformed policy'] as const) {
+  test(`a ${reduction} clears shown typing statuses without needing a stop`, async (t) => {
+    const { h } = await connected(t);
+    await mention(h);
+    typing(h);
+    await until(() => h.statuses.length === 1, 'status before reduction');
+    if (reduction === 'disabled notification') {
+      h.host.sendNotification(method.FEATURE_SETS_UPDATE, { disabled: ['slack.typing'] });
+    } else if (reduction === 'malformed policy') {
+      await assert.rejects(h.host.sendRequest(method.FEATURE_SETS_UPDATE, {
+        effectiveCapabilities: GRANT, deniedCapabilities: ['channels.typing'],
+      }));
+    } else {
+      await h.host.sendRequest(method.FEATURE_SETS_UPDATE, reduction === 'capability revoked'
+        ? { effectiveCapabilities: FULL_GRANT }
+        : { effectiveCapabilities: GRANT, disabled: ['slack.typing'] });
+    }
+    await settled(h);
+    assert.deepEqual(h.statuses, ['C1:4.0:is thinking…', 'C1:4.0:']);
+    typing(h);
+    await settled(h);
+    assert.equal(h.statuses.length, 2, 'inactive typing cannot set another status');
+    if (reduction !== 'malformed policy') {
+      await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: GRANT, disabled: [] });
+      typing(h);
+      await settled(h);
+      assert.equal(h.statuses.at(-1), 'C1:4.0:is thinking…', 're-enabling preserves the unanswered root');
+    }
+  });
+}
+
+for (const name of [method.CHANNELS_TYPING, 'notifications/typing']) {
+  test(`${name} stop clears an owned status even when typing is inactive`, async (t) => {
+    const { h } = await connected(t);
+    await mention(h);
+    typing(h);
+    await until(() => h.statuses.length === 1, 'status');
+    // Isolate the stop gate from proactive cleanup on policy changes.
+    t.mock.method(h.server['slack'], 'clearThreadStatuses', async () => {});
+    await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+    typing(h, 'stop', name);
+    await settled(h);
+    assert.deepEqual(h.statuses, ['C1:4.0:is thinking…', 'C1:4.0:']);
+  });
+}
+
 test('R1-5: peer close clears status and a new peer has no pending thread', async (t) => {
   const f = fakeSlack();
   const server = new SlackMcplServer(f.slack);
@@ -505,6 +551,22 @@ for (const where of ['Slack rejection', 'unexpected turn failure']) {
     assert.equal(calls.length, made, 'a second clear makes no call');
   });
 }
+
+test('clearing statuses for a policy reduction does not release a lasting refusal', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const { a, calls } = adapter({ set: async () => {
+    throw Object.assign(new Error('missing_scope'), {
+      code: 'slack_webapi_platform_error', data: { error: 'missing_scope' },
+    });
+  } });
+  await a.setThreadStatus('C1', '1.0');
+  await a.clearThreadStatuses();
+  await a.setThreadStatus('C1', '1.0');
+  assert.equal(calls.length, 1);
+  await a.resetThreadStatuses();
+  await a.setThreadStatus('C1', '1.0');
+  assert.equal(calls.length, 2, 'only a peer change releases the refusal');
+});
 
 test('a late old-peer refusal cannot disable the new peer status', async (t) => {
   t.mock.method(console, 'error', () => {});

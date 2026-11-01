@@ -6,7 +6,8 @@
   enable status. Ambient, refused and top-level messages get no new
   status. Only writable conversations are eligible, respecting
   `SLACK_DISABLE_DMS`. The server clears status on the `op: 'stop'`
-  extension, a confirmed post, peer disconnect or shutdown, best-effort;
+  extension (even while typing is disabled), a typing-policy reduction,
+  a confirmed post, peer disconnect or shutdown, best-effort;
   Slack expires it after 2 minutes, or clears it when the bot replies in
   that thread. A stop keeps the pending thread for retries and overlapping
   inferences; the root is forgotten on a confirmed post, a newer addressed
