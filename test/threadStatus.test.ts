@@ -325,6 +325,57 @@ test('with DMs off, a conversation Slack confirms as a channel gets its status',
   assert.deepEqual(calls, ['C1:1.0:is thinking…']);
 });
 
+for (const answer of ['missing_scope', 'internal_error', 'rate limit'] as const) {
+  test(`with DMs off, conversations.info ${answer} is ${answer === 'missing_scope' ? 'suppressed until the peer changes' : 'retryable'}`, async (t) => {
+    const api = await fakeSlackApi();
+    t.after(() => api.close());
+    const log = t.mock.method(console, 'error', () => {});
+    api.answerFor('conversations.info', answer === 'rate limit'
+      ? { status: 429, headers: { 'retry-after': '1' }, body: { ok: false, error: 'ratelimited' } }
+      : { body: { ok: false, error: answer } });
+    const web = new SlackWebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: api.url });
+    const socket = { on() {}, async start() {}, async disconnect() {} } as any;
+    const a = new SlackAdapter(web as any, socket, 'UBOT', 'acme', undefined, undefined, true);
+    for (let i = 0; i < 5; i++) await a.setThreadStatus('G1', '1.0');
+    const expected = answer === 'missing_scope' ? 1 : 5;
+    assert.deepEqual(api.calls, Array(expected).fill('conversations.info'));
+    assert.equal(log.mock.callCount(), expected);
+    if (answer === 'missing_scope') {
+      await a.setThreadStatus('G1', '2.0');
+      assert.equal(api.calls.length, 1, 'refusal covers the conversation');
+      await a.resetThreadStatuses();
+      await a.setThreadStatus('G1', '1.0');
+      assert.equal(api.calls.length, 2, 'new peer can ask again');
+    }
+  });
+}
+
+test('a late old-peer conversation check refusal cannot suppress the new peer status', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const { a, calls } = adapter({ disableDms: true, info: { channel: { id: 'C1', is_im: false, is_mpim: false } } });
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let checks = 0;
+  t.mock.method(a['web'].conversations, 'info', async () => {
+    if (++checks === 1) {
+      await held;
+      throw Object.assign(new Error('missing_scope'), {
+        code: 'slack_webapi_platform_error', data: { error: 'missing_scope' },
+      });
+    }
+    return { channel: { id: 'C1', is_im: false, is_mpim: false } };
+  });
+  const first = a.setThreadStatus('C1', '1.0');
+  await until(() => checks === 1, 'old check in flight');
+  const reset = a.resetThreadStatuses();
+  const second = a.setThreadStatus('C1', '2.0');
+  release();
+  await Promise.all([first, reset, second]);
+  assert.equal(checks, 2);
+  assert.deepEqual(calls, ['C1:2.0:is thinking…']);
+  await a.setThreadStatus('C1', undefined);
+});
+
 test('a refusal of one thread (invalid_thread_ts) stops status attempts in that thread only, until the peer changes', async (t) => {
   t.mock.method(console, 'error', () => {});
   const { a, calls } = adapter({ set: async ({ channel_id, thread_ts, status }) => {

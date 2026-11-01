@@ -15,5 +15,6 @@
   hosts without the extension clear via post, disconnect, shutdown or
   expiry. Calls are ordered per conversation, successful refreshes are
   limited to once a minute, and lasting API refusals suppress further
-  attempts until the peer changes, in that conversation, or in that thread
+  attempts until the peer changes (including a lasting conversations.info
+  refusal when DMs are disabled), in that conversation, or in that thread
   for `invalid_thread_ts`.

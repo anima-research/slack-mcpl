@@ -1161,6 +1161,9 @@ export class SlackAdapter {
       try {
         await this.assertNotDm(channelId, 'No thread status was set');
       } catch (err) {
+        if (epoch === this.statusEpoch && !waitToAskAgain(err, 'conversations.info')) {
+          this.statusRefused.add(channelId);
+        }
         console.error(`[slack-mcpl] thread status on ${channelId} refused:`, err instanceof Error ? err.message : err);
         return;
       }
