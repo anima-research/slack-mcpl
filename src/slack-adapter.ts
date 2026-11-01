@@ -40,7 +40,7 @@ import {
 } from './content.js';
 
 /** An acknowledgement reaction is removed after this, replied to or not. */
-const ACK_TTL_MS = 10 * 60 * 1000;
+export const ACK_TTL_MS = 10 * 60 * 1000;
 /** A removal that failed in a way that can pass is tried again after this,
  *  up to ACK_MAX_TRIES tries in all. */
 const ACK_RETRY_MS = 60 * 1000;

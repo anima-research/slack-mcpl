@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { McplConnection, method } from '@animalabs/mcpl-core';
 import * as net from 'node:net';
 import { serveTcp } from '../src/tcp.js';
-import { SlackAdapter, SlackWebClient, SLACK_CLIENT_OPTIONS } from '../src/slack-adapter.js';
+import { ACK_TTL_MS, SlackAdapter, SlackWebClient, SLACK_CLIENT_OPTIONS } from '../src/slack-adapter.js';
 import { SlackMcplServer } from '../src/server.js';
 import { FULL_GRANT, MENTION_EVENT, answerAsHost, connectHost, fakeSlack, harness, initialize, until, type HarnessOptions } from './harness.js';
 import { fakeSlackApi } from './slackApi.js';
@@ -67,8 +67,8 @@ test('R1-2: a refused addressed message gets no status', async (t) => {
   assert.deepEqual(h.statuses, []);
 });
 
-for (const end of ['stop', 'publish', 'tool'] as const) {
-  test(`R1-2: ${end} forgets the pending thread; a later turn does not revive it`, async (t) => {
+for (const end of ['publish', 'tool'] as const) {
+  test(`${end} forgets the pending thread; a later start does not revive it`, async (t) => {
     const { h } = await connected(t);
     await mention(h);
     typing(h);
@@ -77,14 +77,73 @@ for (const end of ['stop', 'publish', 'tool'] as const) {
       await publish(h);
       assert.equal((h.posts.at(-1) as any).thread_ts, '4.0');
     }
-    else if (end === 'tool') await h.host.sendRequest('tools/call', { name: 'send_message', arguments: { channelId: 'C1', content: 'answer' } });
-    else typing(h, 'stop');
+    else await h.host.sendRequest('tools/call', { name: 'send_message', arguments: { channelId: 'C1', content: 'answer' } });
     await until(() => h.statuses.length === 2, 'clear');
     typing(h);
     await settled(h);
     assert.deepEqual(h.statuses, ['C1:4.0:is thinking…', 'C1:4.0:']);
   });
 }
+
+test('a typing stop preserves the pending thread for a retry, and publish ends it', async (t) => {
+  const { h } = await connected(t);
+  await mention(h);
+  typing(h);
+  await until(() => h.statuses.length === 1, 'initial status');
+  typing(h, 'stop');
+  await until(() => h.statuses.length === 2, 'failed attempt clear');
+  typing(h);
+  await settled(h);
+  assert.deepEqual(h.statuses, ['C1:4.0:is thinking…', 'C1:4.0:', 'C1:4.0:is thinking…']);
+  await publish(h);
+  assert.equal((h.posts.at(-1) as any).thread_ts, '4.0');
+  await settled(h);
+  typing(h);
+  await settled(h);
+  assert.deepEqual(h.statuses, ['C1:4.0:is thinking…', 'C1:4.0:', 'C1:4.0:is thinking…', 'C1:4.0:']);
+});
+
+test('an overlapping inference stopping all shown channels preserves an unanswered thread', async (t) => {
+  const { h } = await connected(t);
+  // ActivityModule types in every show_in channel, even while answering C2.
+  const typeAll = (op: string) => {
+    typing(h, op);
+    h.host.sendNotification(method.CHANNELS_TYPING, { channelId: 'slack:C2', op });
+  };
+  typeAll('start');
+  await settled(h);
+  await mention(h); // C1 arrives while C2 is being answered.
+  typeAll('start'); // The ongoing inference's next typing tick.
+  await until(() => h.statuses.length === 1, 'C1 status during C2 inference');
+  typeAll('stop'); // C2 stream-end stops every show_in channel.
+  await until(() => h.statuses.length === 2, 'stream-end clear');
+  typeAll('start'); // The inference that actually answers C1.
+  await settled(h);
+  assert.deepEqual(h.statuses, ['C1:4.0:is thinking…', 'C1:4.0:', 'C1:4.0:is thinking…']);
+  await publish(h);
+  assert.equal((h.posts.at(-1) as any).thread_ts, '4.0');
+});
+
+test('pending roots expire at the acknowledgement age cap, not at the last typing stop', async (t) => {
+  virtualClock(t);
+  const { h } = await connected(t);
+  await mention(h);
+  typing(h);
+  await until(() => h.statuses.length === 1, 'initial status');
+  elapse(ACK_TTL_MS - 1);
+  typing(h, 'stop');
+  await until(() => h.statuses.length === 2, 'clear before expiry');
+  typing(h);
+  await settled(h);
+  assert.equal(h.statuses.at(-1), 'C1:4.0:is thinking…', 'root survives until the age cap');
+  elapse(1);
+  typing(h);
+  await settled(h);
+  assert.deepEqual(h.statuses, ['C1:4.0:is thinking…', 'C1:4.0:', 'C1:4.0:is thinking…', 'C1:4.0:']);
+  typing(h);
+  await settled(h);
+  assert.equal(h.statuses.length, 4, 'expired root cannot be revived');
+});
 
 test('R1-3: top-level mention stays top-level through publish, without a status', async (t) => {
   const { h } = await connected(t);
@@ -108,7 +167,7 @@ test('R1-6: notifications/typing alias sets and clears; idle typing is silent', 
   await until(() => h.statuses.length === 2, 'alias clear');
   typing(h, 'start', 'notifications/typing');
   await settled(h);
-  assert.deepEqual(h.statuses, ['C1:4.0:is thinking…', 'C1:4.0:']);
+  assert.deepEqual(h.statuses, ['C1:4.0:is thinking…', 'C1:4.0:', 'C1:4.0:is thinking…']);
 });
 
 test('channels/typing with { channelId } alone, as mcpl-core types it, shows the status', async (t) => {
@@ -132,7 +191,7 @@ test('an addressed message taken in the shown thread after the last start stays 
   assert.deepEqual(h.statuses, ['C1:4.0:is thinking…', 'C1:4.0:', 'C1:4.0:is thinking…']);
 });
 
-test("a stop forgets only the thread its turn showed: a newer pending thread shows at the next start", async (t) => {
+test("a stop preserves a newer pending thread for the next start", async (t) => {
   const { h } = await connected(t);
   await mention(h);
   typing(h);

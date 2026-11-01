@@ -37,9 +37,10 @@ that grant arrives; plain MCP tool calls are unaffected.
   status because publish replies top-level. The server clears it on
   an `op: 'stop'` extension, a confirmed post in that conversation, peer
   disconnect or shutdown (best-effort, within the existing 5-second shutdown
-  budget). A stop forgets the thread the host's last typing start was for; if the
-  conversation's latest addressed message was taken after that start, it
-  stays pending and shows at the next start. `ChannelsTypingParams` declares only `{channelId}`, not `op`:
+  budget). A stop clears the status but keeps the pending thread, so a retry or
+  overlapping inference can show it again. The root is forgotten on a confirmed
+  post, a newer addressed message, peer change, or after 10 minutes (the
+  acknowledgement lifetime). `ChannelsTypingParams` declares only `{channelId}`, not `op`:
   hosts sending only that shape clear via post, disconnect, shutdown or expiry.
   Successful statuses refresh at most once a minute; Slack expires them
   after 2 minutes. Lasting API refusals disable status in that conversation

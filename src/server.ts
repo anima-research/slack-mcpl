@@ -40,6 +40,7 @@ import type {
 } from '@animalabs/mcpl-core';
 
 import {
+  ACK_TTL_MS,
   GaveUp,
   LONE_SURROGATE,
   SLACK_CLIENT_OPTIONS,
@@ -223,7 +224,8 @@ export class SlackMcplServer {
    *  here — a publish goes into the last incoming message's thread, or
    *  top-level when the conversation isn't threaded. */
   private lastIncomingThreadTs = new Map<string, string | undefined>();
-  private lastIncomingRoot = new Map<string, { ts: string; started: boolean }>();
+  /** Latest accepted addressed thread, retained across typing stops until answered or aged out. */
+  private lastIncomingRoot = new Map<string, { ts: string; at: number }>();
 
   /** The conversation this peer was last sent a message from, or the bot last
    *  posted in: an incoming message from any other conversation names its
@@ -587,13 +589,15 @@ export class SlackMcplServer {
         const p = (notif.params ?? {}) as { channelId?: unknown; op?: unknown };
         if (typeof p.channelId !== 'string') break;
         const id = parseMcplChannelId(p.channelId)?.conversationId ?? p.channelId;
-        const root = this.lastIncomingRoot.get(id);
         if (p.op === 'stop') {
-          if (root?.started) this.lastIncomingRoot.delete(id);
           void this.slack.setThreadStatus(id, undefined);
           break;
         }
-        if (root) root.started = true;
+        let root = this.lastIncomingRoot.get(id);
+        if (root && clock.now() - root.at >= ACK_TTL_MS) {
+          this.lastIncomingRoot.delete(id);
+          root = undefined;
+        }
         void this.slack.setThreadStatus(id, root?.ts);
         break;
       }
@@ -1807,7 +1811,7 @@ export class SlackMcplServer {
       if (this.conn !== conn) return;
       this.lastIncomingThreadTs.set(msg.channelId, msg.threadTs);
       if (isAddressed) {
-        if (msg.threadTs) this.lastIncomingRoot.set(msg.channelId, { ts: msg.threadTs, started: false });
+        if (msg.threadTs) this.lastIncomingRoot.set(msg.channelId, { ts: msg.threadTs, at: clock.now() });
         else this.lastIncomingRoot.delete(msg.channelId);
       }
       this.forwardedWatermark.set(msg.channelId, msg.id);
