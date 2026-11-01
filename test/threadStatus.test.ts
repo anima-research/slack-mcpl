@@ -37,7 +37,7 @@ async function mention(h: ReturnType<typeof harness>, extra = {}) {
   await Promise.all(h.server['forwarding'].values()); // Wait for taken()/notTaken().
 }
 
-test('R1-1/R1-6: original harness grant keeps push and publish, with no status', async (t) => {
+test('original harness grant keeps push and publish, with no status', async (t) => {
   const { h, receipt } = await connected(t, {}, FULL_GRANT);
   assert.ok(!(receipt as any).unavailableFeatures.some((f: any) => f.featureSet === 'slack.messaging'));
   await mention(h);
@@ -48,7 +48,7 @@ test('R1-1/R1-6: original harness grant keeps push and publish, with no status',
   assert.equal(h.posts.length, 1);
 });
 
-test('R1-2: ambient delivery does not move a pending addressed thread', async (t) => {
+test('ambient delivery does not move a pending addressed thread', async (t) => {
   const { h } = await connected(t);
   await mention(h);
   typing(h);
@@ -59,7 +59,7 @@ test('R1-2: ambient delivery does not move a pending addressed thread', async (t
   assert.deepEqual(h.statuses, ['C1:4.0:is thinking…']);
 });
 
-test('R1-2: a refused addressed message gets no status', async (t) => {
+test('a refused addressed message gets no status', async (t) => {
   const { h } = await connected(t, { pushAccepted: false });
   await mention(h);
   typing(h);
@@ -145,7 +145,7 @@ test('pending roots expire at the acknowledgement age cap, not at the last typin
   assert.equal(h.statuses.length, 4, 'expired root cannot be revived');
 });
 
-test('R1-3: top-level mention stays top-level through publish, without a status', async (t) => {
+test('top-level mention stays top-level through publish, without a status', async (t) => {
   const { h } = await connected(t);
   await mention(h, { thread_ts: undefined });
   typing(h);
@@ -155,7 +155,7 @@ test('R1-3: top-level mention stays top-level through publish, without a status'
   assert.equal((h.posts.at(-1) as any).thread_ts, undefined);
 });
 
-test('R1-6: notifications/typing alias sets and clears; idle typing is silent', async (t) => {
+test('notifications/typing alias sets and clears; idle typing is silent', async (t) => {
   const { h } = await connected(t);
   typing(h);
   await settled(h);
@@ -204,7 +204,7 @@ test("a stop preserves a newer pending thread for the next start", async (t) => 
   assert.deepEqual(h.statuses, ['C1:4.0:is thinking…', 'C1:4.0:', 'C1:7.0:is thinking…']);
 });
 
-test('R1-1: explicitly disabled typing set cannot set status', async (t) => {
+test('explicitly disabled typing set cannot set status', async (t) => {
   const { h } = await connected(t);
   await mention(h);
   await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: GRANT, disabled: ['slack.typing'] });
@@ -259,7 +259,7 @@ for (const name of [method.CHANNELS_TYPING, 'notifications/typing']) {
   });
 }
 
-test('R1-5: peer close clears status and a new peer has no pending thread', async (t) => {
+test('peer close clears status and a new peer has no pending thread', async (t) => {
   const f = fakeSlack();
   const server = new SlackMcplServer(f.slack);
   const a = connectHost(server);
@@ -310,7 +310,7 @@ test('status refreshes after sixty seconds, and moving threads clears first', as
 });
 
 for (const opts of [{ sendChannels: ['C9'] }, { disableDms: true }, { absent: true }]) {
-  test(`R1-6: no status when ${JSON.stringify(opts)}`, async (t) => {
+  test(`no status when ${JSON.stringify(opts)}`, async (t) => {
     t.mock.method(console, 'error', () => {});
     const { a, calls } = adapter(opts);
     await a.setThreadStatus('C1', '1.0');
@@ -395,7 +395,7 @@ test('a refusal of one thread (invalid_thread_ts) stops status attempts in that 
 });
 
 for (const code of ['method_deprecated', 'method_not_supported_for_channel_type', 'internal_error']) {
-  test(`R1-4: real WebClient ${code} is ${code === 'internal_error' ? 'retryable' : 'suppressed'}`, async (t) => {
+  test(`real WebClient ${code} is ${code === 'internal_error' ? 'retryable' : 'suppressed'}`, async (t) => {
     const api = await fakeSlackApi();
     t.after(() => api.close());
     const log = t.mock.method(console, 'error', () => {});
@@ -410,7 +410,7 @@ for (const code of ['method_deprecated', 'method_not_supported_for_channel_type'
   });
 }
 
-test('R1-5: shutdown clears and refuses new starts', async () => {
+test('shutdown clears and refuses new starts', async () => {
   const { a, calls } = adapter();
   await a.setThreadStatus('C1', '1.0');
   await a.stop();
@@ -419,7 +419,7 @@ test('R1-5: shutdown clears and refuses new starts', async () => {
 });
 
 for (const fail of [false, true]) {
-  test(`R1-5: slow set (${fail ? 'failure' : 'success'}) is ordered before move and stop`, async (t) => {
+  test(`slow set (${fail ? 'failure' : 'success'}) is ordered before move and stop`, async (t) => {
     t.mock.method(console, 'error', () => {});
     let release!: () => void;
     const held = new Promise<void>((r) => { release = r; });
@@ -439,7 +439,7 @@ for (const fail of [false, true]) {
   });
 }
 
-test('R1-4: a permanent refusal lasts only for this peer, with no pointless stop call', async (t) => {
+test('a permanent refusal lasts only for this peer, with no pointless stop call', async (t) => {
   t.mock.method(console, 'error', () => {});
   let refuse = true;
   const { a, calls } = adapter({ set: async () => {
@@ -457,7 +457,7 @@ test('R1-4: a permanent refusal lasts only for this peer, with no pointless stop
   assert.deepEqual(calls, ['C1:1.0:is thinking…', 'C1:2.0:is thinking…']);
 });
 
-test('R1-5: shutdown waits for in-flight set, skips queued start, then clears', async () => {
+test('shutdown waits for in-flight set, skips queued start, then clears', async () => {
   let release!: () => void;
   const held = new Promise<void>((r) => { release = r; });
   const { a, calls } = adapter({ set: async ({ status }) => { if (status) await held; } });
@@ -513,7 +513,7 @@ function holdClear(t: TestContext, slack: SlackAdapter) {
   return { release, clearing: () => clearing };
 }
 
-test('R2-M1: no acknowledgement for messages arriving during a held disconnect clear', async (t) => {
+test('no acknowledgement for messages arriving during a held disconnect clear', async (t) => {
   const f = fakeSlack({ ackReaction: 'eyes' });
   const server = new SlackMcplServer(f.slack);
   const h = { ...f, server, ...connectHost(server) };
@@ -530,7 +530,7 @@ test('R2-M1: no acknowledgement for messages arriving during a held disconnect c
   assert.ok(!f.reactions.some((r) => r.startsWith('add:C1:7.0:')), 'no false received reaction');
 });
 
-test('R2-M2: TCP reconnect is accepted while the previous peer clear is held', async (t) => {
+test('TCP reconnect is accepted while the previous peer clear is held', async (t) => {
   const f = fakeSlack();
   const server = new SlackMcplServer(f.slack);
   const tcp = net.createServer();
@@ -575,7 +575,7 @@ test('R2-M2: TCP reconnect is accepted while the previous peer clear is held', a
 });
 
 for (const where of ['Slack rejection', 'unexpected turn failure']) {
-  test(`R2-M3: ${where} cannot crash or poison the queue`, async (t) => {
+  test(`${where} cannot crash or poison the queue`, async (t) => {
     t.mock.method(console, 'error', () => {});
     const unhandled: unknown[] = [];
     const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
@@ -643,7 +643,7 @@ test('a late old-peer refusal cannot disable the new peer status', async (t) => 
   assert.equal(calls.at(-1), 'C1:2.0:');
 });
 
-test('R3-P2: a refused teardown clear does not suppress the next peer set', async (t) => {
+test('a refused teardown clear does not suppress the next peer set', async (t) => {
   t.mock.method(console, 'error', () => {});
   const { a, calls } = adapter({ set: async ({ status }) => {
     if (!status) throw Object.assign(new Error('method_deprecated'), {
@@ -658,7 +658,7 @@ test('R3-P2: a refused teardown clear does not suppress the next peer set', asyn
   assert.equal(calls.at(-1), 'C1:2.0:');
 });
 
-test('R3-P1: a non-Error rejection permits an immediate same-thread refresh retry', async (t) => {
+test('a non-Error rejection permits an immediate same-thread refresh retry', async (t) => {
   virtualClock(t);
   t.mock.method(console, 'error', () => {});
   let bad = true;
