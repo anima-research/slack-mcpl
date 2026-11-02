@@ -44,6 +44,7 @@ import {
   GaveUp,
   LONE_SURROGATE,
   SLACK_CLIENT_OPTIONS,
+  STATUS_REFRESH_MS,
   assertRequestFits,
   fileLeftByUpload,
   leftOutNote,
@@ -225,7 +226,7 @@ export class SlackMcplServer {
    *  top-level when the conversation isn't threaded. */
   private lastIncomingThreadTs = new Map<string, string | undefined>();
   /** Latest accepted addressed thread, retained across typing stops until answered or aged out. */
-  private lastIncomingRoot = new Map<string, { ts: string; at: number }>();
+  private lastIncomingRoot = new Map<string, { ts: string; at: number; lastStart?: number }>();
 
   /** The conversation this peer was last sent a message from, or the bot last
    *  posted in: an incoming message from any other conversation names its
@@ -603,15 +604,22 @@ export class SlackMcplServer {
         if (typeof p.channelId !== 'string') break;
         const id = parseMcplChannelId(p.channelId)?.conversationId ?? p.channelId;
         if (p.op === 'stop') {
+          const root = this.lastIncomingRoot.get(id);
+          if (root) root.lastStart = undefined;
           void this.slack.setThreadStatus(id, undefined);
           break;
         }
         if (!this.grant.isFeatureSetActive(TYPING_FEATURE_SET)) break;
         let root = this.lastIncomingRoot.get(id);
-        if (root && clock.now() - root.at >= ACK_TTL_MS) {
+        const now = clock.now();
+        // Only a new run is age-capped; regular host refreshes must not clear
+        // a long-running turn. A stop or a refresh-interval gap ends a run.
+        const opensRun = root?.lastStart === undefined || now - root.lastStart > STATUS_REFRESH_MS;
+        if (root && opensRun && now - root.at >= ACK_TTL_MS) {
           this.lastIncomingRoot.delete(id);
           root = undefined;
         }
+        if (root) root.lastStart = now;
         void this.slack.setThreadStatus(id, root?.ts);
         break;
       }

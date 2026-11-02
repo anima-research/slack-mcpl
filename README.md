@@ -40,8 +40,11 @@ that grant arrives; plain MCP tool calls are unaffected.
   disconnect or shutdown (best-effort, within the existing 5-second shutdown
   budget). A stop clears the status but keeps the pending thread, so a retry or
   overlapping inference can show it again. The root is forgotten on a confirmed
-  post, a newer addressed message, peer change, or after 10 minutes (the
-  acknowledgement lifetime). `ChannelsTypingParams` declares only `{channelId}`, not `op`:
+  post, a newer addressed message, or peer change. A start that opens a new
+  typing run also forgets it if 10 minutes have passed since the message was
+  taken (the acknowledgement lifetime). A run opens after a stop or more than
+  60 seconds without a start; continuous refreshes keep a long turn's status
+  alive. A first start after the age cap gets no status. `ChannelsTypingParams` declares only `{channelId}`, not `op`:
   hosts sending only that shape clear via post, disconnect, shutdown or expiry.
   Successful statuses refresh at most once a minute; Slack expires them
   after 2 minutes. Lasting API refusals disable status in that conversation

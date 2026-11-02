@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { McplConnection, method } from '@animalabs/mcpl-core';
 import * as net from 'node:net';
 import { serveTcp } from '../src/tcp.js';
-import { ACK_TTL_MS, SlackAdapter, SlackWebClient, SLACK_CLIENT_OPTIONS } from '../src/slack-adapter.js';
+import { ACK_TTL_MS, STATUS_REFRESH_MS, SlackAdapter, SlackWebClient, SLACK_CLIENT_OPTIONS } from '../src/slack-adapter.js';
 import { SlackMcplServer } from '../src/server.js';
 import { FULL_GRANT, MENTION_EVENT, answerAsHost, connectHost, fakeSlack, harness, initialize, until, type HarnessOptions } from './harness.js';
 import { fakeSlackApi } from './slackApi.js';
@@ -124,7 +124,7 @@ test('an overlapping inference stopping all shown channels preserves an unanswer
   assert.equal((h.posts.at(-1) as any).thread_ts, '4.0');
 });
 
-test('pending roots expire at the acknowledgement age cap, not at the last typing stop', async (t) => {
+test('a new typing run expires a pending root at the acknowledgement age cap', async (t) => {
   virtualClock(t);
   const { h } = await connected(t);
   await mention(h);
@@ -137,12 +137,66 @@ test('pending roots expire at the acknowledgement age cap, not at the last typin
   await settled(h);
   assert.equal(h.statuses.at(-1), 'C1:4.0:is thinking…', 'root survives until the age cap');
   elapse(1);
+  typing(h, 'stop');
   typing(h);
   await settled(h);
   assert.deepEqual(h.statuses, ['C1:4.0:is thinking…', 'C1:4.0:', 'C1:4.0:is thinking…', 'C1:4.0:']);
   typing(h);
   await settled(h);
   assert.equal(h.statuses.length, 4, 'expired root cannot be revived');
+});
+
+test('continuous seven-second typing refreshes preserve a run beyond eleven minutes', async (t) => {
+  virtualClock(t);
+  const { h } = await connected(t);
+  await mention(h);
+  for (let ms = 0; ms <= 11 * 60 * 1000; ms += 7000) {
+    typing(h);
+    await settled(h);
+    assert.equal(h.statuses.at(-1), 'C1:4.0:is thinking…');
+    elapse(7000);
+  }
+  assert.ok(h.statuses.length > 1, 'the status was refreshed, not merely left alone');
+  assert.ok(h.statuses.every((s) => s === 'C1:4.0:is thinking…'), 'no mid-run clear');
+  typing(h, 'stop');
+  await settled(h);
+  const stopped = [...h.statuses];
+  typing(h);
+  await settled(h);
+  assert.deepEqual(h.statuses, stopped, 'a new run after the age cap cannot revive the root');
+});
+
+test('an aged root survives a refresh-interval gap exactly, but not a longer gap', async (t) => {
+  virtualClock(t);
+  const { h } = await connected(t);
+  await mention(h);
+  for (let ms = 0; ms < ACK_TTL_MS; ms += 7000) {
+    typing(h);
+    await settled(h);
+    elapse(7000);
+  }
+  elapse(STATUS_REFRESH_MS - 7000);
+  typing(h);
+  await settled(h);
+  assert.equal(h.statuses.at(-1), 'C1:4.0:is thinking…', 'equal gap continues the run');
+  elapse(STATUS_REFRESH_MS + 1);
+  typing(h);
+  await settled(h);
+  assert.equal(h.statuses.at(-1), 'C1:4.0:', 'longer gap opens a capped run');
+  const expired = [...h.statuses];
+  typing(h);
+  await settled(h);
+  assert.deepEqual(h.statuses, expired, 'expired root cannot be revived');
+});
+
+test('a first typing start at the acknowledgement age cap gets no status', async (t) => {
+  virtualClock(t);
+  const { h } = await connected(t);
+  await mention(h);
+  elapse(ACK_TTL_MS);
+  typing(h);
+  await settled(h);
+  assert.deepEqual(h.statuses, []);
 });
 
 test('top-level mention stays top-level through publish, without a status', async (t) => {

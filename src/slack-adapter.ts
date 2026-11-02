@@ -51,7 +51,7 @@ const ACK_MAX_TRIES = 5;
 const MAY_HAVE_LANDED = new Set(['already_reacted', 'internal_error', 'fatal_error', 'service_unavailable', 'file_update_failed']);
 /** The host refreshes typing every few seconds; Slack keeps a thread status
  *  for 2 minutes, so it is set again only after this. */
-const STATUS_REFRESH_MS = 60 * 1000;
+export const STATUS_REFRESH_MS = 60 * 1000;
 const STATUS_TEXT = 'is thinking…';
 const STATUS_THREAD_REFUSALS = new Set(['invalid_thread_ts']);
 
