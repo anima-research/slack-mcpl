@@ -1206,6 +1206,13 @@ export class SlackAdapter {
     if (!this.web.assistant) return 'uncertain';
     const epoch = this.statusEpoch;
     try {
+      // The policy stack is optional on this branch. When composed with it,
+      // authorize every effect (including clears) using its fresh write gate.
+      const policy = this as unknown as {
+        readonly hasAccessPolicy?: boolean;
+        requireWritableConversation(id: string, scope: string, notDone: string): Promise<unknown>;
+      };
+      if (policy.hasAccessPolicy) await policy.requireWritableConversation(channelId, 'chat:write', 'No thread status was set');
       await this.web.assistant.threads.setStatus({ channel_id: channelId, thread_ts: threadTs, status });
       return 'ok';
     } catch (err) {
