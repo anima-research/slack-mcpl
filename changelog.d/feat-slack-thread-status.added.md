@@ -14,7 +14,8 @@
   message, or peer change. A new typing run is capped at the 10-minute
   acknowledgement lifetime since the message was taken, but continuous
   refreshes preserve a running turn. A stop or more than 60 seconds without
-  a start ends a run; a first start after the cap gets no status. The declared `ChannelsTypingParams` has only `{channelId}`, so
+  a start ends a run; a first start at or after the cap gets no status.
+  The declared `ChannelsTypingParams` has only `{channelId}`, so
   hosts without the extension clear via post, disconnect, shutdown or
   expiry. Calls are ordered per conversation, successful refreshes are
   limited to once a minute, and lasting API refusals suppress further

@@ -44,12 +44,16 @@ that grant arrives; plain MCP tool calls are unaffected.
   typing run also forgets it if 10 minutes have passed since the message was
   taken (the acknowledgement lifetime). A run opens after a stop or more than
   60 seconds without a start; continuous refreshes keep a long turn's status
-  alive. A first start after the age cap gets no status. `ChannelsTypingParams` declares only `{channelId}`, not `op`:
+  alive. A first start at or after the age cap gets no status.
+  `ChannelsTypingParams` declares only `{channelId}`, not `op`:
   hosts sending only that shape clear via post, disconnect, shutdown or expiry.
   Successful statuses refresh at most once a minute; Slack expires them
   after 2 minutes. Lasting API refusals disable status in that conversation
   until the peer changes, except `invalid_thread_ts`, which disables it in
-  that thread only; transient failures may retry on the next refresh.
+  that thread only; transient failures may retry on the next refresh,
+  including a conversation check rate-limited without usable Retry-After.
+  Policy-reduction clears run independently of the policy request's time
+  budget, even when it queued behind another request.
   A failed clear is not retried: that status stays until Slack expires it
   or the bot replies in that thread, unless a later status there replaces
   it.
