@@ -1,0 +1,1 @@
+- With DMs disabled, keep thread-status conversation checks retryable after a rate-limit response with absent or invalid Retry-After. Only confirmed channel-policy refusals and lasting Slack refusals suppress later starts until the peer changes.

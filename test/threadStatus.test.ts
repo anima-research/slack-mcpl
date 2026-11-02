@@ -448,6 +448,43 @@ for (const answer of ['missing_scope', 'internal_error', 'rate limit'] as const)
   });
 }
 
+for (const retryAfter of [undefined, 'not-a-timeout']) {
+  test(`with DMs off, a conversations.info 429 with Retry-After ${retryAfter ?? 'absent'} permits a later status`, async (t) => {
+    const api = await fakeSlackApi();
+    t.after(() => api.close());
+    const log = t.mock.method(console, 'error', () => {});
+    api.answerFor('conversations.info',
+      { status: 429, headers: retryAfter === undefined ? {} : { 'retry-after': retryAfter }, body: { ok: false, error: 'ratelimited' } },
+      { body: { ok: true, channel: { id: 'C9', name: 'general', is_im: false, is_mpim: false } } });
+    const web = new SlackWebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: api.url });
+    const socket = { on() {}, async start() {}, async disconnect() {} } as any;
+    const a = new SlackAdapter(web as any, socket, 'UBOT', 'acme', undefined, undefined, true);
+    await a.setThreadStatus('C9', '1.0');
+    assert.deepEqual(api.calls, ['conversations.info'], 'the failed check must not permit a write');
+    assert.match(String(log.mock.calls.at(-1)?.arguments[1]), /Try again shortly/);
+    await a.setThreadStatus('C9', '1.0');
+    await a.setThreadStatus('C9', '1.0');
+    assert.deepEqual(api.calls, ['conversations.info', 'conversations.info', 'assistant.threads.setStatus']);
+    assert.equal(api.sent.at(-1)?.get('status'), 'is thinking…');
+    assert.equal(log.mock.callCount(), 1, 'the transient check is logged only once');
+  });
+}
+
+for (const channel of [{ id: 'G1', is_mpim: true }, { id: 'G1' }]) {
+  test(`with DMs off, a confirmed ${channel.is_mpim ? 'group DM' : 'non-channel'} refusal is remembered until peer change`, async (t) => {
+    const log = t.mock.method(console, 'error', () => {});
+    const { a, calls } = adapter({ disableDms: true, info: { channel } });
+    const check = t.mock.method(a['web'].conversations, 'info');
+    for (let i = 0; i < 3; i++) await a.setThreadStatus('G1', '1.0');
+    assert.deepEqual(calls, []);
+    assert.equal(check.mock.callCount(), 1);
+    assert.equal(log.mock.callCount(), 1);
+    await a.resetThreadStatuses();
+    await a.setThreadStatus('G1', '1.0');
+    assert.equal(log.mock.callCount(), 2, 'a new peer rechecks the policy refusal');
+  });
+}
+
 test('a late old-peer conversation check refusal cannot suppress the new peer status', async (t) => {
   t.mock.method(console, 'error', () => {});
   const { a, calls } = adapter({ disableDms: true, info: { channel: { id: 'C1', is_im: false, is_mpim: false } } });

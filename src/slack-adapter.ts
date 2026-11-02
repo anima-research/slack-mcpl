@@ -55,6 +55,9 @@ export const STATUS_REFRESH_MS = 60 * 1000;
 const STATUS_TEXT = 'is thinking…';
 const STATUS_THREAD_REFUSALS = new Set(['invalid_thread_ts']);
 
+/** This adapter confirmed a DM or a conversation it cannot treat as a channel. */
+class ChannelOnlyRefusal extends Error {}
+
 /** Slack's code, when Slack refused the call; undefined for any other error,
  *  an answer with no code in Slack's form (SLACK_CODE) included. */
 export function slackRefusal(err: unknown): string | undefined {
@@ -1161,7 +1164,10 @@ export class SlackAdapter {
       try {
         await this.assertNotDm(channelId, 'No thread status was set');
       } catch (err) {
-        if (epoch === this.statusEpoch && !waitToAskAgain(err, 'conversations.info')) {
+        // Only confirmed policy refusals or Slack's lasting original answer
+        // suppress later starts. A code-less client failure may pass next time.
+        const lasting = err instanceof ChannelOnlyRefusal || (err instanceof Error && refusedForGood(err.cause));
+        if (epoch === this.statusEpoch && lasting) {
           this.statusRefused.add(channelId);
         }
         console.error(`[slack-mcpl] thread status on ${channelId} refused:`, err instanceof Error ? err.message : err);
@@ -1427,7 +1433,7 @@ export class SlackAdapter {
   private async assertNotDm(channelId: string, notDone: string): Promise<void> {
     if (!this.disableDms || this.channelIds.has(channelId)) return;
     const refuse = (why: string) =>
-      new Error(
+      new ChannelOnlyRefusal(
         `${notDone}: ${channelId} ${why}, and this bot works only in channels here, since direct messages are ` +
           'turned off. list_channels shows the ones it can use.',
       );
@@ -1447,6 +1453,7 @@ export class SlackAdapter {
       throw new Error(
         `${notDone}: Slack couldn't confirm ${channelId} is a channel (${why}), and with direct messages turned ` +
           `off, this bot works only in conversations Slack confirms are channels. ${afterFailedCheck(err)}`,
+        { cause: err },
       );
     }
     if (!this.channelIds.has(channelId)) throw refuse("isn't a channel");
