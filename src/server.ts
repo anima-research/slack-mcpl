@@ -414,7 +414,7 @@ export class SlackMcplServer {
       // Reductions (including a malformed policy's fail-closed grant) retire
       // queued starts and clear owned statuses, without forgetting refusals.
       if (wasTyping && !this.grant.isFeatureSetActive(TYPING_FEATURE_SET)) {
-        void this.slack.clearThreadStatuses();
+        void outsideCallTime(() => this.slack.clearThreadStatuses());
       }
     }
   }

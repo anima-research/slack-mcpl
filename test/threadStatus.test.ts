@@ -298,6 +298,50 @@ for (const reduction of ['disabled request', 'capability revoked', 'disabled not
   });
 }
 
+test('a typing-policy reduction queued twenty seconds behind a tool sends its clear', async (t) => {
+  virtualClock(t);
+  const api = await fakeSlackApi();
+  t.after(() => api.close());
+  const log = t.mock.method(console, 'error', () => {});
+  const { h } = await connected(t);
+  const slack = h.server['slack'];
+  const web = new SlackWebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: api.url });
+  // Keep the incoming-message harness, but send statuses through the real
+  // client's deadline check and the loopback Slack endpoint.
+  t.mock.method(slack['web'].assistant!.threads, 'setStatus', web.assistant.threads.setStatus.bind(web.assistant.threads));
+  await mention(h);
+  typing(h);
+  await settled(h);
+  assert.deepEqual(api.sent.map((p) => p.get('status')), ['is thinking…']);
+
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  t.after(() => release());
+  let inTool = false;
+  t.mock.method(slack, 'listConversations', async () => {
+    inTool = true;
+    await held;
+    return { conversations: [], leftOut: [] };
+  });
+  const slow = h.host.sendRequest('tools/call', { name: 'list_channels', arguments: {} });
+  await until(() => inTool, 'preceding tool in flight');
+  let arrived = false;
+  h.server['conn']!.on('request', (req) => {
+    if (req.method === method.FEATURE_SETS_UPDATE) arrived = true;
+  });
+  const reduction = h.host.sendRequest(method.FEATURE_SETS_UPDATE, {
+    effectiveCapabilities: GRANT, disabled: ['slack.typing'],
+  });
+  await until(() => arrived, 'policy request queued behind the tool');
+  elapse(20_000);
+  release();
+  await Promise.all([slow, reduction]);
+  await settled(h);
+  assert.deepEqual(api.calls, ['assistant.threads.setStatus', 'assistant.threads.setStatus']);
+  assert.deepEqual(api.sent.map((p) => p.get('status')), ['is thinking…', '']);
+  assert.ok(!log.mock.calls.some((c) => c.arguments.some((a) => String(a).includes("out of this call's time"))));
+});
+
 for (const name of [method.CHANNELS_TYPING, 'notifications/typing']) {
   test(`${name} stop clears an owned status even when typing is inactive`, async (t) => {
     const { h } = await connected(t);
