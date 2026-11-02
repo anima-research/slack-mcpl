@@ -267,7 +267,7 @@ test('explicitly disabled typing set cannot set status', async (t) => {
   assert.deepEqual(h.statuses, []);
 });
 
-for (const reduction of ['disabled request', 'capability revoked', 'disabled notification', 'malformed policy'] as const) {
+for (const reduction of ['disabled request', 'capability revoked', 'disabled notification', 'malformed policy', 'restrictive enabled allow-list'] as const) {
   test(`a ${reduction} clears shown typing statuses without needing a stop`, async (t) => {
     const { h } = await connected(t);
     await mention(h);
@@ -279,6 +279,8 @@ for (const reduction of ['disabled request', 'capability revoked', 'disabled not
       await assert.rejects(h.host.sendRequest(method.FEATURE_SETS_UPDATE, {
         effectiveCapabilities: GRANT, deniedCapabilities: ['channels.typing'],
       }));
+    } else if (reduction === 'restrictive enabled allow-list') {
+      await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: GRANT, enabled: ['slack.messaging'] });
     } else {
       await h.host.sendRequest(method.FEATURE_SETS_UPDATE, reduction === 'capability revoked'
         ? { effectiveCapabilities: FULL_GRANT }
