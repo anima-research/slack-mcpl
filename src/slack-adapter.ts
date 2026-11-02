@@ -1212,7 +1212,10 @@ export class SlackAdapter {
         readonly hasAccessPolicy?: boolean;
         requireWritableConversation(id: string, scope: string, notDone: string): Promise<unknown>;
       };
-      if (policy.hasAccessPolicy) await policy.requireWritableConversation(channelId, 'chat:write', 'No thread status was set');
+      if (policy.hasAccessPolicy) {
+        await policy.requireWritableConversation(channelId, 'chat:write', 'No thread status was set');
+        if (status && (this.stopping || epoch !== this.statusEpoch)) return 'uncertain';
+      }
       await this.web.assistant.threads.setStatus({ channel_id: channelId, thread_ts: threadTs, status });
       return 'ok';
     } catch (err) {
