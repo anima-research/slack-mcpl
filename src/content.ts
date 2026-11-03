@@ -7,6 +7,7 @@
  * Salvaged from zulip-mcp PR #8 (multi-platform branch), Slack halves only.
  */
 
+import type { PolicyFileRef } from './file-access.js';
 import { channelShown, mimeShown, nameShown } from './framing.js';
 
 // Anthropic refuses images larger than this; mirror their cap server-side
@@ -64,18 +65,22 @@ function inTransit(err: unknown, signal?: AbortSignal): Error {
 export async function fetchAttachmentBytes(
   url: string,
   fallbackName: string,
-  opts: { headers?: Record<string, string>; signal?: AbortSignal } = {},
+  opts: { headers?: Record<string, string>; signal?: AbortSignal; redirect?: RequestInit['redirect'] } = {},
 ): Promise<FetchedAttachment> {
-  const resp = await fetch(url, { headers: opts.headers ?? {}, redirect: 'follow', signal: opts.signal }).catch((err: unknown) => {
+  const resp = await fetch(url, { headers: opts.headers ?? {}, redirect: opts.redirect ?? 'follow', signal: opts.signal }).catch((err: unknown) => {
     throw inTransit(err, opts.signal);
   });
   if (!resp.ok) {
     const answered = `HTTP ${resp.status} ${resp.statusText}`.trim();
+    // Policy callers cannot fix a denial by supplying a different URL.
+    const source = opts.redirect === 'error'
+      ? 'Use channelId and fileId from an attachment reference; this server verifies access again.'
+      : ATTACHMENT_URL_SOURCE;
     // A timeout, a rate limit or a failing server says nothing about the url.
     throw new Error(
       resp.status === 408 || resp.status === 429 || resp.status >= 500
         ? `Nothing was fetched: the file's url answered ${answered}, so the server was busy or failing. Try again shortly.`
-        : `Nothing was fetched: the file's url answered ${answered}. ${ATTACHMENT_URL_SOURCE} If it was exact, the ` +
+        : `Nothing was fetched: the file's url answered ${answered}. ${source} ${opts.redirect === 'error' ? 'The' : 'If it was exact, the'} ` +
             'file may have been deleted, or this bot may not be allowed to read it; calling again gets the same ' +
             'answer unless someone shares the file where this bot can read it, or, if the Slack app lacks ' +
             "files:read (Slack's file links need it), whoever runs this host adds that scope to the app's bot " +
@@ -192,7 +197,11 @@ export function attachmentName(url: URL): string {
   }
 }
 
-export interface AttachmentRef {
+export type AttachmentRef = PolicyFileRef | LegacyAttachmentRef;
+
+export interface LegacyAttachmentRef {
+  channelId?: never;
+  fileId?: never;
   path: string;       // url_private — needs Bearer bot-token auth to fetch
   name: string;       // basename for human display
   mimeType: string;   // best-effort from extension or the API
@@ -364,7 +373,7 @@ export interface SlackHistoryMessage {
   root?: { thread_ts?: string; ts?: string };
   reply_count?: number;
   bot_id?: string;
-  files?: Array<{ name?: string; mimetype?: string; url_private?: string }>;
+  files?: Array<{ id?: string; name?: string; mimetype?: string; url_private?: string }>;
 }
 
 /** The minimal conversations.history surface fetchSlackHistory needs —
@@ -407,6 +416,7 @@ export async function fetchSlackHistory(
   const collected: SlackHistoryMessage[] = [];
   let cursor: string | undefined;
   let truncated = false;
+  const cursors = new Set<string>();
   do {
     const result = await client.conversations.history({
       channel: params.channel,
@@ -422,6 +432,8 @@ export async function fetchSlackHistory(
       truncated = true;
       cursor = undefined;
     }
+    if (cursor && cursors.has(cursor)) throw new Error('Slack history cursor cycle');
+    if (cursor) cursors.add(cursor);
   } while (cursor);
   return { messages: collected.reverse(), truncated };
 }
