@@ -253,8 +253,13 @@ export class SlackMcplServer {
    */
   constructor(
     private slack: SlackAdapter,
-    private opts: { subscribeMemberChannels?: boolean } = {},
+    private opts: { subscribeMemberChannels?: boolean; disabledTools?: readonly string[] } = {},
   ) {
+    const names = new Set(toolDefinitions.map(tool => tool.name));
+    const unknownTool = opts.disabledTools?.find(name => !names.has(name));
+    if (unknownTool !== undefined) throw new Error(`Unknown disabled tool: ${JSON.stringify(unknownTool)}`);
+    // Caller-owned options must not change the operator policy after startup.
+    this.opts = { ...opts, disabledTools: [...(opts.disabledTools ?? [])] };
     // Once for the server's life: the adapter keeps every handler it's
     // given, and each forwards to whichever connection is being served, so
     // one per connection forwarded each message once per connection served.
@@ -390,7 +395,8 @@ export class SlackMcplServer {
    *  during a connection, as a grant can. */
   private offeredTools() {
     return toolDefinitions.filter((t) =>
-      (t.name !== 'send_dm' || this.slack.dmsWritable) && (t.name !== 'refresh_channels' || this.mcplEnabled));
+      (t.name !== 'send_dm' || this.slack.dmsWritable) && (t.name !== 'refresh_channels' || this.mcplEnabled)
+      && !this.opts.disabledTools?.includes(t.name));
   }
 
   private requireMcpl(): void {
@@ -602,6 +608,10 @@ export class SlackMcplServer {
     // are not subject to a grant — there is none to consult.
     if (this.mcplEnabled && !this.grant.has('tools')) {
       throw capabilityDenied('tools');
+    }
+
+    if (this.opts.disabledTools?.includes(name)) {
+      return { content: [textContent(`Tool '${name}' is disabled by operator configuration`)], isError: true };
     }
 
     // Check feature set permission
