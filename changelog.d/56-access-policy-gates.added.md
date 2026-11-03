@@ -1,0 +1,1 @@
+- Prepare dormant Slack adapter access-policy gates; no supported setting activates them and existing operator access controls remain unchanged.
