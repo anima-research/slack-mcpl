@@ -100,7 +100,7 @@ export async function nonJsonSlackApiUrl(
 
 function fakeWeb(
   posts: unknown[], reactions: string[], uploads: unknown[], deletedMessages: unknown[], deletedFiles: string[], uploadsBegun: unknown[],
-  reads: string[],
+  reads: string[], statuses: string[],
   dms: Array<{ id: string; user: string }> = [],
   displayNames: Record<string, string> = {},
   channelName = 'general',
@@ -108,6 +108,10 @@ function fakeWeb(
 ): SlackWebLike {
   let started = 0;
   return {
+    assistant: { threads: { async setStatus({ channel_id, thread_ts, status }) {
+      statuses.push(`${channel_id}:${thread_ts}:${status}`);
+      return {};
+    } } },
     auth: {
       async test() {
         return {};
@@ -228,6 +232,8 @@ export interface Harness {
   /** conversations.history / conversations.replies calls, as
    *  `history:<channel>` and `replies:<channel>:<ts>`. */
   reads: string[];
+  /** assistant.threads.setStatus calls: channel:thread:status. */
+  statuses: string[];
   /** files.completeUploadExternal's calls, each a shared upload. */
   uploads: unknown[];
   /** files.getUploadURLExternal's calls, each an upload's first step. */
@@ -244,15 +250,16 @@ export function fakeSlack(opts: HarnessOptions = {}) {
   const posts: unknown[] = [];
   const reactions: string[] = [];
   const reads: string[] = [];
+  const statuses: string[] = [];
   const uploads: unknown[] = [];
   const uploadsBegun: unknown[] = [];
   const deletedMessages: unknown[] = [];
   const deletedFiles: string[] = [];
   const slack = new SlackAdapter(
-    fakeWeb(posts, reactions, uploads, deletedMessages, deletedFiles, uploadsBegun, reads, opts.dms, opts.displayNames, opts.channelName, opts.historyMessages), socket, 'UBOT', 'acme',
+    fakeWeb(posts, reactions, uploads, deletedMessages, deletedFiles, uploadsBegun, reads, statuses, opts.dms, opts.displayNames, opts.channelName, opts.historyMessages), socket, 'UBOT', 'acme',
     undefined, opts.sendChannels, opts.disableDms, opts.ackReaction, opts.scopes,
   );
-  return { slack, socket, posts, reactions, reads, uploads, uploadsBegun, deletedMessages, deletedFiles };
+  return { slack, socket, posts, reactions, reads, statuses, uploads, uploadsBegun, deletedMessages, deletedFiles };
 }
 
 /** Answer the server's requests on `host` as an MCPL host would; returns the
@@ -306,10 +313,10 @@ export function connectHost(server: SlackMcplServer, opts: HarnessOptions = {}) 
 }
 
 export function harness(opts: HarnessOptions = {}): Harness {
-  const { slack, socket, posts, reactions, reads, uploads, uploadsBegun, deletedMessages, deletedFiles } = fakeSlack(opts);
+  const { slack, socket, posts, reactions, reads, statuses, uploads, uploadsBegun, deletedMessages, deletedFiles } = fakeSlack(opts);
   const server = new SlackMcplServer(slack, { subscribeMemberChannels: opts.subscribeMemberChannels });
   const { host, hostSaw, served, close } = connectHost(server, opts);
-  return { server, socket, host, hostSaw, posts, reactions, reads, uploads, uploadsBegun, deletedMessages, deletedFiles, served, close };
+  return { server, socket, host, hostSaw, posts, reactions, reads, statuses, uploads, uploadsBegun, deletedMessages, deletedFiles, served, close };
 }
 
 export async function initialize(h: { host: McplConnection }, mcpl: boolean) {

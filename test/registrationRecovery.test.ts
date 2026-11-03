@@ -25,6 +25,8 @@ function fakeSlack(list = async () => [conversation()]) {
   const deleted: string[] = [];
   let sent = 0;
   const slack = {
+    async setThreadStatus() {},
+    async resetThreadStatuses() {},
     teamName: 'acme',
     dmsWritable: true,
     canWrite: () => true,
