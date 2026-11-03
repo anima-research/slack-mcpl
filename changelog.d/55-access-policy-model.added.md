@@ -1,0 +1,1 @@
+- Prepare an internal Slack access-policy model; this is inert and does not change operator configuration or runtime access.
