@@ -7,6 +7,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mcplChannelId, parseMcplChannelId, toDescriptor, ChannelManager } from '../src/channels.js';
+import { HOSTILE_NAME as hostile, NAME_LEAK as leak } from './hostileName.js';
 
 test('mcplChannelId round-trips through parseMcplChannelId', () => {
   assert.equal(mcplChannelId('C123'), 'slack:C123');
@@ -31,6 +32,39 @@ test('toDescriptor labels channels, DMs, and group DMs distinctly', () => {
   const gdm = toDescriptor({ id: 'G1', kind: 'group_dm', name: 'mpdm-a--b-1', isMember: true }, 'acme');
   assert.equal(gdm.label, 'Group DM: mpdm-a--b-1 (acme)');
 });
+
+for (const kind of ['channel', 'private_channel', 'group_dm', 'dm'] as const) {
+  const prefix = kind === 'dm' ? 'DM: @' : kind === 'group_dm' ? 'Group DM: ' : '';
+  const sigil = kind === 'channel' || kind === 'private_channel' ? '#' : '';
+
+  test(`toDescriptor preserves plain ${kind} names and team names`, () => {
+    const desc = toDescriptor({ id: 'C1', kind, name: 'plain-name', isMember: true }, 'acme team');
+    assert.equal(desc.label, `${prefix}${sigil}plain-name (acme team)`);
+  });
+
+  test(`toDescriptor quotes hostile ${kind} names losslessly`, () => {
+    const desc = toDescriptor({ id: 'C1', kind, name: hostile, isMember: true }, 'acme');
+    assert.doesNotMatch(desc.label, leak);
+    assert.ok(desc.label.startsWith(prefix));
+    assert.ok(desc.label.endsWith(' (acme)'));
+    const quoted = desc.label.slice(prefix.length, -' (acme)'.length);
+    assert.equal(JSON.parse(quoted), `${sigil}${hostile}`);
+  });
+
+  test(`toDescriptor quotes hostile team names for ${kind} losslessly`, () => {
+    const desc = toDescriptor({ id: 'C1', kind, name: 'plain-name', isMember: true }, hostile);
+    assert.doesNotMatch(desc.label, leak);
+    const beforeTeam = `${prefix}${sigil}plain-name (`;
+    assert.ok(desc.label.startsWith(beforeTeam));
+    assert.ok(desc.label.endsWith(')'));
+    assert.equal(JSON.parse(desc.label.slice(beforeTeam.length, -1)), hostile);
+  });
+
+  test(`toDescriptor omits an empty workspace for ${kind}`, () => {
+    const desc = toDescriptor({ id: 'C1', kind, name: 'plain-name', isMember: true }, '');
+    assert.equal(desc.label, `${prefix}${sigil}plain-name`);
+  });
+}
 
 test('ChannelManager tracks registered vs open channels', () => {
   const mgr = new ChannelManager();

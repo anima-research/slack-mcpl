@@ -210,6 +210,8 @@ export interface HarnessOptions {
   displayNames?: Record<string, string>;
   /** The name conversations.info and conversations.list give C1 (default general). */
   channelName?: string;
+  /** The workspace name the adapter reports (default acme). */
+  teamName?: string;
   /** Messages, as Slack gives them: conversations.history gives those that aren't replies, conversations.replies a thread's root and its replies (default none). */
   historyMessages?: Array<Record<string, unknown>>;
   /** The bot token's scopes, as auth.test would report them (default unknown). */
@@ -249,7 +251,7 @@ export function fakeSlack(opts: HarnessOptions = {}) {
   const deletedMessages: unknown[] = [];
   const deletedFiles: string[] = [];
   const slack = new SlackAdapter(
-    fakeWeb(posts, reactions, uploads, deletedMessages, deletedFiles, uploadsBegun, reads, opts.dms, opts.displayNames, opts.channelName, opts.historyMessages), socket, 'UBOT', 'acme',
+    fakeWeb(posts, reactions, uploads, deletedMessages, deletedFiles, uploadsBegun, reads, opts.dms, opts.displayNames, opts.channelName, opts.historyMessages), socket, 'UBOT', opts.teamName ?? 'acme',
     undefined, opts.sendChannels, opts.disableDms, opts.ackReaction, opts.scopes,
   );
   return { slack, socket, posts, reactions, reads, uploads, uploadsBegun, deletedMessages, deletedFiles };
