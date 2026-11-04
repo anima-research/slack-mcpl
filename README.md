@@ -404,8 +404,11 @@ Rich usergroups, date fallbacks and toned emoji are retained; literal rich
 text is escaped before Slack formatting.
 
 Deduplication compares each attachment body and each block independently,
-against original text and previously appended units. Keys normalize whitespace,
-Slack mention/link/escape encodings, list/quote/code markers and emphasis order;
+against original text and previously appended units. Plain keys normalize only
+whitespace and Slack mention/link/escape encodings,
+never punctuation. Rich-text mirrors additionally serialize their known list,
+quote and code structure and canonicalize only balanced, word-bounded emphasis
+order (without deleting emphasis markers);
 rich channel elements carry labels from original text. Dedup is independent of
 the name cache; names are resolved for display afterward. The `Notification`
 placeholder never suppresses a distinct body.
