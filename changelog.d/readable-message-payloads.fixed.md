@@ -1,6 +1,5 @@
-Render readable classic attachments and Block Kit text in history, threads,
-backscroll and eligible live messages, without repeating mirrored message text.
-Bound supplemental text and skip redundant URL previews; preserve existing live
-bot and edit filtering.
-Deduplicate equivalent Slack mention/link/escape encodings after name resolution,
-and truncate supplemental text without splitting Unicode code points.
+- Render readable attachments and blocks in history, threads, backscroll and
+  eligible live messages; deduplicate each supplemental unit independently.
+  Preserve original Slack text for raw metadata and mention/wake decisions.
+  Search rendered history content, retain shared messages, and mark bounded
+  supplemental output visibly when truncated.

@@ -17,8 +17,16 @@ async function shaped(payload: Record<string, unknown>, bot = false) {
   const thread = await adapter.readThread('C1', row.ts, {});
   const backscroll = await adapter.fetchHistory('C1');
   const received: SlackMessageData[] = [];
-  adapter.onMessage(m => { received.push(m); });
+  let release!: () => void;
+  const delayed = new Promise<void>(resolve => { release = resolve; });
+  const liveAdapter = new SlackAdapter({
+    users: { info: async () => { await delayed; return { user: { name: 'alice' } }; } },
+  } as any, { on: (_: string, h: any) => { handler = h; } } as any, 'UBOT', 'example');
+  liveAdapter.onMessage(m => { received.push(m); });
   handler({ event: { type: 'message', channel: 'C1', ...row }, ack: async () => {} });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(received.length, 0, 'live delivery awaits its own lookup');
+  release();
   await new Promise(resolve => setTimeout(resolve, 0));
   return { contents: [history.messages[0].content, thread.messages[0].content, backscroll.messages[0].content], received };
 }
@@ -69,13 +77,13 @@ test('rich_text mirror stays byte-identical; distinct block still appended', asy
 
 test('malformed shapes are absent and nested cycles are bounded', async () => {
   const cycle: any = { type: 'rich_text_section' }; cycle.elements = [cycle];
-  await expectText({ text: 'Original', attachments: [null, 7, { fields: [null, { title: {}, value: [] }] }, { text: 'Valid' }], blocks: [null, { type: 'section', text: 7, fields: {} }, { type: 'rich_text', elements: [cycle] }] }, 'Original\nValid');
+  await expectText({ text: 'Original', attachments: [null, 7, { fields: [null, { title: {}, value: [] }] }, { text: 'Valid' }], blocks: [null, { type: 'section', text: 7, fields: {} }, { type: 'rich_text', elements: [cycle] }] }, 'Original\nValid[…truncated]');
   await expectText({ text: 'Original', attachments: {}, blocks: 'bad' }, 'Original');
 });
 
 test('suffix is capped at 16384 code units without truncating original text', async () => {
   const text = 'Original'.repeat(3000);
-  await expectText({ text, attachments: [{ text: 'x'.repeat(20000) }] }, text + '\n' + 'x'.repeat(16383));
+  await expectText({ text, attachments: [{ text: 'x'.repeat(20000) }] }, text + '\n' + 'x'.repeat(16383 - '[…truncated]'.length) + '[…truncated]');
 });
 
 test('unfurls already linked in text and app unfurls are skipped; standalone preview retained', async () => {
@@ -129,9 +137,9 @@ for (const shape of ['attachment', 'section', 'rich_text'] as const) {
           assert.ok(output.startsWith(text));
           assert.ok(output.length <= text.length + 16384);
           const suffix = (text ? '\n' : '') + body;
-          let expected = suffix.slice(0, 16384);
+          let expected = suffix.slice(0, 16384 - '[…truncated]'.length);
           if (/[\uD800-\uDBFF]$/.test(expected)) expected = expected.slice(0, -1);
-          assert.equal(output, text + expected);
+          assert.equal(output, text + expected + '[…truncated]');
         }
       }
     }
@@ -176,3 +184,134 @@ for (const nested of [true, false]) {
     assert.equal(live!.content, expected, 'raw live content has no leading newline or undefined');
   });
 }
+
+const section = (text: string) => ({ type: 'section', text: { type: 'mrkdwn', text } });
+const richBlock = (...elements: unknown[]) => ({ type: 'rich_text', elements });
+const richSection = (...elements: unknown[]) => ({ type: 'rich_text_section', elements });
+const literal = (text: string) => ({ type: 'text', text });
+
+for (const [text, element] of [
+  ['Hello', richSection(literal('Hello'))],
+  ['• a', { type: 'rich_text_list', elements: [richSection(literal('a'))] }],
+  ['&gt; a', { type: 'rich_text_quote', elements: [literal('a')] }],
+  ['`招`', { type: 'rich_text_preformatted', elements: [literal('招')] }],
+  ['```\na\n```', { type: 'rich_text_preformatted', elements: [literal('a')] }],
+  ['*_word_*', richSection({ ...literal('word'), style: { bold: true, italic: true } })],
+  ['<#C1|general>', richSection({ type: 'channel', channel_id: 'C1' })],
+] as const) {
+  test('review mirrors with distinct block siblings: ' + text, async () => {
+    const result = await shaped({ text, blocks: [richBlock(element), section('Extra')] });
+    assert.equal(result.received[0].content, text + '\nExtra');
+  });
+}
+
+test('review supplemental fragments dedup independently', async () => {
+  await expectText({ text: 'Notification', attachments: [{ text: 'Body' }, { text: 'Body' }], blocks: [section('Body'), section('Other')] }, 'Notification\nBody\nOther');
+});
+
+test('review rich usergroup date and toned emoji preserved and deduplicated', async () => {
+  const body = '<!subteam^S1> Today :thumbsup::skin-tone-2:';
+  const blocks = [richBlock(richSection({ type: 'usergroup', usergroup_id: 'S1' }, literal(' '), { type: 'date', fallback: 'Today' }, literal(' '), { type: 'emoji', name: 'thumbsup', skin_tone: 2 }))];
+  await expectText({ blocks }, body);
+  assert.equal((await expectText({ text: body, blocks }, body))!.content, body);
+});
+
+test('review rich literal escapes cannot become mentions or entities', async () => {
+  const live = await expectText({ blocks: [richBlock(richSection(literal('&lt; <@U1> & >')))] }, '&lt; <@U1> & >');
+  assert.deepEqual(live!.mentionIds, []);
+});
+
+test('review shared bot mentions are display-only and raw text is preserved', async () => {
+  const live = await expectText({ text: 'Notification', attachments: [{ is_share: true, text: '<@UBOT>' }] }, 'Notification\n@alice (uid:UBOT)');
+  assert.deepEqual(live!.mentionIds, []);
+  assert.equal(live!.mentionsBot, false);
+  assert.equal(live!.rawContent, 'Notification');
+});
+
+test('review preview URLs compare exactly, Slack links normalize, shares survive', async () => {
+  await expectText({ text: '<https://example.com/other|Label>', attachments: [
+    { from_url: 'https://example.com', text: 'Details' },
+    { from_url: 'https://example.com/other', text: 'Skip' },
+    { from_url: 'https://example.com/other', is_share: true, text: 'Shared' },
+    { from_url: 'https://example.com/other', is_msg_unfurl: true, text: 'Message' },
+  ] }, 'Label (https://example.com/other)\nDetails\nShared\nMessage');
+});
+
+test('review fresh display lookup uses the extracted rendered payload', async () => {
+  const live = await expectText({ text: '@U1 (uid:U1)', attachments: [{ text: '<@U1>' }, { text: '<@U2>' }] }, '@U1 (uid:U1)\n@alice (uid:U2)');
+  assert.deepEqual(live!.mentionIds, []);
+});
+
+test('review traversal budget and array/depth cuts carry one final marker', async () => {
+  for (const payload of [
+    { attachments: Array.from({ length: 2001 }, () => ({})), blocks: [section('lost')] },
+    { blocks: [richBlock(Array.from({length: 14}).reduce<any>(e => richSection(e), literal('deep')))] },
+  ]) {
+    const result = await shaped(payload);
+    for (const text of result.contents) {
+      assert.ok(text.endsWith('[…truncated]'));
+      assert.equal(text.split('[…truncated]').length, 2);
+    }
+  }
+});
+
+test('review attachment nested blocks precede top-level blocks (documented order)', async () => {
+  await expectText({ attachments: [{ blocks: [section('Nested')] }], blocks: [section('Top')] }, 'Nested\nTop');
+});
+
+test('review textContains searches delivered content on history and thread', async () => {
+  const row = { ts: '100.000001', text: 'Notification', blocks: [section('deployment failed')] };
+  const adapter = new SlackAdapter({ conversations: {
+    history: async () => ({ messages: [row] }), replies: async () => ({ messages: [row] }),
+  } } as any, { on() {} } as any, 'UBOT', 'example');
+  for (const result of [await adapter.readHistory('C1', { textContains: 'deployment failed' }), await adapter.readThread('C1', row.ts, {})]) {
+    assert.equal(result.messages[0]?.content, 'Notification\ndeployment failed');
+  }
+});
+
+import { readFileSync, mkdtempSync, cpSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { release } from '../scripts/release-changelog.mjs';
+import { method } from '@animalabs/mcpl-core';
+import { harness, initialize, FULL_GRANT, until } from './harness.js';
+
+test('review fragment passes the actual release validator', () => {
+  const root = mkdtempSync(join(tmpdir(), 'payload-release-'));
+  try {
+    for (const file of ['package.json', 'CHANGELOG.md', 'changelog.d']) cpSync(file, join(root, file), { recursive: true });
+    assert.doesNotThrow(() => release(root));
+
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('review server shared mentions neither wake nor auto-subscribe; raw metadata remains original', async () => {
+  const h = harness();
+  try {
+    await initialize(h, true);
+    await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+    await until(() => h.hostSaw.some(r => r.method === method.CHANNELS_REGISTER), 'registration');
+    const event = { type: 'message', channel: 'C1', channel_type: 'channel', user: 'U1', ts: '100.1', text: 'Notification', attachments: [{ is_share: true, text: '<@UBOT> Details' }] };
+    await h.socket.emitMessage(event);
+    assert.equal(h.hostSaw.filter(r => r.method === method.PUSH_EVENT).length, 0, 'unsubscribed ambient shared mention is silent');
+    await h.host.sendRequest('tools/call', { name: 'subscribe_channel', arguments: { channelId: 'C1' } });
+    await h.socket.emitMessage({ ...event, ts: '100.2' });
+    await until(() => h.hostSaw.some(r => r.method === method.PUSH_EVENT), 'ambient delivery');
+    const push: any = h.hostSaw.find(r => r.method === method.PUSH_EVENT)!.params;
+
+    assert.ok(push.tags.includes('chat:ambient'));
+    assert.ok(!push.tags.includes('chat:mention'));
+    assert.ok(!push.tags.includes('chat:addressed'));
+    await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'slack:C1', type: 'slack', address: { channelId: 'C1' } });
+    await h.socket.emitMessage({ ...event, ts: '100.3' });
+    await until(() => h.hostSaw.some(r => r.method === method.CHANNELS_INCOMING), 'channel delivery');
+    const incoming: any = h.hostSaw.find(r => r.method === method.CHANNELS_INCOMING)!.params;
+    assert.equal(incoming.messages[0].metadata.rawContent, 'Notification');
+    assert.deepEqual(incoming.messages[0].metadata.mentionIds, []);
+
+  } finally { await h.close(); }
+});
+
+test('review docs pin the real nested-before-top-level order', () => {
+  assert.match(readFileSync('README.md', 'utf8'), /then that attachment's nested blocks, then top-level blocks/);
+});

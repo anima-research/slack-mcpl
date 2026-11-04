@@ -395,16 +395,31 @@ built on `@animalabs/mcpl-core`'s `grantFromUpdate`/`capabilityGranted`/
 
 ### Readable message payloads
 
-History, threads, backscroll and eligible live messages keep Slack's `text`
-first, then append readable classic attachments and header/section/context/
-rich-text blocks. Mirrors of `text` are not repeated after whitespace normalization and the
-existing Slack mention/link/escape rendering with resolved user names;
-mrkdwn is retained for the existing Slack text formatter. Attachment titles
-include their plain-text link, fields use `title: value`, and `fallback` is used
-only when no other attachment text exists. Image-only payloads and interactive
-controls are ignored. App unfurls are skipped; classic URL previews are skipped
-when their `from_url` is already in `text`, but standalone previews are retained.
-Only appended material is capped at 16,384 UTF-16 code units (including its
-separator), always at a code-point boundary; original text is never truncated. Traversal is limited to 2,000
-nodes and 12 nested rich-text levels. Existing live bot/edit filtering is
-unchanged; fetched history and threads show the current stored message text.
+History, threads, backscroll and eligible live messages keep Slack's original
+`text` first. In order, append each classic attachment's readable body
+(pretext, title with link, text, fields as `title: value`, else fallback),
+then that attachment's nested blocks, then top-level blocks. Header, section,
+context and rich_text are supported; image/interactive controls are ignored.
+Rich usergroups, date fallbacks and toned emoji are retained; literal rich
+text is escaped before Slack formatting.
+
+Deduplication compares each attachment body and each block independently,
+against original text and previously appended units. Keys normalize whitespace,
+Slack mention/link/escape encodings, list/quote/code markers and emphasis order;
+rich channel elements carry labels from original text. Dedup is independent of
+the name cache; names are resolved for display afterward. The `Notification`
+placeholder never suppresses a distinct body.
+
+Only original Slack text creates mentions, addressing, wake or auto-subscription.
+Quoted/shared/block mentions are display content only. Live `metadata.rawContent`
+remains original Slack text; `content`/`cleanContent` include supplemental text.
+History `textContains` searches rendered content (with the documented user-ID
+mention form); threads remain unfiltered because fetch_thread has no filters.
+
+App/link previews are skipped, except message shares (`is_share` or
+`is_msg_unfurl`). Classic previews are skipped only when `from_url` exactly
+matches a URL in original text, including Slack `<url|label>` forms.
+The supplemental suffix is capped at 16,384 UTF-16 units including separator
+and a single final `[…truncated]` marker when any length, traversal (2,000
+nodes) or rich nesting (12 levels) bound cuts content. Cuts preserve code points;
+original text is never truncated. Existing live bot/edit filtering is unchanged.
