@@ -397,13 +397,14 @@ built on `@animalabs/mcpl-core`'s `grantFromUpdate`/`capabilityGranted`/
 
 History, threads, backscroll and eligible live messages keep Slack's `text`
 first, then append readable classic attachments and header/section/context/
-rich-text blocks. Whitespace-normalized mirrors of `text` are not repeated;
+rich-text blocks. Mirrors of `text` are not repeated after whitespace normalization and the
+existing Slack mention/link/escape rendering with resolved user names;
 mrkdwn is retained for the existing Slack text formatter. Attachment titles
 include their plain-text link, fields use `title: value`, and `fallback` is used
 only when no other attachment text exists. Image-only payloads and interactive
 controls are ignored. App unfurls are skipped; classic URL previews are skipped
 when their `from_url` is already in `text`, but standalone previews are retained.
 Only appended material is capped at 16,384 UTF-16 code units (including its
-separator); original text is never truncated. Traversal is limited to 2,000
+separator), always at a code-point boundary; original text is never truncated. Traversal is limited to 2,000
 nodes and 12 nested rich-text levels. Existing live bot/edit filtering is
 unchanged; fetched history and threads show the current stored message text.

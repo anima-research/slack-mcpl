@@ -113,3 +113,48 @@ test('explicit empty text plus attachments has no leading blank line', async () 
   const blocks = await expectText({ text: '', blocks: [{ type: 'section', text: { type: 'mrkdwn', text: 'Body' } }] }, 'Body');
   assert.equal(blocks!.content, 'Body');
 });
+
+for (const shape of ['attachment', 'section', 'rich_text'] as const) {
+  test(`code-point-safe truncation: ${shape}, odd/even boundaries and original separator`, async () => {
+    for (const text of ['', 'H', 'H'.repeat(16384)]) {
+      for (const prefix of ['', 'x']) {
+        const body = prefix + '😀'.repeat(9000);
+        const payload = shape === 'attachment' ? { attachments: [{ text: body }] }
+          : shape === 'section' ? { blocks: [{ type: 'section', text: { type: 'mrkdwn', text: body } }] }
+          : { blocks: [{ type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [{ type: 'text', text: body }] }] }] };
+        const result = await shaped({ text, ...payload });
+        for (const output of [...result.contents, result.received[0].content, result.received[0].cleanContent]) {
+          // Runtime is Node 22; the project's TypeScript lib remains ES2022.
+          assert.equal((output as string & { isWellFormed(): boolean }).isWellFormed(), true);
+          assert.ok(output.startsWith(text));
+          assert.ok(output.length <= text.length + 16384);
+          const suffix = (text ? '\n' : '') + body;
+          let expected = suffix.slice(0, 16384);
+          if (/[\uD800-\uDBFF]$/.test(expected)) expected = expected.slice(0, -1);
+          assert.equal(output, text + expected);
+        }
+      }
+    }
+  });
+}
+
+test('canonical mention dedup resolves labelled/unlabelled attachment and rich_text mentions', async () => {
+  for (const [text, mirror] of [['<@U2|alice>', '<@U2>'], ['<@U2>', '<@U2|alice>']]) {
+    const result = await expectText({ text, attachments: [{ text: mirror }], blocks: [
+      { type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [{ type: 'user', user_id: 'U2' }] }] },
+    ] }, '@alice (uid:U2)');
+    assert.equal(result!.content, text, 'raw original must be untouched');
+  }
+});
+
+test('canonical dedup uses existing link rendering and escape semantics without double formatting', async () => {
+  for (const [text, mirror, expected] of [
+    ['<https://example.com>', 'https://example.com', 'https://example.com'],
+    ['<https://example.com|Label>', 'Label (https://example.com)', 'Label (https://example.com)'],
+    ['A &amp; B', 'A & B', 'A & B'],
+    ['&amp;lt;', '&lt;', '&lt;\n<'],
+  ]) {
+    const result = await expectText({ text, attachments: [{ text: mirror }] }, expected);
+    assert.equal(result!.content, text === '&amp;lt;' ? text + '\n' + mirror : text);
+  }
+});

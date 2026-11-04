@@ -1,3 +1,5 @@
+import { formatSlackText } from './content.js';
+
 /** Readable Slack payload text. Never changes the original text; only the
  * suffix is bounded (16,384 UTF-16 code units including its separator).
  * A traversal budget and depth limit also bound malformed/nested payloads. */
@@ -9,12 +11,25 @@ const list = (v: unknown): unknown[] => Array.isArray(v) ? v : [];
 const string = (v: unknown): string => typeof v === 'string' ? v : '';
 const normalized = (v: string) => v.replace(/\s+/g, ' ').trim();
 
-export function renderMessageText(message: { text?: unknown; attachments?: unknown; blocks?: unknown }): string {
+/** Truncate a UTF-16 prefix without splitting a supplementary code point.
+ * Existing malformed input is not repaired; truncation must not create it. */
+function prefix(text: string, limit: number): string {
+  let end = Math.min(text.length, limit);
+  if (end > 0 && end < text.length &&
+      text.charCodeAt(end - 1) >= 0xD800 && text.charCodeAt(end - 1) <= 0xDBFF &&
+      text.charCodeAt(end) >= 0xDC00 && text.charCodeAt(end) <= 0xDFFF) end--;
+  return text.slice(0, end);
+}
+
+export function renderMessageText(
+  message: { text?: unknown; attachments?: unknown; blocks?: unknown },
+  userNames: Map<string, string> = new Map(),
+): string {
   const original = string(message.text);
   let budget = 2000;
   const renderLimit = Math.max(MAX_MESSAGE_TEXT_APPEND, original.length + 1);
-  const bounded = (v: unknown) => string(v).slice(0, renderLimit);
-  const join = (v: string[], separator = '\n') => v.filter(Boolean).join(separator).slice(0, renderLimit);
+  const bounded = (v: unknown) => prefix(string(v), renderLimit);
+  const join = (v: string[], separator = '\n') => prefix(v.filter(Boolean).join(separator), renderLimit);
   const textObject = (v: unknown) => --budget < 0 ? '' : bounded(object(v).text);
   function rich(v: unknown, depth = 0): string {
     if (--budget < 0 || depth > 12) return '';
@@ -63,9 +78,11 @@ export function renderMessageText(message: { text?: unknown; attachments?: unkno
     }));
   }
   const appended: string[] = [];
-  const seen = new Set([normalized(original)]);
+  // Format keys only. Return raw Slack text so the adapter formats output once.
+  const keyFor = (value: string) => normalized(formatSlackText(value, userNames));
+  const seen = new Set([keyFor(original)]);
   function append(value: string) {
-    const key = normalized(value);
+    const key = keyFor(value);
     if (key && !seen.has(key)) { appended.push(value); seen.add(key); }
   }
   for (const raw of list(message.attachments).slice(0, 2000)) {
@@ -90,5 +107,5 @@ export function renderMessageText(message: { text?: unknown; attachments?: unkno
   }
   append(blocks(message.blocks));
   const suffix = join(appended);
-  return original + (suffix ? ((original ? '\n' : '') + suffix).slice(0, MAX_MESSAGE_TEXT_APPEND) : '');
+  return original + (suffix ? prefix((original ? '\n' : '') + suffix, MAX_MESSAGE_TEXT_APPEND) : '');
 }
