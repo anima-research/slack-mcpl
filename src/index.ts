@@ -35,7 +35,7 @@ import * as net from 'node:net';
 import { McplConnection } from '@animalabs/mcpl-core';
 import { connectSlack } from './slack-adapter.js';
 import { SlackMcplServer } from './server.js';
-import { startupSettings } from './config.js';
+import { StartupRefusal, startupSettings } from './config.js';
 import { serveTcp } from './tcp.js';
 
 async function main(): Promise<void> {
@@ -59,7 +59,8 @@ async function main(): Promise<void> {
   );
   console.error(
     `[slack-mcpl] writes: ${sendChannels?.length ? `only ${sendChannels.join(', ')}` : 'anywhere'}; ` +
-      `DMs: ${disableDms ? 'off' : 'on'}`,
+      `DMs: ${disableDms ? 'off' : 'on'}; ` +
+      `bot messages: ${botMessages === 'all' ? 'all' : botMessages ? 'only ' + botMessages.join(', ') : 'off'}`,
   );
 
   // Clear pending acknowledgement reactions and thread statuses before exiting,
@@ -99,6 +100,7 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  console.error('[slack-mcpl] Fatal error:', err);
+  if (err instanceof StartupRefusal) console.error(err.message);
+  else console.error('[slack-mcpl] Fatal error:', err);
   process.exit(1);
 });

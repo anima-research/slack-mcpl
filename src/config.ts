@@ -1,3 +1,6 @@
+/** An expected startup refusal: report its operator guidance without a stack. */
+export class StartupRefusal extends Error {}
+
 /** Parse an operator switch. An absent value is off; a present value must
  *  say yes or no so a broken environment template cannot disable a guard. */
 export function booleanFlag(name: string, raw: string | undefined): boolean {
@@ -56,7 +59,11 @@ export function startupSettings(
     const ids = value.split(',').map((s) => s.trim());
     if (value === 'all') botMessages = 'all';
     else if (ids.every((id) => /^[BUW][A-Z0-9]+$/.test(id))) botMessages = ids;
-    else return { refusal: 'SLACK_BOT_MESSAGES must be all or a comma-separated list of bot/user IDs; unset it to drop bot messages' };
+    else {
+      const bad = ids.findIndex((id) => !/^[BUW][A-Z0-9]+$/.test(id));
+      return { refusal: 'SLACK_BOT_MESSAGES must be all or a comma-separated list of bot/user IDs; ' +
+        `invalid entry ${bad + 1}: ${JSON.stringify(ids[bad])}; unset it to drop bot messages` };
+    }
   }
   let disableDms: boolean;
   let subscribeMemberChannels: boolean;

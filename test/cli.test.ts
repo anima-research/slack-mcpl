@@ -9,12 +9,27 @@ const root = fileURLToPath(new URL('..', import.meta.url));
 /** Start the CLI as an operator would, with tokens Slack would reject, so
  *  whatever it reports instead of an API error was checked before connecting.
  *  The test's own SLACK_* variables are left out. */
-function startWith(vars: Record<string, string>) {
+function startWith(vars: Record<string, string>, auth?: Record<string, unknown>) {
+  // Preload production clients with a local auth answer. Any unexpected Web API
+  // call fails rather than contacting Slack; no Socket Mode connection starts.
+  const preload = auth === undefined ? [] : ['--import', 'data:text/javascript,' + encodeURIComponent(`
+    import { WebClient } from ${JSON.stringify(import.meta.resolve('@slack/web-api'))};
+    import { SocketModeClient } from ${JSON.stringify(import.meta.resolve('@slack/socket-mode'))};
+    import { SlackMcplServer } from ${JSON.stringify(new URL('../src/server.ts', import.meta.url).href)};
+    import { SlackAdapter } from ${JSON.stringify(new URL('../src/slack-adapter.ts', import.meta.url).href)};
+    WebClient.prototype.apiCall = async function(method) {
+      if (method !== 'auth.test') throw new Error('Unexpected API call: ' + method);
+      return ${JSON.stringify(auth)};
+    };
+    SocketModeClient.prototype.start = async function() {};
+    SlackMcplServer.prototype.serve = async function() {};
+    SlackAdapter.prototype.stop = async function() {};
+  `)];
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
     if (value !== undefined && !key.startsWith('SLACK_')) env[key] = value;
   }
-  return spawnSync(process.execPath, ['--import', 'tsx', 'src/index.ts', '--stdio'], {
+  return spawnSync(process.execPath, ['--import', 'tsx', ...preload, 'src/index.ts', '--stdio'], {
     cwd: root,
     env: { ...env, SLACK_BOT_TOKEN: 'xoxb-0-test', SLACK_APP_TOKEN: 'xapp-0-test', ...vars },
     input: '',
@@ -105,5 +120,28 @@ test('a SLACK_DM_USERS that names no user is refused with one line, DMs on or of
 test('invalid bot policy stops startup with one line before connecting', () => {
   const run = startWith({ SLACK_BOT_MESSAGES: 'true' });
   assert.equal(run.status, 1);
-  assert.equal(run.stderr, 'SLACK_BOT_MESSAGES must be all or a comma-separated list of bot/user IDs; unset it to drop bot messages\n');
+  assert.equal(run.stderr, 'SLACK_BOT_MESSAGES must be all or a comma-separated list of bot/user IDs; invalid entry 1: "true"; unset it to drop bot messages\n');
+});
+
+test('missing bot self identity gives an actionable one-line startup refusal', () => {
+  for (const auth of [{ ok: true, user_id: 'UBOT' }, { ok: true, bot_id: 'BSELF' }]) {
+    const run = startWith({ SLACK_BOT_MESSAGES: 'all' }, auth);
+    assert.equal(run.status, 1);
+    assert.match(run.stderr, /auth\.test.*bot_id.*user_id/);
+    assert.match(run.stderr, /unset SLACK_BOT_MESSAGES/);
+    assert.ok(!run.stderr.includes('Fatal error'));
+    assert.equal(run.stderr.trim().split('\n').length, 1);
+  }
+});
+
+test('startup policy log distinguishes off, all and an explicit bot allow-list', () => {
+  for (const [vars, expected] of [
+    [{}, 'bot messages: off'],
+    [{ SLACK_BOT_MESSAGES: 'all' }, 'bot messages: all'],
+    [{ SLACK_BOT_MESSAGES: 'B1,U2' }, 'bot messages: only B1, U2'],
+  ] as const) {
+    const run = startWith(vars, { ok: true, user_id: 'UBOT', bot_id: 'BSELF', team: 'example' });
+    assert.equal(run.status, 0, run.stderr);
+    assert.ok(run.stderr.includes(expected), run.stderr);
+  }
 });

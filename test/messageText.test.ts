@@ -358,3 +358,15 @@ test('round 2 balanced bold italic mirror order works in both directions', async
     assert.equal(result.received[0].content, text);
   }
 });
+
+for (const blocks of [
+  [section('<@UBOT>')],
+  [richBlock(richSection({ type: 'user', user_id: 'UBOT' }))],
+]) {
+  test('section and rich-user bot mentions are display-only, never addressing', async () => {
+    const live = await expectText({ text: 'Notification', blocks }, 'Notification\n@alice (uid:UBOT)');
+    assert.deepEqual(live!.mentionIds, []);
+    assert.equal(live!.mentionsBot, false);
+    assert.equal(live!.rawContent, 'Notification');
+  });
+}

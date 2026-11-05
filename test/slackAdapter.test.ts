@@ -17,7 +17,7 @@ function makeAdapter(opts: Pick<SlackAdapterConfig, 'dmUsers' | 'botMessages' | 
   } as any;
   const web = {
     users: {
-      info: async ({ user }: { user: string }) => ({ user: { name: user.toLowerCase(), is_bot: opts.botUsers?.includes(user) } }),
+      info: async ({ user }: { user: string }) => ({ user: { name: user.toLowerCase(), is_bot: opts.botUsers?.includes(user) ?? false } }),
     },
   } as any;
   const adapter = new SlackAdapter(web, socket, 'UBOT', 'acme', opts.dmUsers,
@@ -199,4 +199,61 @@ test('unset bot policy preserves delivery of unmarked users even if users.info i
   await emit({ type: 'message', channel: 'C1', user: 'U1', ts: '1.0', text: 'legacy' });
   assert.equal(received.length, 1);
   assert.equal(received[0].isBot, undefined);
+});
+
+// #66 bot review 1: user-only events must not bypass an ID allow-list when
+// Slack cannot establish whether their author is human.
+for (const failure of ['timeout', 'refusal', 'missing-user', 'missing-status'] as const) {
+  test(`bot allow-list fails closed and retries an unverifiable author: ${failure}`, async () => {
+    let handler: any;
+    let calls = 0;
+    const adapter = new SlackAdapter({
+      users: { info: async () => {
+        calls++;
+        if (calls > 2) return { user: { name: 'verified', is_bot: false } };
+        if (failure === 'timeout') throw new Error('request timed out');
+        if (failure === 'refusal') throw Object.assign(new Error('missing_scope'), { data: { error: 'missing_scope' } });
+        return failure === 'missing-user' ? {} : { user: { name: 'unknown' } };
+      } },
+    } as any, { on: (_: string, h: any) => { handler = h; } } as any,
+    'UBOT', 'acme', undefined, undefined, false, undefined, undefined, ['BALLOWED'], 'BSELF');
+    const received: SlackMessageData[] = [];
+    adapter.onMessage(m => received.push(m));
+    for (let n = 1; n <= 4; n++) {
+      handler({ event: { type: 'message', channel: 'C1', user: 'UUNKNOWN', ts: `${n}.0` }, ack: async () => {} });
+      await new Promise(r => setTimeout(r, 0));
+      assert.equal(received.length, n >= 3 ? n - 2 : 0, 'unverified senders are dropped, verified humans pass');
+      assert.equal(calls, Math.min(n, 3), 'neither a refusal nor an inconclusive answer is cached as human');
+    }
+    assert.equal(received[0].authorName, 'verified');
+  });
+}
+
+for (const botMessages of [undefined, 'all'] as const) {
+  test(`unverifiable authors retain best-effort delivery with policy ${botMessages}`, async () => {
+    let handler: any;
+    let calls = 0;
+    const adapter = new SlackAdapter({
+      users: { info: async () => { calls++; throw Object.assign(new Error('missing_scope'), { data: { error: 'missing_scope' } }); } },
+    } as any, { on: (_: string, h: any) => { handler = h; } } as any,
+    'UBOT', 'acme', undefined, undefined, false, undefined, undefined, botMessages, 'BSELF');
+    const received: SlackMessageData[] = [];
+    adapter.onMessage(m => received.push(m));
+    for (const ts of ['1.0', '2.0']) {
+      handler({ event: { type: 'message', channel: 'C1', user: 'UUNKNOWN', ts }, ack: async () => {} });
+      await new Promise(r => setTimeout(r, 0));
+    }
+    assert.equal(received.length, 2);
+    assert.equal(received[0].authorName, 'UUNKNOWN');
+    assert.equal(calls, 1, 'legacy permanent-refusal caching is unchanged');
+  });
+}
+
+test('user-less admitted bots keep Slack username, with bot ID fallback', async () => {
+  const { emit, received } = makeAdapter({ botMessages: ['B1'] });
+  const event = { type: 'message', subtype: 'bot_message', channel: 'C1', bot_id: 'B1', ts: '1.0' };
+  await emit({ ...event, username: 'Deploy notifier' });
+  await emit(event);
+  assert.deepEqual(received.map(m => m.authorName), ['Deploy notifier', 'B1']);
+  assert.deepEqual(received.map(m => m.authorId), ['B1', 'B1']);
 });

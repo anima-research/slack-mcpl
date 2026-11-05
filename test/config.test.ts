@@ -35,3 +35,14 @@ test('operator switches refuse present empty, whitespace, and unrecognized value
     }
   }
 });
+
+test('bot policy refusal identifies the invalid entry and its position safely', () => {
+  const result = startupSettings(['--stdio'], {
+    SLACK_BOT_TOKEN: 'xoxb-test', SLACK_APP_TOKEN: 'xapp-test',
+    SLACK_BOT_MESSAGES: 'B123,U456,wrong\nentry,B789',
+  });
+  assert.ok('refusal' in result);
+  assert.ok(result.refusal.includes('entry 3'));
+  assert.ok(result.refusal.includes(JSON.stringify('wrong\nentry')));
+  assert.equal(result.refusal.split('\n').length, 1);
+});

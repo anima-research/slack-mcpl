@@ -20,7 +20,7 @@
  * Event handling salvaged from zulip-mcp PR #8's SlackAdapter.
  */
 
-import type { BotMessagePolicy } from './config.js';
+import { StartupRefusal, type BotMessagePolicy } from './config.js';
 import { renderMessageText } from './message-text.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { WebClient, ErrorCode, LogLevel, type Logger, type WebAPICallResult, type WebClientOptions } from '@slack/web-api';
@@ -257,6 +257,7 @@ const CONTENT_SUBTYPES = new Set([undefined, 'file_share', 'thread_broadcast', '
 /** The fields of a Socket Mode message event this adapter dereferences.
  * Payloads come off the wire — everything is optional until checked. */
 interface SlackMessageEvent {
+  username?: string;
   type?: string;
   subtype?: string;
   channel?: string;
@@ -820,6 +821,7 @@ export class SlackAdapter {
   private inbound = new Map<string, Promise<void>>();
   private userNameCache = new Map<string, string>();
   private botUsers = new Set<string>();
+  private verifiedUsers = new Set<string>();
   private messageHandlers: Array<(msg: SlackMessageData) => void> = [];
   private socketStarted = false;
   /** Conversations Slack reported as DMs or group DMs, and as channels. IDs
@@ -859,7 +861,9 @@ export class SlackAdapter {
     private botId?: string,
   ) {
     if (botMessages && (!botUserId || !botId)) {
-      throw new Error('Bot message delivery requires authenticated bot and user IDs for self-filtering');
+      throw new StartupRefusal('Bot message delivery requires authenticated bot and user IDs for self-filtering: ' +
+        'auth.test must return both bot_id and user_id; use a token whose authentication response contains both, ' +
+        'or unset SLACK_BOT_MESSAGES to start without bot delivery');
     }
     this.scopes = reportedScopes({ scopes });
     const omitted = this.leftOutTypes();
@@ -1714,7 +1718,10 @@ export class SlackAdapter {
     const text = renderMessageText(event);
     const mentionIds = extractSlackUserIds(event.text ?? '');
     await this.resolveUserNames([event.user, ...extractSlackUserIds(text)]);
-    const authorName = this.userNameCache.get(authorId) ?? authorId;
+    const authorName = event.user ? (this.userNameCache.get(authorId) ?? authorId) : (event.username ?? authorId);
+    // In list mode an unknown user-only sender could be an unlisted bot.
+    // Explicit bot metadata already establishes the sender kind.
+    if (Array.isArray(this.botMessages) && !fromBot && !this.verifiedUsers.has(authorId)) return;
     const isBot = fromBot || this.botUsers.has(authorId);
     if (this.botMessages && isBot && !botAllowed) return;
 
@@ -1760,9 +1767,23 @@ export class SlackAdapter {
   private async resolveUserNames(userIds: Array<string | undefined>): Promise<Map<string, unknown>> {
     return resolveSlackUserNames(
       this.botMessages ? { users: { info: async (args) => {
-        const info = await this.web.users.info(args);
-        if (info.user?.is_bot === true) this.botUsers.add(args.user);
-        return info;
+        try {
+          const info = await this.web.users.info(args);
+          if (Array.isArray(this.botMessages) && typeof info.user?.is_bot !== 'boolean') {
+            throw new Error('users.info did not establish the sender kind');
+          }
+          if (typeof info.user?.is_bot === 'boolean') this.verifiedUsers.add(args.user);
+          if (info.user?.is_bot === true) this.botUsers.add(args.user);
+          return info;
+        } catch (err) {
+          // Name resolution normally caches Slack refusals as raw IDs. In list
+          // mode that would suppress identity retries forever. Keep the cause,
+          // but do not present this as a cacheable name-resolution refusal.
+          if (Array.isArray(this.botMessages)) {
+            throw new Error('Cannot verify Slack user for SLACK_BOT_MESSAGES allow-list', { cause: err });
+          }
+          throw err;
+        }
       } } } : this.web,
       this.userNameCache,
       userIds.filter((id): id is string => !!id),
