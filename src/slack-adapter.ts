@@ -26,7 +26,7 @@ import { WebClient, ErrorCode, LogLevel, type Logger, type WebAPICallResult, typ
 import { SocketModeClient } from '@slack/socket-mode';
 import { associatedFile, FILE_ID, policyFileRefs, privateFileUrl, type PolicyFileRef } from './file-access.js';
 import { clock } from './clock.js';
-import { SlackAccessPolicy, type SlackAccessPolicyConfig } from './access-policy.js';
+import { HISTORY_MEMBERSHIP_PROOF, SlackAccessPolicy, type SlackAccessPolicyConfig } from './access-policy.js';
 import { NOTHING_RETURNED, SLACK_TS, readBounded, readOptions, type HistoryReadResult, type ReadStop } from './history-read.js';
 import {
   formatSlackText,
@@ -787,7 +787,7 @@ export interface SlackWebLike {
       members?: unknown; response_metadata?: { next_cursor?: unknown };
     }>;
     open(args: { users: string }): Promise<{ channel?: { id?: string } }>;
-    history(args: Record<string, unknown>): Promise<{ messages?: unknown[]; has_more?: boolean; response_metadata?: { next_cursor?: string } }>;
+    history(args: Record<string, unknown>): Promise<{ ok?: boolean; messages?: unknown[]; has_more?: boolean; response_metadata?: { next_cursor?: string } }>;
     replies(args: Record<string, unknown>): Promise<{ messages?: unknown[]; has_more?: boolean; response_metadata?: { next_cursor?: string } }>;
   };
   auth: {
@@ -998,13 +998,35 @@ export class SlackAdapter {
    *  missing carries `nameWait`. */
   async listConversations(includeNonMember = false, waitOut?: SlackWaitOut): Promise<SlackListing> {
     const noneReadable = () => new NoReadableConversations(this.conversationTypes().map((type) => TYPE_SCOPE[type]));
+    // Pinned public channels cannot be discovered without channels:read.
+    // Keep successful fresh proofs across scope restarts, outside page budgets.
+    const pinned: SlackConversationInfo[] = [];
+    for (const id of this.accessPolicy?.historyMembershipFallbacks(this.scopes) ?? []) {
+      for (let attempts = 0; ; attempts++) {
+        try {
+          const info = await this.describeConversation(await this.readAccessConversation(id));
+          if (info) pinned.push(info);
+          break;
+        } catch (err) {
+          const method = failedRequest(err) ?? 'conversations.history';
+          const wait = waitToAskAgain(err, method) ?? (slackRefusal(err) === 'ratelimited'
+            ? { method, seconds: retryAfterSeconds(err) ?? FAILED_WAIT_SECONDS, why: 'limited' as const } : undefined);
+          if (wait && waitOut && attempts < 4) { await waitOut(wait, attempts + 1); continue; }
+          // Only a terminal admission failure isolates a stale pin. Preserve
+          // #61's transient/deadline errors rather than claiming completeness.
+          if (wait || err instanceof OutOfCallTime) throw err;
+          this.noteAdmissionFailure('listing');
+          break;
+        }
+      }
+    }
     let types = this.readableTypes();
     // Unknown scopes cannot authorize a listing or an auth.test probe.
-    if (this.accessPolicy && types.length === 0) return { conversations: [], leftOut: this.conversationTypes() };
-    let out: SlackConversationInfo[] = [];
+    if (this.accessPolicy && types.length === 0) return { conversations: pinned, leftOut: this.conversationTypes() };
+    let out: SlackConversationInfo[] = [...pinned];
     let cursor: string | undefined;
     let limited = 0;
-    const checked = new Set<string>();
+    const checked = new Set(pinned.map((info) => info.id));
     const cursors = new Set<string>();
     const names = { waitOut };
     let pages = 0;
@@ -1021,10 +1043,11 @@ export class SlackAdapter {
       if (now.join(',') === types.join(',')) return false;
       if (now.length === 0) throw noneReadable();
       types = now;
-      out = [];
+      out = [...pinned];
       cursor = undefined;
       limited = 0;
       checked.clear();
+      for (const info of pinned) checked.add(info.id);
       cursors.clear();
       return true;
     };
@@ -1117,11 +1140,27 @@ export class SlackAdapter {
     return this.describeConversation((info.channel ?? {}) as SlackApiConversation);
   }
 
-  /** Only fresh exact metadata authorizes access; cached labels/kinds never do. */
+  /** Fresh exact metadata, or fresh history success for operator-attested public
+   * pins without channels:read. Never infer public visibility from an ID or API success. */
   private async readAccessConversation(channelId: string): Promise<SlackApiConversation> {
     if (!this.accessPolicy) throw new Error('Slack access policy is not configured');
     if (!/^[CGD][A-Z0-9]+$/.test(channelId)) throw new Error('Invalid Slack conversation ID');
     if (!Array.isArray(this.scopes)) throw new Error('Slack scope metadata is unavailable');
+    if (this.accessPolicy.usesHistoryMembershipFallback(channelId, this.scopes)) {
+      this.accessPolicy.requireScope(this.scopes, 'channels:history');
+      const result = await this.web.conversations.history({ channel: channelId, limit: 1 });
+      // Only fallback history has this stricter proof contract. Benign Slack
+      // warnings are irrelevant; preserve the existing info/member checks below.
+      if (result.ok !== true || 'error' in result || !Array.isArray(result.messages)) {
+        throw new Error(`Could not freshly confirm membership of ${channelId}`);
+      }
+      const conversation = {
+        id: channelId, name: channelId, is_im: false, is_mpim: false,
+        is_private: false, is_member: true, [HISTORY_MEMBERSHIP_PROOF]: true as const,
+      };
+      this.accessPolicy.requireReadable(channelId, conversation, this.scopes);
+      return conversation;
+    }
     const result = await this.web.conversations.info({ channel: channelId });
     let conversation = result.channel as SlackApiConversation | undefined;
     if (conversation?.id === channelId && conversation.is_mpim === true && conversation.is_member === undefined

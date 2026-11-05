@@ -389,12 +389,42 @@ SLACK_ACCESS_POLICY='{"readJoinedChannels":true,"writeChannels":["CEXAMPLE"],"dm
 | `writeChannels` | yes | Exact uppercase C/G IDs; writable pins, not membership proof |
 | `dmUsers` | yes | Exact uppercase U/W peer IDs; deliberate read **and write** grant |
 | `groupDms` | no | Exact uppercase G IDs; omission/empty denies group DMs |
+| `historyMembershipFallbackChannels` | no | Operator-attested public C IDs, also in `writeChannels`; omission/empty keeps normal metadata checks |
 
 Empty lists deny; IDs are exact uppercase. Joined ordinary channels require
 fresh membership and enabled joined reads; writes also need a pin. DMs require
 an allowed peer for reads and writes, not a D-ID pin. Groups need explicit
 naming and current membership; writes also need a pin. With joined reads off,
 every write pin must also be named in groupDms. No auto-join.
+
+For a bot token without `channels:read`, an optional public-pin fallback is:
+
+```json
+{"readJoinedChannels":true,"writeChannels":["CEXAMPLE"],"dmUsers":[],"historyMembershipFallbackChannels":["CEXAMPLE"]}
+```
+
+**Trust boundary:** the operator attests that each exact pin is a public,
+ordinary channel, and remains public. A C prefix and successful history call
+cannot establish visibility (including after public-to-private conversion).
+Never pin private channels or DMs here; remove a pin before changing visibility.
+Only public C write pins are accepted, with joined reads enabled; fallback and
+`groupDms` must not overlap. G/private IDs and D/DM IDs cannot use this path.
+It does not join channels or bypass Slack membership refusals.
+
+Only when `channels:read` is absent, each operation first requires
+`channels:history` and a fresh one-message `conversations.history` response with
+`ok: true`. Its content is discarded; no proof is cached or added to reported
+scopes. The synthetic label is the channel ID. Metadata, history/thread reads,
+backscroll, writes, ACKs and status all recheck admission. A continuation checks
+again; proof requests are outside data-page budgets. With `channels:read`, the
+normal metadata path wins, even after refusal. Other scope/file gates remain.
+
+Pinned channels precede ordinary listing results and survive scope restarts
+and page-limit truncation without duplicates. A terminal stale-pin refusal
+omits only that pin, with aggregate admission diagnostics; later operations
+still fail closed. Transient/rate-limit/deadline failures propagate, or use the
+existing bounded background retries, rather than masquerading as a complete
+listing. Unset fallback is behavior-identical to the normal policy path.
 
 Scope grants still apply. Unknown scope metadata refuses startup; known
 limited grants diagnose missing capabilities and deny affected operations.

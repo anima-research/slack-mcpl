@@ -3,11 +3,18 @@ export interface SlackAccessPolicyConfig {
   readonly readJoinedChannels: boolean;
   readonly writeChannels: readonly string[];
   readonly dmUsers: readonly string[];
+  /** Exact public write pins, verified as public by the operator. History
+   * success proves fresh bot access, NOT visibility; C IDs alone are not proof. */
+  readonly historyMembershipFallbackChannels?: readonly string[];
   /** Exact joined group-DM IDs. Writes also need a writeChannels pin. */
   readonly groupDms?: readonly string[];
 }
 
+/** In-process evidence only; neither JSON nor Slack metadata can mint it. */
+export const HISTORY_MEMBERSHIP_PROOF: unique symbol = Symbol('Slack bot history membership');
+
 export interface AccessConversation {
+  [HISTORY_MEMBERSHIP_PROOF]?: true;
   id?: string;
   user?: string;
   is_im?: boolean;
@@ -24,7 +31,7 @@ const idList = (value: unknown, pattern: RegExp): value is string[] =>
   Array.isArray(value) && Array.from(value).every((id) => typeof id === 'string' && pattern.test(id));
 
 const REQUIRED_KEYS = new Set<string | symbol>(['readJoinedChannels', 'writeChannels', 'dmUsers']);
-const ALLOWED_KEYS = new Set([...REQUIRED_KEYS, 'groupDms']);
+const ALLOWED_KEYS = new Set([...REQUIRED_KEYS, 'groupDms', 'historyMembershipFallbackChannels']);
 
 /** One strict, unversioned format for future embedded and JSON callers.
  * Snapshot before validating so accessors cannot change the values we retain. */
@@ -34,17 +41,26 @@ export function parseAccessPolicy(value: unknown): SlackAccessPolicyConfig {
   const keys = new Set(Reflect.ownKeys(config));
   if ([...REQUIRED_KEYS].some((key) => !keys.has(key))
       || [...keys].some((key) => !ALLOWED_KEYS.has(key))) throw new Error('Invalid Slack access policy');
-  const { readJoinedChannels, writeChannels, dmUsers, groupDms } = config;
+  const { readJoinedChannels, writeChannels, dmUsers, groupDms, historyMembershipFallbackChannels } = config;
   const channels = Array.isArray(writeChannels) ? Array.from(writeChannels) : writeChannels;
   const users = Array.isArray(dmUsers) ? Array.from(dmUsers) : dmUsers;
   const groups = Array.isArray(groupDms) ? Array.from(groupDms) : groupDms;
+  const fallback = Array.isArray(historyMembershipFallbackChannels) ? Array.from(historyMembershipFallbackChannels) : historyMembershipFallbackChannels;
+  if (Array.isArray(groups) && Array.isArray(fallback) && groups.some((id) => fallback.includes(id))) {
+    throw new Error('Invalid Slack access policy: groupDms and historyMembershipFallbackChannels must not overlap');
+  }
   if (typeof readJoinedChannels !== 'boolean' || !idList(channels, CHANNEL_ID)
       || !idList(users, USER_ID) || (keys.has('groupDms') && !idList(groups, GROUP_DM_ID))) throw new Error('Invalid Slack access policy');
+  if (keys.has('historyMembershipFallbackChannels') && (!idList(fallback, /^C[A-Z0-9]+$/)
+      || fallback.some((id) => !channels.includes(id)))) {
+    throw new Error('Invalid Slack access policy: history membership fallback must name pinned public write channels');
+  }
   if (!readJoinedChannels && channels.some((id) => !(groups as string[] | undefined)?.includes(id))) {
     throw new Error('readJoinedChannels:false requires every writeChannels entry to also be in groupDms');
   }
   return Object.freeze({ readJoinedChannels, writeChannels: Object.freeze(channels), dmUsers: Object.freeze(users),
-    ...(keys.has('groupDms') ? { groupDms: Object.freeze(groups as string[]) } : {}) });
+    ...(keys.has('groupDms') ? { groupDms: Object.freeze(groups as string[]) } : {}),
+    ...(keys.has('historyMembershipFallbackChannels') ? { historyMembershipFallbackChannels: Object.freeze(fallback as string[]) } : {}) });
 }
 
 /** Pure decisions over supplied metadata: no Slack calls or cached membership.
@@ -56,6 +72,7 @@ export class SlackAccessPolicy {
   private readonly dmUsers: ReadonlySet<string>;
   private readonly groupDms: ReadonlySet<string>;
   private readonly readJoinedChannels: boolean;
+  private readonly historyFallbackChannels: ReadonlySet<string>;
 
   constructor(config: SlackAccessPolicyConfig) {
     const parsed = parseAccessPolicy(config);
@@ -63,6 +80,16 @@ export class SlackAccessPolicy {
     this.dmUsers = new Set(parsed.dmUsers);
     this.groupDms = new Set(parsed.groupDms);
     this.readJoinedChannels = parsed.readJoinedChannels;
+    this.historyFallbackChannels = new Set(parsed.historyMembershipFallbackChannels);
+  }
+
+  historyMembershipFallbacks(scopes: readonly string[] | undefined): string[] {
+    if (!Array.isArray(scopes) || scopes.includes('channels:read') || !this.readJoinedChannels) return [];
+    return [...this.historyFallbackChannels];
+  }
+
+  usesHistoryMembershipFallback(channelId: string, scopes: readonly string[] | undefined): boolean {
+    return this.historyMembershipFallbacks(scopes).includes(channelId);
   }
 
   get groupDmsReadable(): boolean { return this.groupDms.size > 0; }
@@ -120,7 +147,10 @@ export class SlackAccessPolicy {
         || !CHANNEL_ID.test(channelId) || conversation.is_member !== true || !this.readJoinedChannels) {
       throw new Error(`Conversation ${channelId} is not a confirmed joined channel`);
     }
-    this.requireScope(scopes, conversation.is_private ? 'groups:read' : 'channels:read');
+    if (conversation.is_private === false && conversation[HISTORY_MEMBERSHIP_PROOF] === true
+        && this.usesHistoryMembershipFallback(channelId, scopes)) {
+      this.requireScope(scopes, 'channels:history');
+    } else this.requireScope(scopes, conversation.is_private ? 'groups:read' : 'channels:read');
     return conversation.is_private ? 'private_channel' : 'channel';
   }
 

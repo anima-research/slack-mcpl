@@ -38,9 +38,9 @@ test('validation and construction reject missing, unknown and null fields identi
     delete missing[key];
     invalid.push(missing, { ...config(), [key]: null }, { ...config(), [key]: undefined });
   }
-  // These extensions are deliberately unsupported in A1, even empty or null.
+  // The optional fallback still rejects null, private IDs and unpinned IDs.
   for (const key of ['historyMembershipFallbackChannels']) {
-    for (const value of [null, [], ['G1']]) invalid.push({ ...config(), [key]: value });
+    for (const value of [null, ['G1'], ['COTHER']]) invalid.push({ ...config(), [key]: value });
   }
   invalid.push({ ...config(), readJoinedChannels: 'true' });
   for (const value of invalid) {
