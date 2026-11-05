@@ -449,6 +449,13 @@ export class OutOfCallTime extends Error {
  *  from, so the explainer can tell a write's own request from one made before
  *  it. */
 const failedRequests = new WeakMap<object, string>();
+// Only opt-in fallback admission sets this evidence. Do not classify every
+// conversations.history failure as pre-write: preserve the unset path.
+const historyAdmissionFailures = new WeakSet<object>();
+
+export function failedHistoryAdmission(err: unknown): boolean {
+  return err !== null && typeof err === 'object' && historyAdmissionFailures.has(err);
+}
 
 /** The request `err` came from: the Web API method SlackWebClient marked it
  *  with, or OutOfCallTime's own, which names a Web API method or what else the
@@ -999,7 +1006,8 @@ export class SlackAdapter {
   async listConversations(includeNonMember = false, waitOut?: SlackWaitOut): Promise<SlackListing> {
     const noneReadable = () => new NoReadableConversations(this.conversationTypes().map((type) => TYPE_SCOPE[type]));
     // Pinned public channels cannot be discovered without channels:read.
-    // Keep successful fresh proofs across scope restarts, outside page budgets.
+    // Keep fresh proofs outside page budgets, but discard them if metadata
+    // admission becomes available during a scope restart.
     const pinned: SlackConversationInfo[] = [];
     for (const id of this.accessPolicy?.historyMembershipFallbacks(this.scopes) ?? []) {
       for (let attempts = 0; ; attempts++) {
@@ -1020,6 +1028,8 @@ export class SlackAdapter {
         }
       }
     }
+    // A scope change can also land between the last pin and this continuation.
+    if (this.scopes?.includes('channels:read')) pinned.length = 0;
     let types = this.readableTypes();
     // Unknown scopes cannot authorize a listing or an auth.test probe.
     if (this.accessPolicy && types.length === 0) return { conversations: pinned, leftOut: this.conversationTypes() };
@@ -1043,6 +1053,8 @@ export class SlackAdapter {
       if (now.join(',') === types.join(',')) return false;
       if (now.length === 0) throw noneReadable();
       types = now;
+      // Synthetic pins cannot bypass fresh metadata once channels:read is known.
+      if (this.scopes?.includes('channels:read')) pinned.length = 0;
       out = [...pinned];
       cursor = undefined;
       limited = 0;
@@ -1148,7 +1160,17 @@ export class SlackAdapter {
     if (!Array.isArray(this.scopes)) throw new Error('Slack scope metadata is unavailable');
     if (this.accessPolicy.usesHistoryMembershipFallback(channelId, this.scopes)) {
       this.accessPolicy.requireScope(this.scopes, 'channels:history');
-      const result = await this.web.conversations.history({ channel: channelId, limit: 1 });
+      let result: Awaited<ReturnType<SlackWebLike['conversations']['history']>>;
+      try { result = await this.web.conversations.history({ channel: channelId, limit: 1 }); }
+      catch (err) {
+        if (err !== null && typeof err === 'object') historyAdmissionFailures.add(err);
+        throw err;
+      }
+      // A concurrent listing may have learned channels:read while history was
+      // in flight. Normal metadata must win, not synthetic member flags.
+      if (!this.accessPolicy.usesHistoryMembershipFallback(channelId, this.scopes)) {
+        return this.readAccessConversation(channelId);
+      }
       // Only fallback history has this stricter proof contract. Benign Slack
       // warnings are irrelevant; preserve the existing info/member checks below.
       if (result.ok !== true || 'error' in result || !Array.isArray(result.messages)) {

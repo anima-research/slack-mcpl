@@ -11,8 +11,10 @@ intentionally grants reads **and writes** to those peers.
 The complete JSON object requires boolean readJoinedChannels, array
 writeChannels (exact uppercase C/G IDs), and array dmUsers (exact uppercase
 U/W IDs). Optional groupDms accepts exact uppercase G IDs; omission/empty
-means no group DMs. Empty arrays deny their category. Unknown keys, wrong
-kinds, missing required fields and malformed IDs refuse startup. Only absence
+means no group DMs. Optional historyMembershipFallbackChannels accepts exact
+uppercase C IDs that are also writeChannels pins; the operator must verify
+these are public channels. Omission/empty disables this fallback. Empty arrays
+deny their category. Unknown keys, wrong kinds, missing required fields and malformed IDs refuse startup. Only absence
 of the setting selects legacy mode. Empty/whitespace/null are not absence.
 
 Values for SLACK_ACCESS_POLICY:
@@ -27,8 +29,19 @@ For a read-only group use empty writeChannels. If joined reads are false,
 every write pin must also occur in groupDms; ordinary pins would be unusable.
 A G prefix alone is not MPIM proof: a legacy private channel mistakenly named
 in groupDms can pass syntactic validation but cannot gain group-DM access.
-With joined reads off, such a pin remains unusable. No auto-join or
-pinned-channel fallback.
+With joined reads off, such a pin remains unusable. No auto-join is performed.
+
+For a public write pin whose token lacks channels:read, explicitly opt in with
+`{"readJoinedChannels":true,"writeChannels":["CEXAMPLE"],"dmUsers":[],"historyMembershipFallbackChannels":["CEXAMPLE"]}`.
+Each operation requires channels:history and a fresh successful bot
+conversations.history proof. The operator attests public visibility: a C ID
+or API success alone does not prove it. This is not access to an unjoined
+public channel; Slack must confirm bot access. Private channels, DMs and group
+DMs cannot use the fallback. With channels:read, fresh conversations.info
+metadata always wins, including when the scope is learned during a proof or
+listing; an info refusal never triggers history fallback. Stale pins are
+omitted without ending listing of other admitted conversations. Transient
+proof failures still fail foreground listing rather than look complete.
 
 | Target | Read | Write |
 |---|---|---|
@@ -51,7 +64,10 @@ Legacy DM-off maps to empty dmUsers AND omitted/empty groupDms. Resolve
 legacy D-ID write destinations to deliberately permitted peers. Ordinary
 C/G write pins need joined reads; group pins additionally need groupDms.
 
-Matching channels/groups/im/mpim read and history scopes still apply.
+Matching channels/groups/im/mpim read and history scopes still apply, except
+that the explicit public-pin fallback above does not require channels:read.
+Proofs are outside data-page budgets and are repeated for each operation;
+other effect, file and directory scopes are never inferred or bypassed.
 Effects need chat:write, files:write or reactions:write; DM/group opening
 and writing need im:write/mpim:write where applicable. File reads **and policy
 rollback deletion need files:read** for fresh association. Unknown scope

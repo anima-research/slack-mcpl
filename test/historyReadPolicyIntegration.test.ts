@@ -20,8 +20,8 @@ function fixture(options: {scopes?: string[]; dmUsers?: string[]; disableDms?: b
     async history(args: any) {
       calls.push({method: 'history', args});
       if (!joined) throw new Error('not_in_channel');
-      // A pinned channel's membership proof asks for one message; a page of
-      // a read may too, so only the proof is answered with none.
+      // This simple stub treats every limit-1 call as a proof. Tests of
+      // limit-1 data pages must override it to distinguish calls explicitly.
       return options.fallback && args.limit === 1 ? {ok: true, messages: []} : {ok: true, messages: [
         {ts: '2.0', user: 'U1', text: 'second', files: [{id: 'FVALID', mode: 'hosted', name: 'a.txt', url_private: 'https://files.slack.com/untrusted'}]},
         {ts: '1.0', user: 'U1', text: 'first'},
@@ -145,4 +145,40 @@ test('pinned thread and backscroll recheck proof, outside the backscroll page ca
   h.web.conversations.history = async args => { h.calls.push({ method: 'history', args }); throw new Error('not_in_channel'); };
   await assert.rejects(h.adapter.readThread('C1', '1.0', {}), /not_in_channel/);
   assert.ok(!h.calls.some(c => c.method === 'replies'));
+});
+
+
+test('limit-1 fallback data page is distinguished from proof by request order', async () => {
+  const h = fixture({ scopes: ['channels:history'], fallback: true });
+  let requests = 0;
+  h.web.conversations.history = async args => {
+    h.calls.push({ method: 'history', args });
+    assert.equal(args.limit, 1);
+    return ++requests === 1 ? { ok: true, messages: [] }
+      : { ok: true, messages: [{ ts: '1.0', text: 'one data message' }] };
+  };
+  const read = await h.adapter.readHistory('C1', { limit: 1 });
+  assert.equal(read.messages[0]?.content, 'one data message');
+  assert.equal(read.pagination.pages, 1);
+  assert.equal(requests, 2);
+});
+
+
+test('loopback tool reports failed history proof as nothing posted, not an uncertain write', async t => {
+  t.mock.method(console, 'error', () => {});
+  const api = await fakeSlackApi(); t.after(() => api.close());
+  api.answerFor('conversations.history', { status: 503, body: { ok: false } });
+  const client = new SlackWebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: api.url });
+  const adapter = new SlackAdapter(client as unknown as SlackWebLike, { on() {}, async start() {}, async disconnect() {} },
+    'UBOT', 'test', undefined, undefined, false, undefined, ['channels:history', 'chat:write'],
+    new SlackAccessPolicy({ readJoinedChannels: true, writeChannels: ['C1'], dmUsers: [], historyMembershipFallbackChannels: ['C1'] }));
+  const h = connectHost(new SlackMcplServer(adapter)); t.after(() => h.close());
+  await initialize(h, false);
+  const result = await h.host.sendRequest('tools/call', { name: 'send_message', arguments: { channelId: 'C1', content: 'not sent' } }) as {
+    isError?: boolean; content: Array<{ text: string }>;
+  };
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /Nothing was posted.*HTTP 503/);
+  assert.doesNotMatch(result.content[0].text, /whether the message was posted is unknown|Check fetch_history/);
+  assert.deepEqual(api.calls, ['conversations.history']);
 });

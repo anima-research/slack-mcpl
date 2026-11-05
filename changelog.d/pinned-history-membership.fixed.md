@@ -6,3 +6,7 @@
 - Terminal stale pins no longer hide other conversations. Transient/deadline
   errors, bounded background retries, pagination limits and partial history
   results keep their existing semantics; proof requests are not data pages.
+
+- Normal metadata admission takes precedence when `channels:read` is learned
+  during a proof or listing restart. Failed history admission reports that
+  nothing was posted, rather than an uncertain write outcome.

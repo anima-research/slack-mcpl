@@ -147,8 +147,10 @@ export class SlackAccessPolicy {
         || !CHANNEL_ID.test(channelId) || conversation.is_member !== true || !this.readJoinedChannels) {
       throw new Error(`Conversation ${channelId} is not a confirmed joined channel`);
     }
-    if (conversation.is_private === false && conversation[HISTORY_MEMBERSHIP_PROOF] === true
-        && this.usesHistoryMembershipFallback(channelId, scopes)) {
+    if (conversation.is_private === false && conversation[HISTORY_MEMBERSHIP_PROOF] === true) {
+      if (!this.usesHistoryMembershipFallback(channelId, scopes)) {
+        throw new Error(`Conversation ${channelId} requires fresh Slack metadata`);
+      }
       this.requireScope(scopes, 'channels:history');
     } else this.requireScope(scopes, conversation.is_private ? 'groups:read' : 'channels:read');
     return conversation.is_private ? 'private_channel' : 'channel';

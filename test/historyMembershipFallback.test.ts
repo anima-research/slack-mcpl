@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { ErrorCode } from '@slack/web-api';
 import { SlackAdapter, OutOfCallTime, type SlackWebLike } from '../src/slack-adapter.js';
 import { SlackAccessPolicy, HISTORY_MEMBERSHIP_PROOF } from '../src/access-policy.js';
+import { explainSlackError } from '../src/slack-errors.js';
 
 const PIN = 'CPINNED', OWNER = 'UOWNER';
 const scopes = ['channels:history', 'chat:write', 'im:read', 'im:history', 'im:write', 'users:read', 'reactions:write'];
@@ -218,16 +219,18 @@ test('stale proof isolates only its pin, preserving ordinary conversations', asy
   assert.ok(!h.calls.some(c => c.method === 'post'));
 });
 
-test('pins survive scope restarts and page truncation exactly once, without extra proof', async () => {
+for (const joined of [false, true]) test(`scope restart rechecks history pins with normal metadata: joined=${joined}`, async (t) => {
+  t.mock.method(console, 'error', () => {});
   const h = fixture({ scopes: [...scopes, 'groups:read'], pages: 2 }); let pages = 0;
+  h.info({ id: PIN, name: 'metadata-name', is_im: false, is_mpim: false, is_private: false, is_member: joined });
   h.web.conversations.list = async () => {
     assert.ok(++pages <= 2, 'listing ceiling');
     return { channels: [{ id: PIN, is_member: true }], response_metadata: { scopes: ['channels:read'], next_cursor: String(pages) } };
   };
   const out = await h.adapter.listConversations();
-  assert.deepEqual(out.conversations.map(c => c.id), [PIN]);
+  assert.deepEqual(out.conversations.map(c => [c.id, c.name]), joined ? [[PIN, 'metadata-name']] : []);
   assert.deepEqual(out.truncation, { reason: 'page_limit', pages: 2, limit: 2 });
-  assert.deepEqual(h.calls.map(c => c.method), ['history']);
+  assert.deepEqual(h.calls.map(c => c.method), ['history', 'info']);
 });
 
 test('unset fallback and unknown scopes never make history proof requests', async () => {
@@ -244,4 +247,46 @@ test('metadata API refusal with channels:read cannot activate pinned history fal
   h.web.conversations.info = async () => { throw terminal(); };
   await assert.rejects(h.adapter.readHistory(PIN, {}), /not_in_channel/);
   assert.ok(!h.calls.some(c => c.method === 'history'));
+});
+
+for (const joined of [false, true]) test(`in-flight proof yields to newly learned metadata scope: joined=${joined}`, async () => {
+  const h = fixture();
+  let release!: () => void;
+  const paused = new Promise<void>(resolve => { release = resolve; });
+  let entered!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  h.web.conversations.history = async () => { entered(); await paused; return { ok: true, messages: [] }; };
+  h.info({ id: PIN, is_im: false, is_mpim: false, is_private: false, is_member: joined });
+  const posting = h.adapter.sendMessage(PIN, 'after scope grant');
+  await started;
+  (h.adapter as any).takeScopes(['channels:read']);
+  release();
+  if (joined) await posting;
+  else await assert.rejects(posting, /not a confirmed joined/);
+  assert.deepEqual(h.calls.map(c => c.method), joined ? ['info', 'post'] : ['info']);
+});
+
+test('synthetic proof cannot pass the pure gate once normal metadata scope is known', () => {
+  const policy = new SlackAccessPolicy({ writeChannels: [PIN], dmUsers: [], readJoinedChannels: true, historyMembershipFallbackChannels: [PIN] });
+  const proof = { id: PIN, is_im: false, is_mpim: false, is_private: false, is_member: true, [HISTORY_MEMBERSHIP_PROOF]: true as const };
+  assert.throws(() => policy.requireReadable(PIN, proof, [...scopes, 'channels:read']), /fresh.*metadata/);
+});
+
+test('failed history admission is pre-write, without reclassifying an actual post failure', async () => {
+  const h = fixture();
+  const failure = Object.assign(new Error('timeout'), { code: ErrorCode.RequestError, original: { code: 'ETIMEDOUT' } });
+  const call = { tool: 'send_message', args: { channelId: PIN } };
+  // An unmarked error keeps the #61 uncertain-write interpretation.
+  assert.match(explainSlackError(failure, call), /whether the message was posted is unknown/);
+  h.fail(failure);
+  await assert.rejects(h.adapter.sendMessage(PIN, 'not attempted'), e => e === failure);
+  const explanation = explainSlackError(failure, call);
+  assert.match(explanation, /Nothing was posted/);
+  assert.doesNotMatch(explanation, /whether the message was posted is unknown|Check fetch_history/);
+  assert.equal(h.calls.some(c => c.method === 'post'), false);
+  h.fail();
+  const postFailure = Object.assign(new Error('post timeout'), { code: ErrorCode.RequestError });
+  h.web.chat.postMessage = async () => { throw postFailure; };
+  await assert.rejects(h.adapter.sendMessage(PIN, 'attempted'), e => e === postFailure);
+  assert.match(explainSlackError(postFailure, call), /whether the message was posted is unknown/);
 });
