@@ -420,8 +420,11 @@ again; proof requests are outside data-page budgets. With `channels:read`, the
 normal metadata path wins, even after refusal. Other scope/file gates remain.
 
 Pinned channels precede ordinary listing results and survive scope restarts
-and page-limit truncation without duplicates. A terminal stale-pin refusal
-omits only that pin, with aggregate admission diagnostics; later operations
+and page-limit truncation without duplicates only while `channels:read` is
+absent. Once it is available, pins require normal metadata readmission; an
+exhausted listing page budget can leave them omitted until a later listing.
+A terminal stale-pin refusal omits only that pin, with aggregate admission
+diagnostics; later operations
 still fail closed. Transient/rate-limit/deadline failures propagate, or use the
 existing bounded background retries, rather than masquerading as a complete
 listing. Unset fallback is behavior-identical to the normal policy path.

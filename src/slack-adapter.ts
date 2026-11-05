@@ -1064,6 +1064,11 @@ export class SlackAdapter {
       return true;
     };
     for (;;) {
+      // A concurrent grant can land during page admission even with a next
+      // cursor. Reconcile seeded pins before continuing or returning at the
+      // page cap; startOver clears synthetic/checked state, not pages used.
+      // Leave unseeded listings on the unchanged normal-policy path.
+      if (pinned.length) startOver();
       if (pages >= this.pagination.conversations) {
         return listing({ reason: 'page_limit', pages, limit: this.pagination.conversations });
       }

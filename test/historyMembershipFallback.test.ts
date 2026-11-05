@@ -290,3 +290,44 @@ test('failed history admission is pre-write, without reclassifying an actual pos
   await assert.rejects(h.adapter.sendMessage(PIN, 'attempted'), e => e === postFailure);
   assert.match(explainSlackError(postFailure, call), /whether the message was posted is unknown/);
 });
+
+// Real concurrent listings: no direct scope mutation. The second listing learns
+// a grant while the first is paused in its final page's metadata admission.
+for (const pages of [1, 2]) for (const joined of [false, true]) {
+  test(`concurrent scope grant invalidates synthetic pins before cursor/page-limit return: pages=${pages}, joined=${joined}`, async (t) => {
+    t.mock.method(console, 'error', () => {});
+    const h = fixture({ scopes: ['channels:history', 'groups:read'], pages });
+    let entered!: () => void, release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const paused = new Promise<void>(resolve => { release = resolve; });
+    let lists = 0;
+    h.web.conversations.list = async args => {
+      h.calls.push({ method: 'list', args });
+      assert.ok(++lists <= (pages === 1 ? 2 : 4), 'shared listing page ceiling');
+      if (lists === 1) return { channels: [{ id: 'GOTHER', is_member: true }], response_metadata: { next_cursor: 'more' } };
+      if (lists === 2) return { channels: [], response_metadata: { scopes: ['channels:read'] } };
+      // After restarting, the first listing must forget the checked synthetic
+      // pin and readmit it through metadata, with no old-type cursor.
+      assert.equal(args.cursor, undefined);
+      assert.equal(args.types, 'public_channel,private_channel');
+      if (lists === 3) return { channels: [], response_metadata: {} };
+      return { channels: [{ id: PIN, is_member: true }], response_metadata: { next_cursor: 'new-more' } };
+    };
+    h.web.conversations.info = async args => {
+      h.calls.push({ method: 'info', args });
+      if (args.channel === PIN) return { channel: { id: PIN, name: 'metadata-name', is_im: false, is_mpim: false, is_private: false, is_member: joined } };
+      entered(); await paused;
+      return { channel: { id: 'GOTHER', is_im: false, is_mpim: false, is_private: true, is_member: true } };
+    };
+    const first = h.adapter.listConversations();
+    await started;
+    try { await h.adapter.listConversations(); } finally { release(); }
+    const result = await first;
+    assert.ok((h.adapter as any).scopes.includes('channels:read'));
+    assert.deepEqual(result.conversations.map(c => [c.id, c.name]), pages === 2 && joined ? [[PIN, 'metadata-name']] : []);
+    assert.deepEqual(result.leftOut, []);
+    assert.deepEqual(result.truncation, { reason: 'page_limit', pages, limit: pages });
+    assert.equal(h.calls.filter(c => c.method === 'info' && c.args.channel === PIN).length, pages === 2 ? 1 : 0);
+    assert.equal(lists, pages === 1 ? 2 : 4);
+  });
+}
