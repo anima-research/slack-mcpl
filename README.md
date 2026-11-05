@@ -375,14 +375,21 @@ Switches take `true`/`false` (also `1`/`0`, `yes`/`no`); any other value stops t
 admission, use an allow-list such as `SLACK_BOT_MESSAGES=B012ABC,U034DEF`:
 either the event's bot ID or its author user ID must match (`U…` and `W…`
 user IDs are accepted). A bot event without a user ID uses its bot ID as
-author. Startup requires both authenticated self IDs so messages from this
+author ID, and Slack's username as its display name when supplied.
+With an ID allow-list, unverifiable user-only senders are dropped: a failed or
+inconclusive `users.info` lookup is not evidence that a sender is human and
+is retried on the next message. Verified humans still pass without being listed.
+Unset and `all` modes retain best-effort delivery when a lookup fails.
+Startup requires both authenticated self IDs so messages from this
 connector are dropped by user ID **or** bot ID, even if explicitly allowed.
 
 Admitted messages carry `chat:from-bot` (not `chat:from-human`) and a
 `[Slack source: bot]` text marker. Existing subscriptions, mention/DM wake
-policy, and DM controls still apply: this option does not subscribe to
-channels or grant access. For ambient channel delivery, subscribe to the
-channel or enable `SLACK_SUBSCRIBE_MEMBER_CHANNELS`.
+policy, and DM controls still apply. Enabling this option alone does not
+subscribe to channels or grant access, but an admitted bot mention can auto-subscribe
+a channel under the existing first-interaction rules and can receive the
+configured acknowledgement reaction. For other ambient channel delivery,
+subscribe to the channel or enable `SLACK_SUBSCRIBE_MEMBER_CHANNELS`.
 
 **Loop risk:** self-filtering prevents reacting to this connector's own
 messages, not cycles between different bots. A bot mentioning another bot,
@@ -451,4 +458,6 @@ matches a URL in original text, including Slack `<url|label>` forms.
 The supplemental suffix is capped at 16,384 UTF-16 units including separator
 and a single final `[…truncated]` marker when any length, traversal (2,000
 nodes) or rich nesting (12 levels) bound cuts content. Cuts preserve code points;
-original text is never truncated. Existing live bot/edit filtering is unchanged.
+original text is never truncated. Edit filtering is unchanged.
+Live bot messages are dropped by default;
+see **Bot message delivery** for opt-in admission and self-filtering.
