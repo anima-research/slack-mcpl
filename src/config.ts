@@ -8,6 +8,9 @@ export function booleanFlag(name: string, raw: string | undefined): boolean {
   throw new Error(`${name} must be true or false, got ${JSON.stringify(raw)}`);
 }
 
+/** Other bots admitted to live delivery: all, or bot/user IDs. */
+export type BotMessagePolicy = 'all' | string[];
+
 export interface StartupSettings {
   useStdio: boolean;
   tcpPort: number | undefined;
@@ -18,6 +21,7 @@ export interface StartupSettings {
   disableDms: boolean;
   subscribeMemberChannels: boolean;
   ackReaction: string | undefined;
+  botMessages: BotMessagePolicy | undefined;
 }
 
 export function startupSettings(
@@ -46,6 +50,14 @@ export function startupSettings(
   if (env.SLACK_SEND_CHANNELS !== undefined && sendChannels!.length === 0) {
     return { refusal: 'SLACK_SEND_CHANNELS is set but names no conversation; unset it to allow writing anywhere' };
   }
+  let botMessages: BotMessagePolicy | undefined;
+  if (env.SLACK_BOT_MESSAGES !== undefined) {
+    const value = env.SLACK_BOT_MESSAGES.trim();
+    const ids = value.split(',').map((s) => s.trim());
+    if (value === 'all') botMessages = 'all';
+    else if (ids.every((id) => /^[BUW][A-Z0-9]+$/.test(id))) botMessages = ids;
+    else return { refusal: 'SLACK_BOT_MESSAGES must be all or a comma-separated list of bot/user IDs; unset it to drop bot messages' };
+  }
   let disableDms: boolean;
   let subscribeMemberChannels: boolean;
   try {
@@ -56,6 +68,6 @@ export function startupSettings(
   }
   const ackReaction = env.SLACK_ACK_REACTION?.replace(/:/g, '').trim() || undefined;
   return {
-    settings: { useStdio, tcpPort, botToken, appToken, dmUsers, sendChannels, disableDms, subscribeMemberChannels, ackReaction },
+    settings: { useStdio, tcpPort, botToken, appToken, dmUsers, sendChannels, disableDms, subscribeMemberChannels, ackReaction, botMessages },
   };
 }

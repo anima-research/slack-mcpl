@@ -1,6 +1,20 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { booleanFlag } from '../src/config.js';
+import { booleanFlag, startupSettings } from '../src/config.js';
+
+test('bot message policy defaults off and accepts all or bot/user IDs', () => {
+  const env = { SLACK_BOT_TOKEN: 'xoxb-test', SLACK_APP_TOKEN: 'xapp-test' };
+  for (const [raw, expected] of [[undefined, undefined], [' all ', 'all'], ['B1, U2,W3', ['B1', 'U2', 'W3']]] as const) {
+    const started = startupSettings(['--stdio'], { ...env, SLACK_BOT_MESSAGES: raw });
+    assert.ok('settings' in started);
+    assert.deepEqual(started.settings.botMessages, expected);
+  }
+  for (const raw of ['', ' ', 'true', 'false', 'ALL', 'B1,,U2', 'all,B1', 'C1', 'name']) {
+    const started = startupSettings(['--stdio'], { ...env, SLACK_BOT_MESSAGES: raw });
+    assert.ok('refusal' in started, raw);
+    assert.match(started.refusal, /SLACK_BOT_MESSAGES must be all or a comma-separated list of bot\/user IDs/);
+  }
+});
 
 test('operator switches default off only when absent and accept explicit yes/no values', () => {
   assert.equal(booleanFlag('SWITCH', undefined), false);

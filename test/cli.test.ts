@@ -64,6 +64,7 @@ test('startup reads every setting from the command line and the environment', ()
       disableDms: true,
       subscribeMemberChannels: true,
       ackReaction: 'eyes',
+      botMessages: undefined,
     },
   });
 });
@@ -99,4 +100,10 @@ test('a SLACK_DM_USERS that names no user is refused with one line, DMs on or of
   const unset = startupSettings(['--stdio'], tokens);
   assert.ok('settings' in unset, JSON.stringify(unset));
   assert.equal(unset.settings.dmUsers, undefined);
+});
+
+test('invalid bot policy stops startup with one line before connecting', () => {
+  const run = startWith({ SLACK_BOT_MESSAGES: 'true' });
+  assert.equal(run.status, 1);
+  assert.equal(run.stderr, 'SLACK_BOT_MESSAGES must be all or a comma-separated list of bot/user IDs; unset it to drop bot messages\n');
 });

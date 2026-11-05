@@ -20,6 +20,7 @@
  * Event handling salvaged from zulip-mcp PR #8's SlackAdapter.
  */
 
+import type { BotMessagePolicy } from './config.js';
 import { renderMessageText } from './message-text.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { WebClient, ErrorCode, LogLevel, type Logger, type WebAPICallResult, type WebClientOptions } from '@slack/web-api';
@@ -314,6 +315,10 @@ export interface SlackMessageData {
   threadTs?: string;
   authorId: string;
   authorName: string;
+  /** Set only for opted-in live bot messages. */
+  isBot?: boolean;
+  senderKind?: 'bot';
+  authorBotId?: string;
   /** Original Slack text (before supplemental payload rendering). */
   rawContent?: string;
   /** Rendered mrkdwn content. */
@@ -367,6 +372,8 @@ export interface SlackAdapterConfig {
   disableDms?: boolean;
   /** Emoji name put on an addressed message while the agent works on it. */
   ackReaction?: string;
+  /** Opt in to live messages from other bots. */
+  botMessages?: BotMessagePolicy;
 }
 
 /**
@@ -754,6 +761,8 @@ export async function connectSlack(config: SlackAdapterConfig, slackApiUrl?: str
     config.ackReaction,
     // Granted scopes, from the x-oauth-scopes header of auth.test.
     reportedScopes(auth.response_metadata),
+    config.botMessages,
+    auth.bot_id,
   );
 }
 
@@ -794,7 +803,7 @@ export interface SlackWebLike {
     delete(args: { file: string }): Promise<unknown>;
   };
   users: {
-    info(args: { user: string }): Promise<{ user?: { profile?: { display_name?: string }; real_name?: string; name?: string } }>;
+    info(args: { user: string }): Promise<{ user?: { profile?: { display_name?: string }; real_name?: string; name?: string; is_bot?: boolean } }>;
     list(args: { limit?: number; cursor?: string }): Promise<{ members?: unknown[]; response_metadata?: { next_cursor?: string } }>;
   };
 }
@@ -810,6 +819,7 @@ export class SlackAdapter {
    *  waits for. */
   private inbound = new Map<string, Promise<void>>();
   private userNameCache = new Map<string, string>();
+  private botUsers = new Set<string>();
   private messageHandlers: Array<(msg: SlackMessageData) => void> = [];
   private socketStarted = false;
   /** Conversations Slack reported as DMs or group DMs, and as channels. IDs
@@ -845,7 +855,12 @@ export class SlackAdapter {
     /** The bot token's scopes, as auth.test reported them; undefined, or an
      *  empty list, is unknown, so a listing asks for every type. */
     scopes?: string[],
+    private botMessages?: BotMessagePolicy,
+    private botId?: string,
   ) {
+    if (botMessages && (!botUserId || !botId)) {
+      throw new Error('Bot message delivery requires authenticated bot and user IDs for self-filtering');
+    }
     this.scopes = reportedScopes({ scopes });
     const omitted = this.leftOutTypes();
     if (omitted.length) this.logLeftOut(omitted, '');
@@ -1673,20 +1688,25 @@ export class SlackAdapter {
    *  they make, or undefined for an event that isn't delivered. */
   private async prepareMessageEvent(event: SlackMessageEvent): Promise<SlackMessageData | undefined> {
     if (!event || event.type !== 'message') return;
-    if (!CONTENT_SUBTYPES.has(event.subtype)) return;
-    // Self-filter: skip our own messages and other bots' (bot_id covers
-    // bot_message-without-subtype edge cases like app-posted file shares).
-    if (event.bot_id) return;
+    if (!CONTENT_SUBTYPES.has(event.subtype) && !(this.botMessages && event.subtype === 'bot_message')) return;
+    // Check both authenticated identities, including bot events without a user.
     if (this.botUserId !== null && event.user === this.botUserId) return;
-    // A real user content message always carries channel, user, and ts;
+    if (this.botId && event.bot_id === this.botId) return;
+    const fromBot = !!event.bot_id || event.subtype === 'bot_message';
+    const botAllowed = this.botMessages === 'all' ||
+      Array.isArray(this.botMessages) && this.botMessages.some((id) => id === event.bot_id || id === event.user);
+    if (fromBot && !botAllowed) return;
+    // Legacy bot messages can lack a user; use their bot ID as author instead.
+    const authorId = event.user || (fromBot && this.botMessages ? event.bot_id : undefined);
+    // A content message always carries channel, author, and ts;
     // a malformed payload missing any of them is dropped, not crashed on
     // (parseFloat(undefined) → NaN → toISOString() throws).
-    if (!event.channel || !event.user || !event.ts) return;
+    if (!event.channel || !authorId || !event.ts) return;
 
     const isDM = event.channel_type === 'im' || event.channel.startsWith('D');
     // Only what Slack marks as a channel gets through, not merely what isn't marked a DM.
     if (this.disableDms && event.channel_type !== 'channel' && event.channel_type !== 'group') return;
-    if (isDM && this.dmUsers && !this.dmUsers.includes(event.user)) {
+    if (isDM && this.dmUsers && !this.dmUsers.includes(authorId)) {
       return; // DM whitelist active and this sender isn't on it
     }
 
@@ -1694,7 +1714,9 @@ export class SlackAdapter {
     const text = renderMessageText(event);
     const mentionIds = extractSlackUserIds(event.text ?? '');
     await this.resolveUserNames([event.user, ...extractSlackUserIds(text)]);
-    const authorName = this.userNameCache.get(event.user) ?? event.user;
+    const authorName = this.userNameCache.get(authorId) ?? authorId;
+    const isBot = fromBot || this.botUsers.has(authorId);
+    if (this.botMessages && isBot && !botAllowed) return;
 
     const attachments: AttachmentRef[] = (event.files ?? [])
       .filter((f): f is { url_private: string; name?: string; mimetype?: string } => !!f.url_private)
@@ -1713,8 +1735,10 @@ export class SlackAdapter {
       channelId: event.channel,
       id: String(event.ts),
       threadTs: event.thread_ts || event.root?.thread_ts || undefined,
-      authorId: String(event.user),
+      authorId,
       authorName,
+      ...(this.botMessages && isBot ? { isBot: true, senderKind: 'bot' as const,
+        ...(event.bot_id ? { authorBotId: event.bot_id } : {}) } : {}),
       ...(text !== (event.text ?? '') ? { rawContent: event.text ?? '' } : {}),
       content: text,
       cleanContent: formatSlackText(text, this.userNameCache),
@@ -1735,7 +1759,11 @@ export class SlackAdapter {
    *  Returns the error of each lookup left uncached. */
   private async resolveUserNames(userIds: Array<string | undefined>): Promise<Map<string, unknown>> {
     return resolveSlackUserNames(
-      this.web,
+      this.botMessages ? { users: { info: async (args) => {
+        const info = await this.web.users.info(args);
+        if (info.user?.is_bot === true) this.botUsers.add(args.user);
+        return info;
+      } } } : this.web,
       this.userNameCache,
       userIds.filter((id): id is string => !!id),
     );
