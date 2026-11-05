@@ -359,6 +359,7 @@ Switches take `true`/`false` (also `1`/`0`, `yes`/`no`); any other value stops t
 |----------|----------|-------------|
 | `SLACK_BOT_TOKEN` | yes | Bot token (`xoxb-…`) for Web API calls |
 | `SLACK_APP_TOKEN` | yes | App-level token (`xapp-…`, `connections:write`) for Socket Mode |
+| `SLACK_BOT_MESSAGES` | no | Opt in to live messages from other bots: `all`, or comma-separated bot IDs/user IDs (e.g. `B012ABC,U034DEF`). Unset drops bot events as before; empty or invalid values stop startup. Own messages are always dropped. See [Bot message delivery](#bot-message-delivery). |
 | `SLACK_DM_USERS` | no | Comma-separated user-ID whitelist for DMs; others' DMs are dropped. It filters incoming DMs only, not group DMs, history reads or the conversation list. Set but naming no user is refused at startup |
 | `SLACK_SEND_CHANNELS` | no | Comma-separated conversation-ID allow-list for writes (send, upload, DM, edit, delete, reaction, and the host's `channels/publish`); writes elsewhere are refused before the call reaches Slack. Other conversations are registered `inbound`, `list_channels` shows `writable: false`, and the first message the agent gets from one, addressed or not, carries a read-only note. A mention there still reaches the agent; whether it wakes is the host's policy. `send_dm` is refused before a DM is opened, and not offered, unless the list names a DM. Set but empty is refused at startup; the effective list is logged |
 | `SLACK_SUBSCRIBE_MEMBER_CHANNELS` | no | `true` delivers ambient messages from every channel the bot is a member of, so inviting the bot is the subscription. `unsubscribe_channel` then mutes a conversation (`subscribe_channel` unmutes it) and `list_subscriptions` lists the muted ones. Takes `true` or `false` (also `1`/`0`, `yes`/`no`); unset is off, and any other value, empty included, stops startup |
@@ -368,11 +369,47 @@ Switches take `true`/`false` (also `1`/`0`, `yes`/`no`); any other value stops t
 | `SLACK_BACKSCROLL_LIMIT` | no | Messages fetched on first interaction with a conversation (default 50) |
 | `SLACK_MCPL_DEBUG_LOG` | no | Absolute path for a diagnostic file log |
 
+## Bot message delivery
+
+`SLACK_BOT_MESSAGES=all` admits other bots' live messages. For narrower
+admission, use an allow-list such as `SLACK_BOT_MESSAGES=B012ABC,U034DEF`:
+either the event's bot ID or its author user ID must match (`U…` and `W…`
+user IDs are accepted). A bot event without a user ID uses its bot ID as
+author ID, and Slack's username as its display name when supplied.
+With an ID allow-list, explicitly listed user or bot IDs pass even when
+`users.info` fails; unknown listed senders are conservatively marked as bot,
+never human. Unlisted senders pass only after Slack verifies they are human.
+During `users.info` outages, first-seen human messages may therefore be lost.
+Failed or inconclusive verifications are never cached as human: retries share
+in-flight lookups per user and cool down for 30 seconds, with at most 256
+negative entries (oldest evicted). Verified humans pass without being listed.
+Unset and `all` modes retain best-effort delivery when a lookup fails.
+Startup requires both authenticated self IDs so messages from this
+connector are dropped by user ID **or** bot ID, even if explicitly allowed.
+
+Admitted messages carry `chat:from-bot` (not `chat:from-human`) and a
+`[Slack source: bot]` text marker. Existing subscriptions, mention/DM wake
+policy, and DM controls still apply. Enabling this option alone does not
+subscribe to channels or grant access, but an admitted bot mention can auto-subscribe
+a channel under the existing first-interaction rules and can receive the
+configured acknowledgement reaction. For other ambient channel delivery,
+subscribe to the channel or enable `SLACK_SUBSCRIBE_MEMBER_CHANNELS`.
+
+**Loop risk:** self-filtering prevents reacting to this connector's own
+messages, not cycles between different bots. A bot mentioning another bot,
+or sending it a DM, can trigger a reply loop under the host's wake policy.
+Prefer an allow-list and configure host-side bot wake restrictions/rate
+limits before enabling this option. Unset it to disable ordinary bot
+delivery. This option does not change history reads.
+
 ## Tests
 
 ```bash
 npm test
 ```
+
+Bot delivery tests cover admission/self-filtering, startup parsing, and both
+live MCPL lanes, including attachment/block-only payloads from integrations.
 
 ## Contributing
 
@@ -392,3 +429,39 @@ The MCPL 0.5 policy handshake (`src/grant.ts`, `src/errors.ts`, and the
 `src/grant.ts`, which is itself protocol-generic — no Zulip-specific logic —
 built on `@animalabs/mcpl-core`'s `grantFromUpdate`/`capabilityGranted`/
 `deriveFeatureSets`.
+
+### Readable message payloads
+
+History, threads, backscroll and eligible live messages keep Slack's original
+`text` first. In order, append each classic attachment's readable body
+(pretext, title with link, text, fields as `title: value`, else fallback),
+then that attachment's nested blocks, then top-level blocks. Header, section,
+context and rich_text are supported; image/interactive controls are ignored.
+Rich usergroups, date fallbacks and toned emoji are retained; literal rich
+text is escaped before Slack formatting.
+
+Deduplication compares each attachment body and each block independently,
+against original text and previously appended units. Plain keys normalize only
+whitespace and Slack mention/link/escape encodings,
+never punctuation. Rich-text mirrors additionally serialize their known list,
+quote and code structure and canonicalize only balanced, word-bounded emphasis
+order (without deleting emphasis markers);
+rich channel elements carry labels from original text. Dedup is independent of
+the name cache; names are resolved for display afterward. The `Notification`
+placeholder never suppresses a distinct body.
+
+Only original Slack text creates mentions, addressing, wake or auto-subscription.
+Quoted/shared/block mentions are display content only. Live `metadata.rawContent`
+remains original Slack text; `content`/`cleanContent` include supplemental text.
+History `textContains` searches rendered content (with the documented user-ID
+mention form); threads remain unfiltered because fetch_thread has no filters.
+
+App/link previews are skipped, except message shares (`is_share` or
+`is_msg_unfurl`). Classic previews are skipped only when `from_url` exactly
+matches a URL in original text, including Slack `<url|label>` forms.
+The supplemental suffix is capped at 16,384 UTF-16 units including separator
+and a single final `[…truncated]` marker when any length, traversal (2,000
+nodes) or rich nesting (12 levels) bound cuts content. Cuts preserve code points;
+original text is never truncated. Edit filtering is unchanged.
+Live bot messages are dropped by default;
+see **Bot message delivery** for opt-in admission and self-filtering.

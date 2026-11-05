@@ -41,7 +41,7 @@ export const SUBSCRIPTIONS_FEATURE_SET = 'slack.subscriptions';
 export const SLACK_TAG_ONTOLOGY: TagOntology = {
   coreTags: [
     'chat:addressed', 'chat:mention', 'chat:dm', 'chat:ambient',
-    'chat:private', 'chat:from-human', 'chat:thread',
+    'chat:private', 'chat:from-human', 'chat:from-bot', 'chat:thread',
     'chat:has-image', 'chat:has-file',
   ],
   defaultTreatment: [

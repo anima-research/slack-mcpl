@@ -1,6 +1,20 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { booleanFlag } from '../src/config.js';
+import { booleanFlag, startupSettings } from '../src/config.js';
+
+test('bot message policy defaults off and accepts all or bot/user IDs', () => {
+  const env = { SLACK_BOT_TOKEN: 'xoxb-test', SLACK_APP_TOKEN: 'xapp-test' };
+  for (const [raw, expected] of [[undefined, undefined], [' all ', 'all'], ['B1, U2,W3', ['B1', 'U2', 'W3']]] as const) {
+    const started = startupSettings(['--stdio'], { ...env, SLACK_BOT_MESSAGES: raw });
+    assert.ok('settings' in started);
+    assert.deepEqual(started.settings.botMessages, expected);
+  }
+  for (const raw of ['', ' ', 'true', 'false', 'ALL', 'B1,,U2', 'all,B1', 'C1', 'name']) {
+    const started = startupSettings(['--stdio'], { ...env, SLACK_BOT_MESSAGES: raw });
+    assert.ok('refusal' in started, raw);
+    assert.match(started.refusal, /SLACK_BOT_MESSAGES must be all or a comma-separated list of bot\/user IDs/);
+  }
+});
 
 test('operator switches default off only when absent and accept explicit yes/no values', () => {
   assert.equal(booleanFlag('SWITCH', undefined), false);
@@ -19,5 +33,29 @@ test('operator switches refuse present empty, whitespace, and unrecognized value
         message: `${name} must be true or false, got ${JSON.stringify(raw)}`,
       });
     }
+  }
+});
+
+test('bot policy refusal identifies the invalid entry and its position safely', () => {
+  const result = startupSettings(['--stdio'], {
+    SLACK_BOT_TOKEN: 'xoxb-test', SLACK_APP_TOKEN: 'xapp-test',
+    SLACK_BOT_MESSAGES: 'B123,U456,wrong\nentry,B789',
+  });
+  assert.ok('refusal' in result);
+  assert.ok(result.refusal.includes('entry 3'));
+  assert.match(result.refusal, /entry 3: expected a bot\/user ID/);
+  assert.ok(!result.refusal.includes('wrong'));
+  assert.equal(result.refusal.split('\n').length, 1);
+});
+
+test('bot policy refusal never echoes supplied credentials or control characters', () => {
+  for (const value of ['xoxb-FAKE-SECRET', 'xapp-FAKE-SECRET', 'bad\nvalue', '']) {
+    const result = startupSettings(['--stdio'], {
+      SLACK_BOT_TOKEN: 'fake', SLACK_APP_TOKEN: 'fake', SLACK_BOT_MESSAGES: `B1,${value}`,
+    });
+    assert.ok('refusal' in result);
+    assert.match(result.refusal, /invalid entry 2: (expected a bot\/user ID|empty entry)/);
+    if (value) assert.ok(!result.refusal.includes(value));
+    assert.equal(result.refusal.split('\n').length, 1);
   }
 });

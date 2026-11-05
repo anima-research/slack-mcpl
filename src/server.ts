@@ -1781,7 +1781,8 @@ export class SlackMcplServer {
     // The context is recorded as the message goes out, so the next message
     // is compared with what this peer was sent last.
     this.lastChannelId = msg.channelId;
-    const renderedContent = `${prefixBlock}${location}${nameShown(msg.authorName)}: ${senderText(msg.cleanContent)}`;
+    const sourceLabel = msg.isBot ? '[Slack source: bot]\n' : '';
+    const renderedContent = `${prefixBlock}${location}${sourceLabel}${nameShown(msg.authorName)}: ${senderText(msg.cleanContent)}`;
 
     const contentBlocks: ContentBlock[] = [textContent(renderedContent)];
     if (msg.attachments.length > 0) {
@@ -1789,14 +1790,13 @@ export class SlackMcplServer {
     }
 
     // MCPL RFC-001 event tags — reserved chat:* core, umbrellas included.
-    // The host's wake gate routes on these. Other bots' messages never get
-    // here (the adapter self-filters bot_id), so from-human is uniform.
+    // The host's wake gate routes on these, including opted-in bot messages.
     const eventTags: string[] = (() => {
       const t = new Set<string>();
       if (msg.mentionsBot) t.add('chat:mention');
       if (msg.isDM) { t.add('chat:dm'); t.add('chat:private'); }
       t.add(isAddressed ? 'chat:addressed' : 'chat:ambient');
-      t.add('chat:from-human');
+      t.add(msg.isBot ? 'chat:from-bot' : 'chat:from-human');
       if (msg.threadTs) t.add('chat:thread');
       for (const a of msg.attachments) {
         t.add(a.isImage ? 'chat:has-image' : 'chat:has-file');
@@ -1812,7 +1812,7 @@ export class SlackMcplServer {
       thread_ts: msg.threadTs,
       channel_type: msg.channelType,
       team: msg.teamId,
-      rawContent: msg.content,
+      rawContent: msg.rawContent ?? msg.content,
       botUserId: this.slack.botUserId ?? undefined,
       ...(msg.attachments.length > 0 ? { attachments: msg.attachments } : {}),
     };
