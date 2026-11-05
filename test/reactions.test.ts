@@ -513,6 +513,62 @@ test('agent adoption waits for in-flight ACK removal before re-adding', async t 
   assert.deepEqual(f.calls, ['add', 'remove:1.0:eyes', 'add']);
 });
 
+for (const outcome of ['already_reacted', 'success', 'invalid_name', 'expiry'] as const) {
+  test(`ACK cleanup starting during server adoption preserves the result (${outcome})`, async t => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    let present = false;
+    let release!: () => void;
+    let adds = 0;
+    const effects: string[] = [];
+    const web = { reactions: {
+      add: async () => {
+        effects.push('add');
+        if (++adds === 1) { present = true; return; }
+        const already = present;
+        await new Promise<void>(resolve => { release = resolve; });
+        if (outcome === 'invalid_name') throw refusal('invalid_name');
+        if (already) throw refusal('already_reacted');
+        present = true;
+      },
+      remove: async () => { effects.push('remove'); present = false; },
+    } } as unknown as SlackWebLike;
+    const slack = new SlackAdapter(web, { on() {}, async start() {}, async disconnect() {} }, 'UBOT', 'test',
+      undefined, undefined, false, 'eyes');
+    const h = connectHost(new SlackMcplServer(slack));
+    t.after(async () => { release?.(); await h.close(); await slack.stop(); });
+    await initialize(h, false);
+    await slack.acknowledge('C1', '1.0');
+    if (outcome === 'success') present = false;
+    if (outcome === 'expiry') t.mock.timers.tick(10 * 60 * 1000 - 1000);
+    const adopting = call(h, 'add_reaction', args);
+    await flush();
+    assert.ok(release, 'the add must be awaiting its Slack response');
+    const clearing = outcome === 'expiry' ? undefined : slack.clearAck('C1');
+    if (outcome === 'expiry') t.mock.timers.tick(1000);
+    await flush();
+    // Release before assertions so even a broken reservation cannot strand the server.
+    const duringAdd = [...effects];
+    release();
+    const result = await adopting;
+    await clearing;
+    await flush();
+    assert.deepEqual(duringAdd, ['add', 'add'], 'cleanup must not overtake the add response');
+    if (outcome === 'invalid_name') {
+      assert.equal(result.isError, true);
+      await slack.clearAck('C1');
+      assert.equal(present, false, 'a failed adoption must leave normal cleanup pending');
+      assert.deepEqual(effects, ['add', 'add', 'remove']);
+    } else {
+      assert.notEqual(result.isError, true);
+      await slack.clearAck('C1');
+      t.mock.timers.tick(20 * 60 * 1000);
+      await flush();
+      assert.equal(present, true, 'the adopted reaction must survive cleanup');
+      assert.deepEqual(effects, ['add', 'add']);
+    }
+  });
+}
+
 for (const ackReaction of [undefined, 'eyes']) {
   test(`offered reaction/read descriptions explain configured ACK (${ackReaction ?? 'unset'})`, async t => {
     const h = harness({ ackReaction }); t.after(() => h.close());

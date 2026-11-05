@@ -157,6 +157,8 @@ type AckEntry = {
   added: Promise<boolean>;
   tries: number;
   removing?: Promise<void>;
+  /** An agent's add owns the entry until Slack answers; failure keeps cleanup pending. */
+  adopting?: Promise<void>;
   /** Slack confirmed removal or answered no_reaction; dropping cleanup alone proves neither. */
   gone?: boolean;
 };
@@ -1175,9 +1177,12 @@ export class SlackAdapter {
     const pending = this.ackPending.get(channelId);
     if (!pending || !this.ackReaction) return;
     const targets = ts === undefined ? [...pending.keys()] : pending.has(ts) ? [ts] : [];
-    await Promise.all(targets.map((t) => {
+    await Promise.all(targets.map(async (t) => {
       const entry = pending.get(t);
       if (!entry) return;
+      while (entry.adopting) await entry.adopting;
+      // A confirmed adoption retires cleanup. A failed add leaves it ours.
+      if (pending.get(t) !== entry) return;
       // Posts, expiry, and shutdown share one removal, including the wait
       // for reactions.add. Reserve it before any asynchronous work settles.
       if (!entry.removing) {
@@ -1444,15 +1449,27 @@ export class SlackAdapter {
     await this.assertNotDm(channelId, 'No reaction was added');
     if (entry) {
       await entry.added;
-      while (entry.removing) await entry.removing;
+      while (entry.removing || entry.adopting) await (entry.removing ?? entry.adopting);
     }
+    const add = async () => {
+      try {
+        await this.web.reactions.add({ channel: channelId, timestamp: ts, name });
+        if (entry) this.dropAck(channelId, ts, entry);
+      } catch (err) {
+        // Slack confirmed the agent's desired reaction is already present.
+        if (entry && slackRefusal(err) === 'already_reacted') this.dropAck(channelId, ts, entry);
+        throw err;
+      }
+    };
+    if (!entry) return add();
+    // Reserve before invoking Slack, not just after waiting for older cleanup.
+    const added = Promise.resolve().then(add);
+    const adopting = added.then(() => {}, () => {});
+    entry.adopting = adopting;
     try {
-      await this.web.reactions.add({ channel: channelId, timestamp: ts, name });
-      if (entry) this.dropAck(channelId, ts, entry);
-    } catch (err) {
-      // Slack confirmed the agent's desired reaction is already present.
-      if (entry && slackRefusal(err) === 'already_reacted') this.dropAck(channelId, ts, entry);
-      throw err;
+      await added;
+    } finally {
+      if (entry.adopting === adopting) entry.adopting = undefined;
     }
   }
 
@@ -1472,11 +1489,14 @@ export class SlackAdapter {
     const name = reactionName(emoji);
     const entry = name === this.ackReaction ? this.ackPending.get(channelId)?.get(ts) : undefined;
     // Let an already-running automatic cleanup finish before the explicit call.
-    while (entry?.removing) {
-      await entry.removing;
+    while (entry?.removing || entry?.adopting) {
+      await (entry.removing ?? entry.adopting);
       // A terminal failure also drops cleanup. Only Slack-confirmed absence
       // makes another removal redundant; otherwise ask and report its answer.
-      if (entry.gone) return false;
+      if (entry.gone) {
+        if (policy.hasAccessPolicy) await policy.requireWritableConversation(channelId, 'reactions:write', 'No reaction was removed');
+        return false;
+      }
     }
     const remove = async () => {
       if (entry) {
