@@ -3,7 +3,10 @@
   messages carry `chat:from-bot` and a bot-source text marker. The connector's
   own user and bot IDs are always filtered. Existing DM and subscription
   controls still apply; admitted mentions can auto-subscribe and receive
-  the configured acknowledgement reaction. With an ID allow-list, user-only
-  senders are dropped until Slack verifies their sender kind; failed lookups
-  are retried rather than cached as human. Other bots can form reply loops,
+  the configured acknowledgement reaction. With an ID allow-list, explicitly
+  listed IDs pass even if verification fails, conservatively marked as bot.
+  Unlisted senders must be verified human; first-seen human messages may be
+  lost during users.info outages. Failures have a bounded 256-entry negative
+  cache with a 30-second retry cooldown and per-user in-flight coalescing,
+  never a human classification. Other bots can form reply loops,
   so prefer an allow-list and host-side bot wake restrictions/rate limits.

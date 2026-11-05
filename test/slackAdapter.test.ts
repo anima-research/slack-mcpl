@@ -204,7 +204,9 @@ test('unset bot policy preserves delivery of unmarked users even if users.info i
 // #66 bot review 1: user-only events must not bypass an ID allow-list when
 // Slack cannot establish whether their author is human.
 for (const failure of ['timeout', 'refusal', 'missing-user', 'missing-status'] as const) {
-  test(`bot allow-list fails closed and retries an unverifiable author: ${failure}`, async () => {
+  test(`bot allow-list fails closed and retries an unverifiable author: ${failure}`, async (t) => {
+    let now = Date.now();
+    t.mock.method(Date, 'now', () => now);
     let handler: any;
     let calls = 0;
     const adapter = new SlackAdapter({
@@ -224,6 +226,7 @@ for (const failure of ['timeout', 'refusal', 'missing-user', 'missing-status'] a
       await new Promise(r => setTimeout(r, 0));
       assert.equal(received.length, n >= 3 ? n - 2 : 0, 'unverified senders are dropped, verified humans pass');
       assert.equal(calls, Math.min(n, 3), 'neither a refusal nor an inconclusive answer is cached as human');
+      now += 30_000;
     }
     assert.equal(received[0].authorName, 'verified');
   });
@@ -256,4 +259,82 @@ test('user-less admitted bots keep Slack username, with bot ID fallback', async 
   await emit(event);
   assert.deepEqual(received.map(m => m.authorName), ['Deploy notifier', 'B1']);
   assert.deepEqual(received.map(m => m.authorId), ['B1', 'B1']);
+});
+
+// #66 bot review 1 round 2: listed unknowns pass conservatively; unlisted
+// unknowns fail closed, including user-only bots without metadata.
+function verificationAdapter(info: (args: { user: string }) => Promise<any>, policy = ['UALLOWED', 'BALLOWED']) {
+  return new SlackAdapter({ users: { info } } as any, { on() {} } as any,
+    'UBOT', 'acme', undefined, undefined, false, undefined, undefined, policy, 'BSELF') as any;
+}
+const verificationEvent = { type: 'message', channel: 'C1', user: 'UALLOWED', ts: '1.0', text: '' };
+
+for (const failure of ['refusal', 'timeout', 'inconclusive']) {
+  test(`explicitly listed user or bot survives ${failure} without asserting human`, async () => {
+    const adapter = verificationAdapter(async () => {
+      if (failure === 'inconclusive') return { user: { name: 'unknown' } };
+      throw Object.assign(new Error(failure), failure === 'refusal' ? { data: { error: 'missing_scope' } } : {});
+    });
+    for (const identity of [{ user: 'UALLOWED' }, { user: 'UOTHER', bot_id: 'BALLOWED' }]) {
+      const msg = await adapter.prepareMessageEvent({ ...verificationEvent, ...identity });
+      assert.ok(msg);
+      assert.equal(msg.isBot, true);
+      assert.equal(msg.senderKind, 'bot');
+    }
+    assert.equal(await adapter.prepareMessageEvent({ ...verificationEvent, user: 'UUNLISTED' }), undefined);
+  });
+}
+
+for (const failure of ['refusal', 'timeout', 'inconclusive']) {
+  test(`verification failures have a cooldown, coalesce in flight, and recover as verified humans: ${failure}`, async (t) => {
+    let now = 1_000;
+    t.mock.method(Date, 'now', () => now);
+    let calls = 0;
+    let recovering = false;
+    let finish!: (value: any) => void;
+    let fail!: (error: Error) => void;
+    const adapter = verificationAdapter(async () => {
+      calls++;
+      if (calls > 1 && !recovering) throw new Error('unexpected retry within cooldown');
+      return new Promise((resolve, reject) => { finish = resolve; fail = reject; });
+    });
+    const event = { ...verificationEvent, user: 'UUNKNOWN' };
+    const batch = Array.from({ length: 25 }, (_, n) =>
+      adapter.prepareMessageEvent({ ...event, channel: `C${n}`, text: '<@UUNKNOWN>' }));
+    await new Promise(r => setImmediate(r));
+    assert.equal(calls, 1, 'same user across authors and mentions shares an in-flight lookup');
+    if (failure === 'inconclusive') finish({ user: { name: 'not-verified' } });
+    else fail(Object.assign(new Error(failure), failure === 'refusal' ? { data: { error: 'missing_scope' } } : {}));
+    assert.ok((await Promise.all(batch)).every(m => m === undefined));
+    for (let n = 0; n < 25; n++) assert.equal(await adapter.prepareMessageEvent(event), undefined);
+    assert.equal(calls, 1, 'negative verification cooldown suppresses repeated requests');
+    assert.equal(adapter.userNameCache.has('UUNKNOWN'), false, 'failure is not a human/name cache entry');
+    now += 29_999;
+    assert.equal(await adapter.prepareMessageEvent(event), undefined);
+    assert.equal(calls, 1, 'cooldown lasts 30 seconds');
+    now++;
+    recovering = true;
+    const retry = adapter.prepareMessageEvent(event);
+    await new Promise(r => setImmediate(r));
+    assert.equal(calls, 2, 'retry after cooldown');
+    finish({ user: { name: 'human', is_bot: false } });
+    const msg = await retry;
+    assert.ok(msg);
+    assert.equal(msg.isBot, undefined);
+    assert.equal(msg.authorName, 'human');
+    assert.equal(adapter.verificationFailures.size, 0, 'success clears negative entry');
+  });
+}
+
+test('negative verification cache is bounded and evicts oldest failures', async () => {
+  let calls = 0;
+  const adapter = verificationAdapter(async () => { calls++; throw new Error('offline'); });
+  for (let n = 0; n < 257; n++) {
+    assert.equal(await adapter.prepareMessageEvent({ ...verificationEvent, user: `U${n}` }), undefined);
+  }
+  assert.equal(adapter.verificationFailures.size, 256);
+  await adapter.prepareMessageEvent({ ...verificationEvent, user: 'U256' });
+  assert.equal(calls, 257, 'newest entry remains cooled down');
+  await adapter.prepareMessageEvent({ ...verificationEvent, user: 'U0' });
+  assert.equal(calls, 258, 'oldest evicted entry can retry');
 });

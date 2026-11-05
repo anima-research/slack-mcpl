@@ -822,6 +822,10 @@ export class SlackAdapter {
   private userNameCache = new Map<string, string>();
   private botUsers = new Set<string>();
   private verifiedUsers = new Set<string>();
+  // LIST-only negative verification state: never a name or proof of humanity.
+  // FIFO eviction bounds retained failures; retry after 30 seconds.
+  private verificationFailures = new Map<string, number>();
+  private verificationInFlight = new Map<string, Promise<Awaited<ReturnType<SlackWebLike['users']['info']>>>>();
   private messageHandlers: Array<(msg: SlackMessageData) => void> = [];
   private socketStarted = false;
   /** Conversations Slack reported as DMs or group DMs, and as channels. IDs
@@ -1720,9 +1724,11 @@ export class SlackAdapter {
     await this.resolveUserNames([event.user, ...extractSlackUserIds(text)]);
     const authorName = event.user ? (this.userNameCache.get(authorId) ?? authorId) : (event.username ?? authorId);
     // In list mode an unknown user-only sender could be an unlisted bot.
-    // Explicit bot metadata already establishes the sender kind.
-    if (Array.isArray(this.botMessages) && !fromBot && !this.verifiedUsers.has(authorId)) return;
-    const isBot = fromBot || this.botUsers.has(authorId);
+    // An explicitly listed identity needs no classification to be admitted.
+    // Unknown listed senders are conservatively tagged as bot, never human.
+    const unverified = Array.isArray(this.botMessages) && !this.verifiedUsers.has(authorId);
+    if (unverified && !botAllowed) return;
+    const isBot = fromBot || this.botUsers.has(authorId) || unverified;
     if (this.botMessages && isBot && !botAllowed) return;
 
     const attachments: AttachmentRef[] = (event.files ?? [])
@@ -1762,28 +1768,54 @@ export class SlackAdapter {
     return msg;
   }
 
+  /** LIST lookups share in-flight work across authors and mentions. A failure
+   *  stays separate from verified identity/name caches and cools down retries. */
+  private async verifyListUser(args: { user: string }): Promise<Awaited<ReturnType<SlackWebLike['users']['info']>>> {
+    const retryAt = this.verificationFailures.get(args.user);
+    if (retryAt !== undefined && Date.now() < retryAt) {
+      throw new Error('Slack user verification is cooling down');
+    }
+    const pending = this.verificationInFlight.get(args.user);
+    if (pending) return pending;
+    const lookup = (async () => {
+      try {
+        const info = await this.web.users.info(args);
+        if (typeof info.user?.is_bot !== 'boolean') {
+          throw new Error('users.info did not establish the sender kind');
+        }
+        this.verifiedUsers.add(args.user);
+        if (info.user.is_bot) this.botUsers.add(args.user);
+        this.verificationFailures.delete(args.user);
+        return info;
+      } catch (err) {
+        this.verificationFailures.delete(args.user);
+        this.verificationFailures.set(args.user, Date.now() + 30_000);
+        if (this.verificationFailures.size > 256) {
+          this.verificationFailures.delete(this.verificationFailures.keys().next().value!);
+        }
+        // Do not let the shared name resolver cache a permanent refusal as
+        // a raw-ID name: that would prevent verification after the cooldown.
+        throw new Error('Cannot verify Slack user for SLACK_BOT_MESSAGES allow-list', { cause: err });
+      }
+    })();
+    this.verificationInFlight.set(args.user, lookup);
+    try {
+      return await lookup;
+    } finally {
+      this.verificationInFlight.delete(args.user);
+    }
+  }
+
   /** Resolve user IDs into this adapter's cache (shared logic in content.ts).
    *  Returns the error of each lookup left uncached. */
   private async resolveUserNames(userIds: Array<string | undefined>): Promise<Map<string, unknown>> {
     return resolveSlackUserNames(
       this.botMessages ? { users: { info: async (args) => {
-        try {
-          const info = await this.web.users.info(args);
-          if (Array.isArray(this.botMessages) && typeof info.user?.is_bot !== 'boolean') {
-            throw new Error('users.info did not establish the sender kind');
-          }
-          if (typeof info.user?.is_bot === 'boolean') this.verifiedUsers.add(args.user);
-          if (info.user?.is_bot === true) this.botUsers.add(args.user);
-          return info;
-        } catch (err) {
-          // Name resolution normally caches Slack refusals as raw IDs. In list
-          // mode that would suppress identity retries forever. Keep the cause,
-          // but do not present this as a cacheable name-resolution refusal.
-          if (Array.isArray(this.botMessages)) {
-            throw new Error('Cannot verify Slack user for SLACK_BOT_MESSAGES allow-list', { cause: err });
-          }
-          throw err;
-        }
+        if (Array.isArray(this.botMessages)) return this.verifyListUser(args);
+        const info = await this.web.users.info(args);
+        if (typeof info.user?.is_bot === 'boolean') this.verifiedUsers.add(args.user);
+        if (info.user?.is_bot === true) this.botUsers.add(args.user);
+        return info;
       } } } : this.web,
       this.userNameCache,
       userIds.filter((id): id is string => !!id),

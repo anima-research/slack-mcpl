@@ -376,9 +376,13 @@ admission, use an allow-list such as `SLACK_BOT_MESSAGES=B012ABC,U034DEF`:
 either the event's bot ID or its author user ID must match (`U…` and `W…`
 user IDs are accepted). A bot event without a user ID uses its bot ID as
 author ID, and Slack's username as its display name when supplied.
-With an ID allow-list, unverifiable user-only senders are dropped: a failed or
-inconclusive `users.info` lookup is not evidence that a sender is human and
-is retried on the next message. Verified humans still pass without being listed.
+With an ID allow-list, explicitly listed user or bot IDs pass even when
+`users.info` fails; unknown listed senders are conservatively marked as bot,
+never human. Unlisted senders pass only after Slack verifies they are human.
+During `users.info` outages, first-seen human messages may therefore be lost.
+Failed or inconclusive verifications are never cached as human: retries share
+in-flight lookups per user and cool down for 30 seconds, with at most 256
+negative entries (oldest evicted). Verified humans pass without being listed.
 Unset and `all` modes retain best-effort delivery when a lookup fails.
 Startup requires both authenticated self IDs so messages from this
 connector are dropped by user ID **or** bot ID, even if explicitly allowed.

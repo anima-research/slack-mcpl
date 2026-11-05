@@ -62,7 +62,7 @@ export function startupSettings(
     else {
       const bad = ids.findIndex((id) => !/^[BUW][A-Z0-9]+$/.test(id));
       return { refusal: 'SLACK_BOT_MESSAGES must be all or a comma-separated list of bot/user IDs; ' +
-        `invalid entry ${bad + 1}: ${JSON.stringify(ids[bad])}; unset it to drop bot messages` };
+        `invalid entry ${bad + 1}: ${ids[bad] ? 'expected a bot/user ID' : 'empty entry'}; unset it to drop bot messages` };
     }
   }
   let disableDms: boolean;

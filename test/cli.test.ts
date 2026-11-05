@@ -120,7 +120,7 @@ test('a SLACK_DM_USERS that names no user is refused with one line, DMs on or of
 test('invalid bot policy stops startup with one line before connecting', () => {
   const run = startWith({ SLACK_BOT_MESSAGES: 'true' });
   assert.equal(run.status, 1);
-  assert.equal(run.stderr, 'SLACK_BOT_MESSAGES must be all or a comma-separated list of bot/user IDs; invalid entry 1: "true"; unset it to drop bot messages\n');
+  assert.equal(run.stderr, 'SLACK_BOT_MESSAGES must be all or a comma-separated list of bot/user IDs; invalid entry 1: expected a bot/user ID; unset it to drop bot messages\n');
 });
 
 test('missing bot self identity gives an actionable one-line startup refusal', () => {

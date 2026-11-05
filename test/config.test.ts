@@ -43,6 +43,19 @@ test('bot policy refusal identifies the invalid entry and its position safely', 
   });
   assert.ok('refusal' in result);
   assert.ok(result.refusal.includes('entry 3'));
-  assert.ok(result.refusal.includes(JSON.stringify('wrong\nentry')));
+  assert.match(result.refusal, /entry 3: expected a bot\/user ID/);
+  assert.ok(!result.refusal.includes('wrong'));
   assert.equal(result.refusal.split('\n').length, 1);
+});
+
+test('bot policy refusal never echoes supplied credentials or control characters', () => {
+  for (const value of ['xoxb-FAKE-SECRET', 'xapp-FAKE-SECRET', 'bad\nvalue', '']) {
+    const result = startupSettings(['--stdio'], {
+      SLACK_BOT_TOKEN: 'fake', SLACK_APP_TOKEN: 'fake', SLACK_BOT_MESSAGES: `B1,${value}`,
+    });
+    assert.ok('refusal' in result);
+    assert.match(result.refusal, /invalid entry 2: (expected a bot\/user ID|empty entry)/);
+    if (value) assert.ok(!result.refusal.includes(value));
+    assert.equal(result.refusal.split('\n').length, 1);
+  }
 });
