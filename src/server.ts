@@ -390,7 +390,10 @@ export class SlackMcplServer {
    *  during a connection, as a grant can. */
   private offeredTools() {
     return toolDefinitions.filter((t) =>
-      (t.name !== 'send_dm' || this.slack.dmsWritable) && (t.name !== 'refresh_channels' || this.mcplEnabled));
+      (t.name !== 'send_dm' || this.slack.dmsWritable) && (t.name !== 'refresh_channels' || this.mcplEnabled))
+      .map((t) => this.slack.ackReactionName && ['fetch_history', 'fetch_thread', 'add_reaction', 'remove_reaction'].includes(t.name)
+        ? { ...t, description: t.description + ` The configured ACK emoji, ${this.slack.ackReactionName}, is added automatically while a message is being handled and removed after the bot's next confirmed post unless the agent adds it itself.` }
+        : t);
   }
 
   private requireMcpl(): void {
@@ -794,8 +797,14 @@ export class SlackMcplServer {
         const channelId = this.requireString(args, 'channelId');
         const messageId = this.requireString(args, 'messageId');
         const emoji = this.requireString(args, 'emoji');
-        const removed = await this.slack.removeReaction(channelId, messageId, emoji);
-        return removed ? 'Reaction removed' : `Nothing changed: ACK cleanup for message ${messageId} already finished.`;
+        let removed: boolean;
+        try {
+          removed = await this.slack.removeReaction(channelId, messageId, emoji);
+        } catch (err) {
+          if (slackRefusal(err) !== 'no_reaction') throw err;
+          removed = false;
+        }
+        return removed ? 'Reaction removed' : `Nothing changed: message ${messageId} has no ${emoji} reaction from this bot`;
       }
 
       case 'edit_message':

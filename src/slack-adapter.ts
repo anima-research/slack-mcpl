@@ -812,6 +812,9 @@ export class SlackAdapter {
     return !this.disableDms && (!this.sendChannels?.length || this.sendChannels.some((id) => id.startsWith('D')));
   }
 
+  /** Configured automatic acknowledgement emoji, for agent-facing descriptions. */
+  get ackReactionName(): string | undefined { return this.ackReaction; }
+
   private stopping = false;
 
   /** The bot token's scopes, as Slack has reported them with auth.test's
@@ -1177,9 +1180,16 @@ export class SlackAdapter {
       if (!entry) return;
       // Posts, expiry, and shutdown share one removal, including the wait
       // for reactions.add. Reserve it before any asynchronous work settles.
-      entry.removing ??= this.removeAck(channelId, t, entry).finally(() => {
-        entry.removing = undefined;
-      });
+      if (!entry.removing) {
+        const removing = this.removeAck(channelId, t, entry).finally(() => {
+          if (entry.removing !== removing) return;
+          entry.removing = undefined;
+          if (this.ackPending.get(channelId)?.get(t) === entry) {
+            entry.timer = this.armAck(channelId, t, ACK_RETRY_MS);
+          }
+        });
+        entry.removing = removing;
+      }
       return entry.removing;
     }));
   }
@@ -1198,7 +1208,6 @@ export class SlackAdapter {
       // error, a failure in transit or Slack's own failure can pass. The fifth
       // failure drops the entry, so no sixth attempt can start.
       if (refusedForGood(err) || this.stopping || entry.tries >= ACK_MAX_TRIES) this.dropAck(channelId, ts, entry);
-      else entry.timer = this.armAck(channelId, ts, ACK_RETRY_MS);
     }
   }
 
@@ -1427,21 +1436,43 @@ export class SlackAdapter {
   }
 
   async addReaction(channelId: string, ts: string, emoji: string): Promise<void> {
+    const name = reactionName(emoji);
+    // Capture before the first await: acknowledge() installs its own entry
+    // after calling us, and must not mistake that automatic add for adoption.
+    const entry = name === this.ackReaction ? this.ackPending.get(channelId)?.get(ts) : undefined;
     this.assertWritable(channelId, 'No reaction was added');
     await this.assertNotDm(channelId, 'No reaction was added');
-    await this.web.reactions.add({ channel: channelId, timestamp: ts, name: reactionName(emoji) });
+    if (entry) {
+      await entry.added;
+      while (entry.removing) await entry.removing;
+    }
+    try {
+      await this.web.reactions.add({ channel: channelId, timestamp: ts, name });
+      if (entry) this.dropAck(channelId, ts, entry);
+    } catch (err) {
+      // Slack confirmed the agent's desired reaction is already present.
+      if (entry && slackRefusal(err) === 'already_reacted') this.dropAck(channelId, ts, entry);
+      throw err;
+    }
   }
 
   /** Manual removal shares a pending ACK's ordering and cleanup, but unlike
    *  best-effort ACK cleanup, reports Slack's refusal to the caller. Returns
    *  false when a joined cleanup confirmed absence, without another API call. */
   async removeReaction(channelId: string, ts: string, emoji: string): Promise<boolean> {
+    // The policy stack is optional on this branch. Admission also applies to
+    // callers that only join cleanup and never send another Slack request.
+    const policy = this as unknown as {
+      readonly hasAccessPolicy?: boolean;
+      requireWritableConversation(id: string, scope: string, notDone: string): Promise<unknown>;
+    };
+    if (policy.hasAccessPolicy) await policy.requireWritableConversation(channelId, 'reactions:write', 'No reaction was removed');
     this.assertWritable(channelId, 'No reaction was removed');
     await this.assertNotDm(channelId, 'No reaction was removed');
     const name = reactionName(emoji);
     const entry = name === this.ackReaction ? this.ackPending.get(channelId)?.get(ts) : undefined;
     // Let an already-running automatic cleanup finish before the explicit call.
-    if (entry?.removing) {
+    while (entry?.removing) {
       await entry.removing;
       // A terminal failure also drops cleanup. Only Slack-confirmed absence
       // makes another removal redundant; otherwise ask and report its answer.
@@ -1455,10 +1486,6 @@ export class SlackAdapter {
       try {
         // The policy stack is optional on this branch. Check at the effect,
         // after any pending ACK add, so a revoked grant cannot use that wait.
-        const policy = this as unknown as {
-          readonly hasAccessPolicy?: boolean;
-          requireWritableConversation(id: string, scope: string, notDone: string): Promise<unknown>;
-        };
         if (policy.hasAccessPolicy) await policy.requireWritableConversation(channelId, 'reactions:write', 'No reaction was removed');
         await this.web.reactions.remove({ channel: channelId, timestamp: ts, name });
         if (entry) {
@@ -1479,16 +1506,18 @@ export class SlackAdapter {
     clearTimeout(entry.timer);
     const removed = remove();
     // clearAck must stay best-effort even when it joins a manual removal.
-    entry.removing = removed.then(() => {}, () => {}).finally(() => {
+    const removing = removed.then(() => {}, () => {}).finally(() => {
+      if (entry.removing !== removing) return;
       entry.removing = undefined;
       if (this.ackPending.get(channelId)?.get(ts) === entry) {
         entry.timer = this.armAck(channelId, ts, ACK_RETRY_MS);
       }
     });
+    entry.removing = removing;
     try {
       return await removed;
     } finally {
-      await entry.removing;
+      await removing;
     }
   }
 
@@ -1573,7 +1602,7 @@ export class SlackAdapter {
       // or consume the 20-entry cap; unknown counts and ownership stay absent.
       const reactions = Array.isArray(msg.reactions) ? msg.reactions.filter(
         (r): r is { name: string; count?: unknown; users?: unknown } =>
-          r !== null && typeof r === 'object' && !Array.isArray(r) && typeof r.name === 'string',
+          r !== null && typeof r === 'object' && !Array.isArray(r) && typeof r.name === 'string' && r.name !== '',
       ) : [];
       return {
       id,

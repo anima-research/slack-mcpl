@@ -76,17 +76,26 @@ does not declare `channels.streaming`.
 
 | Tool | Arguments | Effect |
 | --- | --- | --- |
-| `add_reaction` | `channelId`, `messageId`, `emoji` | Add this bot's reaction; an existing own reaction changes nothing. |
-| `remove_reaction` | `channelId`, `messageId`, `emoji` | Remove only this bot's reaction; `no_reaction` is an error saying the bot has no such reaction. |
+| `add_reaction` | `channelId`, `messageId`, `emoji` | Add this bot's reaction; an existing own reaction changes nothing except that adding the configured ACK emoji adopts it and cancels automatic cleanup. |
+| `remove_reaction` | `channelId`, `messageId`, `emoji` | Remove only this bot's reaction; an absent own reaction succeeds with "Nothing changed: message X has no &lt;emoji&gt; reaction from this bot". |
 
 Both belong to `slack.messaging`, use `reactions:write`, accept emoji names
 with or without colons, and enforce the same send-list and DM restrictions.
-Like additions, removals are not undone by rollback. Removing the configured
-ACK emoji waits for a pending ACK add; success or `no_reaction` retires that
-message's pending cleanup. If an automatic cleanup already in progress confirms
-removal (or `no_reaction`) while the tool waits, it returns a successful
-"Nothing changed" without another Slack call. If cleanup instead gives up after
-a failure, the tool makes its own removal attempt and reports Slack's answer.
+Like additions, removals are not undone by rollback.
+
+When `SLACK_ACK_REACTION` is set, that emoji is added automatically while a
+message is being handled and removed after the bot's next confirmed post in
+that conversation (or on expiry/rejection/shutdown). It appears in reads as
+this bot's own reaction, not a separate reaction type. The read and reaction
+tool descriptions name the configured emoji. If the agent adds it itself,
+success or `already_reacted` adopts the reaction and cancels that message's
+automatic cleanup. Adding waits for a pending ACK add and any in-flight removal.
+
+Removing the configured ACK emoji waits for a pending ACK add; success or
+`no_reaction` retires that message's pending cleanup. If an automatic cleanup already in progress confirms
+removal (or `no_reaction`) while the tool waits, it returns the same successful
+"Nothing changed: message X has no &lt;emoji&gt; reaction from this bot" without
+another Slack call. If cleanup instead gives up after a failure, the tool makes its own removal attempt and reports Slack's answer.
 Manual ACK removals share automatic cleanup's five-attempt budget: transient
 failures retry after one minute; terminal refusals, shutdown and the fifth
 failure retire cleanup. Other emojis and other messages' ACKs are unchanged.
