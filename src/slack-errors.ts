@@ -43,6 +43,7 @@ import {
   UploadBytesFailed,
   UploadNotConfirmed,
   failedRequest,
+  failedHistoryAdmission,
   retryAfterSeconds,
   slackRefusal,
 } from './slack-adapter.js';
@@ -162,7 +163,7 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
   // to come before the write. An error no request of the client's threw keeps
   // the tool's reading, since then which request failed can't be told.
   const failed = failedRequest(err);
-  const mayHaveWritten = isWrite && (failed === undefined || !BEFORE_WRITE.has(failed));
+  const mayHaveWritten = isWrite && !failedHistoryAdmission(err) && (failed === undefined || !BEFORE_WRITE.has(failed));
   /** For a listing tool: a new call starts over, so a listing too large for
    *  `limit` stops near the same place each time. */
   const startsOver = (limit: string) => LISTINGS.has(call.tool)

@@ -4,6 +4,7 @@
  * request through the adapter's client, so it keeps the call's time and wait
  * budget like every other request. Backscroll keeps the adapter's own pager.
  */
+import { policyFileNote } from './file-access.js';
 import { createHash } from 'node:crypto';
 import { formatSlackText, type SlackHistoryMessage } from './content.js';
 import { mimeShown, nameShown, toolResultJson, urlShown } from './framing.js';
@@ -230,7 +231,7 @@ export function historyRecord(m: HistoryMessage) {
     ...(m.attachments.length > 0
       ? {
           attachments: m.attachments.map((a) =>
-            `${nameShown(a.name)}${a.mimeType ? ` (${mimeShown(a.mimeType)})` : ''}${a.url ? ` — fetchable via fetch_attachment: ${urlShown(a.url)}` : ''}`,
+            a.channelId !== undefined ? policyFileNote(a) : `${nameShown(a.name)}${a.mimeType ? ` (${mimeShown(a.mimeType)})` : ''}${a.url ? ` — fetchable via fetch_attachment: ${urlShown(a.url)}` : ''}`,
           ),
         }
       : {}),
