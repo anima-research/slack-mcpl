@@ -392,7 +392,7 @@ export class SlackMcplServer {
     return toolDefinitions.filter((t) =>
       (t.name !== 'send_dm' || this.slack.dmsWritable) && (t.name !== 'refresh_channels' || this.mcplEnabled))
       .map((t) => this.slack.ackReactionName && ['fetch_history', 'fetch_thread', 'add_reaction', 'remove_reaction'].includes(t.name)
-        ? { ...t, description: t.description + ` The configured ACK emoji, ${this.slack.ackReactionName}, is added automatically while a message is being handled and removed after the bot's next confirmed post unless the agent adds it itself.` }
+        ? { ...t, description: t.description + ` The configured ACK emoji, ${this.slack.ackReactionName}, is added automatically while a message is being handled and removed after the bot's next confirmed post in that conversation, or after 10 minutes, or when the host rejects the message, unless the agent adds it itself.` }
         : t);
   }
 

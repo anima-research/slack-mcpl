@@ -1533,7 +1533,7 @@ export class SlackAdapter {
       try {
         // The policy stack is optional on this branch. Check at the effect,
         // after any pending ACK add, so a revoked grant cannot use that wait.
-        if (policy.hasAccessPolicy) await policy.requireWritableConversation(channelId, 'reactions:write', 'No reaction was removed');
+        if (entry && policy.hasAccessPolicy) await policy.requireWritableConversation(channelId, 'reactions:write', 'No reaction was removed');
         await this.web.reactions.remove({ channel: channelId, timestamp: ts, name });
         if (entry) {
           entry.gone = true;

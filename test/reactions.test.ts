@@ -579,7 +579,7 @@ for (const ackReaction of [undefined, 'eyes']) {
       if (ackReaction) {
         assert.match(description, /eyes/);
         assert.match(description, /added automatically while a message is being handled/);
-        assert.match(description, /removed after the bot's next confirmed post unless the agent adds it itself/);
+        assert.match(description, /removed after the bot's next confirmed post in that conversation, or after 10 minutes, or when the host rejects the message, unless the agent adds it itself/);
       } else {
         assert.doesNotMatch(description, /added automatically/);
       }
