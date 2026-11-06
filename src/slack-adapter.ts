@@ -1140,7 +1140,7 @@ export class SlackAdapter {
   async acknowledge(channelId: string, ts: string): Promise<void> {
     if (!this.ackReaction || this.stopping) return;
     if (this.ackPending.get(channelId)?.has(ts)) return; // Slack delivered the event twice
-    const added = this.addReaction(channelId, ts, this.ackReaction).then(
+    const added = this.addReaction(channelId, ts, this.ackReaction, { automatic: true }).then(
       () => true,
       // The add counts as there, and is removed like an added one, when it may
       // have landed, by the rule that reads a post's failure
@@ -1440,18 +1440,25 @@ export class SlackAdapter {
     await this.web.files.delete({ file: fileId });
   }
 
-  async addReaction(channelId: string, ts: string, emoji: string): Promise<void> {
-    const name = reactionName(emoji);
-    // Capture before the first await: acknowledge() installs its own entry
-    // after calling us, and must not mistake that automatic add for adoption.
-    const entry = name === this.ackReaction ? this.ackPending.get(channelId)?.get(ts) : undefined;
+  async addReaction(channelId: string, ts: string, emoji: string, options: { automatic?: boolean } = {}): Promise<void> {
     this.assertWritable(channelId, 'No reaction was added');
     await this.assertNotDm(channelId, 'No reaction was added');
+    const name = reactionName(emoji);
+    // Automatic ACKs never adopt, even if an admission gate awaited before
+    // this lookup and acknowledge() has already installed their own entry.
+    const entry = !options.automatic && name === this.ackReaction ? this.ackPending.get(channelId)?.get(ts) : undefined;
     if (entry) {
       await entry.added;
       while (entry.removing || entry.adopting) await (entry.removing ?? entry.adopting);
     }
     const add = async () => {
+      // Optional until the policy stack lands. Recheck inside the reserved
+      // adoption, after the ACK add/cleanup waits, just before the effect.
+      const policy = this as unknown as {
+        readonly hasAccessPolicy?: boolean;
+        requireWritableConversation(id: string, scope: string, notDone: string): Promise<unknown>;
+      };
+      if (entry && policy.hasAccessPolicy) await policy.requireWritableConversation(channelId, 'reactions:write', 'No reaction was added');
       try {
         await this.web.reactions.add({ channel: channelId, timestamp: ts, name });
         if (entry) this.dropAck(channelId, ts, entry);

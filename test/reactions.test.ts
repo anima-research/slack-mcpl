@@ -647,3 +647,23 @@ for (const emoji of [':eyes:', 'thumbsup::skin-tone-3']) {
     if (emoji.includes('skin-tone')) assert.match(result.content[0]!.text, /can't be removed here/);
   });
 }
+
+
+test('gate-first addReaction keeps automatic ACK separate from adoption', async t => {
+  const f = adapterFixture();
+  // Model #56's first await before entering the ACK/adoption implementation.
+  const adapter = f.slack as unknown as {
+    addReaction(channel: string, ts: string, emoji: string, options?: { automatic?: boolean }): Promise<void>;
+  };
+  const add = adapter.addReaction.bind(f.slack);
+  adapter.addReaction = async (...args) => { await Promise.resolve(); return add(...args); };
+  // Do not await a deadlocked stop in the red-before/positional mutant.
+  t.after(() => { void f.slack.stop(); });
+  let acknowledged = false;
+  void f.slack.acknowledge('C1', '1.0').then(() => { acknowledged = true; });
+  for (let i = 0; i < 20 && !acknowledged; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(acknowledged, true, 'automatic ACK must not await its own added promise');
+  await f.slack.clearAck('C1');
+  await f.slack.stop();
+  assert.deepEqual(f.calls, ['add', 'remove:1.0:eyes']);
+});

@@ -75,7 +75,7 @@ test('policy composition: revoked membership denies joining successful ACK clean
   const checks: unknown[] = [];
   Object.defineProperty(policy, 'hasAccessPolicy', { value: true });
   policy.requireWritableConversation = async (id, scope, notDone) => {
-    checks.push({ id, scope, notDone });
+    if (notDone === 'No reaction was removed') checks.push({ id, scope, notDone });
     if (!admitted) throw new Error('No reaction was removed: membership revoked');
   };
   let release!: () => void;
@@ -104,7 +104,7 @@ test('policy composition: server refuses revocation while joined ACK cleanup is 
   const checks: unknown[] = [];
   Object.defineProperty(policy, 'hasAccessPolicy', { value: true });
   policy.requireWritableConversation = async (id, scope, notDone) => {
-    checks.push({ id, scope, notDone });
+    if (notDone === 'No reaction was removed') checks.push({ id, scope, notDone });
     if (!admitted) throw new Error(`${notDone}: membership revoked`);
   };
   let release!: () => void;
@@ -131,3 +131,46 @@ test('policy composition: server refuses revocation while joined ACK cleanup is 
   assert.deepEqual(checks, Array(2).fill({ id: 'C1', scope: 'reactions:write', notDone: 'No reaction was removed' }));
   assert.equal(effects, 1, 'only the already-running automatic cleanup reaches Slack');
 });
+
+
+for (const waitingFor of ['add', 'removal']) {
+  test(`policy composition: adoption rechecks after pending ACK ${waitingFor}`, async t => {
+    const f = fakeSlack({ ackReaction: 'eyes' });
+    const policy = f.slack as unknown as {
+      requireWritableConversation(id: string, scope: string, notDone: string): Promise<void>;
+      web: { reactions: { add(): Promise<void>; remove(): Promise<void> } };
+    };
+    let admitted = true;
+    const checks: unknown[] = [];
+    Object.defineProperty(policy, 'hasAccessPolicy', { value: true });
+    policy.requireWritableConversation = async (id, scope, notDone) => {
+      if (notDone === 'No reaction was added') checks.push({ id, scope, notDone });
+      if (!admitted) throw new Error(`${notDone}: membership revoked`);
+    };
+    let release!: () => void;
+    let adds = 0;
+    policy.web.reactions.add = async () => {
+      adds++;
+      if (waitingFor === 'add' && adds === 1) await new Promise<void>(r => { release = r; });
+    };
+    let removes = 0;
+    policy.web.reactions.remove = async () => {
+      if (waitingFor === 'removal' && ++removes === 1) await new Promise<void>(r => { release = r; });
+    };
+    t.after(async () => { release?.(); await f.slack.stop(); });
+    const acknowledging = f.slack.acknowledge('C1', '1.0');
+    if (waitingFor === 'removal') await acknowledging;
+    const clearing = waitingFor === 'removal' ? f.slack.clearAck('C1') : undefined;
+    for (let i = 0; i < 20 && !release; i++) await new Promise(resolve => setImmediate(resolve));
+    assert.ok(release, 'the automatic operation must reach Slack');
+    const adopting = f.slack.addReaction('C1', '1.0', 'eyes');
+    const denied = assert.rejects(adopting, /No reaction was added: membership revoked/);
+    for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve));
+    const before = checks.length;
+    admitted = false;
+    release();
+    await Promise.all([acknowledging, clearing, denied]);
+    assert.deepEqual(checks.slice(before), [{ id: 'C1', scope: 'reactions:write', notDone: 'No reaction was added' }]);
+    assert.equal(adds, 1, 'revocation prevents the adoption effect');
+  });
+}
