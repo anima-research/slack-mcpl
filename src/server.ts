@@ -40,9 +40,11 @@ import type {
 } from '@animalabs/mcpl-core';
 
 import {
+  ACK_TTL_MS,
   GaveUp,
   LONE_SURROGATE,
   SLACK_CLIENT_OPTIONS,
+  STATUS_REFRESH_MS,
   assertRequestFits,
   fileLeftByUpload,
   leftOutNote,
@@ -57,7 +59,7 @@ import {
 } from './slack-adapter.js';
 import { toolDefinitions } from './tools.js';
 import { withToolClasses } from './tool-classes.js';
-import { buildFeatureSets, buildServerCapabilities, featureSetForTool, MESSAGING_FEATURE_SET } from './feature-sets.js';
+import { buildFeatureSets, buildServerCapabilities, featureSetForTool, MESSAGING_FEATURE_SET, TYPING_FEATURE_SET } from './feature-sets.js';
 import { ChannelManager, mcplChannelId, parseMcplChannelId, toDescriptor } from './channels.js';
 import { StateTracker, type UploadedFile } from './state.js';
 import { CapabilityGrant } from './grant.js';
@@ -223,6 +225,8 @@ export class SlackMcplServer {
    *  here — a publish goes into the last incoming message's thread, or
    *  top-level when the conversation isn't threaded. */
   private lastIncomingThreadTs = new Map<string, string | undefined>();
+  /** Latest accepted addressed thread, retained across typing stops until answered or aged out. */
+  private lastIncomingRoot = new Map<string, { ts: string; at: number; lastStart?: number }>();
 
   /** The conversation this peer was last sent a message from, or the bot last
    *  posted in: an incoming message from any other conversation names its
@@ -284,6 +288,7 @@ export class SlackMcplServer {
     this.readOnlyNoted.clear();
     this.forwardedWatermark.clear();
     this.lastIncomingThreadTs.clear();
+    this.lastIncomingRoot.clear();
     this.lastChannelId = null;
     this.forwarding.clear();
 
@@ -321,10 +326,12 @@ export class SlackMcplServer {
         console.error('[slack-mcpl] Connection error:', err);
       }
     } finally {
+      this.conn = null;
       // A failed handshake ends here too: close the connection, so a TCP
       // client isn't left on a socket nobody serves.
-      this.conn = null;
       conn.close();
+      this.lastIncomingRoot.clear();
+      void this.slack.resetThreadStatuses();
     }
   }
 
@@ -402,6 +409,19 @@ export class SlackMcplServer {
     }
   }
 
+  private applyFeatureSetsUpdate(params: FeatureSetsUpdateParams, form: 'request' | 'notification') {
+    const wasTyping = this.grant.isFeatureSetActive(TYPING_FEATURE_SET);
+    try {
+      return this.grant.apply(params, form);
+    } finally {
+      // Reductions (including a malformed policy's fail-closed grant) retire
+      // queued starts and clear owned statuses, without forgetting refusals.
+      if (wasTyping && !this.grant.isFeatureSetActive(TYPING_FEATURE_SET)) {
+        void outsideCallTime(() => this.slack.clearThreadStatuses());
+      }
+    }
+  }
+
   // ── Request Dispatch ──
 
   private async handleRequest(req: JsonRpcRequest): Promise<void> {
@@ -436,7 +456,7 @@ export class SlackMcplServer {
           // establish a ready state (§5.3).
           this.requireMcpl();
           const couldRegister = this.grant.has('channels.register');
-          const receipt = this.grant.apply(params as unknown as FeatureSetsUpdateParams, 'request');
+          const receipt = this.applyFeatureSetsUpdate(params as unknown as FeatureSetsUpdateParams, 'request');
           conn.sendResponse(req.id, receipt);
           // channels/register needs the channels.register capability. Register
           // when the grant first allows it, and again if a later policy turns
@@ -569,7 +589,7 @@ export class SlackMcplServer {
         // §6.7 Notification form: descriptive metadata only. Grant-bearing
         // updates (including the §5.3 initial policy) arrive as a Request.
         if (this.mcplEnabled) {
-          this.grant.apply(notif.params as unknown as FeatureSetsUpdateParams, 'notification');
+          this.applyFeatureSetsUpdate(notif.params as unknown as FeatureSetsUpdateParams, 'notification');
         }
         break;
       }
@@ -580,11 +600,32 @@ export class SlackMcplServer {
       case method.CHANNELS_OUTGOING_COMPLETE:
         break;
 
-      // Slack's Web API has no typing indicator for bots (the RTM one is
-      // deprecated), so typing notifications are accepted and ignored.
-      case 'channels/typing':
-      case 'notifications/typing':
+      case method.CHANNELS_TYPING:
+      case 'notifications/typing': {
+        if (!this.mcplEnabled) break;
+        const p = (notif.params ?? {}) as { channelId?: unknown; op?: unknown };
+        if (typeof p.channelId !== 'string') break;
+        const id = parseMcplChannelId(p.channelId)?.conversationId ?? p.channelId;
+        if (p.op === 'stop') {
+          const root = this.lastIncomingRoot.get(id);
+          if (root) root.lastStart = undefined;
+          void this.slack.setThreadStatus(id, undefined);
+          break;
+        }
+        if (!this.grant.isFeatureSetActive(TYPING_FEATURE_SET)) break;
+        let root = this.lastIncomingRoot.get(id);
+        const now = clock.now();
+        // Only a new run is age-capped; regular host refreshes must not clear
+        // a long-running turn. A stop or a refresh-interval gap ends a run.
+        const opensRun = root?.lastStart === undefined || now - root.lastStart > STATUS_REFRESH_MS;
+        if (root && opensRun && now - root.at >= ACK_TTL_MS) {
+          this.lastIncomingRoot.delete(id);
+          root = undefined;
+        }
+        if (root) root.lastStart = now;
+        void this.slack.setThreadStatus(id, root?.ts);
         break;
+      }
 
       default:
         // Ignore unknown notifications
@@ -1011,6 +1052,8 @@ export class SlackMcplServer {
 
   /** Record that the bot just sent to a conversation, for location headers. */
   private markOutbound(channelId: string): void {
+    this.lastIncomingRoot.delete(channelId);
+    void outsideCallTime(() => this.slack.setThreadStatus(channelId, undefined));
     this.lastChannelId = channelId;
   }
 
@@ -1806,6 +1849,10 @@ export class SlackMcplServer {
       // Acceptance records what this peer received, even if its grant changed.
       if (this.conn !== conn) return;
       this.lastIncomingThreadTs.set(msg.channelId, msg.threadTs);
+      if (isAddressed) {
+        if (msg.threadTs) this.lastIncomingRoot.set(msg.channelId, { ts: msg.threadTs, at: clock.now() });
+        else this.lastIncomingRoot.delete(msg.channelId);
+      }
       this.forwardedWatermark.set(msg.channelId, msg.id);
       if (noteReadOnly) this.readOnlyNoted.add(msg.channelId);
     };

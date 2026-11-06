@@ -79,3 +79,24 @@ test('each bad switch is refused with one line naming it and its value', () => {
     assert.deepEqual(started, { refusal: `${name} must be true or false, got ${JSON.stringify(raw)}` }, `${name}=${JSON.stringify(raw)}`);
   }
 });
+
+test('a SLACK_DM_USERS that names no user is refused with one line, DMs on or off, and an unset one is no whitelist', () => {
+  const tokens = { SLACK_BOT_TOKEN: 'xoxb-0-test', SLACK_APP_TOKEN: 'xapp-0-test' };
+  const cases: Array<Record<string, string>> = [
+    { SLACK_DM_USERS: '' },
+    { SLACK_DM_USERS: ' ' },
+    { SLACK_DM_USERS: ',' },
+    { SLACK_DM_USERS: ' , ,' },
+    { SLACK_DM_USERS: '', SLACK_DISABLE_DMS: 'true' },
+  ];
+  for (const vars of cases) {
+    assert.deepEqual(startupSettings(['--stdio'], { ...tokens, ...vars }), {
+      refusal:
+        'SLACK_DM_USERS is set but names no user; set it to the user IDs whose DMs it lets through, or unset it so it ' +
+        'filters none (SLACK_DISABLE_DMS=true drops every DM)',
+    }, JSON.stringify(vars));
+  }
+  const unset = startupSettings(['--stdio'], tokens);
+  assert.ok('settings' in unset, JSON.stringify(unset));
+  assert.equal(unset.settings.dmUsers, undefined);
+});

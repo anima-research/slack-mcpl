@@ -60,9 +60,9 @@ async function main(): Promise<void> {
       `DMs: ${disableDms ? 'off' : 'on'}`,
   );
 
-  // Take pending acknowledgement reactions off before exiting, for 5 s at
-  // most: a Slack request can take up to its 10-second timeout to fail, so a
-  // removal still waiting on Slack then is left on its message.
+  // Clear pending acknowledgement reactions and thread statuses before exiting,
+  // for 5 s at most: a Slack request can take up to its 10-second timeout to
+  // fail; unfinished reactions remain, and statuses last until Slack clears them.
   let stopping = false;
   const shutdown = () => {
     if (stopping) return;

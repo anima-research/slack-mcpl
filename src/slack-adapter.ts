@@ -12,8 +12,10 @@
  * reply/publish routing posts into the thread of the referenced message
  * (top-level when the conversation isn't threaded).
  *
- * No typing indicator: Slack's Web API exposes none for bots (RTM-only,
- * deprecated), so the server treats channels/typing as a no-op.
+ * Typing: Slack has no typing indicator for bots outside RTM. channels/typing
+ * is shown instead as a thread status ("is thinking…",
+ * assistant.threads.setStatus, which works in channels with chat:write since
+ * 2026-03) on an accepted addressed thread still waiting for an answer.
  *
  * Event handling salvaged from zulip-mcp PR #8's SlackAdapter.
  */
@@ -38,7 +40,7 @@ import {
 } from './content.js';
 
 /** An acknowledgement reaction is removed after this, replied to or not. */
-const ACK_TTL_MS = 10 * 60 * 1000;
+export const ACK_TTL_MS = 10 * 60 * 1000;
 /** A removal that failed in a way that can pass is tried again after this,
  *  up to ACK_MAX_TRIES tries in all. */
 const ACK_RETRY_MS = 60 * 1000;
@@ -47,6 +49,14 @@ const ACK_MAX_TRIES = 5;
  *  already_reacted, to an acknowledgement's add, and the failures the
  *  explainer calls an unknown outcome. */
 const MAY_HAVE_LANDED = new Set(['already_reacted', 'internal_error', 'fatal_error', 'service_unavailable', 'file_update_failed']);
+/** The host refreshes typing every few seconds; Slack keeps a thread status
+ *  for 2 minutes, so it is set again only after this. */
+export const STATUS_REFRESH_MS = 60 * 1000;
+const STATUS_TEXT = 'is thinking…';
+const STATUS_THREAD_REFUSALS = new Set(['invalid_thread_ts']);
+
+/** This adapter confirmed a DM or a conversation it cannot treat as a channel. */
+class ChannelOnlyRefusal extends Error {}
 
 /** Slack's code, when Slack refused the call; undefined for any other error,
  *  an answer with no code in Slack's form (SLACK_CODE) included. */
@@ -776,6 +786,9 @@ export interface SlackWebLike {
     add(args: { channel: string; timestamp: string; name: string }): Promise<unknown>;
     remove(args: { channel: string; timestamp: string; name: string }): Promise<unknown>;
   };
+  assistant?: {
+    threads: { setStatus(args: { channel_id: string; thread_ts: string; status: string }): Promise<unknown> };
+  };
   files: {
     getUploadURLExternal(args: { filename: string; length: number }): Promise<{ upload_url?: string; file_id?: string }>;
     completeUploadExternal(args: Record<string, unknown>): Promise<{ files?: SlackUploadedFile[] }>;
@@ -884,10 +897,10 @@ export class SlackAdapter {
   }
 
   async stop(): Promise<void> {
-    // Best effort: take our reactions off before going away. A crash or kill
-    // cannot, and leaves them on Slack. No new ones while that runs.
+    // Best effort: clear reactions and statuses together before going away.
+    // index.ts gives shutdown five seconds; no new starts while that runs.
     this.stopping = true;
-    await Promise.all([...this.ackPending.keys()].map((c) => this.clearAck(c)));
+    await Promise.all([this.resetThreadStatuses(), ...[...this.ackPending.keys()].map((c) => this.clearAck(c))]);
     // A removal that failed just before stop() began has armed its retry, and
     // the clear above only joined it. Nothing is tried again after a stop.
     for (const [channelId, pending] of [...this.ackPending]) {
@@ -1116,8 +1129,8 @@ export class SlackAdapter {
   }
 
   // ── Acknowledgement reaction ──
-  // Slack has no typing indicator for bots, so "received" is shown as a
-  // reaction on the message that addressed the bot, removed at the bot's next
+  // Independently of typing, "received" is shown as a reaction on the message
+  // that addressed the bot, removed at the bot's next
   // post in that conversation that Slack confirms, or after ACK_TTL_MS,
   // whichever comes first.
 
@@ -1155,6 +1168,96 @@ export class SlackAdapter {
     clearTimeout(entry.timer);
     pending.delete(ts);
     if (pending.size === 0) this.ackPending.delete(channelId);
+  }
+
+  private statusOn = new Map<string, { ts: string; at: number }>();
+  private statusQueue = new Map<string, Promise<void>>();
+  private statusRefused = new Set<string>();
+  private statusEpoch = 0;
+
+  private statusRefusedFor(channelId: string, threadTs: string): boolean {
+    return this.statusRefused.has(channelId) || this.statusRefused.has(`${channelId} ${threadTs}`);
+  }
+
+  /** Best effort, only in writable conversations. Undefined explicitly clears. */
+  setThreadStatus(channelId: string, threadTs: string | undefined): Promise<void> {
+    const epoch = this.statusEpoch;
+    const turn = (this.statusQueue.get(channelId) ?? Promise.resolve()).then(async () => {
+      if (threadTs && (this.stopping || epoch !== this.statusEpoch || this.statusRefused.has(channelId))) return;
+      const cur = this.statusOn.get(channelId);
+      if (threadTs && cur?.ts === threadTs && clock.now() - cur.at < STATUS_REFRESH_MS) return;
+      if (cur && cur.ts !== threadTs) {
+        await this.callStatus(channelId, cur.ts, '');
+        this.statusOn.delete(channelId);
+      }
+      if (!threadTs || !this.canWrite(channelId) || !this.web.assistant || this.statusRefusedFor(channelId, threadTs)) return;
+      try {
+        await this.assertNotDm(channelId, 'No thread status was set');
+      } catch (err) {
+        // Only confirmed policy refusals or Slack's lasting original answer
+        // suppress later starts. A code-less client failure may pass next time.
+        const lasting = err instanceof ChannelOnlyRefusal || (err instanceof Error && refusedForGood(err.cause));
+        if (epoch === this.statusEpoch && lasting) {
+          this.statusRefused.add(channelId);
+        }
+        console.error(`[slack-mcpl] thread status on ${channelId} refused:`, err instanceof Error ? err.message : err);
+        return;
+      }
+      if (this.stopping || epoch !== this.statusEpoch) return;
+      const entry = { ts: threadTs, at: clock.now() };
+      this.statusOn.set(channelId, entry);
+      const outcome = await this.callStatus(channelId, threadTs, STATUS_TEXT);
+      if (outcome !== 'ok') {
+        if (outcome === 'refused') this.statusOn.delete(channelId);
+        else entry.at = -Infinity;
+      }
+    }).catch((err: unknown) => {
+      try { console.error(`[slack-mcpl] thread status on ${channelId} failed:`, err); } catch { /* best effort */ }
+    });
+    this.statusQueue.set(channelId, turn);
+    void turn.then(() => { if (this.statusQueue.get(channelId) === turn) this.statusQueue.delete(channelId); });
+    return turn;
+  }
+
+  /** A peer change also releases lasting refusals. */
+  async resetThreadStatuses(): Promise<void> {
+    this.statusRefused.clear();
+    await this.clearThreadStatuses();
+  }
+
+  /** Retire queued starts and clear owned statuses without releasing refusals. */
+  async clearThreadStatuses(): Promise<void> {
+    this.statusEpoch++;
+    const channels = new Set([...this.statusQueue.keys(), ...this.statusOn.keys()]);
+    await Promise.all([...channels].map((id) => this.setThreadStatus(id, undefined)));
+  }
+
+  private async callStatus(channelId: string, threadTs: string, status: string): Promise<'ok' | 'refused' | 'uncertain'> {
+    if (!this.web.assistant) return 'uncertain';
+    const epoch = this.statusEpoch;
+    try {
+      // The policy stack is optional on this branch. When composed with it,
+      // authorize every effect (including clears) using its fresh write gate.
+      const policy = this as unknown as {
+        readonly hasAccessPolicy?: boolean;
+        requireWritableConversation(id: string, scope: string, notDone: string): Promise<unknown>;
+      };
+      if (policy.hasAccessPolicy) {
+        await policy.requireWritableConversation(channelId, 'chat:write', 'No thread status was set');
+        if (status && (this.stopping || epoch !== this.statusEpoch)) return 'uncertain';
+      }
+      await this.web.assistant.threads.setStatus({ channel_id: channelId, thread_ts: threadTs, status });
+      return 'ok';
+    } catch (err) {
+      if (!this.statusRefusedFor(channelId, threadTs)) {
+        console.error(`[slack-mcpl] thread status on ${channelId} failed:`, err instanceof Error ? err.message : err);
+      }
+      const refused = refusedForGood(err);
+      if (status && epoch === this.statusEpoch && refused) {
+        this.statusRefused.add(STATUS_THREAD_REFUSALS.has(slackRefusal(err) ?? '') ? `${channelId} ${threadTs}` : channelId);
+      }
+      return refused ? 'refused' : 'uncertain';
+    }
   }
 
   /** Mark an addressed message as received. Best-effort: never throws. */
@@ -1381,7 +1484,7 @@ export class SlackAdapter {
   private async assertNotDm(channelId: string, notDone: string): Promise<void> {
     if (!this.disableDms || this.channelIds.has(channelId)) return;
     const refuse = (why: string) =>
-      new Error(
+      new ChannelOnlyRefusal(
         `${notDone}: ${channelId} ${why}, and this bot works only in channels here, since direct messages are ` +
           'turned off. list_channels shows the ones it can use.',
       );
@@ -1401,6 +1504,7 @@ export class SlackAdapter {
       throw new Error(
         `${notDone}: Slack couldn't confirm ${channelId} is a channel (${why}), and with direct messages turned ` +
           `off, this bot works only in conversations Slack confirms are channels. ${afterFailedCheck(err)}`,
+        { cause: err },
       );
     }
     if (!this.channelIds.has(channelId)) throw refuse("isn't a channel");
@@ -1738,7 +1842,7 @@ export class SlackAdapter {
     const isDM = event.channel_type === 'im' || event.channel.startsWith('D');
     // Only what Slack marks as a channel gets through, not merely what isn't marked a DM.
     if (this.disableDms && event.channel_type !== 'channel' && event.channel_type !== 'group') return;
-    if (isDM && this.dmUsers && this.dmUsers.length > 0 && !this.dmUsers.includes(event.user)) {
+    if (isDM && this.dmUsers && !this.dmUsers.includes(event.user)) {
       return; // DM whitelist active and this sender isn't on it
     }
 
