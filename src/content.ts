@@ -7,6 +7,7 @@
  * Salvaged from zulip-mcp PR #8 (multi-platform branch), Slack halves only.
  */
 
+import { mapSlackAngles } from './slack-angle.js';
 import { channelShown, mimeShown, nameShown } from './framing.js';
 
 // Anthropic refuses images larger than this; mirror their cap server-side
@@ -222,14 +223,6 @@ export function classifyExtension(name: string): { mimeType: string; isImage: bo
   return { mimeType: 'application/octet-stream', isImage: false };
 }
 
-// Slack user/channel IDs are documented as uppercase alphanumerics. Single
-// source of truth for every mention regex below — if Slack ever widens the
-// ID alphabet, this is the only line to change. Fresh RegExp per use: 'g'
-// regexes carry lastIndex state and must not be shared between callers.
-const SLACK_ID = '[A-Z0-9]+';
-const slackUserMentionRe = () => new RegExp(`<@(${SLACK_ID})(?:\\|([^>]*))?>`, 'g');
-const slackChannelMentionRe = () => new RegExp(`<#(${SLACK_ID})(?:\\|([^>]*))?>`, 'g');
-
 // Slack message text uses mrkdwn escapes: <@U123> user mentions,
 // <#C123|name> channel mentions, <!here>/<!channel> broadcasts, and
 // <url|label> links. Rewrite them into a readable shape
@@ -237,28 +230,23 @@ const slackChannelMentionRe = () => new RegExp(`<#(${SLACK_ID})(?:\\|([^>]*))?>`
 // resolving user IDs via the provided map (best-effort: an unresolved ID shows
 // the label Slack sent with it, else the raw ID).
 export function formatSlackText(text: string, userNames: Map<string, string>): string {
-  let formatted = text;
-
-  // User mentions: <@U123> or <@U123|fallback>. The name goes in with its `&`
-  // escaped as Slack escapes it, so the unescape below gives it back as it is.
-  formatted = formatted.replace(slackUserMentionRe(), (_m, id: string, fallback?: string) => {
-    const name = userNames.get(id) || (fallback && unescapeSlack(fallback)) || id;
-    return `@${nameShown(name).replace(/&/g, '&amp;')} (uid:${id})`;
+  const formatted = mapSlackAngles(text, token => {
+    let match: RegExpExecArray | null;
+    if ((match = /^<@([A-Z0-9]+)(?:\|([^>]*))?>$/.exec(token))) {
+      const [, id, fallback] = match;
+      const name = userNames.get(id) || (fallback && unescapeSlack(fallback)) || id;
+      return `@${nameShown(name).replace(/&/g, '&amp;')} (uid:${id})`;
+    }
+    if ((match = /^<#([A-Z0-9]+)(?:\|([^>]*))?>$/.exec(token))) {
+      const [, id, name] = match;
+      return name ? channelShown(unescapeSlack(name)).replace(/&/g, '&amp;') : `#${id}`;
+    }
+    if ((match = /^<!(here|channel|everyone)(?:\|[^>]*)?>$/.exec(token))) return '@' + match[1];
+    if ((match = /^<(https?:\/\/[^|>]+)(?:\|([^>]*))?>$/.exec(token))) {
+      return match[2] === undefined ? match[1] : `${match[2]} (${match[1]})`;
+    }
+    return token;
   });
-
-  // Channel mentions: <#C123|name> or <#C123>. The label is whatever the
-  // poster sent, so it's shown by the name rule, as a user mention's name is.
-  formatted = formatted.replace(slackChannelMentionRe(), (_m, id: string, name?: string) => {
-    return name ? channelShown(unescapeSlack(name)).replace(/&/g, '&amp;') : `#${id}`;
-  });
-
-  // Broadcasts: <!here>, <!channel>, <!everyone>
-  formatted = formatted.replace(/<!(here|channel|everyone)(?:\|[^>]*)?>/g, '@$1');
-
-  // Links: <url|label> → label (url), <url> → url
-  formatted = formatted.replace(/<(https?:\/\/[^|>]+)\|([^>]*)>/g, '$2 ($1)');
-  formatted = formatted.replace(/<(https?:\/\/[^>]+)>/g, '$1');
-
   return unescapeSlack(formatted);
 }
 
@@ -277,9 +265,11 @@ export function reactionName(emoji: string): string {
 /** Extract user IDs referenced as <@U123> in Slack mrkdwn, for pre-resolution. */
 export function extractSlackUserIds(text: string): string[] {
   const ids = new Set<string>();
-  const re = slackUserMentionRe();
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(text)) !== null) ids.add(m[1]);
+  mapSlackAngles(text, token => {
+    const match = /^<@([A-Z0-9]+)(?:\|[^>]*)?>$/.exec(token);
+    if (match) ids.add(match[1]);
+    return token;
+  });
   return Array.from(ids);
 }
 
@@ -356,6 +346,7 @@ export async function resolveSlackUserNames(
 /** The fields of a conversations.history message the server reads —
  * structurally satisfied by @slack/web-api's MessageElement. */
 export interface SlackHistoryMessage {
+  client_msg_id?: string;
   attachments?: unknown;
   blocks?: unknown;
   ts?: string;

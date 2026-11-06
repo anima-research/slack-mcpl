@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { SlackAdapter, type SlackMessageData } from '../src/slack-adapter.js';
+import { formatSlackText } from '../src/content.js';
 
 // Exercise the public production entry points, not just the renderer.
 async function shaped(payload: Record<string, unknown>, bot = false) {
@@ -32,7 +33,14 @@ async function shaped(payload: Record<string, unknown>, bot = false) {
 }
 async function expectText(payload: Record<string, unknown>, expected: string, bot = false) {
   const result = await shaped(payload, bot);
-  assert.deepEqual(result.contents, [expected, expected, expected]);
+  const original = formatSlackText(typeof payload.text === 'string' ? payload.text : '', new Map([['U1', 'alice']]));
+  let backscroll = expected;
+  if (expected.length - original.length > 2000) {
+    let suffix = expected.slice(original.length, original.length + 2000 - '[…truncated]'.length);
+    if (/[\uD800-\uDBFF]$/.test(suffix)) suffix = suffix.slice(0, -1);
+    backscroll = original + suffix + '[…truncated]';
+  }
+  assert.deepEqual(result.contents, [expected, expected, backscroll]);
   if (bot) assert.equal(result.received.length, 0, 'existing live bot exclusion');
   else {
     assert.equal(result.received[0].cleanContent, expected);
@@ -59,7 +67,7 @@ test('blocks-only post: headers, sections, fields, context and rich text on ever
       { type: 'rich_text_preformatted', elements: [{ type: 'text', text: 'Code' }] },
     ] },
     { type: 'actions', elements: [{ text: { text: 'ignored' } }] },
-  ] }, 'Heading\n*Section*\nField\nContext\n@alice (uid:U1) #C1\nLink (https://example.com):wave:\nQuote\nCode');
+  ] }, 'Heading\n*Section*\nField\nContext\n@alice (uid:U1) #C1\n• Link (https://example.com):wave:\n> Quote\n```\nCode\n```');
 });
 
 test('identical fallback deduplicates with whitespace normalization, distinct body remains', async () => {
@@ -77,7 +85,7 @@ test('rich_text mirror stays byte-identical; distinct block still appended', asy
 
 test('malformed shapes are absent and nested cycles are bounded', async () => {
   const cycle: any = { type: 'rich_text_section' }; cycle.elements = [cycle];
-  await expectText({ text: 'Original', attachments: [null, 7, { fields: [null, { title: {}, value: [] }] }, { text: 'Valid' }], blocks: [null, { type: 'section', text: 7, fields: {} }, { type: 'rich_text', elements: [cycle] }] }, 'Original\nValid[…truncated]');
+  await expectText({ text: 'Original', attachments: [null, 7, { fields: [null, { title: {}, value: [] }] }, { text: 'Valid' }], blocks: [null, { type: 'section', text: 7, fields: {} }, { type: 'rich_text', elements: [cycle] }] }, 'Original\nValid[…truncated]', true);
   await expectText({ text: 'Original', attachments: {}, blocks: 'bad' }, 'Original');
 });
 
@@ -129,15 +137,15 @@ for (const shape of ['attachment', 'section', 'rich_text'] as const) {
         const body = prefix + '😀'.repeat(9000);
         const payload = shape === 'attachment' ? { attachments: [{ text: body }] }
           : shape === 'section' ? { blocks: [{ type: 'section', text: { type: 'mrkdwn', text: body } }] }
-          : { blocks: [{ type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [{ type: 'text', text: body }] }] }] };
+          : { attachments: [{ blocks: [{ type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [{ type: 'text', text: body }] }] }] }] };
         const result = await shaped({ text, ...payload });
-        for (const output of [...result.contents, result.received[0].content, result.received[0].cleanContent]) {
+        for (const [index, output] of [...result.contents, result.received[0].content, result.received[0].cleanContent].entries()) {
           // Runtime is Node 22; the project's TypeScript lib remains ES2022.
           assert.equal((output as string & { isWellFormed(): boolean }).isWellFormed(), true);
           assert.ok(output.startsWith(text));
           assert.ok(output.length <= text.length + 16384);
           const suffix = (text ? '\n' : '') + body;
-          let expected = suffix.slice(0, 16384 - '[…truncated]'.length);
+          let expected = suffix.slice(0, (index === 2 ? 2000 : 16384) - '[…truncated]'.length);
           if (/[\uD800-\uDBFF]$/.test(expected)) expected = expected.slice(0, -1);
           assert.equal(output, text + expected + '[…truncated]');
         }
@@ -222,7 +230,7 @@ test('review rich literal escapes cannot become mentions or entities', async () 
 });
 
 test('review shared bot mentions are display-only and raw text is preserved', async () => {
-  const live = await expectText({ text: 'Notification', attachments: [{ is_share: true, text: '<@UBOT>' }] }, 'Notification\n@alice (uid:UBOT)');
+  const live = await expectText({ text: 'Notification', attachments: [{ is_share: true, text: '<@UBOT>' }] }, 'Notification\n[shared message from unknown, unknown source]\n> @alice (uid:UBOT)');
   assert.deepEqual(live!.mentionIds, []);
   assert.equal(live!.mentionsBot, false);
   assert.equal(live!.rawContent, 'Notification');
@@ -234,11 +242,11 @@ test('review preview URLs compare exactly, Slack links normalize, shares survive
     { from_url: 'https://example.com/other', text: 'Skip' },
     { from_url: 'https://example.com/other', is_share: true, text: 'Shared' },
     { from_url: 'https://example.com/other', is_msg_unfurl: true, text: 'Message' },
-  ] }, 'Label (https://example.com/other)\nDetails\nShared\nMessage');
+  ] }, 'Label (https://example.com/other)\nDetails\n[shared message from unknown, unknown source]\n> Shared\n[shared message from unknown, unknown source]\n> Message');
 });
 
 test('review fresh display lookup uses the extracted rendered payload', async () => {
-  const live = await expectText({ text: '@U1 (uid:U1)', attachments: [{ text: '<@U1>' }, { text: '<@U2>' }] }, '@U1 (uid:U1)\n@alice (uid:U2)');
+  const live = await expectText({ text: '@U1 (uid:U1)', attachments: [{ text: '<@U1>' }, { text: '<@U2>' }] }, '@U1 (uid:U1)\n@alice (uid:U1)\n@alice (uid:U2)');
   assert.deepEqual(live!.mentionIds, []);
 });
 
@@ -259,7 +267,7 @@ test('review attachment nested blocks precede top-level blocks (documented order
   await expectText({ attachments: [{ blocks: [section('Nested')] }], blocks: [section('Top')] }, 'Nested\nTop');
 });
 
-test('review textContains searches delivered content on history and thread', async () => {
+test('review history textContains searches delivered content; thread returns unfiltered content', async () => {
   const row = { ts: '100.000001', text: 'Notification', blocks: [section('deployment failed')] };
   const adapter = new SlackAdapter({ conversations: {
     history: async () => ({ messages: [row] }), replies: async () => ({ messages: [row] }),
@@ -343,18 +351,18 @@ for (const [text, body] of [
   });
 }
 
-test('round 2 rich structure does not erase literal or unbalanced punctuation', async () => {
+test('R1-2 top-level rich comparison retains literal or unbalanced markers', async () => {
   for (const text of ['a_b', 'a*b', 'a~b', 'a`b', '*word', '_word', '~word']) {
     const body = text.replace(/[_*~`]/g, '');
-    const result = await shaped({ text, blocks: [richBlock(richSection(literal(body)))] });
-    assert.equal(result.received[0].content, text + '\n' + body);
+    const result = await shaped({ text, blocks: [richBlock(richSection(literal(body)))] }, true);
+    assert.equal(result.contents[0], text + '\n' + body);
   }
-  await expectText({ text: 'word', blocks: [richBlock(richSection(literal('*word*')))] }, 'word\n*word*');
+  await expectText({ text: 'word', blocks: [richBlock(richSection(literal('*word*')))] }, 'word\n*word*', true);
 });
 
-test('round 2 balanced bold italic mirror order works in both directions', async () => {
+test('round 5 bot rich emphasis order is not normalized', async () => {
   for (const text of ['*_word_*', '_*word*_']) {
-    const result = await shaped({ text, blocks: [richBlock(richSection({ ...literal('word'), style: { bold: true, italic: true } }))] });
-    assert.equal(result.received[0].content, text);
+    const result = await shaped({ text, blocks: [richBlock(richSection({ ...literal('word'), style: { bold: true, italic: true } }))] }, true);
+    assert.equal(result.contents[0], text === '_*word*_' ? text : text + '\n_*word*_');
   }
 });

@@ -182,8 +182,21 @@ export function backscrollBlock(
   const attrs: string[] = [];
   if (where.channelName && !where.isDM) attrs.push(`channel=${quotedLabel(`#${where.channelName}`)}`);
   if (where.isDM) attrs.push('dm="true"');
-  attrs.push(`count="${messages.length}"`);
-  return [`<backscroll ${attrs.join(' ')}>`, ...messages.map(backscrollLine), '</backscroll>'].join('\n');
+  // Reserve framing/marker space. Keep the newest context, in chronological order.
+  const maxBytes = 32_768;
+  let bytes = Buffer.byteLength(attrs.join(' ')) + 160;
+  const lines: string[] = [];
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const line = backscrollLine(messages[i]);
+    const size = Buffer.byteLength(line) + 1;
+    if (bytes + size > maxBytes) continue;
+    lines.push(line);
+    bytes += size;
+  }
+  const dropped = messages.length - lines.length;
+  attrs.push(`count="${lines.length}"`);
+  return [`<backscroll ${attrs.join(' ')}>`, ...lines.reverse(),
+    ...(dropped ? [`[${dropped} backscroll messages dropped]`] : []), '</backscroll>'].join('\n');
 }
 
 export class SlackMcplServer {
