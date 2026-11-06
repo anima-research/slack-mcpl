@@ -671,11 +671,20 @@ test('gate-first addReaction keeps automatic ACK separate from adoption', async 
 for (const alreadyPresent of [true, false]) {
   test(`redelivery after server adoption preserves ACK (${alreadyPresent ? 'already_reacted' : 'success'})`, async t => {
     t.mock.timers.enable({ apis: ['setTimeout'] });
-    let present = false;
+    const present = new Set<string>();
     const effects: string[] = [];
     const web = { reactions: {
-      add: async () => { effects.push('add'); if (present) throw refusal('already_reacted'); present = true; },
-      remove: async () => { effects.push('remove'); present = false; },
+      add: async ({ channel, timestamp }: { channel: string; timestamp: string }) => {
+        const key = `${channel}:${timestamp}`;
+        effects.push(`add:${key}`);
+        if (present.has(key)) throw refusal('already_reacted');
+        present.add(key);
+      },
+      remove: async ({ channel, timestamp }: { channel: string; timestamp: string }) => {
+        const key = `${channel}:${timestamp}`;
+        effects.push(`remove:${key}`);
+        present.delete(key);
+      },
     } } as unknown as SlackWebLike;
     const slack = new SlackAdapter(web, { on() {}, async start() {}, async disconnect() {} }, 'UBOT', 'test',
       undefined, undefined, false, 'eyes');
@@ -683,20 +692,23 @@ for (const alreadyPresent of [true, false]) {
     t.after(async () => { await h.close(); await slack.stop(); });
     await initialize(h, false);
     await slack.acknowledge('C1', '1.0');
-    if (!alreadyPresent) present = false;
+    if (!alreadyPresent) present.delete('C1:1.0');
     assert.notEqual((await call(h, 'add_reaction', args)).isError, true);
     await slack.acknowledge('C1', '1.0'); // Socket Mode redelivery
     await slack.clearAck('C1');
     t.mock.timers.tick(10 * 60 * 1000 - 1);
     await slack.acknowledge('C1', '1.0');
     await slack.clearAck('C1');
-    assert.equal(present, true, 'redelivery must not recreate automatic cleanup');
-    assert.deepEqual(effects, ['add', 'add']);
-    // Marker is short-lived, and scoped to both conversation and timestamp.
-    t.mock.timers.tick(1);
-    await slack.acknowledge('C1', '1.0');
+    assert.equal(present.has('C1:1.0'), true, 'redelivery must not recreate automatic cleanup');
+    assert.deepEqual(effects, ['add:C1:1.0', 'add:C1:1.0']);
+    // During the marker's lifetime, other conversations/messages still ACK.
     await slack.acknowledge('C2', '1.0');
     await slack.acknowledge('C1', '2.0');
-    assert.deepEqual(effects, ['add', 'add', 'add', 'add', 'add']);
+    assert.deepEqual(effects, ['add:C1:1.0', 'add:C1:1.0', 'add:C2:1.0', 'add:C1:2.0']);
+    // The marker itself is short-lived.
+    t.mock.timers.tick(1);
+    await slack.acknowledge('C1', '1.0');
+    assert.equal(effects.at(-1), 'add:C1:1.0');
+    assert.equal(effects.length, 5);
   });
 }
