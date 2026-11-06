@@ -887,6 +887,10 @@ export class SlackAdapter {
     // Best effort: take our reactions off before going away. A crash or kill
     // cannot, and leaves them on Slack. No new ones while that runs.
     this.stopping = true;
+    for (const adopted of this.ackAdopted.values()) {
+      for (const timer of adopted.values()) clearTimeout(timer);
+    }
+    this.ackAdopted.clear();
     await Promise.all([...this.ackPending.keys()].map((c) => this.clearAck(c)));
     // A removal that failed just before stop() began has armed its retry, and
     // the clear above only joined it. Nothing is tried again after a stop.
@@ -1120,6 +1124,22 @@ export class SlackAdapter {
    *  removal never overtakes an add Slack has answered. An add whose request
    *  timed out can still reach Slack after the removal. */
   private ackPending = new Map<string, Map<string, AckEntry>>();
+  // Keep redelivery from turning an adopted reaction back into automatic ACK
+  // cleanup. Markers expire independently of the retired pending entry.
+  private ackAdopted = new Map<string, Map<string, ReturnType<typeof setTimeout>>>();
+
+  private adoptAck(channelId: string, ts: string, entry: AckEntry): void {
+    this.dropAck(channelId, ts, entry);
+    let adopted = this.ackAdopted.get(channelId);
+    if (!adopted) this.ackAdopted.set(channelId, (adopted = new Map()));
+    clearTimeout(adopted.get(ts));
+    const timer = setTimeout(() => {
+      adopted.delete(ts);
+      if (adopted.size === 0) this.ackAdopted.delete(channelId);
+    }, ACK_TTL_MS);
+    timer.unref?.();
+    adopted.set(ts, timer);
+  }
 
   private armAck(channelId: string, ts: string, ms: number): ReturnType<typeof setTimeout> {
     const timer = setTimeout(() => void this.clearAck(channelId, ts), ms);
@@ -1139,7 +1159,7 @@ export class SlackAdapter {
   /** Mark an addressed message as received. Best-effort: never throws. */
   async acknowledge(channelId: string, ts: string): Promise<void> {
     if (!this.ackReaction || this.stopping) return;
-    if (this.ackPending.get(channelId)?.has(ts)) return; // Slack delivered the event twice
+    if (this.ackPending.get(channelId)?.has(ts) || this.ackAdopted.get(channelId)?.has(ts)) return; // redelivery
     const added = this.addReaction(channelId, ts, this.ackReaction, { automatic: true }).then(
       () => true,
       // The add counts as there, and is removed like an added one, when it may
@@ -1461,10 +1481,10 @@ export class SlackAdapter {
       if (entry && policy.hasAccessPolicy) await policy.requireWritableConversation(channelId, 'reactions:write', 'No reaction was added');
       try {
         await this.web.reactions.add({ channel: channelId, timestamp: ts, name });
-        if (entry) this.dropAck(channelId, ts, entry);
+        if (entry) this.adoptAck(channelId, ts, entry);
       } catch (err) {
         // Slack confirmed the agent's desired reaction is already present.
-        if (entry && slackRefusal(err) === 'already_reacted') this.dropAck(channelId, ts, entry);
+        if (entry && slackRefusal(err) === 'already_reacted') this.adoptAck(channelId, ts, entry);
         throw err;
       }
     };
