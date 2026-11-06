@@ -98,6 +98,7 @@ const CALLS: Array<[tool: string, lead: string, writes: boolean]> = [
   ['edit_message', "The message wasn't changed", true],
   ['delete_message', 'Nothing was deleted', true],
   ['add_reaction', 'No reaction was added', true],
+  ['remove_reaction', 'No reaction was removed', true],
   ['fetch_history', 'No messages were returned', false],
   ['fetch_thread', 'No messages were returned', false],
   ['list_channels', 'Nothing was listed', false],

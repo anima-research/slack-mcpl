@@ -39,6 +39,7 @@ export const TOOL_CLASSES: Record<string, readonly ToolClass[]> = {
   reply_message: ['comms'],
   send_dm: ['comms'],
   add_reaction: ['comms'],
+  remove_reaction: ['comms'],
   edit_message: ['comms'],
   delete_message: ['comms'],
   fetch_history: ['comms'],
