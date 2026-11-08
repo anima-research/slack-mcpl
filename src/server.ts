@@ -182,21 +182,36 @@ export function backscrollBlock(
   const attrs: string[] = [];
   if (where.channelName && !where.isDM) attrs.push(`channel=${quotedLabel(`#${where.channelName}`)}`);
   if (where.isDM) attrs.push('dm="true"');
-  // Reserve framing/marker space. Keep the newest context, in chronological order.
+  // Keep a contiguous newest window. An oversized body gets an in-position
+  // placeholder rather than a silent gap; if even that cannot fit, summarize
+  // the older prefix. Both forms count against the same hard byte budget.
   const maxBytes = 32_768;
-  let bytes = Buffer.byteLength(attrs.join(' ')) + 160;
   const lines: string[] = [];
+  const summary = (count: number, before?: string) =>
+    `[${count} older backscroll ${count === 1 ? 'message' : 'messages'} not shown; fetch_history${before ? ' before ' + before : ''} has ${count === 1 ? 'it' : 'them'}]`;
+  const frame = (count: number) => `<backscroll ${[...attrs, `count="${count}"`].join(' ')}>\n\n</backscroll>`;
+  let bytes = 0;
+  let oldest = messages.length;
   for (let i = messages.length - 1; i >= 0; i--) {
-    const line = backscrollLine(messages[i]);
-    const size = Buffer.byteLength(line) + 1;
-    if (bytes + size > maxBytes) continue;
-    lines.push(line);
-    bytes += size;
+    const message = messages[i];
+    const line = backscrollLine(message);
+    const size = Buffer.byteLength(line);
+    const reserved = Buffer.byteLength(frame(lines.length + 1)) +
+      (i ? Buffer.byteLength(summary(i, message.id)) + 1 : 0);
+    let shown = line;
+    if (bytes + size + 1 + reserved > maxBytes) {
+      shown = backscrollLine({...message, attachments: [], content: `message omitted (${size} bytes); fetch_history has it`});
+    }
+    const shownBytes = Buffer.byteLength(shown) + 1;
+    if (bytes + shownBytes + reserved > maxBytes) break;
+    lines.push(shown);
+    bytes += shownBytes;
+    oldest = i;
   }
-  const dropped = messages.length - lines.length;
   attrs.push(`count="${lines.length}"`);
-  return [`<backscroll ${attrs.join(' ')}>`, ...lines.reverse(),
-    ...(dropped ? [`[${dropped} backscroll messages dropped]`] : []), '</backscroll>'].join('\n');
+  return [`<backscroll ${attrs.join(' ')}>`,
+    ...(oldest ? [summary(oldest, messages[oldest]?.id)] : []),
+    ...lines.reverse(), '</backscroll>'].join('\n');
 }
 
 export class SlackMcplServer {

@@ -354,47 +354,47 @@ native search or interaction-token handling are included.
 ### Readable message payloads
 
 History, threads, backscroll and human live messages keep Slack's original
-`text` first. Bot and integration posts are **not delivered live**; their bodies
-are available through `fetch_history`, `fetch_thread` and backscroll. (Opt-in
-live bot delivery is proposed separately in #66.)
+`text` first. Posts that carry `bot_id` are **not delivered live**; their bodies
+are available through `fetch_history`, `fetch_thread` and backscroll.
 
 In order, append each classic attachment's readable body (pretext, title with
 link, text, fields as `title: value`, else fallback), then that attachment's nested blocks, then top-level blocks.
-Structured nested blocks take precedence over fallback. Shares (`is_share` or
+Readable nested blocks take precedence over fallback; omission placeholders do
+not suppress fallback and are appended after readable content. Shares (`is_share` or
 `is_msg_unfurl`) have a `[shared message from NAME (uid:ID), SOURCE]` header
 and `> `-prefixed lines; other attachments with `author_name` are attributed too.
 Unknown share authors/sources are marked unknown. Header fields are single-line,
-control-safe, bracket/HTML-escaped and capped at 100 encoded characters each.
+control-safe and use the same quoted name/channel rule as sender framing,
+with each input capped at 100 UTF-16 code units before quoting.
 Every logical body line is quoted, including CR, LF, CRLF, U+2028/U+2029, NEL,
 VT and FF breaks (the same set used by sender framing).
 
 Header, section, context, rich_text, markdown, alert, card, video and table text
 are supported. Rich lists retain indentation/offsets, quotes and code retain
 structure, and links/mentions retain styles. Image/interactive controls are
-ignored; other unsupported block types have an `[TYPE omitted]` placeholder.
+ignored (`image`, `actions`, `input`, `divider` and `file`; files are reported
+separately); other unsupported block types have an `[TYPE omitted]` placeholder.
 Literal plain text, rich text, link labels and date fallbacks are escaped.
+Classic titles, field titles and fallback are always literal; pretext, text and
+field values use mrkdwn only when opted in through `mrkdwn_in`.
 
 #### Limits
 
-When `text` is non-empty and `client_msg_id` is present or `bot_id` is absent,
+When `text` is non-empty and either `client_msg_id` is present or all of
+`bot_id`, `app_id` and `bot_profile` are absent,
 **top-level human `rich_text` is not rendered**: it is treated as the client's
-mirror, without comparison, stripping or signatures. Even a differing rich block
-is ignored. Other block types and attachment-nested rich text still render.
+mirror. Even a differing rich block is ignored. Other block types and attachment-nested rich text still render.
 Blocks-only messages still render rich text, including an app posting as a user
-with only blocks. Bot/integration messages with `bot_id` and no `client_msg_id`
-also retain rich text.
+with only blocks. Bot/integration messages carrying `bot_id`, `app_id` or
+`bot_profile`, without `client_msg_id`, also retain rich text.
 
 All rendered supplemental units use plain per-unit dedup against original text
 and earlier units: normalize prose whitespace and Slack encodings, compare
 channel/user IDs rather than labels, and preserve whitespace in backtick spans.
-There is no rich-text equivalence, emphasis stripping or fence normalization.
 This is display dedup, not typed equality: a link and identical rendered literal
 may collapse, while differing markup may appear twice for bots/integrations.
-Tests cover reconstructed client-shaped nested lists, code between paragraphs
-and bold links (not live captures), plus collision pairs through live, channel
-history, thread history and startup backscroll conversion.
-Angle tokens use a bounded linear scan: unclosed tokens and tokens longer than
-1,000 characters remain literal. Original text is unchanged.
+Angle tokens use a linear scan; unclosed tokens remain literal. The original
+Slack text is preserved in raw metadata, while display text is formatted.
 
 Only original Slack text creates mentions, addressing, wake or auto-subscription.
 Quoted/shared/block mentions are display content only. Name resolution includes
@@ -409,14 +409,19 @@ skipped when `from_url` matches an extracted original URL, decoding Slack entiti
 and trimming trailing sentence punctuation from bare URLs. Labelled Slack URL
 targets are compared exactly.
 
-The supplemental suffix cap is **pre-formatting**: 16,384 UTF-16 units including
+The supplemental suffix cap is **pre-formatting**: 16,384 UTF-16 code units including
 separator and a single final `[…truncated]` marker. It does **not** bound delivered
 size: names and formatting may expand it. Traversal (2,000 nodes) and nesting
 (12 levels) also carry that marker; cuts preserve code points. Original text is
-never truncated. Backscroll uses a lower **2,000-character supplemental cap per
+never truncated. Backscroll uses a lower **2,000 UTF-16 code unit supplemental cap per
 message**, and the framed backscroll block has an overall **32 KiB byte budget**.
-It keeps newest fitting lines and reports `[N backscroll messages dropped]` when
-older/oversized lines are omitted. Use the bounded history/thread tools for details.
+It keeps a contiguous newest window. Oversized messages inside it get an
+in-position placeholder with timestamp, ID, author and framed byte size saying
+`fetch_history has it`. If even a placeholder cannot fit, one leading line
+counts the older messages not shown and names the oldest shown ID for
+`fetch_history before`. Placeholders, this summary and framing all count against
+the byte budget. This preserves a fetchable position instead of leaving silent
+gaps. Use the bounded history/thread tools for details.
 
 ## Environment
 
@@ -432,7 +437,7 @@ Switches take `true`/`false` (also `1`/`0`, `yes`/`no`); any other value stops t
 | `SLACK_DISABLE_DMS` | no | `true` drops incoming DMs and group DMs, refuses every write to them and both history reads on them, and leaves them out of `conversations.list`, so they are neither listed nor registered; `send_dm` is not offered. Only a conversation Slack confirms as a channel passes: a group DM ID looks like a channel ID, and a user ID posts into that user's DM. An unknown ID is asked about until Slack confirms it. One Slack won't describe is refused; when the question can't be answered just now (a rate limit, a failure on the way or on Slack's side, or too little of the call's time), nothing is written, and the error says why and that the call can be made again. Incoming events pass only when Slack marks them `channel` or `group`. Takes `true` or `false` (also `1`/`0`, `yes`/`no`); unset is off, and any other value, empty included, stops startup |
 | `SLACK_ACK_REACTION` | no | Emoji name (e.g. `eyes`) put on a message that addresses the bot. It means "received": it is removed at the bot's next post in that conversation that Slack confirms, after 10 minutes, or at once if the host does not accept the message. A removal that fails in a way that can pass (a rate limit, an HTTP error, a network failure, or Slack's own failure such as `internal_error`) is tried again every minute, up to 5 tries in all; one Slack refuses is dropped. An add that fails isn't tried again. One that may have landed is removed as usual: `already_reacted` says it's there, and Slack's failure while handling it (`internal_error`, `fatal_error`, `service_unavailable`), an HTTP error, an answer not in Slack's form or one the client can't read, or a failure in transit after the request may have reached Slack leaves it unknown. One Slack refused, rate-limited or received only in part (`request_timeout`), one whose connection was never made, and one this server refused itself, such as outside `SLACK_SEND_CHANNELS`, isn't there. On SIGTERM, SIGINT or the host closing stdin, pending reactions are removed (5 s at most); a crash cannot, so removal is best-effort. For a typing signal see **Typing** above. |
 | `SLACK_SUBSCRIPTIONS_FILE` | no | JSON file persisting ambient subscriptions across restarts: an array of IDs, or `{subscribed, muted}` while anything is muted (older versions read the object form as empty) |
-| `SLACK_BACKSCROLL_LIMIT` | no | Messages fetched on first interaction with a conversation (default 50) |
+| `SLACK_BACKSCROLL_LIMIT` | no | Messages fetched on first interaction with a conversation (default 50, max 1,000); shown in a newest contiguous window within 32 KiB including framing, in-position omission placeholders and a leading summary for older messages that cannot fit |
 | `SLACK_MCPL_DEBUG_LOG` | no | Absolute path for a diagnostic file log |
 
 ## Tests

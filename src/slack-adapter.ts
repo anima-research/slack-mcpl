@@ -1601,7 +1601,7 @@ export class SlackAdapter {
   private async shapeHistory(messages: SlackHistoryMessage[], maxAppend = MAX_MESSAGE_TEXT_APPEND): Promise<HistoryMessage[]> {
     // Pre-resolve author + mentioned user names in one pass.
     const ids = new Set<string>();
-    const texts = messages.map(msg => renderMessageText(msg, new Map(), maxAppend));
+    const texts = messages.map(msg => renderMessageText(msg, maxAppend));
     for (const [index, msg] of messages.entries()) {
       if (msg.user) ids.add(msg.user);
       for (const id of displayMentionIds(msg.text ?? '', texts[index])) ids.add(id);
