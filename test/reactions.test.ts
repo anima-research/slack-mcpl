@@ -668,47 +668,78 @@ test('gate-first addReaction keeps automatic ACK separate from adoption', async 
   assert.deepEqual(f.calls, ['add', 'remove:1.0:eyes']);
 });
 
-for (const alreadyPresent of [true, false]) {
-  test(`redelivery after server adoption preserves ACK (${alreadyPresent ? 'already_reacted' : 'success'})`, async t => {
-    t.mock.timers.enable({ apis: ['setTimeout'] });
-    const present = new Set<string>();
-    const effects: string[] = [];
-    const web = { reactions: {
-      add: async ({ channel, timestamp }: { channel: string; timestamp: string }) => {
-        const key = `${channel}:${timestamp}`;
-        effects.push(`add:${key}`);
-        if (present.has(key)) throw refusal('already_reacted');
-        present.add(key);
-      },
-      remove: async ({ channel, timestamp }: { channel: string; timestamp: string }) => {
-        const key = `${channel}:${timestamp}`;
-        effects.push(`remove:${key}`);
-        present.delete(key);
-      },
-    } } as unknown as SlackWebLike;
+for (const cleanupFirst of [false, true]) {
+  for (const alreadyPresent of [true, false]) {
+    test(`redelivery after server adoption preserves ACK${cleanupFirst ? ' after cleanup' : ''} (${alreadyPresent ? 'already_reacted' : 'success'})`, async t => {
+      t.mock.timers.enable({ apis: ['setTimeout'] });
+      const present = new Set<string>();
+      const effects: string[] = [];
+      const web = { reactions: {
+        add: async ({ channel, timestamp }: { channel: string; timestamp: string }) => {
+          const key = `${channel}:${timestamp}`;
+          effects.push(`add:${key}`);
+          if (present.has(key)) throw refusal('already_reacted');
+          present.add(key);
+        },
+        remove: async ({ channel, timestamp }: { channel: string; timestamp: string }) => {
+          const key = `${channel}:${timestamp}`;
+          effects.push(`remove:${key}`);
+          present.delete(key);
+        },
+      } } as unknown as SlackWebLike;
+      const slack = new SlackAdapter(web, { on() {}, async start() {}, async disconnect() {} }, 'UBOT', 'test',
+        undefined, undefined, false, 'eyes');
+      const h = connectHost(new SlackMcplServer(slack));
+      t.after(async () => { await h.close(); await slack.stop(); });
+      await initialize(h, false);
+      await slack.acknowledge('C1', '1.0');
+      if (cleanupFirst) await slack.clearAck('C1');
+      // The already_reacted variant models an own reaction restored by another client.
+      if (alreadyPresent) present.add('C1:1.0');
+      else present.delete('C1:1.0');
+      const result = await call(h, 'add_reaction', args);
+      assert.notEqual(result.isError, true);
+      if (!alreadyPresent) assert.equal(result.content[0]!.text, 'Reaction added');
+      await slack.acknowledge('C1', '1.0'); // Socket Mode redelivery
+      await slack.clearAck('C1');
+      t.mock.timers.tick(10 * 60 * 1000 - 1);
+      await slack.acknowledge('C1', '1.0');
+      await slack.clearAck('C1');
+      assert.equal(present.has('C1:1.0'), true, 'redelivery must not recreate automatic cleanup');
+      const adoptionEffects = ['add:C1:1.0', ...(cleanupFirst ? ['remove:C1:1.0'] : []), 'add:C1:1.0'];
+      assert.deepEqual(effects, adoptionEffects);
+      // During the marker's lifetime, other conversations/messages still ACK.
+      await slack.acknowledge('C2', '1.0');
+      await slack.acknowledge('C1', '2.0');
+      assert.deepEqual(effects, [...adoptionEffects, 'add:C2:1.0', 'add:C1:2.0']);
+      // The marker itself is short-lived.
+      t.mock.timers.tick(1);
+      await slack.acknowledge('C1', '1.0');
+      assert.equal(effects.at(-1), 'add:C1:1.0');
+      assert.equal(effects.length, adoptionEffects.length + 3);
+    });
+  }
+}
+
+for (const alreadyPresent of [false, true]) {
+  test(`late adapter adoption after stop does not arm a marker (${alreadyPresent ? 'already_reacted' : 'success'})`, async t => {
+    let release!: () => void;
+    const web = { reactions: { add: async () => {
+      await new Promise<void>(resolve => { release = resolve; });
+      if (alreadyPresent) throw refusal('already_reacted');
+    } } } as unknown as SlackWebLike;
     const slack = new SlackAdapter(web, { on() {}, async start() {}, async disconnect() {} }, 'UBOT', 'test',
       undefined, undefined, false, 'eyes');
-    const h = connectHost(new SlackMcplServer(slack));
-    t.after(async () => { await h.close(); await slack.stop(); });
-    await initialize(h, false);
-    await slack.acknowledge('C1', '1.0');
-    if (!alreadyPresent) present.delete('C1:1.0');
-    assert.notEqual((await call(h, 'add_reaction', args)).isError, true);
-    await slack.acknowledge('C1', '1.0'); // Socket Mode redelivery
-    await slack.clearAck('C1');
-    t.mock.timers.tick(10 * 60 * 1000 - 1);
-    await slack.acknowledge('C1', '1.0');
-    await slack.clearAck('C1');
-    assert.equal(present.has('C1:1.0'), true, 'redelivery must not recreate automatic cleanup');
-    assert.deepEqual(effects, ['add:C1:1.0', 'add:C1:1.0']);
-    // During the marker's lifetime, other conversations/messages still ACK.
-    await slack.acknowledge('C2', '1.0');
-    await slack.acknowledge('C1', '2.0');
-    assert.deepEqual(effects, ['add:C1:1.0', 'add:C1:1.0', 'add:C2:1.0', 'add:C1:2.0']);
-    // The marker itself is short-lived.
-    t.mock.timers.tick(1);
-    await slack.acknowledge('C1', '1.0');
-    assert.equal(effects.at(-1), 'add:C1:1.0');
-    assert.equal(effects.length, 5);
+    t.after(async () => { release?.(); await slack.stop(); });
+    // No pending ACK: stop need not join this direct adapter call.
+    const adding = slack.addReaction('C1', '1.0', 'eyes');
+    const settled = Promise.allSettled([adding]);
+    await flush();
+    assert.ok(release);
+    await slack.stop();
+    release();
+    const [result] = await settled;
+    assert.equal(result!.status, alreadyPresent ? 'rejected' : 'fulfilled');
+    assert.equal((slack as unknown as { ackAdopted: Map<string, unknown> }).ackAdopted.size, 0);
   });
 }

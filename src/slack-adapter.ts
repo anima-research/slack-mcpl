@@ -1142,8 +1142,8 @@ export class SlackAdapter {
   // cleanup. Markers expire independently of the retired pending entry.
   private ackAdopted = new Map<string, Map<string, ReturnType<typeof setTimeout>>>();
 
-  private adoptAck(channelId: string, ts: string, entry: AckEntry): void {
-    this.dropAck(channelId, ts, entry);
+  private markAdopted(channelId: string, ts: string): void {
+    if (this.stopping) return;
     let adopted = this.ackAdopted.get(channelId);
     if (!adopted) this.ackAdopted.set(channelId, (adopted = new Map()));
     clearTimeout(adopted.get(ts));
@@ -1571,7 +1571,8 @@ export class SlackAdapter {
     const name = reactionName(emoji);
     // Automatic ACKs never adopt, even if an admission gate awaited before
     // this lookup and acknowledge() has already installed their own entry.
-    const entry = !options.automatic && name === this.ackReaction ? this.ackPending.get(channelId)?.get(ts) : undefined;
+    const adopts = !options.automatic && name === this.ackReaction;
+    const entry = adopts ? this.ackPending.get(channelId)?.get(ts) : undefined;
     if (entry) {
       await entry.added;
       while (entry.removing || entry.adopting) await (entry.removing ?? entry.adopting);
@@ -1586,10 +1587,14 @@ export class SlackAdapter {
       if (entry && policy.hasAccessPolicy) await policy.requireWritableConversation(channelId, 'reactions:write', 'No reaction was added');
       try {
         await this.web.reactions.add({ channel: channelId, timestamp: ts, name });
-        if (entry) this.adoptAck(channelId, ts, entry);
+        if (entry) this.dropAck(channelId, ts, entry);
+        if (adopts) this.markAdopted(channelId, ts);
       } catch (err) {
         // Slack confirmed the agent's desired reaction is already present.
-        if (entry && slackRefusal(err) === 'already_reacted') this.adoptAck(channelId, ts, entry);
+        if (slackRefusal(err) === 'already_reacted') {
+          if (entry) this.dropAck(channelId, ts, entry);
+          if (adopts) this.markAdopted(channelId, ts);
+        }
         throw err;
       }
     };

@@ -122,7 +122,9 @@ that conversation (or on expiry/rejection/shutdown). It appears in reads as
 this bot's own reaction, not a separate reaction type. The read and reaction
 tool descriptions name the configured emoji. If the agent adds it itself,
 success or `already_reacted` adopts the reaction and cancels that message's
-automatic cleanup. Adding waits for a pending ACK add and any in-flight removal.
+automatic cleanup, even if cleanup finished before the add. Redelivery cannot
+recreate cleanup for that message for 10 minutes. Adding waits for a pending
+ACK add and any in-flight removal.
 
 Removing the configured ACK emoji waits for a pending ACK add; success or
 `no_reaction` retires that message's pending cleanup. If an automatic cleanup already in progress confirms
