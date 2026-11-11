@@ -76,13 +76,13 @@ that grant arrives; plain MCP tool calls are unaffected.
 
 ## Tools
 
-`send_message`, `reply_message`, `upload_file`, `send_dm`, `add_reaction`,
+`send_message`, `reply_message`, `upload_file`, `send_dm`, `add_reaction`, `remove_reaction`,
 `edit_message`, `delete_message`, `list_channels`, `refresh_channels`, `fetch_history`,
 `fetch_thread`, `find_user`, `fetch_attachment`, `subscribe_channel`,
 `unsubscribe_channel`, `list_subscriptions`.
 
 Feature sets: `slack.messaging` (rollback-capable; `send_message`,
-`reply_message`, `upload_file`, `send_dm`, `add_reaction`, `edit_message`, `delete_message`,
+`reply_message`, `upload_file`, `send_dm`, `add_reaction`, `remove_reaction`, `edit_message`, `delete_message`,
 plus push events and `channels/incoming` delivery),
 `slack.history` (`fetch_history`, `fetch_thread`, `fetch_attachment`),
 `slack.subscriptions` (`subscribe_channel`, `unsubscribe_channel`,
@@ -104,6 +104,56 @@ capabilities, not feature-set selection.
 
 The host receives each reply once, through `channels/publish`. The server
 does not declare `channels.streaming`.
+
+## Reactions
+
+| Tool | Arguments | Effect |
+| --- | --- | --- |
+| `add_reaction` | `channelId`, `messageId`, `emoji` | Add this bot's reaction; an existing own reaction changes nothing except that adding the configured ACK emoji adopts it and cancels automatic cleanup. |
+| `remove_reaction` | `channelId`, `messageId`, `emoji` | Remove only this bot's reaction; an absent own reaction succeeds with "Nothing changed: message X has no &lt;emoji&gt; reaction from this bot". |
+
+Both belong to `slack.messaging`, use `reactions:write`, accept emoji names
+with or without colons, and enforce the same send-list and DM restrictions.
+Like additions, removals are not undone by rollback.
+
+When `SLACK_ACK_REACTION` is set, that emoji is added automatically while a
+message is being handled and removed after the bot's next confirmed post in
+that conversation (or on expiry/rejection/shutdown). It appears in reads as
+this bot's own reaction, not a separate reaction type. The read and reaction
+tool descriptions name the configured emoji. If the agent adds it itself,
+success or `already_reacted` adopts the reaction and cancels any pending
+automatic cleanup; redelivery cannot recreate cleanup for that message for
+10 minutes, even if cleanup had already finished. Adding waits for a pending
+ACK add and any in-flight removal.
+
+Removing the configured ACK emoji waits for a pending ACK add; success or
+`no_reaction` retires that message's pending cleanup. If an automatic cleanup already in progress confirms
+removal (or `no_reaction`) while the tool waits, it returns the same successful
+"Nothing changed: message X has no &lt;emoji&gt; reaction from this bot" without
+another Slack call. If cleanup instead gives up after a failure, the tool makes its own removal attempt and reports Slack's answer.
+Manual ACK removals share automatic cleanup's five-attempt budget: transient
+failures retry after one minute; terminal refusals, shutdown and the fifth
+failure retire cleanup. Other emojis and other messages' ACKs are unchanged.
+
+`fetch_history` and `fetch_thread` include `reactions` on messages with reactions:
+`[{"name":"eyes","count":2,"own":true}]`. `count` is Slack's count, not the
+length of its potentially partial user list. `own: true` means that list includes
+this bot's user ID; `own: false` is emitted only when the bot is absent from a
+complete list. `own` is omitted when membership is unknown (a truncated or
+missing list without the bot, insufficient valid metadata, or unknown bot ID).
+Malformed reaction entries are skipped; invalid counts are omitted. Only the first 20 valid reactions in
+Slack's order are listed per message; `reactionsOmitted` gives the number of
+valid reactions left out, when any.
+These fields count against `maxBytes`. Messages without reactions have no
+new fields. Live incoming messages and first-interaction backscroll stay unchanged.
+
+No `reactions:read` scope or extra API call is needed: the existing
+[history response includes reactions](https://docs.slack.dev/reference/methods/conversations.history/#message-types),
+and [history](https://docs.slack.dev/reference/methods/conversations.history/) and
+[thread replies](https://docs.slack.dev/reference/methods/conversations.replies/)
+use the conversation's `*:history` scope. The manifest already grants
+`reactions:write`, the scope required by
+[reactions.remove](https://docs.slack.dev/reference/methods/reactions.remove/).
 
 ## Upload a file
 
@@ -363,7 +413,7 @@ Switches take `true`/`false` (also `1`/`0`, `yes`/`no`); any other value stops t
 | `SLACK_SEND_CHANNELS` | no | Comma-separated conversation-ID allow-list for writes (send, upload, DM, edit, delete, reaction, and the host's `channels/publish`); writes elsewhere are refused before the call reaches Slack. Other conversations are registered `inbound`, `list_channels` shows `writable: false`, and the first message the agent gets from one, addressed or not, carries a read-only note. A mention there still reaches the agent; whether it wakes is the host's policy. `send_dm` is refused before a DM is opened, and not offered, unless the list names a DM. Set but empty is refused at startup; the effective list is logged |
 | `SLACK_SUBSCRIBE_MEMBER_CHANNELS` | no | `true` delivers ambient messages from every channel the bot is a member of, so inviting the bot is the subscription. `unsubscribe_channel` then mutes a conversation (`subscribe_channel` unmutes it) and `list_subscriptions` lists the muted ones. Takes `true` or `false` (also `1`/`0`, `yes`/`no`); unset is off, and any other value, empty included, stops startup |
 | `SLACK_DISABLE_DMS` | no | `true` drops incoming DMs and group DMs, refuses every write to them and both history reads on them, and leaves them out of `conversations.list`, so they are neither listed nor registered; `send_dm` is not offered. Only a conversation Slack confirms as a channel passes: a group DM ID looks like a channel ID, and a user ID posts into that user's DM. An unknown ID is asked about until Slack confirms it. One Slack won't describe is refused; when the question can't be answered just now (a rate limit, a failure on the way or on Slack's side, or too little of the call's time), nothing is written, and the error says why and that the call can be made again. Incoming events pass only when Slack marks them `channel` or `group`. Takes `true` or `false` (also `1`/`0`, `yes`/`no`); unset is off, and any other value, empty included, stops startup |
-| `SLACK_ACK_REACTION` | no | Emoji name (e.g. `eyes`) put on a message that addresses the bot. It means "received": it is removed at the bot's next post in that conversation that Slack confirms, after 10 minutes, or at once if the host does not accept the message. A removal that fails in a way that can pass (a rate limit, an HTTP error, a network failure, or Slack's own failure such as `internal_error`) is tried again every minute, up to 5 tries in all; one Slack refuses is dropped. An add that fails isn't tried again. One that may have landed is removed as usual: `already_reacted` says it's there, and Slack's failure while handling it (`internal_error`, `fatal_error`, `service_unavailable`), an HTTP error, an answer not in Slack's form or one the client can't read, or a failure in transit after the request may have reached Slack leaves it unknown. One Slack refused, rate-limited or received only in part (`request_timeout`), one whose connection was never made, and one this server refused itself, such as outside `SLACK_SEND_CHANNELS`, isn't there. On SIGTERM, SIGINT or the host closing stdin, pending reactions are removed (5 s at most); a crash cannot, so removal is best-effort. For a typing signal see **Typing** above. |
+| `SLACK_ACK_REACTION` | no | Emoji name (e.g. `eyes`) put on a message that addresses the bot. It means "received": it is removed at the bot's next post in that conversation that Slack confirms, after 10 minutes, or at once if the host does not accept the message. A removal that fails in a way that can pass (a rate limit, an HTTP error, a network failure, or Slack's own failure such as `internal_error`) is tried again every minute, up to 5 tries in all; one Slack refuses is dropped. Adding the configured ACK emoji explicitly adopts it on success or `already_reacted` and cancels automatic cleanup, including redelivery for the next 10 minutes. An add that fails isn't tried again. One that may have landed is removed as usual: `already_reacted` says it's there, and Slack's failure while handling it (`internal_error`, `fatal_error`, `service_unavailable`), an HTTP error, an answer not in Slack's form or one the client can't read, or a failure in transit after the request may have reached Slack leaves it unknown. One Slack refused, rate-limited or received only in part (`request_timeout`), one whose connection was never made, and one this server refused itself, such as outside `SLACK_SEND_CHANNELS`, isn't there. On SIGTERM, SIGINT or the host closing stdin, pending reactions are removed (5 s at most); a crash cannot, so removal is best-effort. For a typing signal see **Typing** above. |
 | `SLACK_SUBSCRIPTIONS_FILE` | no | JSON file persisting ambient subscriptions across restarts: an array of IDs, or `{subscribed, muted}` while anything is muted (older versions read the object form as empty) |
 | `SLACK_BACKSCROLL_LIMIT` | no | Messages fetched on first interaction with a conversation (default 50) |
 | `SLACK_MCPL_DEBUG_LOG` | no | Absolute path for a diagnostic file log |
