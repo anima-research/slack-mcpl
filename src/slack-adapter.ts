@@ -20,6 +20,7 @@
  * Event handling salvaged from zulip-mcp PR #8's SlackAdapter.
  */
 
+import { MAX_MESSAGE_TEXT_APPEND, renderMessageText } from './message-text.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { WebClient, ErrorCode, LogLevel, type Logger, type WebAPICallResult, type WebClientOptions } from '@slack/web-api';
 import { SocketModeClient } from '@slack/socket-mode';
@@ -255,11 +256,14 @@ const CONTENT_SUBTYPES = new Set([undefined, 'file_share', 'thread_broadcast', '
 /** The fields of a Socket Mode message event this adapter dereferences.
  * Payloads come off the wire — everything is optional until checked. */
 interface SlackMessageEvent {
+  client_msg_id?: string;
   type?: string;
   subtype?: string;
   channel?: string;
   user?: string;
   text?: string;
+  attachments?: unknown;
+  blocks?: unknown;
   ts?: string;
   thread_ts?: string;
   /** On a thread_broadcast the parent may be named only here. */
@@ -311,7 +315,9 @@ export interface SlackMessageData {
   threadTs?: string;
   authorId: string;
   authorName: string;
-  /** Raw mrkdwn text as received. */
+  /** Original Slack text (before supplemental payload rendering). */
+  rawContent?: string;
+  /** Rendered mrkdwn content. */
   content: string;
   /** Mentions resolved to @name (uid:U…), links/broadcasts unescaped. */
   cleanContent: string;
@@ -1589,19 +1595,20 @@ export class SlackAdapter {
       ...(opts.latest !== undefined ? { latest: opts.latest } : {}),
       maxMessages: opts.limit ?? 50,
     });
-    return { messages: await this.shapeHistory(messages), truncated };
+    return { messages: await this.shapeHistory(messages, 2000), truncated };
   }
 
-  private async shapeHistory(messages: SlackHistoryMessage[]): Promise<HistoryMessage[]> {
+  private async shapeHistory(messages: SlackHistoryMessage[], maxAppend = MAX_MESSAGE_TEXT_APPEND): Promise<HistoryMessage[]> {
     // Pre-resolve author + mentioned user names in one pass.
     const ids = new Set<string>();
-    for (const msg of messages) {
+    const texts = messages.map(msg => renderMessageText(msg, maxAppend));
+    for (const [index, msg] of messages.entries()) {
       if (msg.user) ids.add(msg.user);
-      for (const id of extractSlackUserIds(msg.text ?? '')) ids.add(id);
+      for (const id of displayMentionIds(msg.text ?? '', texts[index])) ids.add(id);
     }
     await this.resolveUserNames(Array.from(ids));
 
-    return messages.map((msg) => {
+    return messages.map((msg, index) => {
       const id = String(msg.ts ?? '');
       // The thread a message belongs to: the one its parent's ts names, as
       // Slack reports it, or the message's own.
@@ -1612,7 +1619,7 @@ export class SlackAdapter {
       authorId: msg.user,
       ...(msg.bot_id ? { authorBotId: msg.bot_id } : {}),
       authorName: msg.user ? (this.userNameCache.get(msg.user) ?? msg.user) : (msg.username ?? 'bot'),
-      content: formatSlackText(msg.text ?? '', this.userNameCache),
+      content: formatSlackText(texts[index], displayNames(msg.text ?? '', texts[index], this.userNameCache)),
       threadTs: msg.thread_ts && msg.thread_ts !== msg.ts ? msg.thread_ts : undefined,
       rootTs: reported ?? id,
       // Missing means unknown, not none.
@@ -1685,8 +1692,10 @@ export class SlackAdapter {
     }
 
     // Resolve author + mentioned users before formatting.
+    await Promise.resolve(); // Socket Mode queues ack first; yield before rendering.
+    const text = renderMessageText(event);
     const mentionIds = extractSlackUserIds(event.text ?? '');
-    await this.resolveUserNames([event.user, ...mentionIds]);
+    await this.resolveUserNames([event.user, ...displayMentionIds(event.text ?? '', text)]);
     const authorName = this.userNameCache.get(event.user) ?? event.user;
 
     const attachments: AttachmentRef[] = (event.files ?? [])
@@ -1708,8 +1717,9 @@ export class SlackAdapter {
       threadTs: event.thread_ts || event.root?.thread_ts || undefined,
       authorId: String(event.user),
       authorName,
-      content: event.text ?? '',
-      cleanContent: formatSlackText(event.text ?? '', this.userNameCache),
+      ...(text !== (event.text ?? '') ? { rawContent: event.text ?? '' } : {}),
+      content: text,
+      cleanContent: formatSlackText(text, displayNames(event.text ?? '', text, this.userNameCache)),
       mentionIds,
       // Personal mention of the bot — hosts use this to gate wake policy.
       // @here/@channel broadcasts deliberately don't count.
@@ -1732,4 +1742,20 @@ export class SlackAdapter {
       userIds.filter((id): id is string => !!id),
     );
   }
+}
+
+/** Supplemental mentions are display-only and may add at most twenty lookups. */
+function displayMentionIds(original: string, rendered: string): string[] {
+  const originals = extractSlackUserIds(original);
+  const known = new Set(originals);
+  const suffix = extractSlackUserIds(rendered.slice(original.length)).filter(id => !known.has(id));
+  return [...originals, ...suffix.slice(0, 20)];
+}
+function displayNames(original: string, rendered: string, cache: Map<string, string>): Map<string, string> {
+  const names = new Map(extractSlackUserIds(rendered).map(id => [id, id]));
+  for (const id of displayMentionIds(original, rendered)) {
+    if (cache.has(id)) names.set(id, cache.get(id)!);
+    else names.delete(id); // Allowed lookups retain Slack's fallback label on transient failure.
+  }
+  return names;
 }

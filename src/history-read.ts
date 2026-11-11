@@ -5,6 +5,7 @@
  * budget like every other request. Backscroll keeps the adapter's own pager.
  */
 import { createHash } from 'node:crypto';
+import { renderMessageText } from './message-text.js';
 import { formatSlackText, type SlackHistoryMessage } from './content.js';
 import { mimeShown, nameShown, toolResultJson, urlShown } from './framing.js';
 import { isNearMiss } from './near-miss.js';
@@ -340,11 +341,9 @@ export async function readBounded(opts: ReadOptions, source: ReadSource): Promis
         : -1;
       if (end >= 0) rows.splice(end);
       const isMatch = (m: SlackHistoryMessage) =>
-        (needle === undefined || fold(formatSlackText(m.text ?? '', BY_ID)).includes(needle)) &&
+        (needle === undefined || fold(formatSlackText(renderMessageText(m), BY_ID)).includes(needle)) &&
         (!opts.authorIds.length || [m.user, m.bot_id].some((id) => id !== undefined && opts.authorIds.includes(id)));
-      // Only the matches the limit can still take are shaped, so names are
-      // looked up for them, not for every message scanned. Some may then not
-      // fit maxBytes; their names stay cached for the call that continues.
+      // Shape only matches; resolve their display names after content filtering.
       const matches = rows.filter(({ m }) => isMatch(m)).slice(0, opts.limit - records.length).map(({ m }) => m);
       const shaped = new Map((await source.shape(matches)).map((m, i) => [matches[i]!, m]));
       for (const [i, { m, ts }] of rows.entries()) {
