@@ -375,8 +375,8 @@ structure, and links/mentions retain styles. Image/interactive controls are
 ignored (`image`, `actions`, `input`, `divider` and `file`; files are reported
 separately); other unsupported block types have an `[TYPE omitted]` placeholder.
 Literal plain text, rich text, link labels and date fallbacks are escaped.
-Classic titles, field titles and fallback are always literal; pretext, text and
-field values use mrkdwn only when opted in through `mrkdwn_in`.
+Classic attachment fields (including titles and fallback) format Slack tokens
+and entities regardless of `mrkdwn_in`; basic styling passes through verbatim.
 
 #### Limits
 
@@ -388,9 +388,11 @@ Blocks-only messages still render rich text, including an app posting as a user
 with only blocks. Bot/integration messages carrying `bot_id`, `app_id` or
 `bot_profile`, without `client_msg_id`, also retain rich text.
 
-All rendered supplemental units use plain per-unit dedup against original text
-and earlier units: normalize prose whitespace and Slack encodings, compare
-channel/user IDs rather than labels, and preserve whitespace in backtick spans.
+All rendered supplemental units deduplicate against original text and earlier
+units with the same attribution, so identical bodies from different authors
+survive. Comparison keys normalize prose whitespace, Slack encodings, combined
+bold/italic marker order and newlines directly inside code fences; compare
+channel/user IDs rather than labels; and preserve other code whitespace.
 This is display dedup, not typed equality: a link and identical rendered literal
 may collapse, while differing markup may appear twice for bots/integrations.
 Angle tokens use a linear scan; unclosed tokens remain literal. The original
@@ -415,12 +417,13 @@ size: names and formatting may expand it. Traversal (2,000 nodes) and nesting
 (12 levels) also carry that marker; cuts preserve code points. Original text is
 never truncated. Backscroll uses a lower **2,000 UTF-16 code unit supplemental cap per
 message**, and the framed backscroll block has an overall **32 KiB byte budget**.
-It keeps a contiguous newest window. Oversized messages inside it get an
-in-position placeholder with timestamp, ID, author and framed byte size saying
+It keeps a contiguous newest window. Messages that exceed the remaining byte
+budget (even if they fit the full budget on their own) get an in-position
+placeholder with timestamp, ID, author and framed byte size saying
 `fetch_history has it`. If even a placeholder cannot fit, one leading line
 counts the older messages not shown and names the oldest shown ID for
-`fetch_history before`. Placeholders, this summary and framing all count against
-the byte budget. This preserves a fetchable position instead of leaving silent
+`fetch_history latest=<oldest shown ID>`. Placeholders, this summary and framing
+all count against the byte budget. This preserves a fetchable position instead of leaving silent
 gaps. Use the bounded history/thread tools for details.
 
 ## Environment

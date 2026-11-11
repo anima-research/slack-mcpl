@@ -188,7 +188,7 @@ export function backscrollBlock(
   const maxBytes = 32_768;
   const lines: string[] = [];
   const summary = (count: number, before?: string) =>
-    `[${count} older backscroll ${count === 1 ? 'message' : 'messages'} not shown; fetch_history${before ? ' before ' + before : ''} has ${count === 1 ? 'it' : 'them'}]`;
+    `[${count} older backscroll ${count === 1 ? 'message' : 'messages'} not shown; fetch_history${before ? ' latest=' + before : ''} has ${count === 1 ? 'it' : 'them'}]`;
   const frame = (count: number) => `<backscroll ${[...attrs, `count="${count}"`].join(' ')}>\n\n</backscroll>`;
   let bytes = 0;
   let oldest = messages.length;

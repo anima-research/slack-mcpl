@@ -18,12 +18,14 @@ const CHANNEL_LABEL = new RegExp(`^<#(${SLACK_ID})\\|([^>]+)>$`);
 const REFERENCE = new RegExp(`^<([@#])(${SLACK_ID})(?:\\|[^>]*)?>$`);
 const validId = (v: unknown): v is string => typeof v === 'string' && ID.test(v);
 
-// Normalize prose whitespace, but retain significant whitespace in code spans.
+// Comparison keys only: normalize prose and equivalent emphasis/fence spellings,
+// but retain significant whitespace inside code spans.
 function normalized(value: string): string {
   let fence = '';
   return value.split(/(`+)/).map((part, i) => {
     if (i % 2) { if (!fence) fence = part; else if (part === fence) fence = ''; return part; }
-    return fence ? part : part.replace(/\s+/g, ' ');
+    if (fence) return fence.length >= 3 ? part.replace(/^\r?\n|\r?\n$/g, '') : part;
+    return part.replace(/_\*([^*_\n]+)\*_/g, '*_$1_*').replace(/\s+/g, ' ');
   }).join('').trim();
 }
 
@@ -79,7 +81,7 @@ export function renderMessageText(
         return styled(url ? (label && label !== url ? `<${url}|${label}>` : `<${url}>`) : label, e.style);
       }
       case 'usergroup': return validId(e.usergroup_id) ? styled(`<!subteam^${e.usergroup_id}>`, e.style) : '';
-      case 'team': return validId(e.team_id) ? styled(`<!team^${e.team_id}>`, e.style) : '';
+      case 'team': return validId(e.team_id) ? styled(`team ${e.team_id}`, e.style) : '';
       case 'date': return styled(escape(bounded(e.fallback)), e.style);
       case 'emoji': return typeof e.name === 'string' ? styled(`:${escape(bounded(e.name))}:${typeof e.skin_tone === 'number' ? ':skin-tone-' + e.skin_tone + ':' : ''}`, e.style) : '';
       case 'broadcast': return ['here', 'channel', 'everyone'].includes(string(e.range)) ? styled(`<!${e.range}>`, e.style) : '';
@@ -137,9 +139,14 @@ export function renderMessageText(
     return match ? `\x00${match[1] === '@' ? 'user' : 'channel'}:${match[2]}\x00` : token;
   }), new Map()));
   const originalKey = keyFor(original);
-  const seen = new Set<string>();
-  const rawSeen = new Set<string>();
-  function unique(value: string): boolean {
+  const scopes = new Map<string, { seen: Set<string>; rawSeen: Set<string> }>();
+  function unique(value: string, attribution = ''): boolean {
+    let scope = scopes.get(attribution);
+    if (!scope) {
+      scope = { seen: new Set(), rawSeen: new Set() };
+      scopes.set(attribution, scope);
+    }
+    const { seen, rawSeen } = scope;
     if (rawSeen.has(value)) return false;
     rawSeen.add(value);
     const key = keyFor(value);
@@ -160,7 +167,7 @@ export function renderMessageText(
     if (match) urls.add(unescape(match[1]));
     return match ? '' : token;
   });
-  for (const match of bareOriginal.matchAll(/https?:\/\/[^\s<>]+/g)) urls.add(unescape(match[0].replace(/[.,;:!?]+$/, '')));
+  for (const match of bareOriginal.matchAll(/https?:\/\/[^\s<>]+/g)) urls.add(unescape(match[0].replace(/(?<![.,;:!?])[.,;:!?]+$/, '')));
   for (const raw of take(message.attachments)) {
     if (full() || !visit()) break;
     const a = object(raw);
@@ -169,17 +176,18 @@ export function renderMessageText(
     if (a.is_share !== true && a.is_msg_unfurl !== true &&
         (a.is_app_unfurl === true || (typeof a.from_url === 'string' &&
           urls.has(a.from_url)))) continue;
-    const mrkdwn = new Set(list(a.mrkdwn_in));
-    const fieldText = (v: unknown, kind?: string) => kind && mrkdwn.has(kind) ? bounded(v) : escape(bounded(v));
+    // Classic attachment fields carry Slack tokens/entities independently of
+    // mrkdwn_in (which governs basic styling, passed through here either way).
+    const fieldText = bounded;
     const title = fieldText(a.title);
     const body = join([
-      fieldText(a.pretext, 'pretext'),
+      fieldText(a.pretext),
       title ? join([title, escape(bounded(a.title_link))], ' ') : '',
-      fieldText(a.text, 'text'),
+      fieldText(a.text),
       ...take(a.fields).map(rawField => {
         if (!visit()) return '';
         const f = object(rawField);
-        return join([fieldText(f.title), fieldText(f.value, 'fields')], ': ');
+        return join([fieldText(f.title), fieldText(f.value)], ': ');
       }),
     ]);
     const nested: string[] = [];
@@ -188,16 +196,20 @@ export function renderMessageText(
       const value = block(rawBlock);
       if (value) (placeholder(rawBlock) ? placeholders : nested).push(value);
     }
-    // Fallback depends on readable output, not omission notices. Dedup each
-    // logical unit before attribution so a header never hides a duplicate.
-    const units = [body || (nested.length ? '' : fieldText(a.fallback)), ...nested, ...placeholders].filter(unique);
     const shared = a.is_share === true || a.is_msg_unfurl === true;
-    if (units.length && (shared || a.author_name)) {
+    let header = '';
+    if (shared || a.author_name) {
       const name = string(a.author_name) ? headerName(string(a.author_name)) : 'unknown';
       const uid = validId(a.author_id) ? ` (uid:${headerName(a.author_id)})` : '';
-      const source = string(a.footer) ? headerName(string(a.footer)) :
-        string(a.channel_name) ? headerChannel(string(a.channel_name)) : 'unknown source';
-      const header = shared ? `[shared message from ${name}${uid}, ${source}]` : `[attachment from ${name}${uid}]`;
+      const source = string(a.channel_name) ? headerChannel(string(a.channel_name)) :
+        string(a.footer) ? headerName(string(a.footer)) : 'unknown source';
+      header = shared ? `[shared message from ${name}${uid}, ${source}]` : `[attachment from ${name}${uid}]`;
+    }
+    // Dedup against original text and within the same attribution, never
+    // erase another sender. Fallback depends on readable output, not notices.
+    const units = [body || (nested.length ? '' : fieldText(a.fallback)), ...nested, ...placeholders]
+      .filter(value => unique(value, header));
+    if (units.length && header) {
       emit(header + '\n' + join(units).split(LINE_BREAK).map(line => '> ' + line).join('\n'));
     } else {
       for (const value of units) emit(value);

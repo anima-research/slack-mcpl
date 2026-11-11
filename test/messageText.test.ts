@@ -147,7 +147,7 @@ for (const shape of ['attachment', 'section', 'rich_text'] as const) {
 
 test('canonical mention dedup resolves labelled/unlabelled attachment and rich_text mentions', async () => {
   for (const [text, mirror] of [['<@U2|alice>', '<@U2>'], ['<@U2>', '<@U2|alice>']]) {
-    const result = await expectText({ text, attachments: [{ text: mirror, mrkdwn_in: ['text'] }], blocks: [
+    const result = await expectText({ text, attachments: [{ text: mirror }], blocks: [
       { type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [{ type: 'user', user_id: 'U2' }] }] },
     ] }, '@alice (uid:U2)');
     assert.equal(result!.content, text, 'raw original must be untouched');
@@ -161,7 +161,7 @@ test('canonical dedup uses existing link rendering and escape semantics without 
     ['A &amp; B', 'A & B', 'A & B'],
     ['&amp;lt;', '&lt;', '&lt;\n<'],
   ]) {
-    const result = await expectText({ text, attachments: [{ text: mirror, mrkdwn_in: ['text'] }] }, expected);
+    const result = await expectText({ text, attachments: [{ text: mirror }] }, expected);
     assert.equal(result!.content, text === '&amp;lt;' ? text + '\n' + mirror : text);
   }
 });
@@ -206,7 +206,7 @@ test('review rich literal escapes cannot become mentions or entities', async () 
 });
 
 test('review shared bot mentions are display-only and raw text is preserved', async () => {
-  const live = await expectText({ text: 'Notification', attachments: [{ is_share: true, text: '<@UBOT>', mrkdwn_in: ['text'] }] }, 'Notification\n[shared message from unknown, unknown source]\n> @alice (uid:UBOT)');
+  const live = await expectText({ text: 'Notification', attachments: [{ is_share: true, text: '<@UBOT>' }] }, 'Notification\n[shared message from unknown, unknown source]\n> @alice (uid:UBOT)');
   assert.deepEqual(live!.mentionIds, []);
   assert.equal(live!.mentionsBot, false);
   assert.equal(live!.rawContent, 'Notification');
@@ -222,7 +222,7 @@ test('review preview URLs compare exactly, Slack links normalize, shares survive
 });
 
 test('review fresh display lookup uses the extracted rendered payload', async () => {
-  const live = await expectText({ text: '@U1 (uid:U1)', attachments: [{ text: '<@U1>', mrkdwn_in: ['text'] }, { text: '<@U2>', mrkdwn_in: ['text'] }] }, '@U1 (uid:U1)\n@alice (uid:U1)\n@alice (uid:U2)');
+  const live = await expectText({ text: '@U1 (uid:U1)', attachments: [{ text: '<@U1>' }, { text: '<@U2>' }] }, '@U1 (uid:U1)\n@alice (uid:U1)\n@alice (uid:U2)');
   assert.deepEqual(live!.mentionIds, []);
 });
 
@@ -275,7 +275,7 @@ test('review server shared mentions neither wake nor auto-subscribe; raw metadat
     await initialize(h, true);
     await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
     await until(() => h.hostSaw.some(r => r.method === method.CHANNELS_REGISTER), 'registration');
-    const event = { type: 'message', channel: 'C1', channel_type: 'channel', user: 'U1', ts: '100.1', text: 'Notification', attachments: [{ is_share: true, text: '<@UBOT> Details', mrkdwn_in: ['text'] }] };
+    const event = { type: 'message', channel: 'C1', channel_type: 'channel', user: 'U1', ts: '100.1', text: 'Notification', attachments: [{ is_share: true, text: '<@UBOT> Details' }] };
     await h.socket.emitMessage(event);
     assert.equal(h.hostSaw.filter(r => r.method === method.PUSH_EVENT).length, 0, 'unsubscribed ambient shared mention is silent');
     await h.host.sendRequest('tools/call', { name: 'subscribe_channel', arguments: { channelId: 'C1' } });
@@ -338,8 +338,7 @@ test('top-level rich comparison retains literal or unbalanced markers', async ()
 
 test('bot rich combined emphasis uses italic inside bold', async () => {
   for (const text of ['*_word_*', '_*word*_']) {
-    const result = await shaped({ text, blocks: [richBlock(richSection({ ...literal('word'), style: { bold: true, italic: true } }))] }, true);
-    assert.equal(result.contents[0], text === '*_word_*' ? text : text + '\n*_word_*');
+    await expectText({ text, blocks: [richBlock(richSection({ ...literal('word'), style: { bold: true, italic: true } }))] }, text, true);
   }
 });
 
@@ -374,22 +373,64 @@ test('attachment fallback precedes unsupported placeholders and remote file bloc
   await expectText({text: 'shared a doc', blocks: [{type: 'file'}]}, 'shared a doc');
   await expectText({attachments: [{fallback: 'Not needed', blocks: [{type: 'plan'}, section('Readable')]}]}, 'Readable\n[plan omitted]');
 });
-test('classic attachment plain fields stay literal and mrkdwn_in controls body fields', async () => {
+test('classic attachment fields format Slack tokens regardless of mrkdwn_in', async () => {
   const a = {title: 'Literal <@U2>', pretext: '<@U2>', text: '<@U2>', fields: [{title: 'a &lt; b', value: '<@U2>'}]};
-  await expectText({attachments: [a]}, '<@U2>\nLiteral <@U2>\n<@U2>\na &lt; b: <@U2>');
-  await expectText({attachments: [{...a, mrkdwn_in: ['pretext', 'text', 'fields']}]}, '@alice (uid:U2)\nLiteral <@U2>\n@alice (uid:U2)\na &lt; b: @alice (uid:U2)');
-  await expectText({attachments: [{fallback: '<@U2> &lt;'}]}, '<@U2> &lt;');
+  await expectText({attachments: [a]}, '@alice (uid:U2)\nLiteral @alice (uid:U2)\n@alice (uid:U2)\na < b: @alice (uid:U2)');
+  await expectText({attachments: [{...a, mrkdwn_in: ['pretext', 'text', 'fields']}]}, '@alice (uid:U2)\nLiteral @alice (uid:U2)\n@alice (uid:U2)\na < b: @alice (uid:U2)');
+  await expectText({attachments: [{fallback: '<@U2> &lt;'}]}, '@alice (uid:U2) <');
 });
 test('rich team broadcasts and dates retain styles', async () => {
   await expectText({blocks: [richBlock(richSection(
     {type: 'team', team_id: 'T1', style: {bold: true}}, literal(' '),
     {type: 'broadcast', range: 'here', style: {bold: true}}, literal(' '),
     {type: 'date', fallback: 'Today', style: {italic: true}},
-  ))]}, '*<!team^T1>* *@here* _Today_');
+  ))]}, '*team T1* *@here* _Today_');
 });
 test('attribution fields follow shared framing name and channel rules', async () => {
   await expectText({attachments: [{is_share: true, author_name: 'Bob [ops]', footer: 'Posted in <#C1|ops>', text: 'Body'}]},
     '[shared message from "Bob [ops]", "Posted in \\u003c#C1|ops\\u003e"]\n> Body');
   await expectText({attachments: [{is_share: true, author_name: 'Bob', channel_name: 'ops', text: 'Body'}]},
     '[shared message from Bob, #ops]\n> Body');
+});
+
+test('classic attachment Slack links and mentions format and deduplicate on every read path', async () => {
+  const text = 'Deploy <https://ci.example/42|#42> by <@U2> &amp; team';
+  const expected = 'Deploy #42 (https://ci.example/42) by @alice (uid:U2) & team';
+  await expectText({attachments: [{text}]}, expected);
+  for (const field of ['text', 'fallback']) {
+    await expectText({text, attachments: [{[field]: text}]}, expected, true);
+  }
+});
+
+test('identical attachment bodies retain distinct authors but deduplicate within an attribution', async () => {
+  for (const shared of [false, true]) {
+    const names = shared ? ['Bob', 'Carol'] : ['job-A', 'job-B'];
+    const body = shared ? 'LGTM' : 'Build failed';
+    const attachments = names.map(author_name => ({is_share: shared, author_name, text: body, blocks: [section(body)]}));
+    const expected = names.map(name => (shared ? `[shared message from ${name}, unknown source]` : `[attachment from ${name}]`) + '\n> ' + body).join('\n');
+    await expectText({attachments: [...attachments, attachments[0]]}, expected);
+  }
+});
+
+test('bot fenced-code mirrors deduplicate both compact and newline-delimited serializations', async () => {
+  const blocks = [richBlock(richSection(literal('Before')), {type: 'rich_text_preformatted', elements: [literal('x')]}, richSection(literal('After')))];
+  for (const text of ['Before\n```x```\nAfter', 'Before\n```\nx\n```\nAfter']) {
+    await expectText({text, blocks}, text, true);
+  }
+  await expectText({blocks}, 'Before\n```x```\nAfter', true);
+});
+
+test('shared attribution prefers a channel name over a footer', async () => {
+  await expectText({attachments: [{is_share: true, author_name: 'Bob', channel_name: 'ops', footer: 'Posted in <#C1|ops>', text: 'Body'}]},
+    '[shared message from Bob, #ops]\n> Body');
+});
+
+test('emphasis and fence comparison normalization leaves literal code and interior whitespace distinct', async () => {
+  for (const [text, body] of [
+    ['`_*word*_`', '`*_word_*`'],
+    ['```a  b```', '```a b```'],
+    ['```a\nb```', '```ab```'],
+  ]) {
+    await expectText({text, attachments: [{text: body}]}, text + '\n' + body);
+  }
 });
