@@ -1651,7 +1651,8 @@ export class SlackMcplServer {
     }
 
     // First-interaction handling: when the very first message from this
-    // conversation for this peer is addressed, pull backscroll for context.
+    // conversation for this peer is addressed, pull backscroll for context
+    // unless SLACK_BACKSCROLL_LIMIT is 0.
     // A mention may also auto-subscribe the conversation, with a system note
     // (below). Both are committed in taken(), once the host has the message
     // that carries them.

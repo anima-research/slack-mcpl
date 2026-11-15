@@ -20,10 +20,11 @@ async function ready(h: Harness) {
   await until(() => h.hostSaw.some((r) => r.method === method.CHANNELS_REGISTER), 'channels/register');
 }
 
-for (const limit of [0, 7]) {
+for (const limit of [0, 7, undefined]) {
   test(`backscroll limit ${limit} controls automatic history without disabling explicit reads`, async (t) => {
     const previous = process.env.SLACK_BACKSCROLL_LIMIT;
-    process.env.SLACK_BACKSCROLL_LIMIT = String(limit);
+    if (limit === undefined) delete process.env.SLACK_BACKSCROLL_LIMIT;
+    else process.env.SLACK_BACKSCROLL_LIMIT = String(limit);
     t.after(() => {
       if (previous === undefined) delete process.env.SLACK_BACKSCROLL_LIMIT;
       else process.env.SLACK_BACKSCROLL_LIMIT = previous;
@@ -35,6 +36,9 @@ for (const limit of [0, 7]) {
     await h.socket.emitMessage(MENTION_EVENT);
     await until(() => pushes(h).length === 1, 'push/event');
     assert.deepEqual(h.reads, limit === 0 ? [] : ['history:C1']);
+    assert.deepEqual(h.historyCalls, limit === 0 ? [] : [
+      { channel: 'C1', limit: limit ?? 50, latest: MENTION_EVENT.ts },
+    ]);
     if (limit === 0) assert.doesNotMatch(pushText(h, 0), /<backscroll/);
     else assert.match(pushText(h, 0), /earlier context/);
 
