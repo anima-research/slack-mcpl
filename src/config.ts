@@ -1,3 +1,13 @@
+/** Parse automatic backscroll once at startup; only decimal digits are accepted. */
+export function parseBackscrollLimit(raw: string | undefined): number {
+  if (raw === undefined) return 50;
+  const value = raw.trim();
+  if (/^[0-9]+$/.test(value) && Number(value) <= 1000) return Number(value);
+  throw new Error(
+    `SLACK_BACKSCROLL_LIMIT must be an integer from 0 to 1000 (0 turns automatic backscroll off), got ${JSON.stringify(raw)}`,
+  );
+}
+
 /** Parse an operator switch. An absent value is off; a present value must
  *  say yes or no so a broken environment template cannot disable a guard. */
 export function booleanFlag(name: string, raw: string | undefined): boolean {
@@ -18,6 +28,7 @@ export interface StartupSettings {
   disableDms: boolean;
   subscribeMemberChannels: boolean;
   ackReaction: string | undefined;
+  backscrollLimit: number;
 }
 
 export function startupSettings(
@@ -39,9 +50,11 @@ export function startupSettings(
   if (env.SLACK_SEND_CHANNELS !== undefined && sendChannels!.length === 0) {
     return { refusal: 'SLACK_SEND_CHANNELS is set but names no conversation; unset it to allow writing anywhere' };
   }
+  let backscrollLimit: number;
   let disableDms: boolean;
   let subscribeMemberChannels: boolean;
   try {
+    backscrollLimit = parseBackscrollLimit(env.SLACK_BACKSCROLL_LIMIT);
     disableDms = booleanFlag('SLACK_DISABLE_DMS', env.SLACK_DISABLE_DMS);
     subscribeMemberChannels = booleanFlag('SLACK_SUBSCRIBE_MEMBER_CHANNELS', env.SLACK_SUBSCRIBE_MEMBER_CHANNELS);
   } catch (err) {
@@ -49,6 +62,6 @@ export function startupSettings(
   }
   const ackReaction = env.SLACK_ACK_REACTION?.replace(/:/g, '').trim() || undefined;
   return {
-    settings: { useStdio, tcpPort, botToken, appToken, dmUsers, sendChannels, disableDms, subscribeMemberChannels, ackReaction },
+    settings: { useStdio, tcpPort, botToken, appToken, dmUsers, sendChannels, disableDms, subscribeMemberChannels, ackReaction, backscrollLimit },
   };
 }

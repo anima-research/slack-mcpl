@@ -22,14 +22,7 @@ async function ready(h: Harness) {
 
 for (const limit of [0, 7, undefined]) {
   test(`backscroll limit ${limit} controls automatic history without disabling explicit reads`, async (t) => {
-    const previous = process.env.SLACK_BACKSCROLL_LIMIT;
-    if (limit === undefined) delete process.env.SLACK_BACKSCROLL_LIMIT;
-    else process.env.SLACK_BACKSCROLL_LIMIT = String(limit);
-    t.after(() => {
-      if (previous === undefined) delete process.env.SLACK_BACKSCROLL_LIMIT;
-      else process.env.SLACK_BACKSCROLL_LIMIT = previous;
-    });
-    const h = harness({ historyMessages: [{ ts: '100.1', user: 'U2', text: 'earlier context' }] });
+    const h = harness({ backscrollLimit: limit, historyMessages: [{ ts: '100.1', user: 'U2', text: 'earlier context' }] });
     t.after(() => h.close());
     await ready(h);
 
@@ -52,13 +45,7 @@ for (const limit of [0, 7, undefined]) {
 }
 
 test('zero backscroll keeps the auto-subscribe conversation name after an outbound write', async (t) => {
-  const previous = process.env.SLACK_BACKSCROLL_LIMIT;
-  process.env.SLACK_BACKSCROLL_LIMIT = '0';
-  t.after(() => {
-    if (previous === undefined) delete process.env.SLACK_BACKSCROLL_LIMIT;
-    else process.env.SLACK_BACKSCROLL_LIMIT = previous;
-  });
-  const h = harness();
+  const h = harness({ backscrollLimit: 0 });
   t.after(() => h.close());
   await ready(h);
 
@@ -74,25 +61,6 @@ test('zero backscroll keeps the auto-subscribe conversation name after an outbou
   await until(() => pushes(h).length === 1, 'push/event');
   assert.deepEqual(h.reads, []);
   assert.match(pushText(h, 0), /Auto-subscribed to #general because you were mentioned/);
-});
-
-test('backscroll limits preserve integer-prefix parsing and fallback bounds', (t) => {
-  const previous = process.env.SLACK_BACKSCROLL_LIMIT;
-  t.after(() => {
-    if (previous === undefined) delete process.env.SLACK_BACKSCROLL_LIMIT;
-    else process.env.SLACK_BACKSCROLL_LIMIT = previous;
-  });
-  const h = harness();
-  t.after(() => h.close());
-  for (const [raw, expected] of [
-    [undefined, 50], ['', 50], ['0', 0], ['1000', 1000],
-    ['-1', 50], ['1001', 50], ['abc', 50],
-    ['0junk', 0], ['7junk', 7], ['1.5', 1],
-  ] as const) {
-    if (raw === undefined) delete process.env.SLACK_BACKSCROLL_LIMIT;
-    else process.env.SLACK_BACKSCROLL_LIMIT = raw;
-    assert.equal(Reflect.get(h.server, 'backscrollLimit'), expected, `raw=${raw}`);
-  }
 });
 
 test('a conversation outside the write allow-list is registered inbound, listed as not writable, and the agent is told', async () => {

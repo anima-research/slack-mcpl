@@ -230,16 +230,6 @@ export class SlackMcplServer {
    *  the host didn't take, unless another conversation is current by then. */
   private lastChannelId: string | null = null;
 
-  /** How many backscroll messages to fetch on first interaction. Tunable via
-   *  SLACK_BACKSCROLL_LIMIT; zero disables automatic backscroll. Accepts
-   *  [0, 1000], otherwise defaults to 50. */
-  private get backscrollLimit(): number {
-    const raw = process.env.SLACK_BACKSCROLL_LIMIT;
-    if (!raw) return 50;
-    const n = parseInt(raw, 10);
-    return Number.isFinite(n) && n >= 0 && n <= 1000 ? n : 50;
-  }
-
   /** Conversations muted with unsubscribe_channel while every member channel
    *  counts as subscribed (`subscribeMemberChannels`). */
   private mutedChannels = new Set<string>();
@@ -254,7 +244,7 @@ export class SlackMcplServer {
    */
   constructor(
     private slack: SlackAdapter,
-    private opts: { subscribeMemberChannels?: boolean } = {},
+    private opts: { subscribeMemberChannels?: boolean; backscrollLimit?: number } = {},
   ) {
     // Once for the server's life: the adapter keeps every handler it's
     // given, and each forwards to whichever connection is being served, so
@@ -1663,7 +1653,7 @@ export class SlackMcplServer {
     // A DM's header says DM and a DM gets no note, so a DM looks up none.
     let meta: Awaited<ReturnType<typeof this.slack.getConversationMeta>> | undefined;
     let backscroll: Awaited<ReturnType<typeof this.slack.fetchHistory>>['messages'] = [];
-    const backscrollLimit = this.backscrollLimit;
+    const backscrollLimit = this.opts.backscrollLimit ?? 50;
     if (isFirstInteraction && isAddressed) {
       if (backscrollLimit > 0) {
         try {

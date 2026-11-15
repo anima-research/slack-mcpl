@@ -43,7 +43,7 @@ async function main(): Promise<void> {
     console.error(startup.refusal);
     process.exit(1);
   }
-  const { useStdio, tcpPort, botToken, appToken, dmUsers, sendChannels, disableDms, subscribeMemberChannels, ackReaction } =
+  const { useStdio, tcpPort, botToken, appToken, dmUsers, sendChannels, disableDms, subscribeMemberChannels, ackReaction, backscrollLimit } =
     startup.settings;
 
   // Connect Slack first: auth.test resolves the bot's identity, then Socket
@@ -51,6 +51,7 @@ async function main(): Promise<void> {
   const slack = await connectSlack({ botToken, appToken, dmUsers, sendChannels, disableDms, ackReaction });
   const server = new SlackMcplServer(slack, {
     subscribeMemberChannels,
+    backscrollLimit,
   });
   await slack.start();
   console.error(
@@ -58,7 +59,7 @@ async function main(): Promise<void> {
   );
   console.error(
     `[slack-mcpl] writes: ${sendChannels?.length ? `only ${sendChannels.join(', ')}` : 'anywhere'}; ` +
-      `DMs: ${disableDms ? 'off' : 'on'}`,
+      `DMs: ${disableDms ? 'off' : 'on'}; backscroll: ${backscrollLimit === 0 ? 'off' : backscrollLimit}`,
   );
 
   // Take pending acknowledgement reactions off before exiting, for 5 s at

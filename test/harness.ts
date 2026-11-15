@@ -209,6 +209,7 @@ export interface HarnessOptions {
   disableDms?: boolean;
   ackReaction?: string;
   subscribeMemberChannels?: boolean;
+  backscrollLimit?: number;
   /** What the host answers to push/event (default true). */
   pushAccepted?: boolean;
   /** DMs conversations.list returns besides C1. */
@@ -317,7 +318,7 @@ export function connectHost(server: SlackMcplServer, opts: HarnessOptions = {}) 
 
 export function harness(opts: HarnessOptions = {}): Harness {
   const { slack, socket, posts, reactions, reads, historyCalls, uploads, uploadsBegun, deletedMessages, deletedFiles } = fakeSlack(opts);
-  const server = new SlackMcplServer(slack, { subscribeMemberChannels: opts.subscribeMemberChannels });
+  const server = new SlackMcplServer(slack, { subscribeMemberChannels: opts.subscribeMemberChannels, backscrollLimit: opts.backscrollLimit });
   const { host, hostSaw, served, close } = connectHost(server, opts);
   return { server, socket, host, hostSaw, posts, reactions, reads, historyCalls, uploads, uploadsBegun, deletedMessages, deletedFiles, served, close };
 }
