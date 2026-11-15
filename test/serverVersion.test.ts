@@ -25,7 +25,7 @@ test('initialize follows package.json version from source and built layouts, out
     const { SlackMcplServer } = await import(pathToFileURL(join(fixture, layout, 'server.ts')).href);
     const input = new PassThrough();
     const output = new PassThrough();
-    const server = new SlackMcplServer({ onMessage() {} });
+    const server = new SlackMcplServer({ onMessage() {}, async resetThreadStatuses() {} });
     const host = McplConnection.fromStreams(output, input);
     const serving = server.serve(McplConnection.fromStreams(input, output));
     const result = (await host.sendRequest('initialize', { capabilities: {} })) as { serverInfo: { name: string; version: string } };

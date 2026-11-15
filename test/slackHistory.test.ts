@@ -13,19 +13,21 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { fetchSlackHistory, type SlackHistoryClient } from '../src/content.js';
 
+type HistoryCall = { limit?: number; cursor?: string; oldest?: string; latest?: string; inclusive?: boolean; served: number };
+
 /** Fake client over `total` messages with ts "1".."<total>" (oldest..newest),
  * served newest-first in cursor pages, honoring the requested `limit`. */
-function fakeHistoryClient(total: number): SlackHistoryClient & { calls: Array<{ limit?: number; cursor?: string }> } {
+function fakeHistoryClient(total: number): SlackHistoryClient & { calls: HistoryCall[] } {
   const newestFirst = Array.from({ length: total }, (_, i) => ({ ts: String(total - i), text: `m${total - i}` }));
-  const calls: Array<{ limit?: number; cursor?: string }> = [];
+  const calls: HistoryCall[] = [];
   return {
     calls,
     conversations: {
       async history(args) {
-        calls.push({ limit: args.limit, cursor: args.cursor });
         const offset = args.cursor ? Number(args.cursor) : 0;
         const pageSize = Math.min(args.limit ?? 100, 100); // Slack caps pages server-side too
         const page = newestFirst.slice(offset, offset + pageSize);
+        calls.push({ limit: args.limit, cursor: args.cursor, oldest: args.oldest, latest: args.latest, inclusive: args.inclusive, served: page.length });
         const nextOffset = offset + page.length;
         return {
           messages: page,
@@ -67,7 +69,15 @@ test('reports truncated=true when the backstop stops the drain', async () => {
 });
 
 test('passes oldest/latest/inclusive through and never asks for more than needed', async () => {
-  const client = fakeHistoryClient(50);
-  await fetchSlackHistory(client, { channel: 'C1', oldest: '10', latest: '99', inclusive: true, maxMessages: 30 });
-  assert.ok(client.calls.every(c => (c.limit ?? 0) <= 30), 'limit bounded by remaining budget');
+  for (const [total, maxMessages] of [[50, 30], [250, 250]] as const) {
+    const client = fakeHistoryClient(total);
+    const { messages } = await fetchSlackHistory(client, { channel: 'C1', oldest: '10', latest: '99', inclusive: true, maxMessages });
+    assert.equal(messages.length, maxMessages);
+    let left = maxMessages;
+    for (const c of client.calls) {
+      assert.deepEqual([c.oldest, c.latest, c.inclusive], ['10', '99', true]);
+      assert.ok(c.limit !== undefined && c.limit <= left, `asked for ${c.limit} with ${left} to go`);
+      left -= c.served;
+    }
+  }
 });

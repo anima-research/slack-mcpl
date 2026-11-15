@@ -32,6 +32,8 @@ function fixture(
   const cleared: string[] = [];
   const acknowledged: string[] = [];
   const slack = {
+    async setThreadStatus() {},
+    async resetThreadStatuses() {},
     teamName: 'acme', botUserId: 'UBOT', dmsWritable: true,
     canWrite,
     onMessage(handler: (msg: SlackMessageData) => void) { handlers.push(handler); },

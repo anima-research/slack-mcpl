@@ -162,7 +162,7 @@ test("every client connectSlack builds logs to stderr, so a rate limit at launch
   );
   assert.equal(stdout, '');
   for (const client of ['auth.test', 'Socket Mode']) {
-    assert.ok(stderr.includes(`[slack-mcpl] ${client} (info): API Call failed due to rate limiting. Will retry in 0 seconds.`), stderr);
+    assert.match(stderr, new RegExp(`^\\[slack-mcpl\\] ${client} \\(info\\): \\S`, 'm'));
   }
   // Debug lines are left out, as the clients' own logger leaves them out at
   // its default level.

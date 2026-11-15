@@ -23,7 +23,7 @@ import { SlackMcplServer } from '../src/server.js';
 import { explainSlackError } from '../src/slack-errors.js';
 import { MESSAGING_FEATURE_SET } from '../src/feature-sets.js';
 import { FULL_GRANT, connectHost, nonJsonSlackApiUrl, initialize, until, uploadEndpoint } from './harness.js';
-import { fakeSlackApi, silentSlackApi, unreachableSlackApiUrl, type FakeSlackApi, type SlackApiAnswer } from './slackApi.js';
+import { clientSays, fakeSlackApi, silentSlackApi, unreachableSlackApiUrl, type FakeSlackApi, type SlackApiAnswer } from './slackApi.js';
 import { virtualClock } from './virtualClock.js';
 import { clock } from '../src/clock.js';
 
@@ -301,7 +301,7 @@ test("a last step Slack can't find the upload's file for shares nothing, and cal
   await steps(t, { last: { body: { ok: false, error: 'file_not_found' } } });
   const err = await adapter().uploadFile('C1', { filename: 'a.txt', data: Buffer.from('a') }).then(() => null, (e: unknown) => e);
   assert.equal(explainSlackError(err, { tool: 'upload_file', args: { channelId: 'C1' } }),
-    "An API error occurred: file_not_found\n\nNothing was shared: Slack couldn't find the file this upload's first step " +
+    `${await clientSays({ body: { ok: false, error: 'file_not_found' } })}\n\nNothing was shared: Slack couldn't find the file this upload's first step ` +
       'set up. Calling again starts a new upload.');
   assert.deepEqual(fileLeftByUpload(err), { fileId: 'F1', mayHaveShared: false });
 });
@@ -392,7 +392,7 @@ test("a sharing message Slack refuses to delete counts as a message not deleted,
   assert.equal(rolledBack.reason, 'Rolled back (0/1 messages and 1/1 files deleted). Slack refused to delete these, and calling again ' +
     "won't change that: message 5.5 in C1, which shared file F1");
   assert.deepEqual(lines.filter((l) => l.includes('Rollback')), [
-    "[slack-mcpl] Rollback couldn't delete message 5.5, which shared file F1, in C1: An API error occurred: cant_delete_message",
+    `[slack-mcpl] Rollback couldn't delete message 5.5, which shared file F1, in C1: ${await clientSays({ body: { ok: false, error: 'cant_delete_message' } })}`,
   ]);
 });
 

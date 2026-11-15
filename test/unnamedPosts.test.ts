@@ -24,7 +24,7 @@ import { explainSlackError, type SlackCall } from '../src/slack-errors.js';
 import { SlackMcplServer } from '../src/server.js';
 import { MESSAGING_FEATURE_SET } from '../src/feature-sets.js';
 import { FULL_GRANT, connectHost, initialize, nonJsonSlackApiUrl } from './harness.js';
-import { fakeSlackApi, silentSlackApi, unreachableSlackApiUrl, type SlackApiAnswer, type FakeSlackApi } from './slackApi.js';
+import { clientSays, fakeSlackApi, silentSlackApi, unreachableSlackApiUrl, type SlackApiAnswer, type FakeSlackApi } from './slackApi.js';
 
 let api: FakeSlackApi;
 let client: SlackWebClient;
@@ -143,7 +143,7 @@ test('a post that failed in a way that may have posted it may remain after a rol
   const lost = await call('send_message', { channelId: 'C2', content: 'two' });
   assert.match(lost.content[0].text, /Slack answered with HTTP 503, so whether the message was posted is unknown\./);
   const refused = await call('send_message', { channelId: 'C3', content: 'three' });
-  assert.match(refused.content[0].text, /^An API error occurred: not_in_channel\n\nNothing was posted/);
+  assert.ok(refused.content[0].text.startsWith(`${await clientSays({ body: { ok: false, error: 'not_in_channel' } })}\n\nNothing was posted`), refused.content[0].text);
   const from = api.calls.length;
   const back = await rollback(one.state!.checkpoint);
   assert.deepEqual(deletes(from), []);
@@ -294,7 +294,7 @@ test('a publish whose answer names no message is answered as any publish whose o
   // has said "unknown" all along. Then an answer with no ts.
   const failed = await publish();
   const unconfirmed = await publish();
-  assert.match(failed.message, /An API error occurred: internal_error\n\nSlack failed while handling the call, /);
+  assert.ok(failed.message.includes(`${await clientSays({ body: { ok: false, error: 'internal_error' } })}\n\nSlack failed while handling the call, `), failed.message);
   assert.match(unconfirmed.message, /chat\.postMessage: the answer named no message in C1\n\nSlack's answer to the post named no message, /);
   // Both are the same kind of error, ending in the same check.
   for (const answer of [failed, unconfirmed]) {

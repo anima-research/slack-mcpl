@@ -8,7 +8,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { WebClient } from '@slack/web-api';
 import { SLACK_CLIENT_OPTIONS, SlackAdapter, type SlackMessageData, type SlackWebLike } from '../src/slack-adapter.js';
-import { fakeSlackApi, unreachableSlackApiUrl } from './slackApi.js';
+import { anyPort, clientError, clientSays, fakeSlackApi, unreachableSlackApiUrl } from './slackApi.js';
 
 /** What a refusal says when DMs are off, after what didn't happen. */
 const offHere =
@@ -185,19 +185,16 @@ for (const [what, answer, next] of [
   [
     "Slack rate-limits the lookup without the Retry-After the client needs",
     { status: 429, body: { ok: false, error: 'ratelimited' } },
-    '(Retry header did not contain a valid timeout (url: http://127.0.0.1:PORT/api/conversations.info, retry-after ' +
-      `header: undefined)), ` +
-      `${confirms} Try again shortly.`,
+    null,
   ],
 ] as const) {
   test(`when ${what}, a conversation Slack can't confirm as a channel is refused, and the text says what to do`, { timeout: 5000 }, async (t) => {
     const api = await fakeSlackApi();
     t.after(() => api.close());
     api.answer(answer);
-    // The local endpoint's port, in the client's own message for a 429 without
-    // Retry-After, changes from run to run.
+    const said = next ?? `(${await clientSays(answer, 'conversations.info')}), ${confirms} Try again shortly.`;
     await assert.rejects(strictOver(api.url).fetchHistory('CUNKNOWN'), (err: Error) => {
-      assert.equal(err.message.replace(/127\.0\.0\.1:\d+/, '127.0.0.1:PORT'), `Nothing was read: Slack couldn't confirm CUNKNOWN is a channel ${next}`);
+      assert.equal(anyPort(err.message), anyPort(`Nothing was read: Slack couldn't confirm CUNKNOWN is a channel ${said}`));
       return true;
     });
     assert.deepEqual(api.calls, ['conversations.info'], 'nothing is read');
@@ -207,21 +204,28 @@ for (const [what, answer, next] of [
 // A check that can pass isn't refused: its own error reaches the caller,
 // which the explainer reads as a request made before the read or the write,
 // and nothing is read.
-for (const [what, answer, error] of [
-  ['Slack rate-limits the lookup', { status: 429, headers: { 'retry-after': '2' }, body: { ok: false, error: 'ratelimited' } },
-    'A rate-limit has been reached, you may retry this request in 2 seconds'],
-  ['Slack fails while answering', { body: { ok: false, error: 'internal_error' } }, 'An API error occurred: internal_error'],
-  ['Slack answers fatal_error', { body: { ok: false, error: 'fatal_error' } }, 'An API error occurred: fatal_error'],
-  ['Slack answers service_unavailable', { body: { ok: false, error: 'service_unavailable' } }, 'An API error occurred: service_unavailable'],
-  ['Slack answers request_timeout', { body: { ok: false, error: 'request_timeout' } }, 'An API error occurred: request_timeout'],
-  ['Slack answers ratelimited in an HTTP 200', { body: { ok: false, error: 'ratelimited' } }, 'An API error occurred: ratelimited'],
-  ['Slack answers HTTP 503', { status: 503, body: { ok: false } }, 'An HTTP protocol error occurred: statusCode = 503'],
+for (const [what, answer] of [
+  ['Slack rate-limits the lookup', { status: 429, headers: { 'retry-after': '2' }, body: { ok: false, error: 'ratelimited' } }],
+  ['Slack fails while answering', { body: { ok: false, error: 'internal_error' } }],
+  ['Slack answers fatal_error', { body: { ok: false, error: 'fatal_error' } }],
+  ['Slack answers service_unavailable', { body: { ok: false, error: 'service_unavailable' } }],
+  ['Slack answers request_timeout', { body: { ok: false, error: 'request_timeout' } }],
+  ['Slack answers ratelimited in an HTTP 200', { body: { ok: false, error: 'ratelimited' } }],
+  ['Slack answers HTTP 503', { status: 503, body: { ok: false } }],
 ] as const) {
   test(`when ${what}, the check's own error reaches the caller, and nothing is read`, { timeout: 5000 }, async (t) => {
     const api = await fakeSlackApi();
     t.after(() => api.close());
+    const own = await clientError(answer, 'conversations.info');
     api.answer(answer);
-    await assert.rejects(strictOver(api.url).fetchHistory('CUNKNOWN'), { message: error });
+    const fields = (e: unknown) => {
+      const { message, code, data, retryAfter, statusCode } = e as { message: string; code?: string; data?: unknown; retryAfter?: number; statusCode?: number };
+      return { message, code, data, retryAfter, statusCode };
+    };
+    await assert.rejects(strictOver(api.url).fetchHistory('CUNKNOWN'), (err: unknown) => {
+      assert.deepEqual(fields(err), fields(own));
+      return true;
+    });
     assert.deepEqual(api.calls, ['conversations.info'], 'nothing is read');
   });
 }

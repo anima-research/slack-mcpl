@@ -1,0 +1,1 @@
+- Clear typing statuses outside the policy request's time budget, so a typing-policy reduction queued behind a slow tool still sends its clear.

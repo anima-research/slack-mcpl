@@ -1,0 +1,855 @@
+import test, { type TestContext } from 'node:test';
+import assert from 'node:assert/strict';
+import { McplConnection, method } from '@animalabs/mcpl-core';
+import * as net from 'node:net';
+import { serveTcp } from '../src/tcp.js';
+import { ACK_TTL_MS, STATUS_REFRESH_MS, SlackAdapter, SlackWebClient, SLACK_CLIENT_OPTIONS } from '../src/slack-adapter.js';
+import { SlackMcplServer } from '../src/server.js';
+import { FULL_GRANT, MENTION_EVENT, answerAsHost, connectHost, fakeSlack, harness, initialize, until, type HarnessOptions } from './harness.js';
+import { fakeSlackApi } from './slackApi.js';
+import { virtualClock, elapse } from './virtualClock.js';
+
+const GRANT = [...FULL_GRANT, 'channels.typing'];
+const typing = (h: { host: ReturnType<typeof harness>['host'] }, op = 'start', name: string = method.CHANNELS_TYPING) =>
+  h.host.sendNotification(name, { channelId: 'slack:C1', op });
+const publish = (h: ReturnType<typeof harness>) => h.host.sendRequest(method.CHANNELS_PUBLISH,
+  { channelId: 'slack:C1', content: [{ type: 'text', text: 'answer' }] });
+const delivered = (h: ReturnType<typeof harness>) => h.hostSaw.filter((r) => r.method === method.PUSH_EVENT || r.method === method.CHANNELS_INCOMING).length;
+async function ready(h: Pick<ReturnType<typeof harness>, 'host' | 'hostSaw'>, grant = GRANT) {
+  await initialize(h, true);
+  return h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: grant });
+}
+async function connected(t: TestContext, opts: HarnessOptions = {}, grant = GRANT) {
+  const h = harness(opts);
+  t.after(() => h.close());
+  const receipt = await ready(h, grant);
+  return { h, receipt };
+}
+async function settled(h: Pick<ReturnType<typeof harness>, 'host' | 'server'>) {
+  await h.host.sendRequest('tools/list');
+  await Promise.all(h.server['slack']['statusQueue'].values());
+}
+
+async function mention(h: ReturnType<typeof harness>, extra = {}) {
+  const before = delivered(h);
+  await h.socket.emitMessage({ ...MENTION_EVENT, ts: '5.0', thread_ts: '4.0', ...extra });
+  await until(() => delivered(h) > before, 'message delivered');
+  await Promise.all(h.server['forwarding'].values()); // Wait for taken()/notTaken().
+}
+
+test('original harness grant keeps push and publish, with no status', async (t) => {
+  const { h, receipt } = await connected(t, {}, FULL_GRANT);
+  assert.ok(!(receipt as any).unavailableFeatures.some((f: any) => f.featureSet === 'slack.messaging'));
+  await mention(h);
+  typing(h);
+  await settled(h);
+  assert.deepEqual(h.statuses, []);
+  assert.equal((await publish(h) as any).delivered, true);
+  assert.equal(h.posts.length, 1);
+});
+
+test('ambient delivery does not move a pending addressed thread', async (t) => {
+  const { h } = await connected(t);
+  await mention(h);
+  typing(h);
+  await until(() => h.statuses.length === 1, 'status');
+  await mention(h, { ts: '6.0', thread_ts: '6.0', text: 'lunch?', user: 'U3' });
+  typing(h);
+  await settled(h);
+  assert.deepEqual(h.statuses, ['C1:4.0:is thinking…']);
+});
+
+test('a refused addressed message gets no status', async (t) => {
+  const { h } = await connected(t, { pushAccepted: false });
+  await mention(h);
+  typing(h);
+  await settled(h);
+  assert.deepEqual(h.statuses, []);
+});
+
+for (const end of ['publish', 'tool'] as const) {
+  test(`${end} forgets the pending thread; a later start does not revive it`, async (t) => {
+    const { h } = await connected(t);
+    await mention(h);
+    typing(h);
+    await until(() => h.statuses.length === 1, 'status');
+    if (end === 'publish') {
+      await publish(h);
+      assert.equal((h.posts.at(-1) as any).thread_ts, '4.0');
+    }
+    else await h.host.sendRequest('tools/call', { name: 'send_message', arguments: { channelId: 'C1', content: 'answer' } });
+    await until(() => h.statuses.length === 2, 'clear');
+    typing(h);
+    await settled(h);
+    assert.deepEqual(h.statuses, ['C1:4.0:is thinking…', 'C1:4.0:']);
+  });
+}
+
+test('a typing stop preserves the pending thread for a retry, and publish ends it', async (t) => {
+  const { h } = await connected(t);
+  await mention(h);
+  typing(h);
+  await until(() => h.statuses.length === 1, 'initial status');
+  typing(h, 'stop');
+  await until(() => h.statuses.length === 2, 'failed attempt clear');
+  typing(h);
+  await settled(h);
+  assert.deepEqual(h.statuses, ['C1:4.0:is thinking…', 'C1:4.0:', 'C1:4.0:is thinking…']);
+  await publish(h);
+  assert.equal((h.posts.at(-1) as any).thread_ts, '4.0');
+  await settled(h);
+  typing(h);
+  await settled(h);
+  assert.deepEqual(h.statuses, ['C1:4.0:is thinking…', 'C1:4.0:', 'C1:4.0:is thinking…', 'C1:4.0:']);
+});
+
+test('an overlapping inference stopping all shown channels preserves an unanswered thread', async (t) => {
+  const { h } = await connected(t);
+  // ActivityModule types in every show_in channel, even while answering C2.
+  const typeAll = (op: string) => {
+    typing(h, op);
+    h.host.sendNotification(method.CHANNELS_TYPING, { channelId: 'slack:C2', op });
+  };
+  typeAll('start');
+  await settled(h);
+  await mention(h); // C1 arrives while C2 is being answered.
+  typeAll('start'); // The ongoing inference's next typing tick.
+  await until(() => h.statuses.length === 1, 'C1 status during C2 inference');
+  typeAll('stop'); // C2 stream-end stops every show_in channel.
+  await until(() => h.statuses.length === 2, 'stream-end clear');
+  typeAll('start'); // The inference that actually answers C1.
+  await settled(h);
+  assert.deepEqual(h.statuses, ['C1:4.0:is thinking…', 'C1:4.0:', 'C1:4.0:is thinking…']);
+  await publish(h);
+  assert.equal((h.posts.at(-1) as any).thread_ts, '4.0');
+});
+
+test('a new typing run expires a pending root at the acknowledgement age cap', async (t) => {
+  virtualClock(t);
+  const { h } = await connected(t);
+  await mention(h);
+  typing(h);
+  await until(() => h.statuses.length === 1, 'initial status');
+  elapse(ACK_TTL_MS - 1);
+  typing(h, 'stop');
+  await until(() => h.statuses.length === 2, 'clear before expiry');
+  typing(h);
+  await settled(h);
+  assert.equal(h.statuses.at(-1), 'C1:4.0:is thinking…', 'root survives until the age cap');
+  elapse(1);
+  typing(h, 'stop');
+  typing(h);
+  await settled(h);
+  assert.deepEqual(h.statuses, ['C1:4.0:is thinking…', 'C1:4.0:', 'C1:4.0:is thinking…', 'C1:4.0:']);
+  typing(h);
+  await settled(h);
+  assert.equal(h.statuses.length, 4, 'expired root cannot be revived');
+});
+
+test('continuous seven-second typing refreshes preserve a run beyond eleven minutes', async (t) => {
+  virtualClock(t);
+  const { h } = await connected(t);
+  await mention(h);
+  for (let ms = 0; ms <= 11 * 60 * 1000; ms += 7000) {
+    typing(h);
+    await settled(h);
+    assert.equal(h.statuses.at(-1), 'C1:4.0:is thinking…');
+    elapse(7000);
+  }
+  assert.ok(h.statuses.length > 1, 'the status was refreshed, not merely left alone');
+  assert.ok(h.statuses.every((s) => s === 'C1:4.0:is thinking…'), 'no mid-run clear');
+  typing(h, 'stop');
+  await settled(h);
+  const stopped = [...h.statuses];
+  typing(h);
+  await settled(h);
+  assert.deepEqual(h.statuses, stopped, 'a new run after the age cap cannot revive the root');
+});
+
+test('an aged root survives a refresh-interval gap exactly, but not a longer gap', async (t) => {
+  virtualClock(t);
+  const { h } = await connected(t);
+  await mention(h);
+  for (let ms = 0; ms < ACK_TTL_MS; ms += 7000) {
+    typing(h);
+    await settled(h);
+    elapse(7000);
+  }
+  elapse(STATUS_REFRESH_MS - 7000);
+  typing(h);
+  await settled(h);
+  assert.equal(h.statuses.at(-1), 'C1:4.0:is thinking…', 'equal gap continues the run');
+  elapse(STATUS_REFRESH_MS + 1);
+  typing(h);
+  await settled(h);
+  assert.equal(h.statuses.at(-1), 'C1:4.0:', 'longer gap opens a capped run');
+  const expired = [...h.statuses];
+  typing(h);
+  await settled(h);
+  assert.deepEqual(h.statuses, expired, 'expired root cannot be revived');
+});
+
+test('a first typing start at the acknowledgement age cap gets no status', async (t) => {
+  virtualClock(t);
+  const { h } = await connected(t);
+  await mention(h);
+  elapse(ACK_TTL_MS);
+  typing(h);
+  await settled(h);
+  assert.deepEqual(h.statuses, []);
+});
+
+test('top-level mention stays top-level through publish, without a status', async (t) => {
+  const { h } = await connected(t);
+  await mention(h, { thread_ts: undefined });
+  typing(h);
+  await settled(h);
+  await publish(h);
+  assert.deepEqual(h.statuses, []);
+  assert.equal((h.posts.at(-1) as any).thread_ts, undefined);
+});
+
+test('notifications/typing alias sets and clears; idle typing is silent', async (t) => {
+  const { h } = await connected(t);
+  typing(h);
+  await settled(h);
+  assert.deepEqual(h.statuses, []);
+  await mention(h);
+  typing(h, 'start', 'notifications/typing');
+  await until(() => h.statuses.length === 1, 'alias status');
+  typing(h, 'stop', 'notifications/typing');
+  await until(() => h.statuses.length === 2, 'alias clear');
+  typing(h, 'start', 'notifications/typing');
+  await settled(h);
+  assert.deepEqual(h.statuses, ['C1:4.0:is thinking…', 'C1:4.0:', 'C1:4.0:is thinking…']);
+});
+
+test('channels/typing with { channelId } alone, as mcpl-core types it, shows the status', async (t) => {
+  const { h } = await connected(t);
+  await mention(h);
+  h.host.sendNotification(method.CHANNELS_TYPING, { channelId: 'slack:C1' });
+  await until(() => h.statuses.length === 1, 'status');
+  assert.deepEqual(h.statuses, ['C1:4.0:is thinking…']);
+});
+
+test('an addressed message taken in the shown thread after the last start stays pending through a stop', async (t) => {
+  const { h } = await connected(t);
+  await mention(h);
+  typing(h);
+  await until(() => h.statuses.length === 1, 'status');
+  await mention(h, { ts: '5.5' });
+  typing(h, 'stop');
+  await until(() => h.statuses.length === 2, 'clear');
+  typing(h);
+  await until(() => h.statuses.length === 3, 'the follow-up');
+  assert.deepEqual(h.statuses, ['C1:4.0:is thinking…', 'C1:4.0:', 'C1:4.0:is thinking…']);
+});
+
+test("a stop preserves a newer pending thread for the next start", async (t) => {
+  const { h } = await connected(t);
+  await mention(h);
+  typing(h);
+  await until(() => h.statuses.length === 1, 'status');
+  await mention(h, { ts: '7.5', thread_ts: '7.0' });
+  typing(h, 'stop');
+  await until(() => h.statuses.length === 2, 'clear');
+  typing(h);
+  await until(() => h.statuses.length === 3, 'the newer thread');
+  assert.deepEqual(h.statuses, ['C1:4.0:is thinking…', 'C1:4.0:', 'C1:7.0:is thinking…']);
+});
+
+test('explicitly disabled typing set cannot set status', async (t) => {
+  const { h } = await connected(t);
+  await mention(h);
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: GRANT, disabled: ['slack.typing'] });
+  typing(h);
+  await settled(h);
+  assert.deepEqual(h.statuses, []);
+});
+
+for (const reduction of ['disabled request', 'capability revoked', 'disabled notification', 'malformed policy', 'restrictive enabled allow-list'] as const) {
+  test(`a ${reduction} clears shown typing statuses without needing a stop`, async (t) => {
+    const { h } = await connected(t);
+    await mention(h);
+    typing(h);
+    await until(() => h.statuses.length === 1, 'status before reduction');
+    if (reduction === 'disabled notification') {
+      h.host.sendNotification(method.FEATURE_SETS_UPDATE, { disabled: ['slack.typing'] });
+    } else if (reduction === 'malformed policy') {
+      await assert.rejects(h.host.sendRequest(method.FEATURE_SETS_UPDATE, {
+        effectiveCapabilities: GRANT, deniedCapabilities: ['channels.typing'],
+      }));
+    } else if (reduction === 'restrictive enabled allow-list') {
+      await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: GRANT, enabled: ['slack.messaging'] });
+    } else {
+      await h.host.sendRequest(method.FEATURE_SETS_UPDATE, reduction === 'capability revoked'
+        ? { effectiveCapabilities: FULL_GRANT }
+        : { effectiveCapabilities: GRANT, disabled: ['slack.typing'] });
+    }
+    await settled(h);
+    assert.deepEqual(h.statuses, ['C1:4.0:is thinking…', 'C1:4.0:']);
+    typing(h);
+    await settled(h);
+    assert.equal(h.statuses.length, 2, 'inactive typing cannot set another status');
+    if (reduction !== 'malformed policy') {
+      await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: GRANT, disabled: [] });
+      typing(h);
+      await settled(h);
+      assert.equal(h.statuses.at(-1), 'C1:4.0:is thinking…', 're-enabling preserves the unanswered root');
+    }
+  });
+}
+
+test('a typing-policy reduction queued twenty seconds behind a tool sends its clear', async (t) => {
+  virtualClock(t);
+  const api = await fakeSlackApi();
+  t.after(() => api.close());
+  const log = t.mock.method(console, 'error', () => {});
+  const { h } = await connected(t);
+  const slack = h.server['slack'];
+  const web = new SlackWebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: api.url });
+  // Keep the incoming-message harness, but send statuses through the real
+  // client's deadline check and the loopback Slack endpoint.
+  t.mock.method(slack['web'].assistant!.threads, 'setStatus', web.assistant.threads.setStatus.bind(web.assistant.threads));
+  await mention(h);
+  typing(h);
+  await settled(h);
+  assert.deepEqual(api.sent.map((p) => p.get('status')), ['is thinking…']);
+
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  t.after(() => release());
+  let inTool = false;
+  t.mock.method(slack, 'listConversations', async () => {
+    inTool = true;
+    await held;
+    return { conversations: [], leftOut: [] };
+  });
+  const slow = h.host.sendRequest('tools/call', { name: 'list_channels', arguments: {} });
+  await until(() => inTool, 'preceding tool in flight');
+  let arrived = false;
+  h.server['conn']!.on('request', (req) => {
+    if (req.method === method.FEATURE_SETS_UPDATE) arrived = true;
+  });
+  const reduction = h.host.sendRequest(method.FEATURE_SETS_UPDATE, {
+    effectiveCapabilities: GRANT, disabled: ['slack.typing'],
+  });
+  await until(() => arrived, 'policy request queued behind the tool');
+  elapse(20_000);
+  release();
+  await Promise.all([slow, reduction]);
+  await settled(h);
+  assert.deepEqual(api.calls, ['assistant.threads.setStatus', 'assistant.threads.setStatus']);
+  assert.deepEqual(api.sent.map((p) => p.get('status')), ['is thinking…', '']);
+  assert.ok(!log.mock.calls.some((c) => c.arguments.some((a) => String(a).includes("out of this call's time"))));
+});
+
+for (const name of [method.CHANNELS_TYPING, 'notifications/typing']) {
+  test(`${name} stop clears an owned status even when typing is inactive`, async (t) => {
+    const { h } = await connected(t);
+    await mention(h);
+    typing(h);
+    await until(() => h.statuses.length === 1, 'status');
+    // Isolate the stop gate from proactive cleanup on policy changes.
+    t.mock.method(h.server['slack'], 'clearThreadStatuses', async () => {});
+    await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+    typing(h, 'stop', name);
+    await settled(h);
+    assert.deepEqual(h.statuses, ['C1:4.0:is thinking…', 'C1:4.0:']);
+  });
+}
+
+test('peer close clears status and a new peer has no pending thread', async (t) => {
+  const f = fakeSlack();
+  const server = new SlackMcplServer(f.slack);
+  const a = connectHost(server);
+  t.after(() => a.close());
+  await ready(a);
+  await f.socket.emitMessage({ ...MENTION_EVENT, thread_ts: '4.0' });
+  await until(() => a.hostSaw.some((r) => r.method === method.PUSH_EVENT), 'first delivery');
+  await Promise.all(server['forwarding'].values());
+  typing(a);
+  await until(() => f.statuses.length === 1, 'first status');
+  await a.close();
+  await Promise.all(f.slack['statusQueue'].values());
+  assert.deepEqual(f.statuses, ['C1:4.0:is thinking…', 'C1:4.0:'], 'clear before another peer types');
+  const b = connectHost(server);
+  t.after(() => b.close());
+  await ready(b);
+  typing(b);
+  await b.host.sendRequest('tools/list');
+  await Promise.all(f.slack['statusQueue'].values());
+  assert.deepEqual(f.statuses, ['C1:4.0:is thinking…', 'C1:4.0:']);
+});
+
+type Status = { channel_id: string; thread_ts: string; status: string };
+function adapter(opts: { sendChannels?: string[]; disableDms?: boolean; absent?: boolean; info?: unknown; set?: (a: Status) => Promise<unknown> } = {}) {
+  const calls: string[] = [];
+  const web = {
+    chat: { postMessage: async () => ({ ts: '9.0' }) },
+    conversations: { info: async () => opts.info ?? ({ channel: { is_mpim: true } }) },
+    assistant: opts.absent ? undefined : { threads: { setStatus: async (a: Status) => {
+      calls.push(`${a.channel_id}:${a.thread_ts}:${a.status}`);
+      return opts.set?.(a);
+    } } },
+  } as any;
+  const socket = { on() {}, async start() {}, async disconnect() {} } as any;
+  return { a: new SlackAdapter(web, socket, 'UBOT', 'acme', undefined, opts.sendChannels, opts.disableDms), calls };
+}
+
+test('status refreshes after sixty seconds, and moving threads clears first', async (t) => {
+  virtualClock(t);
+  const { a, calls } = adapter();
+  await a.setThreadStatus('C1', '1.0');
+  await a.setThreadStatus('C1', '1.0');
+  elapse(60000);
+  await a.setThreadStatus('C1', '1.0');
+  await a.setThreadStatus('C1', '2.0');
+  await a.setThreadStatus('C1', undefined);
+  assert.deepEqual(calls, ['C1:1.0:is thinking…', 'C1:1.0:is thinking…', 'C1:1.0:', 'C1:2.0:is thinking…', 'C1:2.0:']);
+});
+
+for (const opts of [{ sendChannels: ['C9'] }, { disableDms: true }, { absent: true }]) {
+  test(`no status when ${JSON.stringify(opts)}`, async (t) => {
+    t.mock.method(console, 'error', () => {});
+    const { a, calls } = adapter(opts);
+    await a.setThreadStatus('C1', '1.0');
+    await a.setThreadStatus('D1', '1.0');
+    assert.deepEqual(calls, []);
+  });
+}
+
+test('with DMs off, a conversation Slack confirms as a channel gets its status', async () => {
+  const { a, calls } = adapter({ disableDms: true, info: { channel: { id: 'C1', is_im: false, is_mpim: false } } });
+  await a.setThreadStatus('C1', '1.0');
+  assert.deepEqual(calls, ['C1:1.0:is thinking…']);
+});
+
+for (const answer of ['missing_scope', 'internal_error', 'rate limit'] as const) {
+  test(`with DMs off, conversations.info ${answer} is ${answer === 'missing_scope' ? 'suppressed until the peer changes' : 'retryable'}`, async (t) => {
+    const api = await fakeSlackApi();
+    t.after(() => api.close());
+    const log = t.mock.method(console, 'error', () => {});
+    api.answerFor('conversations.info', answer === 'rate limit'
+      ? { status: 429, headers: { 'retry-after': '1' }, body: { ok: false, error: 'ratelimited' } }
+      : { body: { ok: false, error: answer } });
+    const web = new SlackWebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: api.url });
+    const socket = { on() {}, async start() {}, async disconnect() {} } as any;
+    const a = new SlackAdapter(web as any, socket, 'UBOT', 'acme', undefined, undefined, true);
+    for (let i = 0; i < 5; i++) await a.setThreadStatus('G1', '1.0');
+    const expected = answer === 'missing_scope' ? 1 : 5;
+    assert.deepEqual(api.calls, Array(expected).fill('conversations.info'));
+    assert.equal(log.mock.callCount(), expected);
+    if (answer === 'missing_scope') {
+      await a.setThreadStatus('G1', '2.0');
+      assert.equal(api.calls.length, 1, 'refusal covers the conversation');
+      await a.resetThreadStatuses();
+      await a.setThreadStatus('G1', '1.0');
+      assert.equal(api.calls.length, 2, 'new peer can ask again');
+    }
+  });
+}
+
+for (const retryAfter of [undefined, 'not-a-timeout']) {
+  test(`with DMs off, a conversations.info 429 with Retry-After ${retryAfter ?? 'absent'} permits a later status`, async (t) => {
+    const api = await fakeSlackApi();
+    t.after(() => api.close());
+    const log = t.mock.method(console, 'error', () => {});
+    api.answerFor('conversations.info',
+      { status: 429, headers: retryAfter === undefined ? {} : { 'retry-after': retryAfter }, body: { ok: false, error: 'ratelimited' } },
+      { body: { ok: true, channel: { id: 'C9', name: 'general', is_im: false, is_mpim: false } } });
+    const web = new SlackWebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: api.url });
+    const socket = { on() {}, async start() {}, async disconnect() {} } as any;
+    const a = new SlackAdapter(web as any, socket, 'UBOT', 'acme', undefined, undefined, true);
+    await a.setThreadStatus('C9', '1.0');
+    assert.deepEqual(api.calls, ['conversations.info'], 'the failed check must not permit a write');
+    assert.match(String(log.mock.calls.at(-1)?.arguments[1]), /Try again shortly/);
+    await a.setThreadStatus('C9', '1.0');
+    await a.setThreadStatus('C9', '1.0');
+    assert.deepEqual(api.calls, ['conversations.info', 'conversations.info', 'assistant.threads.setStatus']);
+    assert.equal(api.sent.at(-1)?.get('status'), 'is thinking…');
+    assert.equal(log.mock.callCount(), 1, 'the transient check is logged only once');
+  });
+}
+
+for (const channel of [{ id: 'G1', is_mpim: true }, { id: 'G1' }]) {
+  test(`with DMs off, a confirmed ${channel.is_mpim ? 'group DM' : 'non-channel'} refusal is remembered until peer change`, async (t) => {
+    const log = t.mock.method(console, 'error', () => {});
+    const { a, calls } = adapter({ disableDms: true, info: { channel } });
+    const check = t.mock.method(a['web'].conversations, 'info');
+    for (let i = 0; i < 3; i++) await a.setThreadStatus('G1', '1.0');
+    assert.deepEqual(calls, []);
+    assert.equal(check.mock.callCount(), 1);
+    assert.equal(log.mock.callCount(), 1);
+    await a.resetThreadStatuses();
+    await a.setThreadStatus('G1', '1.0');
+    assert.equal(log.mock.callCount(), 2, 'a new peer rechecks the policy refusal');
+  });
+}
+
+test('a late old-peer conversation check refusal cannot suppress the new peer status', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const { a, calls } = adapter({ disableDms: true, info: { channel: { id: 'C1', is_im: false, is_mpim: false } } });
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let checks = 0;
+  t.mock.method(a['web'].conversations, 'info', async () => {
+    if (++checks === 1) {
+      await held;
+      throw Object.assign(new Error('missing_scope'), {
+        code: 'slack_webapi_platform_error', data: { error: 'missing_scope' },
+      });
+    }
+    return { channel: { id: 'C1', is_im: false, is_mpim: false } };
+  });
+  const first = a.setThreadStatus('C1', '1.0');
+  await until(() => checks === 1, 'old check in flight');
+  const reset = a.resetThreadStatuses();
+  const second = a.setThreadStatus('C1', '2.0');
+  release();
+  await Promise.all([first, reset, second]);
+  assert.equal(checks, 2);
+  assert.deepEqual(calls, ['C1:2.0:is thinking…']);
+  await a.setThreadStatus('C1', undefined);
+});
+
+test('a refusal of one thread (invalid_thread_ts) stops status attempts in that thread only, until the peer changes', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const { a, calls } = adapter({ set: async ({ channel_id, thread_ts, status }) => {
+    if (channel_id === 'C1' && thread_ts === '1.0' && status) throw Object.assign(new Error('invalid_thread_ts'), {
+      code: 'slack_webapi_platform_error', data: { error: 'invalid_thread_ts' },
+    });
+  } });
+  await a.setThreadStatus('C1', '1.0');
+  await a.setThreadStatus('C1', '2.0');
+  await a.setThreadStatus('C1', '1.0');
+  await a.setThreadStatus('C2', '1.0');
+  await a.resetThreadStatuses();
+  await a.setThreadStatus('C1', '1.0');
+  assert.deepEqual(calls, [
+    'C1:1.0:is thinking…', 'C1:2.0:is thinking…', 'C1:2.0:', 'C2:1.0:is thinking…', 'C2:1.0:', 'C1:1.0:is thinking…',
+  ]);
+});
+
+for (const code of ['method_deprecated', 'method_not_supported_for_channel_type', 'internal_error']) {
+  test(`real WebClient ${code} is ${code === 'internal_error' ? 'retryable' : 'suppressed'}`, async (t) => {
+    const api = await fakeSlackApi();
+    t.after(() => api.close());
+    const log = t.mock.method(console, 'error', () => {});
+    api.answerFor('assistant.threads.setStatus', { body: { ok: false, error: code } });
+    const web = new SlackWebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: api.url });
+    const socket = { on() {}, async start() {}, async disconnect() {} } as any;
+    const a = new SlackAdapter(web as any, socket, 'UBOT', 'acme');
+    for (let i = 0; i < 3; i++) await a.setThreadStatus('C1', '1.0');
+    const expected = code === 'internal_error' ? 3 : 1;
+    assert.equal(api.calls.length, expected);
+    assert.equal(log.mock.callCount(), expected);
+  });
+}
+
+test('shutdown clears and refuses new starts', async () => {
+  const { a, calls } = adapter();
+  await a.setThreadStatus('C1', '1.0');
+  await a.stop();
+  await a.setThreadStatus('C1', '2.0');
+  assert.deepEqual(calls, ['C1:1.0:is thinking…', 'C1:1.0:']);
+});
+
+for (const fail of [false, true]) {
+  test(`slow set (${fail ? 'failure' : 'success'}) is ordered before move and stop`, async (t) => {
+    t.mock.method(console, 'error', () => {});
+    let release!: () => void;
+    const held = new Promise<void>((r) => { release = r; });
+    const { a, calls } = adapter({ set: async ({ thread_ts, status }) => {
+      if (thread_ts === '1.0' && status) { await held; if (fail) throw new Error('transient'); }
+    } });
+    const first = a.setThreadStatus('C1', '1.0');
+    await until(() => calls.length === 1, 'in flight');
+    const next = a.setThreadStatus('C1', '2.0');
+    const stop = a.setThreadStatus('C1', undefined);
+    await nextTurn();
+    const beforeRelease = [...calls];
+    release();
+    await Promise.all([first, next, stop]);
+    assert.deepEqual(beforeRelease, ['C1:1.0:is thinking…']);
+    assert.equal(calls.at(-1), 'C1:2.0:');
+  });
+}
+
+test('a permanent refusal lasts only for this peer, with no pointless stop call', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  let refuse = true;
+  const { a, calls } = adapter({ set: async () => {
+    if (refuse) throw Object.assign(new Error('no_permission'), {
+      code: 'slack_webapi_platform_error', data: { error: 'no_permission' },
+    });
+  } });
+  await a.setThreadStatus('C1', '1.0');
+  await a.setThreadStatus('C1', undefined);
+  refuse = false;
+  await a.setThreadStatus('C1', '2.0');
+  assert.equal(calls.length, 1);
+  await a.resetThreadStatuses();
+  await a.setThreadStatus('C1', '2.0');
+  assert.deepEqual(calls, ['C1:1.0:is thinking…', 'C1:2.0:is thinking…']);
+});
+
+test('shutdown waits for in-flight set, skips queued start, then clears', async () => {
+  let release!: () => void;
+  const held = new Promise<void>((r) => { release = r; });
+  const { a, calls } = adapter({ set: async ({ status }) => { if (status) await held; } });
+  const first = a.setThreadStatus('C1', '1.0');
+  await until(() => calls.length === 1, 'in flight');
+  const queued = a.setThreadStatus('C1', '2.0');
+  const stopping = a.stop();
+  await nextTurn();
+  release();
+  await Promise.all([first, queued, stopping]);
+  assert.deepEqual(calls, ['C1:1.0:is thinking…', 'C1:1.0:']);
+});
+
+test('an unconfirmed post retains pending context, but a confirmed post ends it', async (t) => {
+  const f = fakeSlack();
+  const server = new SlackMcplServer(f.slack);
+  const h = { ...f, server, ...connectHost(server) };
+  t.after(() => h.close());
+  await ready(h);
+  await mention(h);
+  typing(h);
+  await until(() => h.statuses.length === 1, 'status');
+  const original = f.slack.sendMessage.bind(f.slack);
+  let fail = true;
+  t.mock.method(f.slack, 'sendMessage', async (...args: Parameters<typeof original>) => {
+    if (fail) throw new Error('post not confirmed');
+    return original(...args);
+  });
+  await assert.rejects(publish(h));
+  typing(h);
+  await settled(h);
+  assert.deepEqual(h.statuses, ['C1:4.0:is thinking…']);
+  fail = false;
+  await publish(h);
+  await until(() => h.statuses.length === 2, 'clear');
+  typing(h);
+  await settled(h);
+  assert.deepEqual(h.statuses, ['C1:4.0:is thinking…', 'C1:4.0:']);
+});
+
+const nextTurn = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+function holdClear(t: TestContext, slack: SlackAdapter) {
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const threads = slack['web'].assistant!.threads;
+  const original = threads.setStatus.bind(threads);
+  let clearing = false;
+  t.mock.method(threads, 'setStatus', async (args: Status) => {
+    if (!args.status) { clearing = true; await held; }
+    return original(args);
+  });
+  return { release, clearing: () => clearing };
+}
+
+test('no acknowledgement for messages arriving during a held disconnect clear', async (t) => {
+  const f = fakeSlack({ ackReaction: 'eyes' });
+  const server = new SlackMcplServer(f.slack);
+  const h = { ...f, server, ...connectHost(server) };
+  await ready(h);
+  await mention(h);
+  typing(h);
+  await until(() => f.statuses.length === 1, 'status');
+  const held = holdClear(t, f.slack);
+  const closing = h.close();
+  t.after(async () => { held.release(); await closing; await f.slack.stop(); });
+  await until(held.clearing, 'held clear');
+  await f.socket.emitMessage({ ...MENTION_EVENT, ts: '7.0', thread_ts: '7.0' });
+  await nextTurn();
+  assert.ok(!f.reactions.some((r) => r.startsWith('add:C1:7.0:')), 'no false received reaction');
+});
+
+test('TCP reconnect is accepted while the previous peer clear is held', async (t) => {
+  const f = fakeSlack();
+  const server = new SlackMcplServer(f.slack);
+  const tcp = net.createServer();
+  await new Promise<void>((resolve) => tcp.listen(0, '127.0.0.1', resolve));
+  const logs: string[] = [];
+  serveTcp(tcp, (c) => server.serve(c), (...args) => logs.push(args.join(' ')));
+  const sockets: net.Socket[] = [];
+  const held = holdClear(t, f.slack);
+  t.after(async () => {
+    held.release();
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve) => tcp.close(() => resolve()));
+    await f.slack.stop();
+  });
+  const connect = async () => {
+    const socket = net.connect((tcp.address() as net.AddressInfo).port, '127.0.0.1');
+    sockets.push(socket);
+    await new Promise<void>((resolve, reject) => { socket.once('connect', resolve); socket.once('error', reject); });
+    const host = McplConnection.fromTcp(socket);
+    const hostSaw = answerAsHost(host);
+    await ready({ host, hostSaw });
+    return { host, hostSaw, socket };
+  };
+  const first = await connect();
+  await f.socket.emitMessage({ ...MENTION_EVENT, ts: '5.0', thread_ts: '4.0' });
+  await until(() => server['forwardedWatermark'].get('C1') === '5.0', 'accepted first message');
+  typing(first);
+  await until(() => f.statuses.length === 1, 'first status');
+  first.socket.destroy();
+  await until(held.clearing, 'old peer clear');
+  await nextTurn();
+  const second = await connect();
+  assert.ok(!logs.some((l) => l.includes('Refused a client')));
+  await f.socket.emitMessage({ ...MENTION_EVENT, ts: '8.0', thread_ts: '8.0' });
+  await until(() => server['forwardedWatermark'].get('C1') === '8.0', 'accepted second message');
+  typing(second);
+  await second.host.sendRequest('tools/list');
+  assert.deepEqual(f.statuses, ['C1:4.0:is thinking…'], 'new status waits behind the old clear');
+  held.release();
+  await until(() => f.statuses.length === 3, 'old clear then new set');
+  assert.deepEqual(f.statuses, ['C1:4.0:is thinking…', 'C1:4.0:', 'C1:8.0:is thinking…']);
+});
+
+for (const where of ['Slack rejection', 'unexpected turn failure']) {
+  test(`${where} cannot crash or poison the queue`, async (t) => {
+    t.mock.method(console, 'error', () => {});
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+    t.after(() => { process.off('unhandledRejection', onUnhandled); });
+    let bad = true;
+    let reached = 0;
+    const { a, calls } = adapter({ set: async () => { if (bad && where === 'Slack rejection') { reached++; throw null; } } });
+    if (where === 'unexpected turn failure') {
+      (a as any).canWrite = () => { if (bad) { reached++; throw undefined; } return true; };
+    }
+    void a.setThreadStatus('C1', '1.0');
+    await until(() => reached === 1, 'the injected failure');
+    await nextTurn();
+    bad = false;
+    await a.setThreadStatus('C1', '2.0');
+    await a.setThreadStatus('C1', undefined);
+    const made = calls.length;
+    await a.setThreadStatus('C1', undefined);
+    await nextTurn();
+    assert.deepEqual(unhandled, []);
+    assert.ok(calls.includes('C1:2.0:is thinking…'), 'a later set reached Slack');
+    assert.equal(calls.at(-1), 'C1:2.0:', 'its clear followed');
+    assert.equal(calls.length, made, 'a second clear makes no call');
+  });
+}
+
+test('clearing statuses for a policy reduction does not release a lasting refusal', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const { a, calls } = adapter({ set: async () => {
+    throw Object.assign(new Error('missing_scope'), {
+      code: 'slack_webapi_platform_error', data: { error: 'missing_scope' },
+    });
+  } });
+  await a.setThreadStatus('C1', '1.0');
+  await a.clearThreadStatuses();
+  await a.setThreadStatus('C1', '1.0');
+  assert.equal(calls.length, 1);
+  await a.resetThreadStatuses();
+  await a.setThreadStatus('C1', '1.0');
+  assert.equal(calls.length, 2, 'only a peer change releases the refusal');
+});
+
+test('a late old-peer refusal cannot disable the new peer status', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const { a, calls } = adapter({ set: async ({ thread_ts, status }) => {
+    if (thread_ts === '1.0') {
+      if (status) await held;
+      throw Object.assign(new Error('no_permission'), {
+        code: 'slack_webapi_platform_error', data: { error: 'no_permission' },
+      });
+    }
+  } });
+  const first = a.setThreadStatus('C1', '1.0');
+  await until(() => calls.length === 1, 'old set in flight');
+  const reset = a.resetThreadStatuses();
+  const second = a.setThreadStatus('C1', '2.0');
+  release();
+  await Promise.all([first, reset, second]);
+  assert.deepEqual(calls, ['C1:1.0:is thinking…', 'C1:2.0:is thinking…'],
+    'a definitively refused set needs no teardown clear, and cannot suppress the new peer');
+  await a.setThreadStatus('C1', undefined);
+  assert.equal(calls.at(-1), 'C1:2.0:');
+});
+
+test('a refused teardown clear does not suppress the next peer set', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const { a, calls } = adapter({ set: async ({ status }) => {
+    if (!status) throw Object.assign(new Error('method_deprecated'), {
+      code: 'slack_webapi_platform_error', data: { error: 'method_deprecated' },
+    });
+  } });
+  await a.setThreadStatus('C1', '1.0');
+  await a.resetThreadStatuses();
+  await a.setThreadStatus('C1', '2.0');
+  assert.deepEqual(calls, ['C1:1.0:is thinking…', 'C1:1.0:', 'C1:2.0:is thinking…']);
+  await a.setThreadStatus('C1', undefined);
+  assert.equal(calls.at(-1), 'C1:2.0:');
+});
+
+test('a non-Error rejection permits an immediate same-thread refresh retry', async (t) => {
+  virtualClock(t);
+  t.mock.method(console, 'error', () => {});
+  let bad = true;
+  const { a, calls } = adapter({ set: async () => { if (bad) throw null; } });
+  await a.setThreadStatus('C1', '1.0');
+  bad = false;
+  await a.setThreadStatus('C1', '1.0'); // No clock advance: still inside the throttle window.
+  assert.deepEqual(calls, ['C1:1.0:is thinking…', 'C1:1.0:is thinking…']);
+  await a.setThreadStatus('C1', undefined);
+});
+
+const ratelimitedSets = () => adapter({ set: async ({ status }) => {
+  if (status) throw Object.assign(new Error('ratelimited'), {
+    code: 'slack_webapi_platform_error', data: { error: 'ratelimited' },
+  });
+} });
+
+test('an uncertain set failure keeps ownership for the teardown clear', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const { a, calls } = ratelimitedSets();
+  await a.setThreadStatus('C1', '1.0');
+  await a.resetThreadStatuses();
+  assert.deepEqual(calls, ['C1:1.0:is thinking…', 'C1:1.0:'], 'an uncertain set may have landed, so the teardown clears it');
+});
+
+test('an uncertain set failure suppresses nothing: the next start tries again', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const { a, calls } = ratelimitedSets();
+  await a.setThreadStatus('C1', '1.0');
+  await a.setThreadStatus('C1', '1.0');
+  assert.deepEqual(calls, ['C1:1.0:is thinking…', 'C1:1.0:is thinking…']);
+});
+
+test('a refused old-peer set cannot suppress a new peer while another clear is pending', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  t.after(() => release());
+  const { a, calls } = adapter({ set: async ({ channel_id, status }) => {
+    if (channel_id === 'C1' && status) throw Object.assign(new Error('no_permission'), {
+      code: 'slack_webapi_platform_error', data: { error: 'no_permission' },
+    });
+    if (channel_id === 'C2' && !status) await held;
+  } });
+  await a.setThreadStatus('C1', '1.0');
+  await a.setThreadStatus('C2', '1.0');
+  const armed = calls.length;
+  await a.setThreadStatus('C1', '3.0');
+  assert.equal(calls.length, armed, 'the old set armed suppression');
+  const reset = a.resetThreadStatuses();
+  const second = a.setThreadStatus('C1', '2.0');
+  await second;
+  const attempted = calls.includes('C1:2.0:is thinking…');
+  release();
+  await reset;
+  assert.ok(attempted, 'reset must retire old suppression before any new turn runs');
+});

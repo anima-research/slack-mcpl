@@ -92,6 +92,13 @@ test('DMs are flagged and the DM whitelist drops unlisted senders', async () => 
   assert.equal(received[0].authorId, 'UFRIEND');
 });
 
+test('an empty DM whitelist admits no DM', async () => {
+  const { emit, received } = makeAdapter({ dmUsers: [] });
+  await emit({ type: 'message', channel: 'D2', channel_type: 'im', user: 'USTRANGER', ts: '4.0', text: 'psst' });
+  await emit({ type: 'message', channel: 'C1', user: 'U1', ts: '4.1', text: 'in a channel' });
+  assert.deepEqual(received.map((m) => m.channelId), ['C1']);
+});
+
 test('file shares become attachment refs with mime classification', async () => {
   const { emit, received } = makeAdapter();
   await emit({

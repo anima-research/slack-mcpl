@@ -64,10 +64,9 @@ for (const status of [408, 429, 503]) {
 
 test('a download that never reaches a server says why, and to try again', async () => {
   const url = (await unreachableSlackApiUrl()) + 'shot.png';
-  await assert.rejects(fetchFrom(url), (err: Error) => {
-    assert.match(err.message, /^Nothing was fetched: the download failed on the way \(connect ECONNREFUSED 127\.0\.0\.1:\d+\)\. Try again shortly\.$/);
-    return true;
-  });
+  const why = await fetch(url).then(() => '', (e: Error & { cause?: Error }) => e.cause?.message ?? '');
+  assert.notEqual(why, '');
+  await assert.rejects(fetchFrom(url), { message: `Nothing was fetched: the download failed on the way (${why}). Try again shortly.` });
 });
 
 test('a download cut off partway says it failed on the way, and why', async (t) => {
@@ -78,11 +77,10 @@ test('a download cut off partway says it failed on the way, and why', async (t) 
     res.write(Buffer.alloc(1024));
     res.socket?.end();
   });
-  await assert.rejects(fetchFrom(url), (err: Error) => {
-    assert.match(err.message, /^Nothing was fetched: the download failed on the way \(.+\)\. Try again shortly\.$/);
-    // The cause's own words, not fetch's outer "terminated".
-    assert.doesNotMatch(err.message, /\(terminated\)/);
-    return true;
+  const failed = await fetch(url).then((resp) => resp.arrayBuffer()).then(() => null, (e: Error & { cause?: Error }) => e);
+  assert.ok(failed?.cause?.message && failed.cause.message !== failed.message, String(failed));
+  await assert.rejects(fetchFrom(url), {
+    message: `Nothing was fetched: the download failed on the way (${failed.cause.message}). Try again shortly.`,
   });
 });
 
