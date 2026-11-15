@@ -3,7 +3,7 @@
 slack-mcpl is part of the Connectome ecosystem
 ([mcpl-core-ts](https://github.com/anima-research/mcpl-core-ts),
 [discord-mcpl](https://github.com/anima-research/discord-mcpl),
-[zulip_mcp](https://github.com/antra-tess/zulip_mcp),
+[zulip_mcp](https://github.com/anima-research/zulip_mcp),
 [agent-framework](https://github.com/anima-research/agent-framework),
 [connectome-host](https://github.com/anima-research/connectome-host)). These
 conventions are the ones the ecosystem's core repos already follow. When in
