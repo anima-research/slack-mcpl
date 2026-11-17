@@ -20,7 +20,3 @@
   name the automatic ACK emoji and explain its lifecycle. Adding it explicitly
   adopts the reaction on success or `already_reacted`, retiring automatic cleanup.
   Redelivered events cannot recreate cleanup for that message for 10 minutes.
-- When combined with the explicit Slack access policy, manual reaction removal
-  requires fresh conversation admission and `reactions:write` before joining
-  cleanup and at the effect, including after waiting for a pending acknowledgement
-  add. Legacy behavior is unchanged.

@@ -404,6 +404,7 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
             'it, or edit in a shorter version and post the rest with reply_message.'
         : `${lead}: Slack refused the text as too long. Split it into shorter messages and send them in order.`;
     case 'no_reaction':
+      // For direct adapter callers; the server maps no_reaction to success.
       return call.tool === 'remove_reaction'
         ? `${lead}: this bot has no such reaction on that message. Only this bot's own reactions can be removed.`
         : undefined;

@@ -30,12 +30,11 @@ test('policy composition: allowed reaction removal uses fresh info and reactions
   assert.equal(await f.adapter.removeReaction('C1', '1.0', ':eyes:'), true);
   assert.deepEqual(f.calls, [
     { method: 'info', args: { channel: 'C1' } },
-    { method: 'info', args: { channel: 'C1' } },
     { method: 'unreact', args: { channel: 'C1', timestamp: '1.0', name: 'eyes' } },
   ]);
   f.state.conversation.is_member = false;
   await assert.rejects(f.adapter.removeReaction('C1', '1.0', ':eyes:'));
-  assert.deepEqual(f.methods(), ['info', 'info', 'unreact', 'info']);
+  assert.deepEqual(f.methods(), ['info', 'unreact', 'info']);
 });
 
 test('policy composition: reaction removal rechecks after a pending ACK add', { skip: !policyPresent }, async t => {
@@ -44,7 +43,8 @@ test('policy composition: reaction removal rechecks after a pending ACK add', { 
   let release!: () => void;
   f.web.reactions.add = async () => new Promise<void>(resolve => { release = resolve; });
   const adding = f.adapter.acknowledge('C1', '1.0');
-  while (!release) await new Promise(resolve => setImmediate(resolve));
+  for (let i = 0; i < 20 && !release; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.ok(release, 'automatic cleanup must reach Slack');
   const removing = f.adapter.removeReaction('C1', '1.0', 'eyes');
   // Let removal reach its wait for the add before revoking membership.
   await new Promise(resolve => setImmediate(resolve));
@@ -84,7 +84,8 @@ test('policy composition: revoked membership denies joining successful ACK clean
   t.after(async () => { release?.(); await f.slack.stop(); });
   await f.slack.acknowledge('C1', '1.0');
   const clearing = f.slack.clearAck('C1');
-  while (!release) await new Promise(resolve => setImmediate(resolve));
+  for (let i = 0; i < 20 && !release; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.ok(release, 'automatic cleanup must reach Slack');
   admitted = false;
   const denied = assert.rejects(f.slack.removeReaction('C1', '1.0', 'eyes'), /membership revoked/);
   await new Promise(resolve => setImmediate(resolve));
@@ -174,3 +175,18 @@ for (const waitingFor of ['add', 'removal']) {
     assert.equal(adds, 1, 'revocation prevents the adoption effect');
   });
 }
+
+
+test('policy composition: non-ACK removal checks admission only once', async t => {
+  const f = fakeSlack({ ackReaction: 'eyes' });
+  t.after(() => f.slack.stop());
+  const policy = f.slack as unknown as {
+    requireWritableConversation(id: string, scope: string, notDone: string): Promise<void>;
+  };
+  const checks: unknown[] = [];
+  Object.defineProperty(policy, 'hasAccessPolicy', { value: true });
+  policy.requireWritableConversation = async (id, scope, notDone) => { checks.push({ id, scope, notDone }); };
+  assert.equal(await f.slack.removeReaction('C1', '1.0', 'wave'), true);
+  assert.deepEqual(checks, [{ id: 'C1', scope: 'reactions:write', notDone: 'No reaction was removed' }]);
+  assert.deepEqual(f.reactions, ['remove:C1:1.0:wave']);
+});
