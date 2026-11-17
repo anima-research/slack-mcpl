@@ -590,7 +590,7 @@ test("a request its call's deadline left no time for says it wasn't sent, and th
   assert.ok(
     text.endsWith(
       `\n\nNothing was posted: this server gives each call ${CALL_SECONDS} seconds from when it reaches this server, and ` +
-        'this one had used 16 of them, waiting behind earlier calls or on its own earlier requests, so too few were ' +
+        'this one had used 16 of them, waiting behind earlier calls, on requests, or on background coordination, so too few were ' +
         "left to send this request to Slack. It wasn't sent, so calling again is safe.",
     ),
     text,

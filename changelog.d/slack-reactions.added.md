@@ -14,13 +14,15 @@
   returns a successful "Nothing changed" without a second Slack call. Joining
   cleanup that gives up after failure instead makes a fresh removal attempt and
   reports Slack's answer. Manual ACK removal shares the automatic cleanup's
-  five-attempt budget and terminal-failure rules; concurrent joiners share one
-  removal even after a transient failure.
+  five-attempt budget and terminal-failure rules; concurrent joiners wait for the in-flight
+  removal, then may each retry serially after transient failures.
 - When `SLACK_ACK_REACTION` is set, the read and reaction tool descriptions
   name the automatic ACK emoji and explain its lifecycle. Adding it explicitly
-  adopts the reaction on success or `already_reacted`, retiring automatic cleanup.
+  adopts the reaction on success or `already_reacted`, retiring unsent automatic
+  cleanup and retries, not a removal already sent. Failed adds do not adopt.
   This also applies after automatic cleanup has finished. Redelivered events
-  cannot recreate cleanup for that message for 10 minutes.
+  cannot recreate cleanup for that message for 10 minutes in this process only,
+  not across restarts.
 - Preserve an agent's explicit ACK-emoji reaction when a delivery installs
   automatic cleanup while the agent's add is in flight. Confirmed adoption
   now retires that newly pending cleanup as well.

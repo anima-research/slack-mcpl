@@ -257,7 +257,7 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
     // (assertRequestFits).
     return (
       `${lead}: this server gives each call ${CALL_SECONDS} seconds from when it reaches this server, and this one ` +
-      `had used ${err.usedSeconds} of them, waiting behind earlier calls or on its own earlier requests, so too ` +
+      `had used ${err.usedSeconds} of them, waiting behind earlier calls, on requests, or on background coordination, so too ` +
       `few were left to send this request to Slack. It wasn't sent, so calling again is safe.` +
       startsOver(`a call's ${CALL_SECONDS} seconds`)
     );

@@ -163,6 +163,7 @@ export class NoReadableConversations extends Error {
 }
 
 type AckEntry = {
+  owner: 'automatic' | 'agent';
   timer: ReturnType<typeof setTimeout>;
   added: Promise<boolean>;
   tries: number;
@@ -1132,7 +1133,7 @@ export class SlackAdapter {
   // Independently of typing, "received" is shown as a reaction on the message
   // that addressed the bot, removed at the bot's next
   // post in that conversation that Slack confirms, or after ACK_TTL_MS,
-  // whichever comes first.
+  // whichever comes first, unless a confirmed explicit add adopts it.
 
   /** `added` settles once reactions.add is answered or its request fails, so a
    *  removal never overtakes an add Slack has answered. An add whose request
@@ -1143,13 +1144,17 @@ export class SlackAdapter {
   private ackAdopted = new Map<string, Map<string, ReturnType<typeof setTimeout>>>();
 
   private markAdopted(channelId: string, ts: string): void {
-    if (this.stopping) return;
     // An acknowledge() during the add may have installed an entry the caller
     // never saw. Slack confirmed our reaction; retire its pending cleanup too.
     const current = this.ackPending.get(channelId)?.get(ts);
-    // A sent removal cannot be recalled; retire its retry after it settles.
-    if (current?.removing) void current.removing.then(() => this.dropAck(channelId, ts, current));
-    else if (current) this.dropAck(channelId, ts, current);
+    if (current) {
+      // Ownership changes synchronously. Keep a reserved/sent removal joinable,
+      // but it may send (or retry) only while automatic cleanup still owns it.
+      current.owner = 'agent';
+      clearTimeout(current.timer);
+      if (!current.removing) this.dropAck(channelId, ts, current);
+    }
+    if (this.stopping) return;
     let adopted = this.ackAdopted.get(channelId);
     if (!adopted) this.ackAdopted.set(channelId, (adopted = new Map()));
     clearTimeout(adopted.get(ts));
@@ -1294,7 +1299,7 @@ export class SlackAdapter {
     // Recorded before the add resolves, so a reply Slack confirms first still removes it.
     let pending = this.ackPending.get(channelId);
     if (!pending) this.ackPending.set(channelId, (pending = new Map()));
-    const entry: AckEntry = { timer: this.armAck(channelId, ts, ACK_TTL_MS), added, tries: 0 };
+    const entry: AckEntry = { owner: 'automatic', timer: this.armAck(channelId, ts, ACK_TTL_MS), added, tries: 0 };
     pending.set(ts, entry);
     if (!(await added)) this.dropAck(channelId, ts, entry); // not there, so nothing to remove
   }
@@ -1312,13 +1317,14 @@ export class SlackAdapter {
       if (!entry) return;
       while (entry.adopting) await entry.adopting;
       // A confirmed adoption retires cleanup. A failed add leaves it ours.
-      if (pending.get(t) !== entry) return;
+      if (pending.get(t) !== entry || entry.owner !== 'automatic') return;
       // Posts, expiry, and shutdown share one removal, including the wait
       // for reactions.add. Reserve it before any asynchronous work settles.
       if (!entry.removing) {
         const removing = this.removeAck(channelId, t, entry).finally(() => {
           if (entry.removing !== removing) return;
           entry.removing = undefined;
+          if (entry.owner === 'agent') this.dropAck(channelId, t, entry);
           if (this.ackPending.get(channelId)?.get(t) === entry) {
             entry.timer = this.armAck(channelId, t, ACK_RETRY_MS);
           }
@@ -1332,6 +1338,7 @@ export class SlackAdapter {
   private async removeAck(channelId: string, ts: string, entry: AckEntry): Promise<void> {
     clearTimeout(entry.timer);
     if (!(await entry.added)) return this.dropAck(channelId, ts, entry);
+    if (entry.owner !== 'automatic' || this.ackPending.get(channelId)?.get(ts) !== entry) return;
     entry.tries++;
     try {
       await this.web.reactions.remove({ channel: channelId, timestamp: ts, name: this.ackReaction! });
@@ -1672,6 +1679,7 @@ export class SlackAdapter {
     const removing = removed.then(() => {}, () => {}).finally(() => {
       if (entry.removing !== removing) return;
       entry.removing = undefined;
+      if (entry.owner === 'agent') this.dropAck(channelId, ts, entry);
       if (this.ackPending.get(channelId)?.get(ts) === entry) {
         entry.timer = this.armAck(channelId, ts, ACK_RETRY_MS);
       }

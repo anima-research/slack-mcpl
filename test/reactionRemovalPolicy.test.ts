@@ -46,8 +46,12 @@ test('policy composition: reaction removal rechecks after a pending ACK add', { 
   for (let i = 0; i < 20 && !release; i++) await new Promise(resolve => setImmediate(resolve));
   assert.ok(release, 'automatic cleanup must reach Slack');
   const removing = f.adapter.removeReaction('C1', '1.0', 'eyes');
-  // Let removal reach its wait for the add before revoking membership.
-  await new Promise(resolve => setImmediate(resolve));
+  // The reservation is installed only after admission and before awaiting add.
+  const pending = f.adapter as { ackPending: Map<string, Map<string, { removing?: Promise<void> }>> };
+  for (let i = 0; i < 20 && !pending.ackPending.get('C1')?.get('1.0')?.removing; i++) {
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  assert.ok(pending.ackPending.get('C1')?.get('1.0')?.removing, 'removal passed admission and is waiting on add');
   f.state.conversation.is_member = false;
   release();
   await adding;
@@ -189,4 +193,25 @@ test('policy composition: non-ACK removal checks admission only once', async t =
   assert.equal(await f.slack.removeReaction('C1', '1.0', 'wave'), true);
   assert.deepEqual(checks, [{ id: 'C1', scope: 'reactions:write', notDone: 'No reaction was removed' }]);
   assert.deepEqual(f.reactions, ['remove:C1:1.0:wave']);
+});
+
+test('effect-time policy refusals do not exhaust ACK cleanup attempts', async t => {
+  const f = fakeSlack({ ackReaction: 'eyes' });
+  t.after(() => f.slack.stop());
+  const policy = f.slack as unknown as {
+    requireWritableConversation(id: string, scope: string, notDone: string): Promise<void>;
+  };
+  Object.defineProperty(policy, 'hasAccessPolicy', { value: true });
+  let checks = 0;
+  policy.requireWritableConversation = async () => {
+    if (++checks % 2 === 0) throw new Error('No reaction was removed: membership revoked');
+  };
+  await f.slack.acknowledge('C1', '1.0');
+  for (let i = 0; i < 5; i++) {
+    await assert.rejects(f.slack.removeReaction('C1', '1.0', 'eyes'), /membership revoked/);
+  }
+  assert.equal(checks, 10, 'each removal passes admission but fails the effect check');
+  assert.deepEqual(f.reactions, ['add:C1:1.0:eyes']);
+  await f.slack.clearAck('C1');
+  assert.deepEqual(f.reactions, ['add:C1:1.0:eyes', 'remove:C1:1.0:eyes']);
 });

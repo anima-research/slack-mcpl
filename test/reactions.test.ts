@@ -579,7 +579,7 @@ for (const ackReaction of [undefined, 'eyes']) {
       if (ackReaction) {
         assert.match(description, /eyes/);
         assert.match(description, /added automatically while a message is being handled/);
-        assert.match(description, /removed after the bot's next confirmed post in that conversation, or after 10 minutes, or when the host rejects the message, unless the agent adds it itself/);
+        assert.match(description, /removed after the bot's next confirmed post in that conversation, or after 10 minutes, or when the host rejects the message, unless an explicit add succeeds or returns already_reacted/);
       } else {
         assert.doesNotMatch(description, /added automatically/);
       }
@@ -804,7 +804,7 @@ for (const prior of ['none', 'cleaned', 'removing'] as const) {
       releaseAdd();
       const result = await adding;
       assert.notEqual(result.isError, true);
-      assert.match(result.content[0]!.text, agentLandsFirst ? /^Reaction added$/ : /^Nothing changed:/);
+      assert.match(result.content[0]!.text, agentLandsFirst ? /^Reaction added$/ : /ACK adopted;/);
       const removalsBeforeCleanup = removes;
       await slack.clearAck('C1');
       t.mock.timers.tick(10 * 60 * 1000);
@@ -869,8 +869,11 @@ for (const agentLandsFirst of [false, true]) test(`adoption retires retry of con
   assert.ok(releaseRemove);
   releaseAdd();
   assert.notEqual((await adding).isError, true);
+  await slack.clearAck('C1');
+  assert.equal(removes, 1, 'confirmed adoption blocks another cleanup while removal is in flight');
   releaseRemove();
   await clearing;
+  await slack.clearAck('C1');
   await flush();
   t.mock.timers.tick(60_000);
   await flush();
@@ -915,4 +918,68 @@ test('malformed or duplicate reaction users do not establish absence', async t =
   const result = await call(h, 'fetch_history', { channelId: 'C1' });
   const reactions = JSON.parse(result.content[0]!.text).messages[0].reactions;
   assert.ok(reactions.every((r: object) => !('own' in r)));
+});
+
+for (const shutdown of [false, true]) {
+  for (const already of [false, true]) {
+    test(`confirmed adoption cancels cleanup reserved behind automatic add (shutdown=${shutdown}, already=${already})`, async t => {
+      let explicit!: () => void, automatic!: () => void;
+      let adds = 0, removes = 0;
+      const web = { reactions: {
+        add: async () => {
+          if (++adds === 1) {
+            await new Promise<void>(r => { explicit = r; });
+            if (already) throw refusal('already_reacted');
+          } else await new Promise<void>(r => { automatic = r; });
+        },
+        remove: async () => { removes++; },
+      } } as unknown as SlackWebLike;
+      const slack = new SlackAdapter(web, { on() {}, async start() {}, async disconnect() {} }, 'UBOT', 'test',
+        undefined, undefined, false, 'eyes');
+      t.after(() => slack.stop());
+      const adopting = slack.addReaction('C1', '1.0', 'eyes');
+      const adopted = already ? assert.rejects(adopting, /already_reacted/) : adopting;
+      await flush();
+      assert.ok(explicit);
+      const acknowledging = slack.acknowledge('C1', '1.0');
+      await flush();
+      assert.ok(automatic);
+      const clearing = shutdown ? slack.stop() : slack.clearAck('C1');
+      explicit();
+      await adopted;
+      automatic();
+      await Promise.all([acknowledging, clearing]);
+      await slack.clearAck('C1');
+      assert.equal(removes, 0);
+    });
+  }
+}
+
+test('adopted entry keeps sent removal joinable and cannot start another automatic cleanup', async t => {
+  let explicit!: () => void, removal!: () => void;
+  let adds = 0, removes = 0;
+  const web = { reactions: {
+    add: async () => { if (++adds === 1) await new Promise<void>(r => { explicit = r; }); },
+    remove: async () => { removes++; await new Promise<void>(r => { removal = r; }); },
+  } } as unknown as SlackWebLike;
+  const slack = new SlackAdapter(web, { on() {}, async start() {}, async disconnect() {} }, 'UBOT', 'test',
+    undefined, undefined, false, 'eyes');
+  t.after(() => slack.stop());
+  const adopting = slack.addReaction('C1', '1.0', 'eyes');
+  await flush();
+  await slack.acknowledge('C1', '1.0');
+  const clearing = slack.clearAck('C1');
+  await flush();
+  assert.ok(removal);
+  explicit();
+  await adopting;
+  const manual = slack.removeReaction('C1', '1.0', 'eyes');
+  await slack.clearAck('C1');
+  await flush();
+  assert.equal(removes, 1, 'manual removal joins the sent operation after adoption');
+  removal();
+  await clearing;
+  assert.equal(await manual, false);
+  await slack.clearAck('C1');
+  assert.equal(removes, 1);
 });

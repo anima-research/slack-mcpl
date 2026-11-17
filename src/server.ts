@@ -57,6 +57,7 @@ import {
   type SlackMessageData,
   type SlackWait,
 } from './slack-adapter.js';
+import { reactionName } from './content.js';
 import { toolDefinitions } from './tools.js';
 import { withToolClasses } from './tool-classes.js';
 import { buildFeatureSets, buildServerCapabilities, featureSetForTool, MESSAGING_FEATURE_SET, TYPING_FEATURE_SET } from './feature-sets.js';
@@ -399,7 +400,7 @@ export class SlackMcplServer {
     return toolDefinitions.filter((t) =>
       (t.name !== 'send_dm' || this.slack.dmsWritable) && (t.name !== 'refresh_channels' || this.mcplEnabled))
       .map((t) => this.slack.ackReactionName && ['fetch_history', 'fetch_thread', 'add_reaction', 'remove_reaction'].includes(t.name)
-        ? { ...t, description: t.description + ` The configured ACK emoji, ${this.slack.ackReactionName}, is added automatically while a message is being handled and removed after the bot's next confirmed post in that conversation, or after 10 minutes, or when the host rejects the message, unless the agent adds it itself.` }
+        ? { ...t, description: t.description + ` The configured ACK emoji, ${this.slack.ackReactionName}, is added automatically while a message is being handled and removed after the bot's next confirmed post in that conversation, or after 10 minutes, or when the host rejects the message, unless an explicit add succeeds or returns already_reacted. Confirmed adoption cancels unsent cleanup and retries, not a removal already sent. Failed adds do not adopt. Redelivery protection lasts 10 minutes in this process only.` }
         : t);
   }
 
@@ -827,7 +828,9 @@ export class SlackMcplServer {
         } catch (err) {
           // The reaction the call asks for is there, which is its intent.
           if (slackRefusal(err) === 'already_reacted') {
-            return `Nothing changed: message ${messageId} already has this bot's ${emoji} reaction.`;
+            return reactionName(emoji) === this.slack.ackReactionName
+              ? `Message ${messageId} already has this bot's ${emoji} reaction. ACK adopted; unsent automatic cleanup and retries cancelled.`
+              : `Nothing changed: message ${messageId} already has this bot's ${emoji} reaction.`;
           }
           throw err;
         }
