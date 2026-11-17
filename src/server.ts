@@ -1766,8 +1766,11 @@ export class SlackMcplServer {
     // the note; one handled during the send still stops the subscribe in
     // taken(). In member mode every conversation is subscribed unless muted,
     // and a mention must not undo a mute. DMs always come through, so no
-    // subscription note for them — just the backscroll.
-    const autoSubscribe = isFirstInteraction && isAddressed && !msg.isDM && !this.opts.subscribeMemberChannels &&
+    // subscription note for them — just the backscroll. Disabling either
+    // subscription-mutating tool also prevents new mention subscriptions;
+    // existing subscriptions and member-channel delivery remain unchanged.
+    const autoSubscribe = this.toolEnabled('subscribe_channel') && this.toolEnabled('unsubscribe_channel') &&
+      isFirstInteraction && isAddressed && !msg.isDM && !this.opts.subscribeMemberChannels &&
       !this.unsubscribedByAgent.has(msg.channelId) && !this.isChannelSubscribed(msg.channelId);
     const blocks: string[] = [];
     if (autoSubscribe) {

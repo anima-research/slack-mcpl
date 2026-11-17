@@ -12,3 +12,8 @@
   cross-reference them). Refusals explain that nothing ran and
   retries cannot override operator policy. Tool-only MCPL feature sets disappear
   from the manifest and grant declarations when all their tools are disabled.
+- Disabling either `subscribe_channel` or `unsubscribe_channel` also prevents
+  new mention-triggered auto-subscriptions and their subscription note. Existing
+  subscriptions (including persisted ones), member-channel delivery, mentions
+  and DMs are unchanged. To remove saved subscriptions while unsubscribe is
+  disabled, stop the server and edit `SLACK_SUBSCRIPTIONS_FILE` before restarting.
