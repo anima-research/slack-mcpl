@@ -268,7 +268,8 @@ export function renderMessageText(
         if (!omitted) hasReadableNested = true;
         if (!unique(value, identity)) continue;
         (omitted ? placeholders : nested).push(value);
-        nestedLength += value.length + (nested.length + placeholders.length > 1 ? 1 : 0);
+        // Deferred omission labels must not crowd out later readable blocks.
+        if (!omitted) nestedLength += value.length + (nested.length > 1 ? 1 : 0);
         if (nestedLength > renderLimit) { truncated = true; break; }
       }
     }

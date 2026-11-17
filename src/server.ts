@@ -59,7 +59,7 @@ import {
 } from './slack-adapter.js';
 import { toolDefinitions } from './tools.js';
 import { withToolClasses } from './tool-classes.js';
-import { buildFeatureSets, buildServerCapabilities, featureSetForTool, MESSAGING_FEATURE_SET, TYPING_FEATURE_SET } from './feature-sets.js';
+import { buildFeatureSets, buildServerCapabilities, featureSetForTool, MESSAGING_FEATURE_SET, HISTORY_FEATURE_SET, TYPING_FEATURE_SET } from './feature-sets.js';
 import { ChannelManager, mcplChannelId, parseMcplChannelId, toDescriptor } from './channels.js';
 import { StateTracker, type UploadedFile } from './state.js';
 import { CapabilityGrant } from './grant.js';
@@ -178,6 +178,7 @@ export function backscrollLine(m: {
 export function backscrollBlock(
   messages: Parameters<typeof backscrollLine>[0][],
   where: { channelName?: string; isDM: boolean },
+  historyGranted = false,
 ): string {
   const attrs: string[] = [];
   if (where.channelName && !where.isDM) attrs.push(`channel=${quotedLabel(`#${Array.from(where.channelName).slice(0, 100).join('')}`)}`);
@@ -188,7 +189,7 @@ export function backscrollBlock(
   const maxBytes = 32_768;
   const lines: string[] = [];
   const summary = (count: number, before?: string) =>
-    `[${count} older backscroll ${count === 1 ? 'message' : 'messages'} not shown; fetch_history${before ? ' latest=' + before : ''} has ${count === 1 ? 'it' : 'them'}]`;
+    `[${count} older backscroll ${count === 1 ? 'message' : 'messages'} not shown${historyGranted ? '; try fetch_history' + (before ? ' latest=' + before : '') : ''}]`;
   const frame = (count: number) => `<backscroll ${[...attrs, `count="${count}"`].join(' ')}>\n\n</backscroll>`;
   const rendered = messages.map(backscrollLine);
   const complete = [`<backscroll ${[...attrs, `count="${messages.length}"`].join(' ')}>`,
@@ -204,7 +205,7 @@ export function backscrollBlock(
       (i ? Buffer.byteLength(summary(i, message.id)) + 1 : 0);
     let shown = line;
     if (bytes + size + 1 + reserved > maxBytes) {
-      shown = backscrollLine({...message, attachments: [], content: `message omitted (${size} bytes); fetch_history has it`});
+      shown = backscrollLine({...message, attachments: [], content: `message omitted (${size} bytes)${historyGranted ? '; try fetch_history' : ''}`});
     }
     const shownBytes = Buffer.byteLength(shown) + 1;
     if (bytes + shownBytes + reserved > maxBytes) break;
@@ -1786,7 +1787,8 @@ export class SlackMcplServer {
       );
     }
     if (backscroll.length > 0) {
-      blocks.push(backscrollBlock(backscroll, { channelName: meta?.name, isDM: msg.isDM }));
+      blocks.push(backscrollBlock(backscroll, { channelName: meta?.name, isDM: msg.isDM },
+        this.grant.has('tools') && this.grant.isFeatureSetActive(HISTORY_FEATURE_SET)));
     }
     // Told with the first message the agent gets from here, addressed or not.
     // Counted as told only once the host has taken that message.

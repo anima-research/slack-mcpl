@@ -437,12 +437,14 @@ never truncated. Backscroll uses a lower **2,000 UTF-16 code unit supplemental c
 message**, and the framed backscroll block has an overall **32 KiB byte budget**.
 It keeps a contiguous newest window. Messages that exceed the remaining byte
 budget (even if they fit the full budget on their own) get an in-position
-placeholder with timestamp, ID, author and framed byte size saying
-`fetch_history has it`. If even a placeholder cannot fit, one leading line
-counts the older messages not shown and names the oldest shown ID for
-`fetch_history latest=<oldest shown ID>`. Placeholders, this summary and framing
-all count against the byte budget. This preserves a fetchable position instead of leaving silent
-gaps. Use the bounded history/thread tools for details.
+placeholder with timestamp, ID, author and framed byte size saying the message
+was omitted. If even a placeholder cannot fit, one leading line counts the older
+messages not shown. When history access is granted, markers suggest
+`try fetch_history`; the summary includes `latest=<oldest shown ID>` when a row
+is shown (otherwise use the triggering message's ID from the location header).
+These are recovery hints, not guarantees: history tools have their own result
+limits. Placeholders, this summary and framing all count against the byte budget,
+preserving positions instead of leaving silent gaps.
 
 ## Environment
 

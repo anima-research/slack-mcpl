@@ -105,19 +105,19 @@ test('backscroll supplemental lines capped at 2000; total block <=32KiB with exp
   assert.ok(m.content.length <= 'Original'.length + 2000);
   assert.match(m.content, /\[…truncated\]/);
   const huge = Array.from({length: 50}, (_, i) => ({...m, id: `${i}`, content: '😀'.repeat(2000)}));
-  const block = backscrollBlock(huge, {isDM: false});
+  const block = backscrollBlock(huge, {isDM: false}, true);
   assert.ok(Buffer.byteLength(block) <= 32_768);
   const count = Number(block.match(/count="(\d+)"/)![1]);
   assert.ok(count > 0 && count < 50);
-  assert.match(block, /older backscroll messages not shown; fetch_history latest=/);
-  assert.match(block, /message omitted \(\d+ bytes\); fetch_history has it/);
+  assert.match(block, /older backscroll messages not shown; try fetch_history latest=/);
+  assert.match(block, /message omitted \(\d+ bytes\); try fetch_history/);
   assert.match(block, /id=49\]/);
   assert.doesNotMatch(block, /id=0\]/);
 });
 
 for (const unit of ['<@U1|', '<https://x/']) test(`unclosed angle candidates remain literal at the text limit ${unit}`, () => {
   const text = unit.repeat(Math.floor(40000 / unit.length));
-  assert.equal(renderMessageText({text}), text);
+  assert.equal(renderMessageText({text, blocks: [section('extra')]}), text + '\nextra');
   assert.equal(formatSlackText(text, new Map()), text);
 });
 test('long labelled mentions format and unclosed openers remain literal', () => {
@@ -246,4 +246,11 @@ test('filtered history never renders author-excluded or beyond-limit rows', asyn
   const result = await adapter.readHistory('C1', {authorIds: ['U1'], textContains: 'target', limit: 1});
   assert.equal(result.messages.length, 1);
   assert.equal(accesses, 0);
+});
+
+test('nested omission labels do not preempt later readable attachment blocks', () => {
+  const blocks = Array.from({length: 100}, (_, i) => ({type: 'unsupported' + i + 'x'.repeat(200)}));
+  const result = renderMessageText({attachments: [{blocks: [...blocks, section('USEFUL')]}]});
+  assert.match(result, /^USEFUL\n/);
+  assert.ok(result.length <= 16384);
 });
