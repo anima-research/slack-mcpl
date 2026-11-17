@@ -20,6 +20,7 @@
  * Event handling salvaged from zulip-mcp PR #8's SlackAdapter.
  */
 
+import { renderMessageText } from './message-text.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { WebClient, ErrorCode, LogLevel, type Logger, type WebAPICallResult, type WebClientOptions } from '@slack/web-api';
 import { SocketModeClient } from '@slack/socket-mode';
@@ -260,6 +261,8 @@ interface SlackMessageEvent {
   channel?: string;
   user?: string;
   text?: string;
+  attachments?: unknown;
+  blocks?: unknown;
   ts?: string;
   thread_ts?: string;
   /** On a thread_broadcast the parent may be named only here. */
@@ -1597,7 +1600,7 @@ export class SlackAdapter {
     const ids = new Set<string>();
     for (const msg of messages) {
       if (msg.user) ids.add(msg.user);
-      for (const id of extractSlackUserIds(msg.text ?? '')) ids.add(id);
+      for (const id of extractSlackUserIds(renderMessageText(msg))) ids.add(id);
     }
     await this.resolveUserNames(Array.from(ids));
 
@@ -1612,7 +1615,7 @@ export class SlackAdapter {
       authorId: msg.user,
       ...(msg.bot_id ? { authorBotId: msg.bot_id } : {}),
       authorName: msg.user ? (this.userNameCache.get(msg.user) ?? msg.user) : (msg.username ?? 'bot'),
-      content: formatSlackText(msg.text ?? '', this.userNameCache),
+      content: formatSlackText(renderMessageText(msg), this.userNameCache),
       threadTs: msg.thread_ts && msg.thread_ts !== msg.ts ? msg.thread_ts : undefined,
       rootTs: reported ?? id,
       // Missing means unknown, not none.
@@ -1685,7 +1688,8 @@ export class SlackAdapter {
     }
 
     // Resolve author + mentioned users before formatting.
-    const mentionIds = extractSlackUserIds(event.text ?? '');
+    const text = renderMessageText(event);
+    const mentionIds = extractSlackUserIds(text);
     await this.resolveUserNames([event.user, ...mentionIds]);
     const authorName = this.userNameCache.get(event.user) ?? event.user;
 
@@ -1708,8 +1712,8 @@ export class SlackAdapter {
       threadTs: event.thread_ts || event.root?.thread_ts || undefined,
       authorId: String(event.user),
       authorName,
-      content: event.text ?? '',
-      cleanContent: formatSlackText(event.text ?? '', this.userNameCache),
+      content: text,
+      cleanContent: formatSlackText(text, this.userNameCache),
       mentionIds,
       // Personal mention of the bot — hosts use this to gate wake policy.
       // @here/@channel broadcasts deliberately don't count.
