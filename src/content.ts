@@ -404,12 +404,14 @@ export async function fetchSlackHistory(
     latest?: string;
     inclusive?: boolean;
     maxMessages: number;
+    signal?: AbortSignal;
   },
 ): Promise<{ messages: SlackHistoryMessage[]; truncated: boolean }> {
   const collected: SlackHistoryMessage[] = [];
   let cursor: string | undefined;
   let truncated = false;
   do {
+    params.signal?.throwIfAborted();
     const result = await client.conversations.history({
       channel: params.channel,
       ...(params.oldest !== undefined ? { oldest: params.oldest } : {}),
@@ -418,6 +420,7 @@ export async function fetchSlackHistory(
       limit: Math.min(200, params.maxMessages - collected.length),
       cursor,
     });
+    params.signal?.throwIfAborted();
     collected.push(...((result.messages ?? []) as SlackHistoryMessage[]));
     cursor = result.response_metadata?.next_cursor || undefined;
     if (cursor && collected.length >= params.maxMessages) {

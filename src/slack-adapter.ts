@@ -1588,12 +1588,14 @@ export class SlackAdapter {
     channelId: string,
     opts: { limit?: number; oldest?: string; latest?: string; signal?: AbortSignal } = {},
   ): Promise<{ messages: HistoryMessage[]; truncated: boolean }> {
+    opts.signal?.throwIfAborted();
     await this.assertNotDm(channelId, 'Nothing was read');
     const { messages, truncated } = await fetchSlackHistory(this.web, {
       channel: channelId,
       ...(opts.oldest !== undefined ? { oldest: opts.oldest } : {}),
       ...(opts.latest !== undefined ? { latest: opts.latest } : {}),
       maxMessages: opts.limit ?? 50,
+      signal: opts.signal,
     });
     return { messages: await this.shapeHistory(messages, 2000, opts.signal), truncated };
   }

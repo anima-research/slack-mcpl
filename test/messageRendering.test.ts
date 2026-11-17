@@ -338,3 +338,33 @@ test('abandoned backscroll starts no further name lookup batches', async () => {
   await assert.rejects(adapter.fetchHistory('C1', {signal: controller.signal}), {name: 'AbortError'});
   assert.equal(lookedUp, 8, 'only the already-started batch may finish');
 });
+
+test('abandoned backscroll starts no history requests after cancellation', async () => {
+  for (const abortAt of ['first page', 'channel check', 'before lookup']) {
+    const controller = new AbortController();
+    let checks = 0;
+    let pages = 0;
+    let names = 0;
+    const adapter = new SlackAdapter({
+      conversations: {
+        info: async () => {
+          checks++;
+          if (abortAt === 'channel check') controller.abort();
+          return {channel: {id: 'C1', is_channel: true, is_im: false, is_mpim: false}};
+        },
+        history: async () => {
+          pages++;
+          if (pages === 1) controller.abort();
+          return {messages: [{ts: '100.000001', user: 'U1', text: 'body'}],
+            response_metadata: {next_cursor: 'older'}};
+        },
+      },
+      users: {info: async () => { names++; return {}; }},
+    } as any, {on(){}} as any, 'UBOT', 'example', undefined, undefined, true);
+    if (abortAt === 'before lookup') controller.abort();
+    await assert.rejects(adapter.fetchHistory('C1', {limit: 500, signal: controller.signal}), {name: 'AbortError'});
+    assert.equal(checks, abortAt === 'before lookup' ? 0 : 1, abortAt);
+    assert.equal(pages, abortAt === 'first page' ? 1 : 0, abortAt);
+    assert.equal(names, 0, abortAt);
+  }
+});
