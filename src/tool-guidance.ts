@@ -2,3 +2,8 @@
 export function toolHint(text: string, enabled: (name: string) => boolean, fallback = ''): string {
   return (text.match(/\b[a-z]+_[a-z_]+\b/g) ?? []).every(enabled) ? text : fallback;
 }
+
+/** Join complete guidance sentences after optional remedies have been selected. */
+export function guidance(...sentences: string[]): string {
+  return sentences.map(sentence => sentence.trim()).filter(Boolean).join(' ');
+}

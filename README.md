@@ -139,7 +139,7 @@ delete them along with later messages: the file, through Slack's file
 deletion API, and the message that shared it, which holds the comment, when
 Slack's answer named that message. When it didn't, the rollback's answer says
 the comment may remain, with a `delete_message` remedy when deletion and a
-suitable history read tool are enabled; otherwise someone with Slack access must locate
+suitable history read tool are operator-enabled and allowed by the host grant; otherwise someone with Slack access must locate
 and delete the sharing message. An upload
 that failed after Slack gave the file its ID is rolled back the same way.
 Rollback is best-effort and reports partial failures by kind, naming each
@@ -150,7 +150,7 @@ message or its call failed in a way that may have posted it. The rollback
 names it as one that may remain, with its conversation, and thread for a
 reply. When enabled, use `fetch_history` for a top-level message or
 `fetch_thread` with the parent thread id for a reply, then `delete_message`
-with each message's own id. If the required read or delete tool is disabled,
+with each message's own id. If the required read or delete tool is disabled or denied by the host grant,
 someone with Slack access must locate and delete each message. Checkpoint
 history is kept in memory across host reconnects, but does not survive a
 server restart. As with message rollback, failed deletions are logged and

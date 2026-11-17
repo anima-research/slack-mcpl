@@ -62,12 +62,12 @@ test('mention attachment and history attachment guidance preserve URLs without a
   assert.doesNotMatch(push, /Auto-subscribed|unsubscribe_channel/);
   assert.deepEqual(JSON.parse(await call(h.host, 'list_subscriptions')).channels, []);
   assert.doesNotMatch(push, /fetchable via fetch_attachment/);
-  assert.match(push, /attachment URL/);
+  assert.match(push, /attachment URL \(content unavailable through this server\)/);
   assert.match(push, /shot.png/);
   assert.ok(push.includes(files[0].url_private));
   const history = await call(h.host, 'fetch_history', { channelId: 'C1' });
   assert.doesNotMatch(history, /fetchable via fetch_attachment/);
-  assert.match(history, /attachment URL/);
+  assert.match(history, /attachment URL \(content unavailable through this server\)/);
   assert.ok(history.includes(files[0].url_private));
   assert.match(history, /fetch_attachment is user content/);
 });
@@ -78,6 +78,12 @@ test('Slack error hints omit disabled alternatives without losing unknown-write 
     const error = { message: code, code: 'slack_webapi_platform_error', data: { error: code } };
     const text = explainSlackError(error, { tool: 'send_message', args: { channelId: 'C1' }, toolEnabled });
     assert.doesNotMatch(text, /list_channels|reply_message|send_message|find_user|fetch_history|fetch_thread/);
+    const explanation = text.split('\n\n').at(-1)!;
+    assert.equal(explanation, explanation.trim());
+    assert.doesNotMatch(explanation, / {2}/);
+    if (code === 'channel_not_found') assert.match(explanation, /Slack doesn't know conversation C1/);
+    if (code === 'user_not_found') assert.match(explanation, /Slack has no user/);
+    if (code.startsWith('restricted_action')) assert.match(explanation, /conversation C1.*thread replies/);
     if (code === 'internal_error') {
       assert.match(text, /whether the message was posted is unknown/);
       assert.match(text, /before posting again/);
@@ -92,7 +98,7 @@ test('adapter restriction hints and read validation honor server tool availabili
   t.after(() => h.close());
   await initialize(h, false);
   const dm = await call(h.host, 'send_dm', { userId: 'U1', content: 'hi' });
-  assert.match(dm, /Nothing was sent/);
+  assert.match(dm, /direct messages are turned off on this host/);
   assert.doesNotMatch(dm, /send_message|list_channels/);
   const read = await call(h.host, 'fetch_history', { channelId: 'invalid' });
   assert.match(read, /Copy channelId=/);
@@ -145,6 +151,7 @@ for (const disabledTools of [['fetch_history'], ['fetch_thread'], ['reply_messag
     for (const name of ['delete_message', 'edit_message', 'add_reaction']) {
       const text = await call(h.host, name, { channelId: 'C1' });
       assert.match(text, /own id=/);
+      if (disabledTools[0] !== 'reply_message') assert.match(text, /messageId from the sending tool/);
       assert.doesNotMatch(text, /thread=|reply_message/);
     }
     if (!disabledTools.includes('reply_message')) {
@@ -239,10 +246,11 @@ for (const disabledTools of [['fetch_history'], ['fetch_thread'], ['delete_messa
     await initialize(h, true);
     await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
     for (const count of [1, 2]) {
+      const threadTs = count === 2 ? '123.4' : undefined;
       let parent = '';
       for (let i = 0; i < count; i++) {
         const sent = await h.host.sendRequest('tools/call', {
-          name: 'upload_file', arguments: { channelId: 'C1', filename: 'a.txt', content: 'a', comment: 'hello' },
+          name: 'upload_file', arguments: { channelId: 'C1', filename: 'a.txt', content: 'a', comment: 'hello', messageId: threadTs },
         }) as { state: { parent: string } };
         if (i === 0) parent = sent.state.parent;
       }
@@ -252,12 +260,13 @@ for (const disabledTools of [['fetch_history'], ['fetch_thread'], ['delete_messa
       for (const name of disabledTools) assert.ok(!result.reason.includes(name), result.reason);
       assert.match(result.reason, /may remain/);
       assert.match(result.reason, /C1/);
-      for (const [read, prefix] of [['fetch_history', 'For top-level sharing messages: '], ['fetch_thread', 'For sharing messages in a thread: ']]) {
-        const expected = disabledTools.includes(read) || disabledTools.includes('delete_message')
-          ? 'Someone with access must locate and delete each message in Slack'
-          : `Use ${read}${read === 'fetch_thread' ? ' with the parent thread id' : ''} to locate each message, then delete_message with its own id`;
-        assert.ok(result.reason.includes(prefix + expected), result.reason);
-      }
+      const read = threadTs ? 'fetch_thread' : 'fetch_history';
+      const target = threadTs ? 'replies in thread 123.4' : 'top-level messages';
+      const expected = disabledTools.includes(read) || disabledTools.includes('delete_message')
+        ? `Someone with access must locate and delete the remaining ${target} in Slack`
+        : `Use ${read}${threadTs ? ' with parent thread id 123.4' : ''} to locate the remaining ${target}, then delete_message with each message's own id`;
+      assert.ok(result.reason.includes(expected), result.reason);
+      assert.ok(result.reason.endsWith('.'));
       assert.doesNotMatch(result.reason, /\.\.|, and Use/);
     }
   });
@@ -275,7 +284,7 @@ test('ungrouped tools remain advertised and callable without tool-bearing featur
   const listed = await h.host.sendRequest('tools/list', {}) as { tools: { name: string }[] };
   assert.deepEqual(listed.tools.map(tool => tool.name).sort(), [...survivors].sort());
   for (const name of survivors) {
-    const result = await h.host.sendRequest('tools/call', { name, arguments: { query: 'alice' } }) as { isError?: boolean; content: { text: string }[] };
+    const result = await h.host.sendRequest('tools/call', { name, arguments: name === 'find_user' ? { query: 'alice' } : {} }) as { isError?: boolean; content: { text: string }[] };
     assert.notEqual(result.isError, true);
     assert.doesNotMatch(result.content[0].text, /capability|not granted|disabled by operator/);
   }
@@ -316,7 +325,7 @@ for (const disabled of ['send_message', 'reply_message']) {
     assert.doesNotMatch(text, new RegExp(disabled));
     assert.ok(text.endsWith(disabled === 'send_message'
       ? 'reply_message posts under a message you choose.'
-      : 'send_message posts in the conversation itself. '), text);
+      : 'send_message posts in the conversation itself.'), text);
   });
 }
 
@@ -336,4 +345,47 @@ test('DM refusal retains channel posting advice without list_channels', async t 
   const text = await call(h.host, 'send_dm', { userId: 'U1', content: 'hi' });
   assert.match(text, /post in a writable channel with send_message\./);
   assert.doesNotMatch(text, /list_channels/);
+});
+
+test('malformed author values do not suppress an available find_user hint', async t => {
+  const h = connectHost(new SlackMcplServer(fakeSlack().slack, { disabledTools: ['send_message'] }));
+  t.after(() => h.close());
+  await initialize(h, false);
+  assert.match(await call(h.host, 'fetch_history', { channelId: 'C1', authorIds: ['send_message'] }), /find_user/);
+});
+
+test('rollback comment recovery respects the host history grant', async t => {
+  const fake = fakeSlack();
+  fake.slack.uploadFile = async () => ({ fileId: 'F1' });
+  const h = connectHost(new SlackMcplServer(fake.slack));
+  t.after(() => h.close());
+  await initialize(h, true);
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT, disabled: ['slack.history'] });
+  const sent = await h.host.sendRequest('tools/call', {
+    name: 'upload_file', arguments: { channelId: 'C1', filename: 'a.txt', content: 'a', comment: 'hello', messageId: '123.4' },
+  }) as { state: { parent: string } };
+  const result = await h.host.sendRequest(method.STATE_ROLLBACK, {
+    featureSet: 'slack.messaging', checkpoint: sent.state.parent,
+  }) as { reason: string };
+  assert.match(result.reason, /Someone with access.*thread 123.4/);
+  assert.doesNotMatch(result.reason, /fetch_history|fetch_thread/);
+});
+
+test('omitted feature sets cannot become active by host selection', async () => {
+  const { CapabilityGrant } = await import('../src/grant.js');
+  const grant = new CapabilityGrant({});
+  grant.apply({ effectiveCapabilities: FULL_GRANT, enabled: ['slack.history'] }, 'request');
+  assert.equal(grant.isFeatureSetActive('slack.history'), false);
+});
+
+test('optional Slack-error sentences have no trailing or doubled spaces', () => {
+  for (const disabled of [[], ['list_channels'], ['reply_message'], ['send_message'], ['send_message', 'reply_message']]) {
+    for (const code of ['channel_not_found', 'invalid_channel_id', 'not_in_channel', 'edit_window_closed', 'user_not_found', 'restricted_action_thread_only_channel']) {
+      const text = explainSlackError({ code: 'slack_webapi_platform_error', data: { error: code } }, {
+        tool: 'send_message', args: { channelId: 'C1' }, toolEnabled: name => !disabled.includes(name),
+      }).split('\n\n').at(-1)!;
+      assert.equal(text, text.trim());
+      assert.doesNotMatch(text, / {2}/);
+    }
+  }
 });

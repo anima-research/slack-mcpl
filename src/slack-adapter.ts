@@ -24,7 +24,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { WebClient, ErrorCode, LogLevel, type Logger, type WebAPICallResult, type WebClientOptions } from '@slack/web-api';
 import { SocketModeClient } from '@slack/socket-mode';
 import { clock } from './clock.js';
-import { toolHint } from './tool-guidance.js';
+import { guidance, toolHint } from './tool-guidance.js';
 import { NOTHING_RETURNED, SLACK_TS, readBounded, readOptions, type HistoryReadResult, type ReadStop } from './history-read.js';
 import {
   formatSlackText,
@@ -1452,8 +1452,8 @@ export class SlackAdapter {
     if (!this.disableDms || this.channelIds.has(channelId)) return;
     const refuse = (why: string) =>
       new ChannelOnlyRefusal(
-        `${notDone}: ${channelId} ${why}, and this bot works only in channels here, since direct messages are ` +
-          'turned off. ' + this.hint('list_channels shows the ones it can use.'),
+        guidance(`${notDone}: ${channelId} ${why}, and this bot works only in channels here, since direct messages are ` +
+          'turned off.', this.hint('list_channels shows the ones it can use.')),
       );
     if (this.dmIds.has(channelId) || channelId.startsWith('D')) throw refuse('is a direct message or group DM');
     try {
@@ -1469,8 +1469,8 @@ export class SlackAdapter {
       const answer = slackRefusal(err);
       const why = answer !== undefined ? `Slack answered ${answer}` : (err as Error).message;
       throw new Error(
-        `${notDone}: Slack couldn't confirm ${channelId} is a channel (${why}), and with direct messages turned ` +
-          `off, this bot works only in conversations Slack confirms are channels. ${this.hint(afterFailedCheck(err))}`,
+        guidance(`${notDone}: Slack couldn't confirm ${channelId} is a channel (${why}), and with direct messages turned ` +
+          `off, this bot works only in conversations Slack confirms are channels.`, this.hint(afterFailedCheck(err))),
         { cause: err },
       );
     }
@@ -1478,9 +1478,9 @@ export class SlackAdapter {
   }
 
   async sendDM(userId: string, text: string): Promise<{ messageId: string; channelId: string }> {
-    const toChannels = this.hint(
-      'To reach people, post in a writable channel with send_message. ') +
-      this.hint('list_channels marks where this bot may write with writable: true.');
+    const toChannels = guidance(this.hint(
+      'To reach people, post in a writable channel with send_message.', 'Someone with Slack access can contact the recipient.'),
+      this.hint('list_channels marks where this bot may write with writable: true.'));
     if (this.disableDms) {
       throw new Error(
         "Nothing was sent: direct messages are turned off on this host, so send_dm can't reach anyone. Calling " +

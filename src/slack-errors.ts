@@ -31,7 +31,7 @@
  * unchanged, except that a read's failure still says that no messages were
  * returned.
  */
-import { toolHint } from './tool-guidance.js';
+import { guidance, toolHint } from './tool-guidance.js';
 import { ErrorCode } from '@slack/web-api';
 import { connectionNeverMade, reactionName } from './content.js';
 import { NOTHING_RETURNED, PARENT_IDS, TS_FORM } from './history-read.js';
@@ -178,9 +178,9 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
       ? `${lead}: Slack is rate-limiting this kind of call for the workspace. Try again shortly.${startsOver("Slack's limit")}`
       : `${lead}: Slack is rate-limiting this kind of call for the workspace, and asks to wait ${seconds} ` +
         `second${seconds === 1 ? '' : 's'} before trying again.${startsOver("Slack's limit")}`;
-  const invite =
+  const invite = guidance(
     "Someone in that conversation has to invite the bot (in Slack, /invite and the bot's name); until then, " +
-    "calling again gets the same answer. " + hint("list_channels shows the conversations it's in.");
+    "calling again gets the same answer.", hint("list_channels shows the conversations it's in."));
   /** A write whose outcome is unknown, and how to check it before trying again. */
   const unknown = (cause: string, note = ''): string => {
     if (POSTS.has(call.tool)) {
@@ -328,22 +328,23 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
   // text says where one would go now rather than how long that lasts.
   if (call.tool === 'channels/publish' && THREAD_REFUSALS.has(code)) {
     return thread
-      ? `${lead}: this server replies in the thread of the last message from a conversation that reached you. ` +
+      ? guidance(`${lead}: this server replies in the thread of the last message from a conversation that reached you. ` +
           `Here that was the thread under message ${thread} in ${conversation}, and Slack refused it. ` +
-          `Another publish to ${conversation} now would go to the same thread. ` +
-          hint('send_message posts in the conversation itself. ') + hint('reply_message posts under a message you choose.')
+          `Another publish to ${conversation} now would go to the same thread.`,
+          hint('send_message posts in the conversation itself.'), hint('reply_message posts under a message you choose.'),
+          call.toolEnabled && !call.toolEnabled('send_message') && !call.toolEnabled('reply_message') ? 'Someone with Slack access can post in the intended conversation or thread.' : '')
       : undefined;
   }
 
   switch (code) {
     case 'channel_not_found':
-      return (
+      return guidance(
         `${lead}: Slack doesn't know ${conversation}, or this bot can't see it. ${RECALLED}, or it's a ` +
-        "private conversation this bot isn't in. " + hint('list_channels shows the conversations this bot can use, with their ids.')
+        "private conversation this bot isn't in.", hint('list_channels shows the conversations this bot can use, with their ids.')
       );
     case 'invalid_channel_id':
-      return (
-        `${lead}: ${channel ?? 'the conversation given'} isn't a Slack conversation id. ${RECALLED}. ` +
+      return guidance(
+        `${lead}: ${channel ?? 'the conversation given'} isn't a Slack conversation id. ${RECALLED}.`,
         hint('list_channels shows the conversations this bot can use, with their ids.')
       );
     case 'not_in_channel':
@@ -395,10 +396,10 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
         `and ${theMessage} in ${conversation} isn't one of them. Calling again won't change that.`
       );
     case 'edit_window_closed':
-      return (
-        `${lead}: this workspace doesn't allow editing a message this old, and calling again won't change that. ` +
-        hint('Use send_message to post a correction. ', 'Someone with Slack access can post a correction. ') +
-        hint('Or use reply_message with its id to put the correction under it.')
+      return guidance(
+        `${lead}: this workspace doesn't allow editing a message this old, and calling again won't change that.`,
+        hint('Use send_message to post a correction.', 'Someone with Slack access can post a correction.'),
+        hint('Use reply_message with the parent thread id to put a correction in that thread.')
       );
     case 'msg_too_long':
       return call.tool === 'edit_message'
@@ -430,11 +431,11 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
       return call.tool === 'upload_file'
         ? `${lead}: ${conversation} takes messages only as thread replies. Pass messageId, the id of the message ` +
           'whose thread the file goes in.'
-        : `${lead}: ${conversation} takes messages only as thread replies. ` + hint("Use reply_message with the id of the message you're answering.");
+        : guidance(`${lead}: ${conversation} takes messages only as thread replies.`, hint("Use reply_message with the parent thread id.", "Someone with Slack access can reply in the thread."));
     case 'restricted_action_non_threadable_channel':
       return call.tool === 'upload_file'
         ? `${lead}: ${conversation} doesn't take thread replies. Upload without messageId instead.`
-        : `${lead}: ${conversation} doesn't take thread replies. ` + hint('Post with send_message instead.');
+        : guidance(`${lead}: ${conversation} doesn't take thread replies.`, hint('Post with send_message instead.', 'Someone with Slack access can post in the conversation.'));
     case 'restricted_action':
     case 'restricted_action_read_only_channel':
     case 'restricted_action_thread_locked':
@@ -513,8 +514,8 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
             "the workspace's admins can."
         : undefined;
     case 'user_not_found':
-      return (
-        `${lead}: Slack has no user ${userId ?? 'by the id given'}. ${RECALLED}. ` + hint("find_user returns each person's userId.")
+      return guidance(
+        `${lead}: Slack has no user ${userId ?? 'by the id given'}. ${RECALLED}.`, hint("find_user returns each person's userId.", "Copy a uid: from a mention.")
       );
     case 'user_not_visible':
       return (

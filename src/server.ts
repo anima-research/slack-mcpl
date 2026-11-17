@@ -814,11 +814,11 @@ export class SlackMcplServer {
           // rollback, and its comment only if Slack may have shared the file
           // with it.
           const left = fileLeftByUpload(err);
-          if (left) this.stateTracker.recordUploaded(left.fileId, channelId, { comment: comment !== undefined && left.mayHaveShared });
+          if (left) this.stateTracker.recordUploaded(left.fileId, channelId, { threadTs: optional('messageId'), comment: comment !== undefined && left.mayHaveShared });
           throw err;
         }
         this.markOutbound(channelId);
-        this.stateTracker.recordUploaded(result.fileId, channelId, { shareTs: result.shareTs, comment: comment !== undefined });
+        this.stateTracker.recordUploaded(result.fileId, channelId, { threadTs: optional('messageId'), shareTs: result.shareTs, comment: comment !== undefined });
         return { fileId: result.fileId, ...this.recipient(channelId) };
       }
 
@@ -1025,7 +1025,7 @@ export class SlackMcplServer {
       return toolHint(
         parent ? ARGUMENT_SOURCES.threadTs : ARGUMENT_SOURCES.messageId,
         this.toolEnabled,
-        parent ? "Copy a reply's thread=, or a message's own id= when it shows no thread=." : "Copy the message's own id= from where it arrived.",
+        parent ? "Copy a reply's thread=, or a message's own id= when it shows no thread=." : "Copy messageId from the sending tool's result, or the message's own id= from where it arrived.",
       );
     }
     return ARGUMENT_SOURCES[key];
@@ -1419,7 +1419,7 @@ export class SlackMcplServer {
       return "This host hasn't granted this server channels.register, so this server can't register conversations with it.";
     }
     if (!this.toolEnabled('refresh_channels')) {
-      return 'Open a conversation by an id already registered with the host; the operator has disabled manual refresh.';
+      return 'The operator has disabled manual refresh. Wait for automatic registration; if it failed, ask the operator to check Slack access and reconnect.';
     }
     return `refresh_channels registers the conversations this bot is in${this.slack.dmsDisabled ? ', channels only while direct messages are turned off' : ''}; open one by the id it announces.`;
   }
@@ -1574,26 +1574,30 @@ export class SlackMcplServer {
     // whether Slack counts a file's sharing message as one isn't known, hence
     // "may".
     const commentsLeft = toDelete.filter((item): item is UploadedFile => item.kind === 'file' && item.comment && !item.shareTs);
-    const locate = (thread: boolean): string => {
-      const read = thread ? 'fetch_thread with the parent thread id' : 'fetch_history';
-      const tool = thread ? 'fetch_thread' : 'fetch_history';
-      return this.toolEnabled(tool) && this.toolEnabled('delete_message')
-        ? `Use ${read} to locate each message, then delete_message with its own id`
-        : 'Someone with access must locate and delete each message in Slack';
+    const recoveryToolEnabled = (name: string): boolean => {
+      const featureSet = featureSetForTool(name);
+      return this.toolEnabled(name) && (!this.mcplEnabled ||
+        (this.grant.has('tools') && (!featureSet || this.grant.isFeatureSetActive(featureSet))));
     };
-    // Upload state does not retain the parent thread id. Explain both cases.
-    const locateComments = `For top-level sharing messages: ${locate(false)}. For sharing messages in a thread: ${locate(true)}`;
+    const locate = (threadTs?: string): string => {
+      const read = threadTs ? `fetch_thread with parent thread id ${threadTs}` : 'fetch_history';
+      const tool = threadTs ? 'fetch_thread' : 'fetch_history';
+      const target = threadTs ? `replies in thread ${threadTs}` : 'top-level messages';
+      return recoveryToolEnabled(tool) && recoveryToolEnabled('delete_message')
+        ? `Use ${read} to locate the remaining ${target}, then delete_message with each message's own id`
+        : `Someone with access must locate and delete the remaining ${target} in Slack`;
+    };
     const mayRemain = left.filter((item) => !item.forGood);
     const refused = left.filter((item) => item.forGood);
     const named = (items: typeof left) => items.map((item) => item.named).join('; ');
     const namedMessageLeft = mayRemain.some((item) => item.kind === 'message' && !item.unnamed);
     const unnamedLeft = mayRemain.some((item) => item.unnamed);
     const remedy = [
-      ...(namedMessageLeft ? [toolHint('delete_message can try a message among them again, by its id', this.toolEnabled,
-        'Someone with access must retry deleting the message in Slack, by its own id')] : []),
+      ...(namedMessageLeft ? [toolHint('delete_message can try a message among them again, by its id', recoveryToolEnabled,
+        'Someone with access must retry deleting the remaining messages in Slack, by its own id')] : []),
       ...(unnamedLeft ? [...new Set(toDelete
         .filter((item) => item.kind === 'message' && item.messageId === undefined)
-        .map((item) => locate(item.kind === 'message' && !!item.threadTs)))] : []),
+        .map((item) => locate(item.threadTs)))] : []),
       ...(mayRemain.some((item) => item.kind === 'file')
         ? ["No tool here deletes a file, and whoever runs this host can delete it with Slack's files.delete, by its id"]
         : []),
@@ -1606,20 +1610,16 @@ export class SlackMcplServer {
             ...(refused.length > 0 ? [`Slack refused to delete these, and calling again won't change that: ${named(refused)}`] : []),
           ].join('. ')]
         : []),
-      ...(commentsLeft.length === 1
-        ? [`The comment of uploaded file ${commentsLeft[0].fileId} may remain in conversation ${commentsLeft[0].channelId}: ` +
-          "this server doesn't know the message that shared the file, so no rollback can delete it. " +
-          locateComments]
-        : commentsLeft.length > 1
-          ? [`The comments of uploaded files ${commentsLeft.map((f) => `${f.fileId} in ${f.channelId}`).join(', ')} may remain: ` +
-            "this server doesn't know the messages that shared them, so no rollback can delete them. " +
-            locateComments]
-          : []),
+      ...commentsLeft.map(file =>
+        `The comment of uploaded file ${file.fileId} may remain in conversation ${file.channelId}: ` +
+        "this server doesn't know the message that shared the file, so no rollback can delete it. " +
+        locate(file.threadTs)),
+
     ];
     return {
       checkpoint: params.checkpoint,
       success: true,
-      reason: notes.length > 0 ? notes.join('. ') : undefined,
+      reason: notes.length > 0 ? notes.join('. ') + '.' : undefined,
     };
   }
 
@@ -1649,10 +1649,10 @@ export class SlackMcplServer {
 
   /** Render attachment refs as a text block the agent can act on. Slack
    *  serves url_private behind bot auth, so bytes are fetched on demand via
-   *  fetch_attachment rather than inlined here. */
+   *  fetch_attachment when enabled rather than inlined here; otherwise the note marks content unavailable. */
   private attachmentNote(attachments: AttachmentRef[]): string {
     const lines = attachments.map((a) =>
-      `- ${nameShown(a.name)} (${mimeShown(a.mimeType)})${a.isImage ? ' — image' : ''}, ${this.toolEnabled('fetch_attachment') ? 'fetchable via fetch_attachment' : 'attachment URL'}: ${urlShown(a.path)}`,
+      `- ${nameShown(a.name)} (${mimeShown(a.mimeType)})${a.isImage ? ' — image' : ''}, ${this.toolEnabled('fetch_attachment') ? 'fetchable via fetch_attachment' : 'attachment URL (content unavailable through this server)'}: ${urlShown(a.path)}`,
     );
     return `[attachments: ${attachments.length}]\n${lines.join('\n')}`;
   }

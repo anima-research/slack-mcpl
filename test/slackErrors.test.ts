@@ -229,7 +229,7 @@ test("another author's message can be neither edited nor deleted, and the text s
 test('a closed edit window offers a new message instead', async () => {
   const text = await explain('edit_window_closed', 'edit_message', { channelId: 'C7', messageId: '1.1' });
   assert.match(text, /this workspace doesn't allow editing a message this old, and calling again won't change that/);
-  assert.match(text, /Use send_message to post a correction\. Or use reply_message with its id/);
+  assert.match(text, /Use send_message to post a correction\. Use reply_message with the parent thread id/);
 });
 
 test("text that's too long: an edit names Slack's limit, a send asks for shorter messages", async () => {
@@ -273,7 +273,7 @@ test('an emoji Slack does not know is named as Slack judged it: as sent, where r
 test("a conversation's threading rule points to the tool that fits it", async () => {
   assert.match(
     await explain('restricted_action_thread_only_channel', 'send_message', { channelId: 'C10' }),
-    /Nothing was posted: conversation C10 takes messages only as thread replies\. Use reply_message with the id of the message you're answering\./,
+    /Nothing was posted: conversation C10 takes messages only as thread replies\. Use reply_message with the parent thread id\./,
   );
   assert.match(
     await explain('restricted_action_non_threadable_channel', 'reply_message', { channelId: 'C10', messageId: '1.1' }),

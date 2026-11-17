@@ -40,6 +40,8 @@ export interface UploadedFile {
   /** The message that shared the file, when Slack's answer named it: it holds
    *  the upload's comment. */
   shareTs?: string;
+  /** Parent thread for a sharing comment, if the upload was threaded. */
+  threadTs?: string;
   /** Whether a comment may have gone out with the file: the upload had one,
    *  and Slack may have shared the file. */
   comment: boolean;
@@ -98,12 +100,13 @@ export class StateTracker {
 
   /** Track the Slack file itself, which files.delete removes, and the message
    *  that shared it, when known, which chat.delete removes. */
-  recordUploaded(fileId: string, channelId: string, share: { shareTs?: string; comment: boolean }): void {
+  recordUploaded(fileId: string, channelId: string, share: { shareTs?: string; threadTs?: string; comment: boolean }): void {
     this.sentItems.push({
       kind: 'file',
       fileId,
       channelId,
       ...(share.shareTs ? { shareTs: share.shareTs } : {}),
+      threadTs: share.threadTs,
       comment: share.comment,
       timestamp: new Date().toISOString(),
     });

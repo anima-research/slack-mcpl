@@ -166,8 +166,8 @@ export function readOptions(args: Record<string, unknown>, kind: Kind, channelId
     if (bad >= 0) {
       throw refused(
         toolHint(`authorIds[${bad}] must be a Slack user or bot ID, as a message's authorId or authorBotId gives it, or find_user's ` +
-          `userId, and this call passed ${passed(ids[bad])}.`, toolEnabled,
-          `authorIds[${bad}] must be a Slack user or bot ID, from a message's authorId or authorBotId, and this call passed ${passed(ids[bad])}.`),
+          'userId', toolEnabled,
+          `authorIds[${bad}] must be a Slack user or bot ID, from a message's authorId or authorBotId`) + `, and this call passed ${passed(ids[bad])}.`,
       );
     }
   }
@@ -233,7 +233,7 @@ export function historyRecord(m: HistoryMessage, attachmentToolEnabled = true) {
     ...(m.attachments.length > 0
       ? {
           attachments: m.attachments.map((a) =>
-            `${nameShown(a.name)}${a.mimeType ? ` (${mimeShown(a.mimeType)})` : ''}${a.url ? ` — ${attachmentToolEnabled ? 'fetchable via fetch_attachment' : 'attachment URL'}: ${urlShown(a.url)}` : ''}`,
+            `${nameShown(a.name)}${a.mimeType ? ` (${mimeShown(a.mimeType)})` : ''}${a.url ? ` — ${attachmentToolEnabled ? 'fetchable via fetch_attachment' : 'attachment URL (content unavailable through this server)'}: ${urlShown(a.url)}` : ''}`,
           ),
         }
       : {}),
