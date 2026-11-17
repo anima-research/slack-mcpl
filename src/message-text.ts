@@ -79,7 +79,7 @@ export function renderMessageText(
   const renderLimit = Math.max(MAX_MESSAGE_TEXT_APPEND, original.length + 1);
   const bounded = (v: unknown) => { const text = string(v); if (text.length > renderLimit) truncated = true; return prefix(text, renderLimit); };
   const join = (v: string[], separator = '\n') => bounded(v.filter(Boolean).join(separator));
-  const textObject = (v: unknown) => !visit() ? '' : object(v).type === 'plain_text' ? escape(bounded(object(v).text)) : bounded(object(v).text);
+  const textObject = (v: unknown) => v == null || !visit() ? '' : object(v).type === 'plain_text' ? escape(bounded(object(v).text)) : bounded(object(v).text);
   function rich(v: unknown, depth = 0): string {
     if (!visit() || depth > 12) { truncated = true; return ''; }
     const e = object(v);
@@ -217,17 +217,17 @@ export function renderMessageText(
     }
     const shared = a.is_share === true || a.is_msg_unfurl === true;
     let header = '';
-    if (shared || a.author_name) {
+    if (shared || string(a.author_name)) {
       const name = string(a.author_name) ? headerName(string(a.author_name)) : 'unknown';
       const uid = validId(a.author_id) ? ` (uid:${headerName(a.author_id)})` : '';
       const source = string(a.channel_name) ? headerChannel(string(a.channel_name)) :
         string(a.footer) ? headerName(string(a.footer)) : 'unknown source';
       header = shared ? `[shared message from ${name}${uid}, ${source}]` : `[attachment from ${name}${uid}]`;
     }
-    // Only unattributed units can mirror the original; uncapped attribution fields
-    // prevent capped display names from merging distinct senders. Fallback depends on readable output, not notices.
+    // Deduplicate within the displayed attribution, including its source kind
+    // (#channel versus footer), escaping and caps.
     const units = [body || (nested.length ? '' : fieldText(a.fallback)), ...nested, ...placeholders]
-      .filter(value => unique(value, header ? JSON.stringify([shared, string(a.author_name), validId(a.author_id) ? a.author_id : '', shared ? (string(a.channel_name) || string(a.footer)) : undefined]) : ''));
+      .filter(value => unique(value, header));
     if (units.length && header) {
       emit(header + '\n' + join(units).split(LINE_BREAK).map(line => '&gt; ' + line).join('\n'));
     } else {
@@ -248,7 +248,7 @@ export function renderMessageText(
   const suffix = join(appended);
   const addition = (original && suffix ? '\n' : '') + suffix;
   if (addition.length > maxAppend) truncated = true;
-  const marker = '[…truncated]';
+  const marker = prefix('[…truncated]', Math.max(0, maxAppend));
   return original + (truncated
     ? prefix(addition || (original ? '\n' : ''), maxAppend - marker.length) + marker
     : addition);

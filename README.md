@@ -391,18 +391,21 @@ with only blocks. Bot/integration messages carrying `bot_id`, `app_id` or
 `bot_profile`, without `client_msg_id`, also retain rich text.
 
 Unattributed supplemental units deduplicate against original text. Attributed
-units deduplicate within the same uncapped author name, valid author ID and (for
-shares) channel name or footer. Other source fields such as author_link are not
-identity keys; different identities under these fields survive. Comparison keys normalize prose whitespace, Slack encodings, combined
+units deduplicate within the same displayed attribution header (including capped
+author name, valid author ID and, for shares, channel or footer). Other source fields such as author_link are not
+identity keys; names differing only beyond the display cap may deduplicate. Comparison keys normalize prose whitespace, Slack encodings, combined
 bold/italic marker order and newlines directly inside code fences; compare
 channel/user IDs rather than labels; and preserve other code whitespace.
 This is display dedup, not typed equality: a link and identical rendered literal
 may collapse, while differing markup may appear twice for bots/integrations.
-Angle tokens use a linear scan; unclosed tokens remain literal. The original
+Angle tokens use a linear scan; unclosed, malformed (such as `<http://|label>`)
+and multiline tokens remain literal, including in original text. Multiline
+mentions therefore do not trigger mention-based wake or auto-subscription. The original
 Slack text is preserved in channels/incoming raw metadata, while display text is formatted.
 push/event does not expose rawContent. Nested angle openers restart the token scan.
 
-Only original Slack text creates mentions, addressing, wake or auto-subscription.
+Only original Slack text supplies mention-based addressing, wake or auto-subscription.
+DM addressing is independent of text, including for blocks-only DMs.
 Quoted/shared/block mentions are display content only. Name resolution includes
 original-text mentions plus at most **20 unique supplemental IDs per message**;
 others display raw IDs, even if cached. Live channels/incoming `metadata.rawContent` remains original
@@ -413,7 +416,10 @@ filters.
 App/link previews are skipped, except message shares. Classic previews are
 skipped when `from_url` matches an extracted original URL, decoding Slack entities
 and trimming trailing sentence punctuation from bare URLs. Labelled Slack URL
-targets are compared exactly.
+targets are compared exactly. No URL canonicalization is performed: trailing
+slashes, scheme/host case, default ports and fragments can prevent a match. Such
+previews remain visible and can consume the entire supplemental allowance; loose
+matches never hide potentially distinct content.
 
 The supplemental suffix cap is **pre-formatting**: 16,384 UTF-16 code units including
 separator and a single final `[…truncated]` marker. It does **not** bound delivered

@@ -167,13 +167,13 @@ test('large bot rich-text mirrors fit traversal before comparison (R4-1)', () =>
   }
 });
 
-test('attributed content is not the original author and capped names are not identities', () => {
+test('attributed content differs from original but identical displayed headers deduplicate', () => {
   const name = 'x'.repeat(100);
   const rendered = renderMessageText({ text: 'same', attachments: [
     { author_name: name + 'A', text: 'same' },
     { author_name: name + 'B', text: 'same' },
   ] });
-  assert.equal(rendered.split('same').length - 1, 3);
+  assert.equal(rendered.split('same').length - 1, 2);
 });
 
 test('backscroll channel framing cannot exceed the byte budget', () => {

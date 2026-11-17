@@ -85,6 +85,7 @@ test('exhausted traversal stops reading pending nested lists and outer entries',
   ]) {
     reads = 0;
     const output = renderMessageText(message);
+    assert.ok(reads >= 1998, `only read ${reads} entries; did not reach nested list`);
     assert.ok(reads <= 2000, `read ${reads} list entries for 2000 visits`);
     assert.ok(!output.includes('unvisited'));
     assert.ok(output.endsWith('[…truncated]'));
@@ -107,4 +108,40 @@ test('attribution keys use typed source fields and valid author IDs', () => {
   assert.equal((renderMessageText({attachments: [
     {...shared, author_id: 'invalid one'}, {...shared, author_id: 'invalid two'},
   ]}).match(/body/g) || []).length, 1);
+});
+
+
+test('attribution dedup uses displayed source kind and capped names', () => {
+  const shared = {is_share: true, author_name: 'A', text: 'body'};
+  const output = renderMessageText({attachments: [
+    {...shared, channel_name: 'ops'}, {...shared, footer: 'ops'},
+  ]});
+  assert.equal((output.match(/body/g) || []).length, 2);
+  assert.equal((renderMessageText({attachments: [
+    {...shared, author_name: 'A'.repeat(100) + 'x'},
+    {...shared, author_name: 'A'.repeat(100) + 'y'},
+  ]}).match(/body/g) || []).length, 1);
+});
+
+test('malformed author names do not create attribution', () => {
+  for (const author_name of [{}, 1, true, []]) {
+    assert.equal(renderMessageText({text: 'hello', attachments: [{author_name, text: 'hello'}]}), 'hello');
+  }
+});
+
+test('absent optional text does not exhaust the traversal allowance', () => {
+  assert.equal(renderMessageText({blocks: [
+    ...Array.from({length: 1999}, () => ({type: 'markdown', text: 'x'})),
+    {type: 'section'},
+  ]}), 'x');
+});
+
+test('tiny supplemental caps also bound the truncation marker', () => {
+  for (let cap = 0; cap < 12; cap++) {
+    const text = 'original';
+    const output = renderMessageText({text, blocks: [{type: 'markdown', text: '😀'.repeat(20)}]}, cap);
+    assert.ok(output.startsWith(text));
+    assert.ok(output.length - text.length <= cap);
+    assert.ok(!/[\uD800-\uDBFF]$/.test(output));
+  }
 });

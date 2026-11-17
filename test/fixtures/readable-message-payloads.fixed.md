@@ -14,7 +14,7 @@
   Malformed nested angle tokens now restart at the inner opener; this also affects
   original-text mention extraction and formatting.
   Size rich mirror traversal to original text, normalize prose bullet spellings,
-  preserve code newlines inside fences, and keep distinct uncapped author-name/valid-ID and share-source identities.
+  preserve code newlines inside fences, and deduplicate by displayed attribution headers, including source kind and caps.
   Bound backscroll channel labels as well as message content; avoid reserving an
   omission summary when the complete block fits.
   Reserve separate attachment and top-level traversal allowances including rich
@@ -23,3 +23,10 @@
   unnecessary history rendering after author/scan/match limits.
   Stop pending list iteration when traversal is exhausted, ignore invalid attribution
   fields in dedup keys, and retain fallback for empty rich quotes/code blocks.
+  Classic unfurl suppression requires an exact extracted URL match, with no URL
+  canonicalization: slash, case, default-port or fragment differences retain
+  previews, which can consume the full supplemental allowance.
+  Malformed and multiline angle tokens remain literal in original text too;
+  multiline mentions do not trigger mention-based wake or auto-subscription.
+  Ignore non-string author names and absent optional text objects; bound even
+  truncation markers by tiny supplemental caps. DM addressing remains text-independent.
