@@ -86,13 +86,13 @@ const NOT_SHOWN = new Set(['channel_not_found', 'invalid_channel_id']);
  *  assertNotDm leaves its error to the explainer. A rate limit's answer
  *  without the Retry-After the client needs does come here, and is told to
  *  try again shortly. */
-function afterFailedCheck(err: unknown): string {
+function afterFailedCheck(err: unknown, enabled: (name: string) => boolean): string {
   const e = err as { data?: { needed?: unknown } } | null;
   const code = slackRefusal(err);
   // Not Slack's refusal, nor a failure waitToAskAgain names, such as a rate
   // limit's answer without the Retry-After the client needs.
   if (code === undefined) return 'Try again shortly.';
-  if (NOT_SHOWN.has(code)) return 'list_channels shows the ones it can use.';
+  if (NOT_SHOWN.has(code)) return toolHint('list_channels shows the ones it can use.', enabled, 'Copy channelId from an incoming channel message, or ask someone with Slack access for a channel ID this bot can use.');
   if (code === 'missing_scope') {
     const needed = typeof e?.data?.needed === 'string' && e.data.needed ? ` (Slack names ${e.data.needed})` : '';
     return (
@@ -1453,7 +1453,7 @@ export class SlackAdapter {
     const refuse = (why: string) =>
       new ChannelOnlyRefusal(
         guidance(`${notDone}: ${channelId} ${why}, and this bot works only in channels here, since direct messages are ` +
-          'turned off.', this.hint('list_channels shows the ones it can use.')),
+          'turned off.', this.hint('list_channels shows the ones it can use.', 'Copy channelId from an incoming channel message, or ask someone with Slack access for a channel ID this bot can use.')),
       );
     if (this.dmIds.has(channelId) || channelId.startsWith('D')) throw refuse('is a direct message or group DM');
     try {
@@ -1470,7 +1470,7 @@ export class SlackAdapter {
       const why = answer !== undefined ? `Slack answered ${answer}` : (err as Error).message;
       throw new Error(
         guidance(`${notDone}: Slack couldn't confirm ${channelId} is a channel (${why}), and with direct messages turned ` +
-          `off, this bot works only in conversations Slack confirms are channels.`, this.hint(afterFailedCheck(err))),
+          `off, this bot works only in conversations Slack confirms are channels.`, afterFailedCheck(err, this.toolEnabled)),
         { cause: err },
       );
     }
@@ -1480,7 +1480,7 @@ export class SlackAdapter {
   async sendDM(userId: string, text: string): Promise<{ messageId: string; channelId: string }> {
     const toChannels = guidance(this.hint(
       'To reach people, post in a writable channel with send_message.', 'Someone with Slack access can contact the recipient.'),
-      this.hint('list_channels marks where this bot may write with writable: true.'));
+      this.hint('list_channels marks where this bot may write with writable: true.', 'Copy channelId from an incoming channel message, or ask someone with Slack access for a writable channel ID.'));
     if (this.disableDms) {
       throw new Error(
         "Nothing was sent: direct messages are turned off on this host, so send_dm can't reach anyone. Calling " +

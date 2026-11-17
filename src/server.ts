@@ -1579,25 +1579,21 @@ export class SlackMcplServer {
       return this.toolEnabled(name) && (!this.mcplEnabled ||
         (this.grant.has('tools') && (!featureSet || this.grant.isFeatureSetActive(featureSet))));
     };
-    const locate = (threadTs?: string): string => {
-      const read = threadTs ? `fetch_thread with parent thread id ${threadTs}` : 'fetch_history';
-      const tool = threadTs ? 'fetch_thread' : 'fetch_history';
-      const target = threadTs ? `replies in thread ${threadTs}` : 'top-level messages';
-      return recoveryToolEnabled(tool) && recoveryToolEnabled('delete_message')
-        ? `Use ${read} to locate the remaining ${target}, then delete_message with each message's own id`
-        : `Someone with access must locate and delete the remaining ${target} in Slack`;
-    };
+    const checkManually = (threadTs?: string): string =>
+      "Someone with access must manually check Slack for the possible post" +
+      (threadTs ? ` in thread ${threadTs}` : ' among top-level messages') +
+      "; this server cannot identify it, so do not delete messages based on this notice";
     const mayRemain = left.filter((item) => !item.forGood);
     const refused = left.filter((item) => item.forGood);
     const named = (items: typeof left) => items.map((item) => item.named).join('; ');
     const namedMessageLeft = mayRemain.some((item) => item.kind === 'message' && !item.unnamed);
     const unnamedLeft = mayRemain.some((item) => item.unnamed);
     const remedy = [
-      ...(namedMessageLeft ? [toolHint('delete_message can try a message among them again, by its id', recoveryToolEnabled,
-        'Someone with access must retry deleting the remaining messages in Slack, by its own id')] : []),
+      ...(namedMessageLeft ? [toolHint('delete_message can retry only the known message IDs listed above', recoveryToolEnabled,
+        "Someone with access can retry deleting only the known message IDs listed above in Slack")] : []),
       ...(unnamedLeft ? [...new Set(toDelete
         .filter((item) => item.kind === 'message' && item.messageId === undefined)
-        .map((item) => locate(item.threadTs)))] : []),
+        .map((item) => checkManually(item.threadTs)))] : []),
       ...(mayRemain.some((item) => item.kind === 'file')
         ? ["No tool here deletes a file, and whoever runs this host can delete it with Slack's files.delete, by its id"]
         : []),
@@ -1613,7 +1609,7 @@ export class SlackMcplServer {
       ...commentsLeft.map(file =>
         `The comment of uploaded file ${file.fileId} may remain in conversation ${file.channelId}: ` +
         "this server doesn't know the message that shared the file, so no rollback can delete it. " +
-        locate(file.threadTs)),
+        checkManually(file.threadTs)),
 
     ];
     return {

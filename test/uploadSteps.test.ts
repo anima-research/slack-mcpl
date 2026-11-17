@@ -81,7 +81,7 @@ async function server(t: { after(fn: () => Promise<void>): void }) {
  *  message this server doesn't know. */
 const commentMayRemain =
   "The comment of uploaded file F1 may remain in conversation C1: this server doesn't know the message that shared " +
-  "the file, so no rollback can delete it. Use fetch_history to locate the remaining top-level messages, then delete_message with each message's own id.";
+  "the file, so no rollback can delete it. Someone with access must manually check Slack for the possible post among top-level messages; this server cannot identify it, so do not delete messages based on this notice.";
 
 /** Methods called from `from` on, the upload's own bytes request included,
  *  less the listing a grant starts in the background. */
@@ -444,10 +444,10 @@ test("the remedy says what can be done for each kind that may remain, and nothin
   t.mock.method(console, 'error', () => {});
   for (const [file, says] of [
     [{ body: { ok: false, error: 'cant_delete_file' } }, 'May remain: message 5.5 in C1, which shared file F1. No rollback tries ' +
-      "these again. delete_message can try a message among them again, by its id. Slack refused to delete these, and calling again won't " +
+      "these again. delete_message can retry only the known message IDs listed above. Slack refused to delete these, and calling again won't " +
       'change that: file F1 in C1'],
     [{ body: { ok: false, error: 'internal_error' } }, 'May remain: file F1 in C1; message 5.5 in C1, which shared file F1. No ' +
-      'rollback tries these again. delete_message can try a message among them again, by its id. No tool here deletes a ' +
+      'rollback tries these again. delete_message can retry only the known message IDs listed above. No tool here deletes a ' +
       "file, and whoever runs this host can delete it with Slack's files.delete, by its id"],
   ] as const) {
     await steps(t, { last: sharedBy('F1', '5.5') });
@@ -470,7 +470,7 @@ test("a delete whose outcome is unknown leaves its item named as one that may re
   await call('upload_file', { channelId: 'C1', filename: 'a.txt', content: 'a', comment: 'Here' });
   assert.equal((await rollback(before.state!.checkpoint)).reason,
     'Rolled back (0/1 messages and 1/1 files deleted). May remain: message 5.5 in C1, which shared file F1. ' +
-      'No rollback tries these again. delete_message can try a message among them again, by its id.');
+      'No rollback tries these again. delete_message can retry only the known message IDs listed above.');
 });
 
 test("a rollback that leaves one upload's file names it, and still notes another's comment it can't reach", { timeout: 5000 }, async (t) => {
@@ -486,7 +486,7 @@ test("a rollback that leaves one upload's file names it, and still notes another
   assert.equal((await rollback(before.state!.checkpoint)).reason,
     "Rolled back (1/1 messages and 1/2 files deleted). Slack refused to delete these, and calling again won't change that: file F1 in C1. The comment of uploaded file F2 may " +
       "remain in conversation C1: this server doesn't know the message that shared the file, so no rollback can delete it. " +
-      "Use fetch_history to locate the remaining top-level messages, then delete_message with each message's own id.");
+      "Someone with access must manually check Slack for the possible post among top-level messages; this server cannot identify it, so do not delete messages based on this notice.");
 });
 
 test('a file Slack says is gone, or no longer visible to this bot, counts as deleted, and its sharing message is still deleted', { timeout: 5000 }, async (t) => {

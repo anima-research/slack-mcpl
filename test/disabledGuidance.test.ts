@@ -22,7 +22,12 @@ test('manifest and grant omit empty tool-only sets but retain messaging and typi
   const result = await initialize(h, true);
   const experimental = result.capabilities.experimental as { mcpl: { featureSets: object } };
   assert.deepEqual(Object.keys(experimental.mcpl.featureSets), ['slack.messaging', 'slack.typing']);
-  const receipt = await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: [] });
+  const receipt = await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: [] }) as {
+    mode: string; unavailableFeatures: { featureSet: string; missingCapabilities: string[] }[];
+  };
+  assert.equal(receipt.mode, 'degraded');
+  assert.deepEqual(receipt.unavailableFeatures.map(item => item.featureSet).sort(), ['slack.messaging', 'slack.typing']);
+  assert.ok(receipt.unavailableFeatures.every(item => item.missingCapabilities.length > 0));
   assert.doesNotMatch(JSON.stringify(receipt), /slack.history|slack.subscriptions/);
   await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
   assert.match(await call(h.host, 'not_a_tool'), /This server's tools are: none\./);
@@ -81,9 +86,17 @@ test('Slack error hints omit disabled alternatives without losing unknown-write 
     const explanation = text.split('\n\n').at(-1)!;
     assert.equal(explanation, explanation.trim());
     assert.doesNotMatch(explanation, / {2}/);
-    if (code === 'channel_not_found') assert.match(explanation, /Slack doesn't know conversation C1/);
+    if (code === 'channel_not_found') {
+      assert.match(explanation, /Slack doesn't know conversation C1/);
+      assert.match(explanation, /Copy channelId from an incoming channel message/);
+    }
     if (code === 'user_not_found') assert.match(explanation, /Slack has no user/);
-    if (code.startsWith('restricted_action')) assert.match(explanation, /conversation C1.*thread replies/);
+    if (code.startsWith('restricted_action')) {
+      assert.match(explanation, /conversation C1.*thread replies/);
+      assert.match(explanation, code.endsWith('non_threadable_channel')
+        ? /Someone with Slack access can post in the conversation/
+        : /Someone with Slack access can reply in the thread/);
+    }
     if (code === 'internal_error') {
       assert.match(text, /whether the message was posted is unknown/);
       assert.match(text, /before posting again/);
@@ -260,12 +273,10 @@ for (const disabledTools of [['fetch_history'], ['fetch_thread'], ['delete_messa
       for (const name of disabledTools) assert.ok(!result.reason.includes(name), result.reason);
       assert.match(result.reason, /may remain/);
       assert.match(result.reason, /C1/);
-      const read = threadTs ? 'fetch_thread' : 'fetch_history';
-      const target = threadTs ? 'replies in thread 123.4' : 'top-level messages';
-      const expected = disabledTools.includes(read) || disabledTools.includes('delete_message')
-        ? `Someone with access must locate and delete the remaining ${target} in Slack`
-        : `Use ${read}${threadTs ? ' with parent thread id 123.4' : ''} to locate the remaining ${target}, then delete_message with each message's own id`;
-      assert.ok(result.reason.includes(expected), result.reason);
+      assert.match(result.reason, /manually check Slack for the possible post/);
+      assert.match(result.reason, /cannot identify it, so do not delete messages based on this notice/);
+      assert.doesNotMatch(result.reason, /fetch_history|fetch_thread|delete_message|locate and delete/);
+      if (threadTs) assert.match(result.reason, /in thread 123\.4/);
       assert.ok(result.reason.endsWith('.'));
       assert.doesNotMatch(result.reason, /\.\.|, and Use/);
     }
@@ -344,6 +355,7 @@ test('DM refusal retains channel posting advice without list_channels', async t 
   await initialize(h, false);
   const text = await call(h.host, 'send_dm', { userId: 'U1', content: 'hi' });
   assert.match(text, /post in a writable channel with send_message\./);
+  assert.match(text, /Copy channelId from an incoming channel message/);
   assert.doesNotMatch(text, /list_channels/);
 });
 
@@ -387,5 +399,16 @@ test('optional Slack-error sentences have no trailing or doubled spaces', () => 
       assert.equal(text, text.trim());
       assert.doesNotMatch(text, / {2}/);
     }
+  }
+});
+
+test('caller IDs cannot suppress available unknown-write remedies', () => {
+  for (const tool of ['send_message', 'reply_message', 'upload_file', 'edit_message']) {
+    const text = explainSlackError({ code: 'slack_webapi_platform_error', data: { error: 'internal_error' } }, {
+      tool, args: { channelId: 'delete_message', messageId: 'delete_message' },
+      toolEnabled: name => name !== 'delete_message',
+    });
+    assert.match(text, tool === 'reply_message' || tool === 'upload_file' ? /Check fetch_thread/ : /fetch_history/);
+    assert.doesNotMatch(text, /ask someone with access|Ask someone with Slack access/);
   }
 });

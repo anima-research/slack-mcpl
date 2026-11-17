@@ -89,7 +89,7 @@ test("a post whose answer names no message is an unknown outcome, joins the next
     checkpoint: one.state!.checkpoint,
     success: true,
     reason: "Rolled back (1/2 messages deleted). May remain: a message in C1 whose id this server doesn't know. No rollback " +
-      'tries these again. Use fetch_history to locate the remaining top-level messages, then delete_message with each message\'s own id.',
+      'tries these again. Someone with access must manually check Slack for the possible post among top-level messages; this server cannot identify it, so do not delete messages based on this notice.',
   });
   assert.deepEqual(unnamedLines(logged), [
     "[slack-mcpl] Rollback couldn't delete a message in C1: Slack's answer to the post named none, or the post's outcome is unknown",
@@ -111,8 +111,7 @@ test("a reply this server can't name is placed under its thread, beside a messag
   assert.equal(
     (await rollback(one.state!.checkpoint)).reason,
     'Rolled back (0/2 messages deleted). May remain: message 1.2 in C1; a message in the thread under message 1.1 in C1 ' +
-      "whose id this server doesn't know. No rollback tries these again. delete_message can try a message among them " +
-      "again, by its id. Use fetch_thread with parent thread id 1.1 to locate the remaining replies in thread 1.1, then delete_message with each message's own id.",
+      "whose id this server doesn't know. No rollback tries these again. delete_message can retry only the known message IDs listed above. Someone with access must manually check Slack for the possible post in thread 1.1; this server cannot identify it, so do not delete messages based on this notice.",
   );
   assert.deepEqual(unnamedLines(logged), [
     "[slack-mcpl] Rollback couldn't delete a message in the thread under message 1.1 in C1: Slack's answer to the post " +
@@ -130,7 +129,7 @@ test("a post this server can't name stays under may remain beside a message Slac
   assert.equal(
     (await rollback(one.state!.checkpoint)).reason,
     "Rolled back (0/2 messages deleted). May remain: a message in C1 whose id this server doesn't know. No rollback tries " +
-      'these again. Use fetch_history to locate the remaining top-level messages, then delete_message with each message\'s own id. ' +
+      'these again. Someone with access must manually check Slack for the possible post among top-level messages; this server cannot identify it, so do not delete messages based on this notice. ' +
       "Slack refused to delete these, and calling again won't change that: message 1.2 in C1.",
   );
 });
@@ -336,15 +335,9 @@ for (const disabled of ['fetch_history', 'fetch_thread', 'delete_message']) {
       const result = await h.host.sendRequest(method.STATE_ROLLBACK, {
         featureSet: MESSAGING_FEATURE_SET, checkpoint: first.state!.checkpoint,
       }) as { reason: string };
-      const read = thread ? 'fetch_thread' : 'fetch_history';
-      if (disabled === read || disabled === 'delete_message') {
-        assert.match(result.reason, /Someone with access must locate and delete the remaining .* in Slack/);
-        assert.doesNotMatch(result.reason, /Use fetch_/);
-      } else {
-        assert.ok(result.reason.includes(`Use ${read}`), result.reason);
-        assert.match(result.reason, /then delete_message with each message's own id/);
-        assert.doesNotMatch(result.reason, /Someone with access/);
-      }
+      assert.match(result.reason, /manually check Slack for the possible post/);
+      assert.match(result.reason, /cannot identify it, so do not delete messages based on this notice/);
+      assert.doesNotMatch(result.reason, /fetch_history|fetch_thread|delete_message|locate and delete/);
       assert.doesNotMatch(result.reason, new RegExp(disabled));
     });
   }
@@ -356,6 +349,6 @@ test('mixed unnamed posts and replies get location-specific rollback remedies', 
   await call('send_message', { channelId: 'C1', content: 'top-level' });
   await call('reply_message', { channelId: 'C1', messageId: '1.1', content: 'reply' });
   const result = await rollback(first.state!.checkpoint);
-  assert.match(result.reason!, /fetch_history to locate the remaining top-level messages/);
-  assert.match(result.reason!, /fetch_thread with parent thread id 1\.1 to locate the remaining replies in thread 1\.1/);
+  assert.match(result.reason!, /manually check Slack for the possible post among top-level messages/);
+  assert.match(result.reason!, /manually check Slack for the possible post in thread 1\.1/);
 });

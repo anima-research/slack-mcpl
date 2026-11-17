@@ -252,3 +252,16 @@ test('conversations.list asks only for the types the token has a read scope for'
   await new SlackAdapter(web, socket, 'UBOT', 'acme', undefined, undefined, false).listConversations();
   assert.deepEqual(listTypes, ['public_channel,private_channel,im', 'public_channel,private_channel,im,mpim']);
 });
+
+test('scope values that resemble disabled tools retain operator remedies', async t => {
+  const api = await fakeSlackApi();
+  t.after(() => api.close());
+  api.answer({ body: { ok: false, error: 'missing_scope', needed: 'delete_message' } });
+  const adapter = strictOver(api.url);
+  adapter.toolEnabled = name => name !== 'delete_message';
+  await assert.rejects(adapter.fetchHistory('CUNKNOWN'), (err: Error) => {
+    assert.match(err.message, /adds the scope it needs \(Slack names delete_message\)/);
+    assert.match(err.message, /reinstalls the app/);
+    return true;
+  });
+});

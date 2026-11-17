@@ -128,7 +128,11 @@ export function explainSlackError(err: unknown, call: SlackCall): string {
 }
 
 function explanation(err: unknown, call: SlackCall): string | undefined {
-  const hint = (text: string, fallback = '') => toolHint(text, call.toolEnabled ?? (() => true), fallback);
+  // Interpolated IDs are data, not tool references; pass explicit dependencies for them.
+  const hint = (text: string, fallback = '', tools?: string[]) => {
+    const enabled = call.toolEnabled ?? (() => true);
+    return tools ? (tools.every(enabled) ? text : fallback) : toolHint(text, enabled, fallback);
+  };
   const e = err as {
     code?: unknown;
     retryAfter?: number;
@@ -191,14 +195,16 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
         : thread
           ? `fetch_thread for the thread under message ${thread} in ${conversation}`
           : `fetch_history for ${conversation}`;
+      const check = hint(where, 'the conversation in Slack (ask someone with access)',
+        !channel ? ['list_channels', 'fetch_history'] : [thread ? 'fetch_thread' : 'fetch_history']);
       if (call.tool === 'upload_file') {
         return (
-          `${cause}, so whether the file was shared is unknown${note}. Check ${hint(where, 'the conversation in Slack (ask someone with access)')} before uploading again, so ` +
+          `${cause}, so whether the file was shared is unknown${note}. Check ${check} before uploading again, so ` +
           "it isn't shared twice."
         );
       }
       return (
-        `${cause}, so whether the message was posted is unknown${note}. Check ${hint(where, 'the conversation in Slack (ask someone with access)')} before posting again, so ` +
+        `${cause}, so whether the message was posted is unknown${note}. Check ${check} before posting again, so ` +
         "it isn't posted twice."
       );
     }
@@ -206,7 +212,7 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
     // and only the agent knows whether the message it names is a thread reply.
     const where = "if it's in the channel itself, and fetch_thread does, with its thread's id, if it's a thread reply";
     if (call.tool === 'edit_message') {
-      return `${cause}, so whether the edit took is unknown${note}. ${hint(`fetch_history shows ${theMessage} as it is now ${where}.`, 'Ask someone with Slack access to check the message before retrying.')}`;
+      return `${cause}, so whether the edit took is unknown${note}. ${hint(`fetch_history shows ${theMessage} as it is now ${where}.`, 'Ask someone with Slack access to check the message before retrying.', ['fetch_history', 'fetch_thread'])}`;
     }
     if (call.tool === 'delete_message') {
       return (
@@ -340,12 +346,12 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
     case 'channel_not_found':
       return guidance(
         `${lead}: Slack doesn't know ${conversation}, or this bot can't see it. ${RECALLED}, or it's a ` +
-        "private conversation this bot isn't in.", hint('list_channels shows the conversations this bot can use, with their ids.')
+        "private conversation this bot isn't in.", hint('list_channels shows the conversations this bot can use, with their ids.', 'Copy channelId from an incoming channel message, or ask someone with Slack access for a channel ID this bot can use.')
       );
     case 'invalid_channel_id':
       return guidance(
         `${lead}: ${channel ?? 'the conversation given'} isn't a Slack conversation id. ${RECALLED}.`,
-        hint('list_channels shows the conversations this bot can use, with their ids.')
+        hint('list_channels shows the conversations this bot can use, with their ids.', 'Copy channelId from an incoming channel message, or ask someone with Slack access for a channel ID this bot can use.')
       );
     case 'not_in_channel':
       if (call.tool === 'upload_file') {
