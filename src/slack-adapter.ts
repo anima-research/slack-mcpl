@@ -1147,7 +1147,9 @@ export class SlackAdapter {
     // An acknowledge() during the add may have installed an entry the caller
     // never saw. Slack confirmed our reaction; retire its pending cleanup too.
     const current = this.ackPending.get(channelId)?.get(ts);
-    if (current && !current.removing) this.dropAck(channelId, ts, current);
+    // A sent removal cannot be recalled; retire its retry after it settles.
+    if (current?.removing) void current.removing.then(() => this.dropAck(channelId, ts, current));
+    else if (current) this.dropAck(channelId, ts, current);
     let adopted = this.ackAdopted.get(channelId);
     if (!adopted) this.ackAdopted.set(channelId, (adopted = new Map()));
     clearTimeout(adopted.get(ts));
@@ -1160,7 +1162,7 @@ export class SlackAdapter {
   }
 
   private armAck(channelId: string, ts: string, ms: number): ReturnType<typeof setTimeout> {
-    const timer = setTimeout(() => void this.clearAck(channelId, ts), ms);
+    const timer = setTimeout(() => void outsideCallTime(() => this.clearAck(channelId, ts)), ms);
     timer.unref?.();
     return timer;
   }
@@ -1640,14 +1642,13 @@ export class SlackAdapter {
       }
     }
     const remove = async () => {
-      if (entry) {
-        await entry.added;
-        entry.tries++;
-      }
+      if (entry) await entry.added;
+      let attempted = false;
       try {
         // The policy stack is optional on this branch. Check at the effect,
         // after any pending ACK add, so a revoked grant cannot use that wait.
         if (entry && policy.hasAccessPolicy) await policy.requireWritableConversation(channelId, 'reactions:write', 'No reaction was removed');
+        attempted = true;
         await this.web.reactions.remove({ channel: channelId, timestamp: ts, name });
         if (entry) {
           entry.gone = true;
@@ -1655,6 +1656,7 @@ export class SlackAdapter {
         }
         return true;
       } catch (err) {
+        if (entry && attempted && !(err instanceof OutOfCallTime)) entry.tries++;
         if (entry && slackRefusal(err) === 'no_reaction') entry.gone = true;
         // Use the automatic cleanup's retry budget and terminal refusals.
         if (entry && (refusedForGood(err) || this.stopping || entry.tries >= ACK_MAX_TRIES)) {
@@ -1778,7 +1780,7 @@ export class SlackAdapter {
           const users = Array.isArray(r.users) ? r.users : undefined;
           const own = this.botUserId === null || !users ? undefined
             : users.includes(this.botUserId) ? true
-            : count !== undefined && users.length === count && users.every((u) => typeof u === 'string') ? false
+            : count !== undefined && users.length === count && new Set(users).size === count && users.every((u) => typeof u === 'string' && /^[UW][A-Z0-9]+$/.test(u)) ? false
             : undefined;
           return { name: r.name, ...(count !== undefined ? { count } : {}), ...(own !== undefined ? { own } : {}) };
         }),

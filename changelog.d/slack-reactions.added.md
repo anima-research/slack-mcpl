@@ -21,3 +21,9 @@
   adopts the reaction on success or `already_reacted`, retiring automatic cleanup.
   This also applies after automatic cleanup has finished. Redelivered events
   cannot recreate cleanup for that message for 10 minutes.
+- Preserve an agent's explicit ACK-emoji reaction when a delivery installs
+  automatic cleanup while the agent's add is in flight. Confirmed adoption
+  now retires that newly pending cleanup as well.
+- Automatic ACK retries run outside the triggering tool call's deadline; unsent
+  manual refusals do not consume the cleanup retry budget. A concurrent removal
+  already sent before adoption may still land, but its failure will not retry.

@@ -836,3 +836,44 @@ test('adoption marker is armed only for a confirmed explicit configured ACK emoj
   await slack.addReaction('C1', '1.0', ':eyes:');
   assert.deepEqual([...markers].map(([channel, messages]) => [channel, [...messages.keys()]]), [['C1', ['1.0']]]);
 });
+
+for (const agentLandsFirst of [false, true]) test(`adoption retires retry of concurrent failed removal (${agentLandsFirst})`, async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let present = false, adds = 0, removes = 0;
+  let releaseAdd!: () => void, releaseRemove!: () => void;
+  const web = { reactions: {
+    add: async () => {
+      if (++adds === 1) {
+        if (agentLandsFirst) present = true;
+        await new Promise<void>(r => { releaseAdd = r; });
+      }
+      present = true;
+    },
+    remove: async () => {
+      removes++;
+      await new Promise<void>(r => { releaseRemove = r; });
+      throw refusal('ratelimited');
+    },
+  } } as unknown as SlackWebLike;
+  const slack = new SlackAdapter(web, { on() {}, async start() {}, async disconnect() {} }, 'UBOT', 'test',
+    undefined, undefined, false, 'eyes');
+  const h = connectHost(new SlackMcplServer(slack));
+  t.after(async () => { await h.close(); await slack.stop(); });
+  await initialize(h, false);
+  const adding = call(h, 'add_reaction', args);
+  await flush();
+  assert.ok(releaseAdd);
+  await slack.acknowledge('C1', '1.0');
+  const clearing = slack.clearAck('C1');
+  await flush();
+  assert.ok(releaseRemove);
+  releaseAdd();
+  assert.notEqual((await adding).isError, true);
+  releaseRemove();
+  await clearing;
+  await flush();
+  t.mock.timers.tick(60_000);
+  await flush();
+  assert.equal(removes, 1);
+  assert.equal(present, true);
+});
