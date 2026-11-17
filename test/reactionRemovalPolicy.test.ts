@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { fakeSlack } from './harness.js';
+import { connectHost, fakeSlack, initialize } from './harness.js';
+import { SlackMcplServer } from '../src/server.js';
 
 // #57 remains independently buildable; policy cases activate on composition.
 const policyPresent = existsSync(new URL('./adapterAccessFixture.ts', import.meta.url));
@@ -90,5 +91,43 @@ test('policy composition: revoked membership denies joining successful ACK clean
   release();
   await Promise.all([clearing, denied]);
   assert.deepEqual(checks, [{ id: 'C1', scope: 'reactions:write', notDone: 'No reaction was removed' }]);
+  assert.equal(effects, 1, 'only the already-running automatic cleanup reaches Slack');
+});
+
+test('policy composition: server refuses revocation while joined ACK cleanup is in flight', async t => {
+  const f = fakeSlack({ ackReaction: 'eyes' });
+  const policy = f.slack as unknown as {
+    requireWritableConversation(id: string, scope: string, notDone: string): Promise<void>;
+    web: { reactions: { remove(): Promise<void> } };
+  };
+  let admitted = true;
+  const checks: unknown[] = [];
+  Object.defineProperty(policy, 'hasAccessPolicy', { value: true });
+  policy.requireWritableConversation = async (id, scope, notDone) => {
+    checks.push({ id, scope, notDone });
+    if (!admitted) throw new Error(`${notDone}: membership revoked`);
+  };
+  let release!: () => void;
+  let effects = 0;
+  policy.web.reactions.remove = async () => { effects++; await new Promise<void>(r => { release = r; }); };
+  const h = connectHost(new SlackMcplServer(f.slack));
+  t.after(async () => { release?.(); await h.close(); await f.slack.stop(); });
+  await initialize(h, false);
+  await f.slack.acknowledge('C1', '1.0');
+  const clearing = f.slack.clearAck('C1');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(release);
+  const removing = h.host.sendRequest('tools/call', {
+    name: 'remove_reaction', arguments: { channelId: 'C1', messageId: '1.0', emoji: 'eyes' },
+  });
+  for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(checks.length, 1, 'the call passed initial admission and is joining cleanup');
+  admitted = false;
+  release();
+  await clearing;
+  const result = await removing as { isError?: boolean; content: Array<{ text: string }> };
+  assert.equal(result.isError, true);
+  assert.match(result.content[0]!.text, /No reaction was removed: membership revoked/);
+  assert.deepEqual(checks, Array(2).fill({ id: 'C1', scope: 'reactions:write', notDone: 'No reaction was removed' }));
   assert.equal(effects, 1, 'only the already-running automatic cleanup reaches Slack');
 });
