@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { SlackAdapter, type SlackMessageData } from '../src/slack-adapter.js';
 import { formatSlackText } from '../src/content.js';
+import { renderMessageText, MAX_MESSAGE_TEXT_APPEND } from '../src/message-text.js';
 
 // Exercise the public production entry points, not just the renderer.
 async function shaped(payload: Record<string, unknown>, bot = false) {
@@ -243,6 +244,23 @@ test('review attachment nested blocks precede top-level blocks (documented order
   await expectText({ attachments: [{ blocks: [section('Nested')] }], blocks: [section('Top')] }, 'Nested\nTop');
 });
 
+for (const length of [16383, 16384, 16385]) {
+  test(`attachment nested section boundary: ${length} code units`, async () => {
+    const text = 'x'.repeat(length - 11) + 'NEEDLE12345';
+    const row = { ts: '100.000001', attachments: [{ blocks: [section(text)] }] };
+    const marker = '[…truncated]';
+    const expected = length <= MAX_MESSAGE_TEXT_APPEND ? text :
+      text.slice(0, MAX_MESSAGE_TEXT_APPEND - marker.length) + marker;
+    assert.equal(renderMessageText(row), expected);
+    const adapter = new SlackAdapter({ conversations: {
+      history: async () => ({ messages: [row] }),
+    } } as any, { on() {} } as any, 'UBOT', 'example');
+    const result = await adapter.readHistory('C1', { textContains: 'NEEDLE12345' });
+    if (length <= MAX_MESSAGE_TEXT_APPEND) assert.equal(result.messages[0]?.content, text);
+    else assert.equal(result.messages.length, 0);
+  });
+}
+
 test('review history textContains searches delivered content; thread returns unfiltered content', async () => {
   const row = { ts: '100.000001', text: 'Notification', blocks: [section('deployment failed')] };
   const adapter = new SlackAdapter({ conversations: {
@@ -446,5 +464,38 @@ test('emphasis and fence comparison normalization leaves literal code and interi
     ['```const s = `\nhi\n`;```', '```const s = `hi`;```'],
   ]) {
     await expectText({text, attachments: [{text: body}]}, text + '\n' + body);
+  }
+});
+
+test('repeated rich channel labels stop rendering before materializing oversized children', () => {
+  const text = '<#C1|' + 'x'.repeat(40_000) + '>';
+  let reads = 0;
+  const elements = Array.from({ length: 13_500 }, () => ({
+    get type() { reads++; return 'channel'; }, channel_id: 'C1',
+  }));
+  for (const limit of [2000, MAX_MESSAGE_TEXT_APPEND]) {
+    reads = 0;
+    const result = renderMessageText({
+      text, attachments: [{ blocks: [richBlock(richSection(...elements))] }],
+    }, limit);
+    assert.ok(result.startsWith(text));
+    assert.ok(result.endsWith('[…truncated]'));
+    assert.ok(result.length <= text.length + limit);
+    assert.ok(reads <= 2, 'must stop expanding repeated labels at the render budget');
+  }
+});
+
+test('null context elements spend visits without reading the discarded tail', () => {
+  const elements = new Array(1_000_000).fill(null);
+  Object.defineProperty(elements, 2000, { get() { throw new Error('read beyond visit budget'); } });
+  assert.equal(renderMessageText({ blocks: [{ type: 'context', elements }] }), '[…truncated]');
+});
+
+test('whitespace-only attachment bodies and nested sections retain fallback', async () => {
+  for (const attachment of [
+    { text: '   ', fallback: 'Failure details' },
+    { blocks: [section(' \n ')], fallback: 'Failure details' },
+  ]) {
+    await expectText({ attachments: [attachment] }, 'Failure details');
   }
 });

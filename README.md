@@ -406,7 +406,8 @@ push/event does not expose rawContent. Nested angle openers restart the token sc
 
 Only original Slack text supplies mention-based addressing, wake or auto-subscription.
 DM addressing is independent of text, including for blocks-only DMs.
-Quoted/shared/block mentions are display content only. Name resolution includes
+Supplemental attachment/shared/block mentions are display content only; quoted
+mentions in original text still participate in addressing. Name resolution includes
 original-text mentions plus at most **20 unique supplemental IDs per message**;
 others display raw IDs, even if cached. Live channels/incoming `metadata.rawContent` remains original
 Slack text; `content`/`cleanContent` include supplemental text. History

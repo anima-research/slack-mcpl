@@ -1,0 +1,1 @@
+- Bound supplemental child rendering before joining strings, including repeated channel-label expansions and null list elements; retain attachment fallback for whitespace-only bodies.

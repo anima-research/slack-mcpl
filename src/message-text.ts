@@ -78,12 +78,29 @@ export function renderMessageText(
   const visit = () => { if (--budget < 0) { truncated = true; return false; } return true; };
   const renderLimit = Math.max(MAX_MESSAGE_TEXT_APPEND, original.length + 1);
   const bounded = (v: unknown) => { const text = string(v); if (text.length > renderLimit) truncated = true; return prefix(text, renderLimit); };
-  const join = (v: string[], separator = '\n') => bounded(v.filter(Boolean).join(separator));
+  // Consume children lazily: each expansion (including reused channel labels)
+  // spends the remaining output allowance before another child is rendered.
+  function* map<T>(values: Iterable<T>, render: (value: T, index: number) => string): Generator<string> {
+    let index = 0;
+    for (const value of values) yield render(value, index++);
+  }
+  function join(values: Iterable<string>, separator = '\n'): string {
+    let result = '';
+    for (const value of values) {
+      if (!value) continue;
+      const part = (result ? separator : '') + value;
+      const remaining = renderLimit - result.length;
+      result += prefix(part, remaining);
+      if (part.length > remaining) { truncated = true; break; }
+    }
+    return result;
+  }
   const textObject = (v: unknown) => v == null || !visit() ? '' : object(v).type === 'plain_text' ? escape(bounded(object(v).text)) : bounded(object(v).text);
+  const listTextObject = (v: unknown) => v == null ? (visit(), '') : textObject(v);
   function rich(v: unknown, depth = 0): string {
     if (!visit() || depth > 12) { truncated = true; return ''; }
     const e = object(v);
-    const children = (separator: string) => join(Array.from(take(e.elements), x => rich(x, depth + 1)), separator);
+    const children = (separator: string) => join(map(take(e.elements), x => rich(x, depth + 1)), separator);
     switch (e.type) {
       case 'text': return styled(escape(bounded(e.text)), e.style);
       case 'user': return validId(e.user_id) ? styled(`<@${e.user_id}>`, e.style) : '';
@@ -99,7 +116,7 @@ export function renderMessageText(
       case 'emoji': return typeof e.name === 'string' ? styled(`:${escape(bounded(e.name))}:${typeof e.skin_tone === 'number' ? ':skin-tone-' + e.skin_tone + ':' : ''}`, e.style) : '';
       case 'broadcast': return ['here', 'channel', 'everyone'].includes(string(e.range)) ? styled(`<!${e.range}>`, e.style) : '';
       case 'rich_text_section': return children('');
-      case 'rich_text_list': return join(Array.from(take(e.elements), (x, i) =>
+      case 'rich_text_list': return join(map(take(e.elements), (x, i) =>
         '    '.repeat(Math.max(0, Math.min(12, Number(e.indent) || 0))) +
         (e.style === 'ordered' ? String(i + 1 + (Number(e.offset) || 0)) + '. ' : ['• ', '◦ ', '▪ '][Math.max(0, Math.min(12, Math.floor(Number(e.indent) || 0))) % 3]) + rich(x, depth + 1)));
       case 'rich_text_quote': {
@@ -134,15 +151,15 @@ export function renderMessageText(
     if (!visit()) return '';
     switch (b.type) {
       case 'header': return textObject(b.text);
-      case 'section': return join([textObject(b.text), ...Array.from(take(b.fields), textObject)]);
-      case 'context': return join(Array.from(take(b.elements), textObject), ' ');
+      case 'section': return join((function* () { yield textObject(b.text); yield* map(take(b.fields), listTextObject); })());
+      case 'context': return join(map(take(b.elements), listTextObject), ' ');
       case 'markdown': return bounded(b.text);
       case 'alert': return textObject(b.text);
       case 'card': return join([textObject(b.title), textObject(b.subtitle), textObject(b.body)]);
       case 'video': return join([textObject(b.title), textObject(b.description)]);
-      case 'table': return join(Array.from(take(b.rows), row => {
+      case 'table': return join(map(take(b.rows), row => {
         if (!visit()) return '';
-        return join(Array.from(take(row), cell => object(cell).type === 'rich_text' ? rich(cell) :
+        return join(map(take(row), cell => object(cell).type === 'rich_text' ? rich(cell) :
           !visit() ? '' : escape(bounded(object(cell).text))), ' | ');
       }));
       case 'actions': case 'input': case 'image': case 'divider': case 'file': return '';
@@ -199,21 +216,26 @@ export function renderMessageText(
     // mrkdwn_in (which governs basic styling, passed through here either way).
     const fieldText = bounded;
     const title = fieldText(a.title);
-    const body = join([
-      fieldText(a.pretext),
-      title ? join([title, escape(bounded(a.title_link))], ' ') : '',
-      fieldText(a.text),
-      ...Array.from(take(a.fields), rawField => {
+    const body = join((function* () {
+      yield fieldText(a.pretext);
+      yield title ? join([title, escape(bounded(a.title_link))], ' ') : '';
+      yield fieldText(a.text);
+      yield* map(take(a.fields), rawField => {
         if (!visit()) return '';
         const f = object(rawField);
         return join([fieldText(f.title), fieldText(f.value)], ': ');
-      }),
-    ]);
+      });
+    })());
     const nested: string[] = [];
     const placeholders: string[] = [];
+    let nestedLength = 0;
     for (const rawBlock of take(a.blocks)) {
       const value = block(rawBlock);
-      if (value) (placeholder(rawBlock) ? placeholders : nested).push(value);
+      if (value.trim()) {
+        (placeholder(rawBlock) ? placeholders : nested).push(value);
+        nestedLength += value.length + (nested.length + placeholders.length > 1 ? 1 : 0);
+        if (nestedLength > renderLimit) { truncated = true; break; }
+      }
     }
     const shared = a.is_share === true || a.is_msg_unfurl === true;
     let header = '';
@@ -226,7 +248,7 @@ export function renderMessageText(
     }
     // Deduplicate within the displayed attribution, including its source kind
     // (#channel versus footer), escaping and caps.
-    const units = [body || (nested.length ? '' : fieldText(a.fallback)), ...nested, ...placeholders]
+    const units = [body.trim() ? body : (nested.length ? '' : fieldText(a.fallback)), ...nested, ...placeholders]
       .filter(value => unique(value, header));
     if (units.length && header) {
       emit(header + '\n' + join(units).split(LINE_BREAK).map(line => '&gt; ' + line).join('\n'));

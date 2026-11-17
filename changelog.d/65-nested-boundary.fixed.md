@@ -1,0 +1,1 @@
+- Preserve attachment nested block text at and below the supplemental text cap; mark truncation only when content exceeds the allowance.
