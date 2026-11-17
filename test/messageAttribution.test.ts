@@ -196,12 +196,7 @@ test('backscroll never waits for supplemental-only mention lookups across rows',
     conversations: { history: async () => ({ messages: rows }) },
   } as any, { on() {} } as any, 'UBOT', 'example');
   const pending = adapter.fetchHistory('C1');
-  // Immediate API answers and shaping settle before the next loop turn,
-  // independent of how long this CPU-constrained runner takes to render.
-  const result = await Promise.race([
-    pending,
-    new Promise<never>((_, reject) => setImmediate(() => reject(new Error('backscroll waited for supplemental names')))),
-  ]);
+  const result = await pending;
   assert.equal(result.messages.length, 50);
   assert.deepEqual(calls, ['UORIGINAL']);
   assert.ok(result.messages.every(row => row.content.includes('@original')));
@@ -220,8 +215,7 @@ test('live delivery uses cached supplemental names without optional lookups', as
   adapter.onMessage(message => delivered.push(message));
   const emit = async (event: Record<string, unknown>) => {
     handler({ack: async () => {}, event: {type: 'message', channel: 'D1', ts: '100.1', ...event}});
-    // Immediate lookups and the delivery chain drain before the next loop turn.
-    await new Promise<void>(resolve => setImmediate(resolve));
+    await (adapter as any).inbound.get('D1');
   };
   await emit({user: 'UCACHED', text: 'prime author cache'});
   for (const text of ['', '<@UBOT>']) {
@@ -235,4 +229,15 @@ test('live delivery uses cached supplemental names without optional lookups', as
     assert.equal(message.mentionsBot, !!text);
   }
   assert.deepEqual(calls, ['UCACHED', 'UAUTHOR', 'UBOT']);
+});
+
+
+test('block-heavy backscroll yields before completing a full window', async () => {
+  const rows = Array.from({length: 1000}, (_, i) => ({ts: `${i + 1}.000001`, blocks: [{type: 'markdown', text: 'x'.repeat(16000)}]}));
+  const adapter = new SlackAdapter({conversations: {history: async () => ({messages: rows})}} as any, {on() {}} as any, 'UBOT', 'example');
+  let finished = false;
+  const pending = adapter.fetchHistory('C1', {limit: 1000}).then(result => { finished = true; return result; });
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(finished, false, 'Socket Mode gets an event-loop turn during rendering');
+  assert.equal((await pending).messages.length, 1000);
 });

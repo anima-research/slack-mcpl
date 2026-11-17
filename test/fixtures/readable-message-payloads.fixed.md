@@ -6,7 +6,7 @@
   Include shared-source attribution, rich styles, classic fields and readable
   fallback; deduplicate supplemental bot mirrors and repeated units within
   the same source message. Keep distinct source timestamps separate for attributed attachments.
-  Skip human rich-text mirrors when ordinary text is present; retain blocks-only
+  Skip human rich-text mirrors when ordinary text is non-whitespace; retain blocks-only
   and bot/integration rich text without a client_msg_id (that marker takes
   precedence). Bound supplemental traversal and output with
   visible truncation markers, and prioritize attachment-nested readable blocks over their omission labels.
@@ -27,3 +27,6 @@
   the host grant needed. Yield between batches of text-filtered history candidates.
   Deduplicate channel mirrors before expanding reused labels, and repeated
   omission labels before charging their deferred allowance.
+  Only unattributed units deduplicate against original text; attributed units
+  retain their source identity. Yield between batches of backscroll rendering.
+  Omission hints explain cursor pagination, including when no placeholder fits.

@@ -416,11 +416,9 @@ DM addressing is independent of text, including for blocks-only DMs.
 Supplemental attachment/shared/block mentions are display content only; quoted
 mentions in original text still participate in addressing. Authors and original-text
 mentions retain their name lookups, which can delay live delivery, reaction ack
-and host wake. Live supplemental-only mentions never trigger lookups:
-use cached names, otherwise raw IDs. Explicit history/thread reads look up at
-most **20 unique supplemental IDs per message**; backscroll
-uses raw IDs for all supplemental-only mentions, even if cached. IDs beyond the
-20-ID limit in explicit reads also display raw IDs, even if cached. Live channels/incoming `metadata.rawContent` remains original
+and host wake. Supplemental-only mentions use cached names or raw IDs without
+lookups in live messages, backscroll and explicit history/thread reads. There is
+no supplemental-ID lookup quota. Live channels/incoming `metadata.rawContent` remains original
 Slack text; live `content` blocks include supplemental text (the adapter's
 internal `cleanContent` field is not exposed on the wire). History
 `textContains` searches rendered content with user-ID mentions; threads have no
@@ -437,10 +435,12 @@ URL punctuation trimming is heuristic and can hide a distinct punctuation-ending
 The supplemental suffix cap is **pre-formatting**: 16,384 UTF-16 code units including
 separator and a single final `[…truncated]` marker. It does **not** bound delivered
 size: names and formatting may expand it. Each of attachment and top-level traversal allows max(2,000, 14 × original
-UTF-16 length + 2) work units, charging visits/list entries and reused channel-label
-characters, reserving room for rich mirror containers.
+UTF-16 length + 2) work units, charging visits/list entries and reserving room for
+rich mirror containers. Reused channel labels instead spend a separate output
+allowance of max(16,384, original UTF-16 length + 1) code units.
 Traversal cuts and nesting (12 levels) also carry that marker; it reports
-unvisited payload, not a guarantee that readable text was omitted; cuts preserve code points. Original text is
+unvisited payload, not a guarantee that readable text was omitted; cuts preserve code points. Unsupported blocks remain omitted on explicit reads; the 16,384-unit explicit-read
+cap cannot be bypassed by rereading through history or threads. Original text is
 never truncated. Backscroll uses a lower **2,000 UTF-16 code unit supplemental cap per
 message**, and the framed backscroll block has an overall **32 KiB byte budget**.
 It keeps a contiguous newest window. Messages that exceed the remaining byte

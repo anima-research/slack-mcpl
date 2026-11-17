@@ -1602,7 +1602,12 @@ export class SlackAdapter {
     // Supplemental-only mentions never spend the read's call budget or grow
     // the name cache. All delivery paths use an existing name or the raw ID.
     const ids = new Set<string>();
-    const texts = messages.map(msg => renderMessageText(msg, maxAppend));
+    const texts: string[] = [];
+    for (let index = 0; index < messages.length; index++) {
+      // Large backscroll windows must not monopolize Socket Mode's loop.
+      if (index > 0 && index % 10 === 0) await new Promise<void>(resolve => setImmediate(resolve));
+      texts.push(renderMessageText(messages[index], maxAppend));
+    }
     for (const msg of messages) {
       if (msg.user) ids.add(msg.user);
       for (const id of extractSlackUserIds(msg.text ?? '')) ids.add(id);

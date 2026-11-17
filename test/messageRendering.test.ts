@@ -134,7 +134,7 @@ test('large bot rich blocks retain distinct words within the supplemental limit'
   assert.ok(output.length <= text.length + 16384);
 });
 
-test('URL punctuation matcher completes in an interruptible worker', async () => {
+test('URL punctuation matcher completes within a CPU-time watchdog in an interruptible worker', async () => {
   const worker = new Worker(new URL('./fixtures/url-punctuation-worker.mjs', import.meta.url));
   try {
     await new Promise<void>((resolve, reject) => {
@@ -144,11 +144,15 @@ test('URL punctuation matcher completes in an interruptible worker', async () =>
       worker.once('exit', code => fail(new Error(`matcher worker exited early: ${code}`)));
       worker.on('message', message => {
         if (message === 'ready') {
-          // Exclude TS loader startup. This is a hard interruption, not a
-          // same-thread timing assertion: the restored /[.,;:!?]+$/ matcher
-          // attempts ~500 billion comparisons on this bounded input.
+          // Process CPU includes worker threads, but excludes suspension and
+          // time denied to a CPU-constrained runner. Exclude loader startup.
+          // The old quadratic matcher attempts ~500 billion comparisons.
           clearTimeout(timer);
-          timer = setTimeout(() => fail(new Error('URL matcher exceeded hard worker deadline')), 10_000);
+          const started = process.cpuUsage();
+          timer = setInterval(() => {
+            const used = process.cpuUsage(started);
+            if (used.user + used.system > 10_000_000) fail(new Error('URL matcher exceeded CPU-time allowance'));
+          }, 100);
           worker.postMessage(1_000_000);
         } else {
           clearTimeout(timer);

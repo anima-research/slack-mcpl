@@ -21,22 +21,24 @@ async function shaped(payload: Record<string, unknown>, bot = false) {
   const received: SlackMessageData[] = [];
   let release!: () => void;
   const delayed = new Promise<void>(resolve => { release = resolve; });
+  let lookupEntered!: () => void;
+  const entered = new Promise<void>(resolve => { lookupEntered = resolve; });
   const liveAdapter = new SlackAdapter({
-    users: { info: async () => { await delayed; return { user: { name: 'alice' } }; } },
+    users: { info: async () => { lookupEntered(); await delayed; return { user: { name: 'alice' } }; } },
   } as any, { on: (_: string, h: any) => { handler = h; } } as any, 'UBOT', 'example');
   liveAdapter.onMessage(m => { received.push(m); });
   handler({ event: { type: 'message', channel: 'C1', ...row }, ack: async () => {} });
-  await new Promise(resolve => setTimeout(resolve, 0));
+  if (!bot) await entered;
   assert.equal(received.length, 0, 'live delivery awaits its own lookup');
   release();
-  await new Promise(resolve => setTimeout(resolve, 0));
+  await (liveAdapter as any).inbound.get('C1');
   return { contents: [history.messages[0].content, thread.messages[0].content, backscroll.messages[0].content], received };
 }
 async function expectText(payload: Record<string, unknown>, expected: string, bot = false) {
   const result = await shaped(payload, bot);
   const original = formatSlackText(typeof payload.text === 'string' ? payload.text : '', new Map([['U1', 'alice']]));
   const originalIds = new Set(extractSlackUserIds(typeof payload.text === 'string' ? payload.text : ''));
-  // Backscroll deliberately leaves supplemental-only mentions as raw IDs.
+  // Every path uses cached names or raw IDs; only U1 is cached in this helper.
   let backscroll = expected.replace(/@alice \(uid:([A-Z0-9]+)\)/g,
     (mention, id) => originalIds.has(id) || id === 'U1' ? mention : `@${id} (uid:${id})`);
   if (backscroll.length - original.length > 2000) {
@@ -229,7 +231,7 @@ test('review preview URLs compare exactly, Slack links normalize, shares survive
   ] }, 'Label (https://example.com/other)\nDetails\n[shared message from unknown, unknown source]\n> Shared\n[shared message from unknown, unknown source]\n> Message');
 });
 
-test('review fresh display lookup uses the extracted rendered payload', async () => {
+test('review supplemental display uses the author cache or raw ID without fresh lookups', async () => {
   const live = await expectText({ text: '@U1 (uid:U1)', attachments: [{ text: '<@U1>' }, { text: '<@U2>' }] }, '@U1 (uid:U1)\n@alice (uid:U1)\n@alice (uid:U2)');
   assert.deepEqual(live!.mentionIds, []);
 });
@@ -307,7 +309,7 @@ test('review fragment passes the actual release validator', () => {
 });
 
 test('review server shared mentions neither wake nor auto-subscribe; raw metadata remains original', async () => {
-  const h = harness();
+  const h = harness({ ackReaction: 'eyes' });
   try {
     await initialize(h, true);
     await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
@@ -334,6 +336,7 @@ test('review server shared mentions neither wake nor auto-subscribe; raw metadat
     const incoming: any = h.hostSaw.find(r => r.method === method.CHANNELS_INCOMING)!.params;
     assert.equal(incoming.messages[0].metadata.rawContent, 'Notification');
     assert.deepEqual(incoming.messages[0].metadata.mentionIds, []);
+    assert.deepEqual(h.reactions, [], 'supplemental mentions never acknowledge');
 
   } finally { await h.close(); }
 });
@@ -706,4 +709,19 @@ test('blocks-only channel metadata preserves the empty original rawContent', asy
 
 test('non-rich comparison intentionally treats bullet glyph variants as equivalent', () => {
   assert.equal(renderMessageText({text: '• x', attachments: [{text: '◦ x'}]}), '• x');
+});
+
+
+test('duplicate deferred omission labels do not falsely truncate original text', () => {
+  assert.equal(renderMessageText({text: '[poll omitted]', attachments: [{blocks: [{type: 'poll'}]}]}, 13), '[poll omitted]');
+});
+
+test('history filters agree with rendered channel labels, usergroups and truncation markers', async () => {
+  const row = {ts: '100.000001', text: '<#C1|operations> <!subteam^S1|responders>', attachments: [{text: 'x'.repeat(17000)}]};
+  const adapter = new SlackAdapter({conversations: {history: async () => ({messages: [row]})}} as any, {on() {}} as any, 'UBOT', 'example');
+  const all = await adapter.readHistory('C1', {});
+  for (const textContains of ['#operations', '@responders', '[…truncated]']) {
+    assert.ok(all.messages[0].content.includes(textContains));
+    assert.deepEqual((await adapter.readHistory('C1', {textContains})).messages, all.messages);
+  }
 });

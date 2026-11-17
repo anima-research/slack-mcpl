@@ -270,7 +270,13 @@ export function renderMessageText(
         if (!omitted) hasReadableNested = true;
         // Deferred notices get their own allowance so they cannot displace
         // readable blocks or retain unbounded keys while waiting for them.
-        if (omitted && scopes.get(identity)?.rawSeen.has(value)) continue;
+        if (omitted) {
+          const scope = scopes.get(identity);
+          if (scope?.rawSeen.has(value)) continue;
+          // Original-text mirrors must not consume the deferred allowance.
+          // Avoid normalizing every rejected label once the allowance is full.
+          if (!identity && originalKey && keyFor(value) === originalKey) continue;
+        }
         const omissionCost = value.length + (placeholders.length ? 1 : 0);
         if (omitted && omissionBytes + omissionCost > omissionLimit) {
           truncated = true;
