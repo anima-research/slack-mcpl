@@ -6,7 +6,8 @@
   the effective disabled set. Every tools/call is affected, whoever sends it;
   server-initiated Slack operations and non-tool host protocol requests (including automatic backscroll,
   acknowledgement reactions, MCPL `channels/publish` and `state/rollback`)
-  are not.
+  are not directly blocked; rollback advice and messaging capability requirements
+  still reflect tool availability.
 - Attachment, argument, channel-open, member-unsubscribe and error guidance
   omit disabled-tool pointers (static tool descriptions and schemas may still
   cross-reference them). Refusals explain that nothing ran and
@@ -25,3 +26,13 @@
 
 - Messaging does not require tools when operator controls and DM policy leave
   it with no offered tools; protocol delivery remains available.
+- Preserve available error remedies when caller IDs or Slack scope values look
+  like disabled tool names; offer channel-ID sources when list_channels is disabled.
+- In-memory mute guidance notes restart recovery when subscribe_channel is disabled.
+- Disabled send_message guidance omits channel-listing advice; message-ID
+  fallbacks also point to the original sending tool's result.
+- To undo subscription changes when the opposite tool is disabled, re-enable
+  that tool or stop the server and edit SLACK_SUBSCRIPTIONS_FILE: undo subscribe
+  by removing the ID from subscribed or adding it to muted (member-channel
+  mode); undo unsubscribe by adding it to subscribed or removing it from muted.
+  Without a subscriptions file, these changes last only until restart.

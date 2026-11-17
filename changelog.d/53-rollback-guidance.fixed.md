@@ -1,3 +1,3 @@
-- Make rollback recovery guidance select the read tool appropriate to each
-  message's location, with explicit Slack-access fallback when required tools
-  are disabled. Keep publish and DM alternatives grammatical independently.
+- Rollback requires manual checks for unidentified posts and upload comments;
+  never delete messages on the strength of these notices. Keep publish and DM
+  alternatives grammatical independently.

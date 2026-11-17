@@ -13,8 +13,8 @@
   to delete uploads made after the checkpoint, with `files.delete` and the
   same write rules, and the message that shared the file, which holds the
   comment, when Slack's answer names it; when it doesn't, the rollback's
-  answer says the comment may remain, and that `delete_message` may delete
-  it. As for sent messages, uploads are tracked for the life of the server
+  answer says the comment may remain and requires a manual Slack check,
+  never deletion on the strength of that notice. As for sent messages, uploads are tracked for the life of the server
   process, across host reconnects. The upload runs in Slack's three steps,
   each request under the call's time. A failure in any of them says whether
   the file may have been shared, and if it may, what to check before

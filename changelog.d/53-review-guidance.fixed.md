@@ -6,8 +6,5 @@
 - Clarify unavailable attachment content, failed registration recovery, and bot
   message IDs; preserve user lookup guidance for malformed author values.
   Undeclared feature sets no longer report themselves active.
-- Clarification: SLACK_DISABLED_TOOLS affects host and agent tool calls, not
-  only the agent's tool surface. Disabling either subscription mutation also
-  suppresses mention auto-subscription; existing subscriptions still deliver.
 - Thread-only refusals recommend reply_message with a parent thread ID; DM
   policy refusals recommend send_message in a writable channel by default.

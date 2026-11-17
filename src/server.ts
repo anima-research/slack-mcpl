@@ -981,7 +981,7 @@ export class SlackMcplServer {
         this.unsubscribedByAgent.add(channelId);
         return this.unsubscribe(channelId)
           ? this.opts.subscribeMemberChannels
-            ? `Muted ambient messages in conversation ${channelId} ${this.toolEnabled('subscribe_channel') ? 'until you subscribe_channel it again' : 'until the operator changes the subscription'}. Mentions and DMs from there will still arrive.`
+            ? `Muted ambient messages in conversation ${channelId} ${this.toolEnabled('subscribe_channel') ? 'until you subscribe_channel it again' : (this.subscriptionsFile() ? 'until the operator changes the subscription' : 'until the operator changes the subscription or this server restarts')}. Mentions and DMs from there will still arrive.`
             : `Unsubscribed from ambient messages in conversation ${channelId}. Mentions and DMs from there will still arrive.`
           : this.opts.subscribeMemberChannels
             ? `Conversation ${channelId} is already muted.`

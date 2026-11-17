@@ -1480,7 +1480,7 @@ export class SlackAdapter {
   async sendDM(userId: string, text: string): Promise<{ messageId: string; channelId: string }> {
     const toChannels = guidance(this.hint(
       'To reach people, post in a writable channel with send_message.', 'Someone with Slack access can contact the recipient.'),
-      this.hint('list_channels marks where this bot may write with writable: true.', 'Copy channelId from an incoming channel message, or ask someone with Slack access for a writable channel ID.'));
+      this.toolEnabled('send_message') ? this.hint('list_channels marks where this bot may write with writable: true.', 'Copy channelId from an incoming channel message, or ask someone with Slack access for a writable channel ID.') : '');
     if (this.disableDms) {
       throw new Error(
         "Nothing was sent: direct messages are turned off on this host, so send_dm can't reach anyone. Calling " +

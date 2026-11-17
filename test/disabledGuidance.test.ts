@@ -250,7 +250,7 @@ test('rollback preserves failure details without advertising disabled retry tool
 });
 
 for (const disabledTools of [['fetch_history'], ['fetch_thread'], ['delete_message'], ['delete_message', 'fetch_history', 'fetch_thread']]) {
-  test(`rollback upload-comment hints respect ${disabledTools}`, async t => {
+  test(`rollback upload comments require manual checks even with disabled ${disabledTools}`, async t => {
     const fake = fakeSlack();
     let files = 0;
     fake.slack.uploadFile = async () => ({ fileId: `F${++files}` });
@@ -366,7 +366,7 @@ test('malformed author values do not suppress an available find_user hint', asyn
   assert.match(await call(h.host, 'fetch_history', { channelId: 'C1', authorIds: ['send_message'] }), /find_user/);
 });
 
-test('rollback comment recovery respects the host history grant', async t => {
+test('rollback comments require manual checks even without the host history grant', async t => {
   const fake = fakeSlack();
   fake.slack.uploadFile = async () => ({ fileId: 'F1' });
   const h = connectHost(new SlackMcplServer(fake.slack));
@@ -396,6 +396,7 @@ test('optional Slack-error sentences have no trailing or doubled spaces', () => 
       const text = explainSlackError({ code: 'slack_webapi_platform_error', data: { error: code } }, {
         tool: 'send_message', args: { channelId: 'C1' }, toolEnabled: name => !disabled.includes(name),
       }).split('\n\n').at(-1)!;
+      assert.ok(text.length > 0, code);
       assert.equal(text, text.trim());
       assert.doesNotMatch(text, / {2}/);
     }
@@ -410,5 +411,48 @@ test('caller IDs cannot suppress available unknown-write remedies', () => {
     });
     assert.match(text, tool === 'reply_message' || tool === 'upload_file' ? /Check fetch_thread/ : /fetch_history/);
     assert.doesNotMatch(text, /ask someone with access|Ask someone with Slack access/);
+  }
+});
+
+test('disabled sending omits channel discovery from DM policy advice', async t => {
+  const fake = fakeSlack({ disableDms: true });
+  const h = connectHost(new SlackMcplServer(fake.slack, { disabledTools: ['send_message'] }));
+  t.after(() => h.close());
+  await initialize(h, false);
+  const text = await call(h.host, 'send_dm', { userId: 'U1', content: 'hi' });
+  assert.match(text, /Someone with Slack access can contact the recipient/);
+  assert.doesNotMatch(text, /list_channels|writable channel/);
+});
+
+test('disabled history fallback names the sending result for bot message IDs', () => {
+  for (const tool of ['edit_message', 'delete_message']) {
+    const text = explainSlackError(
+      { code: 'slack_webapi_platform_error', data: { error: 'message_not_found' } },
+      { tool, args: { channelId: 'C1', messageId: '100.2' },
+        toolEnabled: name => !['fetch_history', 'fetch_thread'].includes(name) },
+    );
+    assert.match(text, /messageId from the original sending tool's result/);
+  }
+});
+
+test('disabled subscribe mute advice distinguishes memory from persisted state', async t => {
+  const previous = process.env.SLACK_SUBSCRIPTIONS_FILE;
+  const dir = mkdtempSync(join(tmpdir(), 'mute-'));
+  t.after(() => {
+    if (previous === undefined) delete process.env.SLACK_SUBSCRIPTIONS_FILE;
+    else process.env.SLACK_SUBSCRIPTIONS_FILE = previous;
+    rmSync(dir, { recursive: true, force: true });
+  });
+  for (const persisted of [false, true]) {
+    if (persisted) process.env.SLACK_SUBSCRIPTIONS_FILE = join(dir, 'subscriptions.json');
+    else delete process.env.SLACK_SUBSCRIPTIONS_FILE;
+    const h = connectHost(new SlackMcplServer(fakeSlack().slack, {
+      disabledTools: ['subscribe_channel'], subscribeMemberChannels: true,
+    }));
+    try {
+      await initialize(h, false);
+      const text = await call(h.host, 'unsubscribe_channel', { channelId: 'C1' });
+      assert.equal(text.includes('or this server restarts'), !persisted);
+    } finally { await h.close(); }
   }
 });

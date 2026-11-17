@@ -314,7 +314,7 @@ test('a publish whose answer names no message is answered as any publish whose o
 
 for (const disabled of ['fetch_history', 'fetch_thread', 'delete_message']) {
   for (const thread of [false, true]) {
-    test(`unnamed rollback selects the correct read for thread=${thread}, disabled=${disabled}`, async t => {
+    test(`unnamed rollback requires a location-specific manual check for thread=${thread}, disabled=${disabled}`, async t => {
       api.answerFor('chat.postMessage', named, unnamed);
       t.after(() => api.answerFor('chat.postMessage'));
       const h = connectHost(new SlackMcplServer(
@@ -335,7 +335,9 @@ for (const disabled of ['fetch_history', 'fetch_thread', 'delete_message']) {
       const result = await h.host.sendRequest(method.STATE_ROLLBACK, {
         featureSet: MESSAGING_FEATURE_SET, checkpoint: first.state!.checkpoint,
       }) as { reason: string };
-      assert.match(result.reason, /manually check Slack for the possible post/);
+      assert.match(result.reason, thread
+        ? /manually check Slack for the possible post in thread 1\.1/
+        : /manually check Slack for the possible post among top-level messages/);
       assert.match(result.reason, /cannot identify it, so do not delete messages based on this notice/);
       assert.doesNotMatch(result.reason, /fetch_history|fetch_thread|delete_message|locate and delete/);
       assert.doesNotMatch(result.reason, new RegExp(disabled));
