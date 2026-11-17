@@ -217,8 +217,8 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
         'if it is already gone, remove_reaction succeeds with "Nothing changed".';
     }
     return (
-      `${cause}, so whether the reaction was added is unknown${note}. Adding it again is safe: if it's there, ` +
-      'add_reaction says so and changes nothing.'
+      `${cause}, so whether the reaction was added is unknown${note}. Adding it again will not duplicate the reaction: if it's there, ` +
+      'add_reaction reports success. For the configured ACK emoji, an unknown outcome leaves automatic cleanup in control; a confirmed retry adopts the ACK and retires unsent cleanup.'
     );
   };
 

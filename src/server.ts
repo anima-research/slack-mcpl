@@ -400,7 +400,7 @@ export class SlackMcplServer {
     return toolDefinitions.filter((t) =>
       (t.name !== 'send_dm' || this.slack.dmsWritable) && (t.name !== 'refresh_channels' || this.mcplEnabled))
       .map((t) => this.slack.ackReactionName && ['fetch_history', 'fetch_thread', 'add_reaction', 'remove_reaction'].includes(t.name)
-        ? { ...t, description: t.description + ` The configured ACK emoji, ${this.slack.ackReactionName}, is added automatically while a message is being handled and removed after the bot's next confirmed post in that conversation, or after 10 minutes, or when the host rejects the message, unless an explicit add succeeds or returns already_reacted. Confirmed adoption cancels unsent cleanup and retries, not a removal already sent. Failed adds do not adopt. Redelivery protection lasts 10 minutes in this process only.` }
+        ? { ...t, description: t.description + ` The configured ACK emoji, ${this.slack.ackReactionName}, is added best-effort to addressed messages while they are being handled; automatic removal is best-effort after the bot's next confirmed post in that conversation, or after 10 minutes, or when the host rejects the message, unless an explicit add confirms adoption (reported as ACK adopted, including when the reaction was already present). Confirmed adoption cancels unsent cleanup and retries, not a removal already sent. Failed adds do not adopt. Redelivery protection lasts 10 minutes in this process only.` }
         : t);
   }
 

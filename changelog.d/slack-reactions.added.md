@@ -29,3 +29,9 @@
 - Automatic ACK retries run outside the triggering tool call's deadline; unsent
   manual refusals do not consume the cleanup retry budget. A concurrent removal
   already sent before adoption may still land, but its failure will not retry.
+- Confirmed explicit ACK adoption cancels cleanup still waiting for the
+  automatic add, including during shutdown. In-flight removals remain joinable,
+  but cannot schedule automatic retries after adoption.
+- Reaction tools distinguish ACK adoption from an unchanged existing reaction;
+  deadline diagnostics include time waiting on background coordination.
+- An unsent manual ACK removal preserves the existing automatic expiry or retry deadline.

@@ -165,6 +165,7 @@ export class NoReadableConversations extends Error {
 type AckEntry = {
   owner: 'automatic' | 'agent';
   timer: ReturnType<typeof setTimeout>;
+  timerDue: number;
   added: Promise<boolean>;
   tries: number;
   removing?: Promise<void>;
@@ -1167,6 +1168,8 @@ export class SlackAdapter {
   }
 
   private armAck(channelId: string, ts: string, ms: number): ReturnType<typeof setTimeout> {
+    const entry = this.ackPending.get(channelId)?.get(ts);
+    if (entry) entry.timerDue = Date.now() + ms;
     const timer = setTimeout(() => void outsideCallTime(() => this.clearAck(channelId, ts)), ms);
     timer.unref?.();
     return timer;
@@ -1299,7 +1302,7 @@ export class SlackAdapter {
     // Recorded before the add resolves, so a reply Slack confirms first still removes it.
     let pending = this.ackPending.get(channelId);
     if (!pending) this.ackPending.set(channelId, (pending = new Map()));
-    const entry: AckEntry = { owner: 'automatic', timer: this.armAck(channelId, ts, ACK_TTL_MS), added, tries: 0 };
+    const entry: AckEntry = { owner: 'automatic', timer: this.armAck(channelId, ts, ACK_TTL_MS), timerDue: Date.now() + ACK_TTL_MS, added, tries: 0 };
     pending.set(ts, entry);
     if (!(await added)) this.dropAck(channelId, ts, entry); // not there, so nothing to remove
   }
@@ -1648,6 +1651,7 @@ export class SlackAdapter {
         return false;
       }
     }
+    let retry = false;
     const remove = async () => {
       if (entry) await entry.added;
       let attempted = false;
@@ -1663,7 +1667,8 @@ export class SlackAdapter {
         }
         return true;
       } catch (err) {
-        if (entry && attempted && !(err instanceof OutOfCallTime)) entry.tries++;
+        retry = attempted && !(err instanceof OutOfCallTime);
+        if (entry && retry) entry.tries++;
         if (entry && slackRefusal(err) === 'no_reaction') entry.gone = true;
         // Use the automatic cleanup's retry budget and terminal refusals.
         if (entry && (refusedForGood(err) || this.stopping || entry.tries >= ACK_MAX_TRIES)) {
@@ -1681,7 +1686,8 @@ export class SlackAdapter {
       entry.removing = undefined;
       if (entry.owner === 'agent') this.dropAck(channelId, ts, entry);
       if (this.ackPending.get(channelId)?.get(ts) === entry) {
-        entry.timer = this.armAck(channelId, ts, ACK_RETRY_MS);
+        // An unsent removal must not shorten (or restart) the existing expiry.
+        entry.timer = this.armAck(channelId, ts, retry ? ACK_RETRY_MS : Math.max(0, entry.timerDue - Date.now()));
       }
     });
     entry.removing = removing;

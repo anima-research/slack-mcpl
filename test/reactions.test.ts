@@ -578,8 +578,8 @@ for (const ackReaction of [undefined, 'eyes']) {
       const description = tools.find(tool => tool.name === name)!.description;
       if (ackReaction) {
         assert.match(description, /eyes/);
-        assert.match(description, /added automatically while a message is being handled/);
-        assert.match(description, /removed after the bot's next confirmed post in that conversation, or after 10 minutes, or when the host rejects the message, unless an explicit add succeeds or returns already_reacted/);
+        assert.match(description, /added best-effort to addressed messages while they are being handled/);
+        assert.match(description, /automatic removal is best-effort after the bot's next confirmed post in that conversation, or after 10 minutes, or when the host rejects the message, unless an explicit add confirms adoption/);
       } else {
         assert.doesNotMatch(description, /added automatically/);
       }
@@ -982,4 +982,26 @@ test('adopted entry keeps sent removal joinable and cannot start another automat
   assert.equal(await manual, false);
   await slack.clearAck('C1');
   assert.equal(removes, 1);
+});
+
+test('unsent manual ACK removal preserves the original ten-minute expiry', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  let unsent = true;
+  const f = adapterFixture({ onRemove: async () => {
+    if (unsent) throw new OutOfCallTime('reactions.remove', 25);
+  } });
+  t.after(() => f.slack.stop());
+  await f.slack.acknowledge('C1', '1.0');
+  t.mock.timers.tick(30_000);
+  await assert.rejects(f.slack.removeReaction('C1', '1.0', 'eyes'), OutOfCallTime);
+  unsent = false;
+  t.mock.timers.tick(60_000);
+  await flush();
+  assert.equal(f.calls.filter(c => c.startsWith('remove:')).length, 1, 'no early cleanup');
+  t.mock.timers.tick(510_000 - 1);
+  await flush();
+  assert.equal(f.calls.filter(c => c.startsWith('remove:')).length, 1);
+  t.mock.timers.tick(1);
+  await flush();
+  assert.equal(f.calls.filter(c => c.startsWith('remove:')).length, 2, 'original expiry, not ten minutes after refusal');
 });
