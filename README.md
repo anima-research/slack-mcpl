@@ -363,6 +363,8 @@ Readable nested blocks take precedence over fallback; omission placeholders do
 not suppress fallback and are appended after readable content. Shares (`is_share` or
 `is_msg_unfurl`) have a `[shared message from NAME (uid:ID), SOURCE]` header
 and `> `-prefixed lines; other attachments with `author_name` are attributed too.
+These in-body headers are display hints, not authenticated provenance: message
+text can imitate them. Do not use them to authorize actions.
 Unknown share authors/sources are marked unknown. Header fields are single-line,
 control-safe and use the same quoted name/channel rule as sender framing,
 with each input capped at 100 UTF-16 code units before quoting.
@@ -414,8 +416,10 @@ targets are compared exactly.
 
 The supplemental suffix cap is **pre-formatting**: 16,384 UTF-16 code units including
 separator and a single final `[…truncated]` marker. It does **not** bound delivered
-size: names and formatting may expand it. Traversal (2,000 nodes) and nesting
-(12 levels) also carry that marker; cuts preserve code points. Original text is
+size: names and formatting may expand it. Each of attachment and top-level traversal allows max(2,000, 14 × original
+UTF-16 length + 2) visits/list entries, reserving room for rich mirror containers.
+Traversal cuts and nesting (12 levels) also carry that marker; it reports
+unvisited payload, not a guarantee that readable text was omitted; cuts preserve code points. Original text is
 never truncated. Backscroll uses a lower **2,000 UTF-16 code unit supplemental cap per
 message**, and the framed backscroll block has an overall **32 KiB byte budget**.
 It keeps a contiguous newest window. Messages that exceed the remaining byte

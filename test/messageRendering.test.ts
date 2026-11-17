@@ -25,7 +25,7 @@ test('plain objects, labels and date fallbacks remain literal; IDs cannot inject
     ] }] },
   ] }), 'Ping <@UBOT> &lt;tag&gt;\na>b <@U2> (https://x.io/?a=1&b=2)<@U3> &lt;');
 });
-test('mirror does not spend display budget twice', () => {
+test('blocks-only rendering retains following content within the minimum traversal allowance', () => {
   const block = { type: 'rich_text', elements: [{ type: 'rich_text_section', elements: Array.from({length: 998}, () => ({type: 'text', text: 'x'})) }] };
   assert.equal(renderMessageText({ blocks: [block, section('AFTER')] }), 'x'.repeat(998) + '\nAFTER');
 });
@@ -56,7 +56,7 @@ test('structured attachment blocks take precedence over fallback; rich structure
     {type: 'rich_text_list', style: 'ordered', offset: 3, indent: 1, elements: [{type: 'rich_text_section', elements: [{type: 'text', text: 'item'}]}]},
     {type: 'rich_text_quote', elements: [{type: 'text', text: 'quote'}]},
     {type: 'rich_text_preformatted', elements: [{type: 'text', text: 'code'}]},
-  ] }] }), '    4. item\n> quote\n```code```');
+  ] }] }), '    4. item\n&gt; quote\n```code```');
 });
 const hostile = { text: ' *a'.repeat(13_333), bot_id: 'B1', blocks: Array.from({length: 50}, (_, i) => rich(' *b'.repeat(13_332) + String(i).padStart(3, '0'))) };
 test('bounded adversarial rich blocks including attachment blocks', () => {
@@ -75,10 +75,13 @@ test('production fetchHistory over ten hostile messages stays bounded', async ()
 test('socket ack precedes any renderer access', async () => {
   let handler: any;
   let acked = false;
+  const accesses: boolean[] = [];
   const adapter = new SlackAdapter({users: {info: async () => ({user: {name: 'Alice'}})}} as any, {on(_: string, h: any){handler = h;}} as any, 'UBOT', 'example');
   const delivered = new Promise<any>(resolve => adapter.onMessage(resolve));
-  handler({ack: async () => {acked = true;}, event: {type: 'message', channel: 'C1', user: 'U1', ts: '100.000001', text: 'hello', get blocks(){assert.ok(acked, 'render before ack'); return [section('body')];}}});
+  handler({ack: async () => {acked = true;}, event: {type: 'message', channel: 'C1', user: 'U1', ts: '100.000001', text: 'hello', get blocks(){accesses.push(acked); return [section('body')];}}});
   assert.equal((await delivered).cleanContent, 'hello\nbody');
+  assert.ok(accesses.length > 0);
+  assert.ok(accesses.every(Boolean), 'render before ack');
 });
 test('only twenty supplemental IDs resolved per message on live and history paths', async () => {
   for (const path of ['live', 'history', 'backscroll']) {
@@ -188,4 +191,57 @@ test('backscroll keeps an exactly fitting complete window without summary reserv
     assert.ok(result.includes(content));
     assert.doesNotMatch(result, /omitted|not shown/);
   }
+});
+
+test('one-character bot mirrors retain their container and attachment traversal allowance', () => {
+  for (const size of [2000, 4000]) {
+    const text = 'x'.repeat(size);
+    const block = {type: 'rich_text', elements: [{type: 'rich_text_section',
+      elements: Array.from({length: size}, () => ({type: 'text', text: 'x'}))}]};
+    for (const cap of [2000, 16384]) {
+      for (const attachments of [[], Array.from({length: 1900}, () => ({text: 'extra'}))]) {
+        assert.equal(renderMessageText({text, bot_id: 'B1', attachments, blocks: [block, section('AFTER')]}, cap),
+          text + (attachments.length ? '\nextra' : '') + '\nAFTER');
+      }
+    }
+  }
+});
+
+test('malformed tokens cannot cross original or supplemental line boundaries', () => {
+  assert.equal(clean({text: '<@U123|', attachments: [{text: 'important>'}]}), '<@U123|\nimportant>');
+  assert.equal(clean({attachments: [{author_name: 'CI', text: '<https://example.com\nhello'}]}),
+    '[attachment from CI]\n> <https://example.com\n> hello');
+});
+
+test('rich quotes prefix every logical line', () => {
+  for (const separator of ['\r', '\r\n', '\u2028', '\u2029']) {
+    assert.equal(clean({blocks: [{type: 'rich_text', elements: [{type: 'rich_text_quote',
+      elements: [{type: 'text', text: 'quoted' + separator + 'also quoted'}]}]}]}),
+      '> quoted\n> also quoted');
+  }
+});
+
+test('mid-line bullet glyph after inline code remains distinct', () => {
+  assert.equal(clean({text: '`x`- alert', attachments: [{text: '`x`• alert'}]}),
+    '`x`- alert\n`x`• alert');
+});
+
+test('hidden attribution fields do not duplicate identical displayed attachments', () => {
+  for (const is_share of [false, true]) {
+    const a = {author_name: 'CI', channel_name: 'ops', text: 'Body', is_share};
+    assert.equal(clean({attachments: [{...a, footer: 'one'}, {...a, footer: 'two'}]}),
+      (is_share ? '[shared message from CI, #ops]' : '[attachment from CI]') + '\n> Body');
+  }
+});
+
+test('filtered history never renders author-excluded or beyond-limit rows', async () => {
+  let accesses = 0;
+  const unread = (ts: string, user: string) => ({ts, user, text: 'target',
+    get blocks() { accesses++; return [section('expensive')]; }});
+  const adapter = new SlackAdapter({conversations: {history: async () => ({messages: [
+    unread('103.0', 'U2'), {ts: '102.0', user: 'U1', text: 'target'}, unread('101.0', 'U1'),
+  ]})}} as any, {on(){}} as any, 'UBOT', 'example');
+  const result = await adapter.readHistory('C1', {authorIds: ['U1'], textContains: 'target', limit: 1});
+  assert.equal(result.messages.length, 1);
+  assert.equal(accesses, 0);
 });

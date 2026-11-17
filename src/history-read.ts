@@ -341,10 +341,14 @@ export async function readBounded(opts: ReadOptions, source: ReadSource): Promis
         : -1;
       if (end >= 0) rows.splice(end);
       const isMatch = (m: SlackHistoryMessage) =>
-        (needle === undefined || fold(formatSlackText(renderMessageText(m), BY_ID)).includes(needle)) &&
-        (!opts.authorIds.length || [m.user, m.bot_id].some((id) => id !== undefined && opts.authorIds.includes(id)));
-      // Shape only matches; resolve their display names after content filtering.
-      const matches = rows.filter(({ m }) => isMatch(m)).slice(0, opts.limit - records.length).map(({ m }) => m);
+        (!opts.authorIds.length || [m.user, m.bot_id].some((id) => id !== undefined && opts.authorIds.includes(id))) &&
+        (needle === undefined || fold(formatSlackText(renderMessageText(m), BY_ID)).includes(needle));
+      // Stop before rendering rows excluded by the author, scan or match limit.
+      const matches: SlackHistoryMessage[] = [];
+      for (const { m } of rows.slice(0, opts.maxScanned - scanned)) {
+        if (matches.length >= opts.limit - records.length) break;
+        if (isMatch(m)) matches.push(m);
+      }
       const shaped = new Map((await source.shape(matches)).map((m, i) => [matches[i]!, m]));
       for (const [i, { m, ts }] of rows.entries()) {
         if (scanned >= opts.maxScanned) { stopReason = 'scan_limit'; break pages; }

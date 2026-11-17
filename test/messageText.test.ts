@@ -253,7 +253,7 @@ test('review history textContains searches delivered content; thread returns unf
   }
 });
 
-import { readFileSync, mkdtempSync, cpSync, rmSync } from 'node:fs';
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { release } from '../scripts/release-changelog.mjs';
@@ -263,8 +263,20 @@ import { harness, initialize, FULL_GRANT, until } from './harness.js';
 test('review fragment passes the actual release validator', () => {
   const root = mkdtempSync(join(tmpdir(), 'payload-release-'));
   try {
-    for (const file of ['package.json', 'CHANGELOG.md', 'changelog.d']) cpSync(file, join(root, file), { recursive: true });
-    assert.doesNotThrow(() => release(root));
+    // Permanent copy survives releases; never let unrelated pending entries
+    // or repository version/Unreleased state make this validation pass.
+    const name = 'readable-message-payloads.fixed.md';
+    const fragment = readFileSync(join('test/fixtures', name), 'utf8');
+    const pending = join('changelog.d', name);
+    if (existsSync(pending)) assert.equal(readFileSync(pending, 'utf8'), fragment);
+    writeFileSync(join(root, 'package.json'), JSON.stringify({ version: '1.2.3' }));
+    writeFileSync(join(root, 'CHANGELOG.md'), '# Changelog\n\n## Unreleased\n');
+    mkdirSync(join(root, 'changelog.d'));
+    assert.throws(() => release(root), /nothing to release/);
+    writeFileSync(join(root, 'changelog.d', name), fragment);
+    assert.match(release(root), /from 1 fragment/);
+    assert.ok(readFileSync(join(root, 'CHANGELOG.md'), 'utf8').includes(fragment.trim()));
+    assert.equal(existsSync(join(root, 'changelog.d', name)), false);
 
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

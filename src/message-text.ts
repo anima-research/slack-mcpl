@@ -32,7 +32,7 @@ function normalized(value: string): string {
       if (parts[i + 1] === fence) part = part.replace(/\r?\n$/, '');
       return part;
     }
-    return part.replace(/(^|\n)([ \t]*)[•◦▪] /g, '$1$2- ').replace(/_\*([^*_\n]+)\*_/g, '*_$1_*').replace(/\s+/g, ' ');
+    return part.replace(i === 0 ? /(^|\n)([ \t]*)[•◦▪] /g : /(\n)([ \t]*)[•◦▪] /g, '$1$2- ').replace(/_\*([^*_\n]+)\*_/g, '*_$1_*').replace(/\s+/g, ' ');
   }).join('').trim();
 }
 
@@ -63,7 +63,8 @@ export function renderMessageText(
     return token;
   });
   let truncated = false;
-  const cap = Math.max(2000, original.length);
+  // Allow container visits along each character's depth-limited path.
+  const cap = Math.max(2000, 14 * original.length + 2);
   let budget = cap;
   const take = (v: unknown): unknown[] => {
     const items = list(v);
@@ -97,7 +98,7 @@ export function renderMessageText(
       case 'rich_text_list': return join(take(e.elements).map((x, i) =>
         '    '.repeat(Math.max(0, Math.min(12, Number(e.indent) || 0))) +
         (e.style === 'ordered' ? String(i + 1 + (Number(e.offset) || 0)) + '. ' : ['• ', '◦ ', '▪ '][Math.max(0, Math.min(12, Math.floor(Number(e.indent) || 0))) % 3]) + rich(x, depth + 1)));
-      case 'rich_text_quote': return children('').split('\n').map(line => '> ' + line).join('\n');
+      case 'rich_text_quote': return children('').split(LINE_BREAK).map(line => '&gt; ' + line).join('\n');
       case 'rich_text_preformatted': return '```' + children('') + '```';
       case 'rich_text': return children('\n');
       default: return '';
@@ -216,9 +217,9 @@ export function renderMessageText(
     // Only unattributed units can mirror the original; full source identity
     // prevents capped display names from merging distinct senders. Fallback depends on readable output, not notices.
     const units = [body || (nested.length ? '' : fieldText(a.fallback)), ...nested, ...placeholders]
-      .filter(value => unique(value, header ? JSON.stringify([shared, a.author_name, a.author_id, a.channel_name, a.footer]) : ''));
+      .filter(value => unique(value, header ? JSON.stringify([shared, a.author_name, a.author_id, shared ? (a.channel_name || a.footer) : undefined]) : ''));
     if (units.length && header) {
-      emit(header + '\n' + join(units).split(LINE_BREAK).map(line => '> ' + line).join('\n'));
+      emit(header + '\n' + join(units).split(LINE_BREAK).map(line => '&gt; ' + line).join('\n'));
     } else {
       for (const value of units) emit(value);
     }
@@ -227,6 +228,8 @@ export function renderMessageText(
   // blocks-only messages (including apps posting as users) still need rendering.
   const skipHumanRichText = original !== '' &&
     (message.client_msg_id !== undefined || (!message.bot_id && !message.app_id && !message.bot_profile));
+  // Attachments must not consume the top-level mirror comparison allowance.
+  budget = cap;
   for (const b of take(message.blocks)) {
     if (full()) break;
     if (skipHumanRichText && object(b).type === 'rich_text') continue;

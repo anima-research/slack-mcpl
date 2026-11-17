@@ -16,3 +16,7 @@
   preserve code newlines inside fences, and keep distinct full attribution identities.
   Bound backscroll channel labels as well as message content; avoid reserving an
   omission summary when the complete block fits.
+  Reserve separate attachment and top-level traversal allowances including rich
+  containers, keep malformed angle tokens within logical lines, and quote every
+  logical line safely. Avoid redundant hidden-source attachment copies and
+  unnecessary history rendering after author/scan/match limits.
