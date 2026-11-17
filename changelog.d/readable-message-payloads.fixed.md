@@ -7,16 +7,19 @@
   or no bot/app provenance; keep blocks-only and bot/integration rich text.
   Deduplicate attachment units within attribution, format classic Slack fields,
   preserve rich styles and prefer readable fallback over omission placeholders.
+  Apply a 32 KiB framed backscroll budget, including ordinary text-only history.
   Mark backscroll messages exceeding the remaining byte budget in position
   and summarize older context outside the bounded newest window.
   Use linear scans for angle tokens and bare URLs, including long labelled links.
   Malformed nested angle tokens now restart at the inner opener; this also affects
   original-text mention extraction and formatting.
   Size rich mirror traversal to original text, normalize prose bullet spellings,
-  preserve code newlines inside fences, and keep distinct full attribution identities.
+  preserve code newlines inside fences, and keep distinct uncapped author-name/valid-ID and share-source identities.
   Bound backscroll channel labels as well as message content; avoid reserving an
   omission summary when the complete block fits.
   Reserve separate attachment and top-level traversal allowances including rich
   containers, keep malformed angle tokens within logical lines, and quote every
   logical line safely. Avoid redundant hidden-source attachment copies and
   unnecessary history rendering after author/scan/match limits.
+  Stop pending list iteration when traversal is exhausted, ignore invalid attribution
+  fields in dedup keys, and retain fallback for empty rich quotes/code blocks.

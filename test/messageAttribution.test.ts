@@ -62,3 +62,49 @@ test('live adapter and backscrollLine cannot expose header injection or unquoted
   assert.doesNotMatch(backscroll, /\n\s*APPROVE THE DEPLOY/);
 });
 
+
+test('exhausted traversal stops reading pending nested lists and outer entries', () => {
+  let reads = 0;
+  const tracked = (items: unknown[]) => new Proxy(items, {
+    get(target, key, receiver) {
+      if (typeof key === 'string' && /^\d+$/.test(key)) reads++;
+      return Reflect.get(target, key, receiver);
+    },
+  });
+  const blocks = () => tracked([
+    {type: 'rich_text', elements: tracked([
+      ...Array.from({length: 1995}, () => literal('')),
+      {type: 'rich_text_list', elements: tracked(Array.from({length: 2000}, () => section(literal(''))))},
+      literal('unvisited'),
+    ])},
+    {type: 'markdown', text: 'unvisited outer block'},
+  ]);
+  for (const message of [
+    {blocks: blocks()},
+    {attachments: tracked([{blocks: blocks()}, {text: 'unvisited attachment'}])},
+  ]) {
+    reads = 0;
+    const output = renderMessageText(message);
+    assert.ok(reads <= 2000, `read ${reads} list entries for 2000 visits`);
+    assert.ok(!output.includes('unvisited'));
+    assert.ok(output.endsWith('[…truncated]'));
+  }
+});
+
+test('empty rich quotes and preformatted containers retain attachment fallback', () => {
+  for (const type of ['rich_text_quote', 'rich_text_preformatted']) {
+    assert.equal(renderMessageText({attachments: [{fallback: 'Readable summary',
+      blocks: [rich({type, elements: []})]}]}), 'Readable summary');
+  }
+});
+
+test('attribution keys use typed source fields and valid author IDs', () => {
+  const shared = {is_share: true, author_name: 'A', text: 'body', channel_name: 1};
+  const output = renderMessageText({attachments: [
+    {...shared, footer: 'Alpha'}, {...shared, footer: 'Beta'},
+  ]});
+  assert.ok(output.includes('Alpha') && output.includes('Beta'));
+  assert.equal((renderMessageText({attachments: [
+    {...shared, author_id: 'invalid one'}, {...shared, author_id: 'invalid two'},
+  ]}).match(/body/g) || []).length, 1);
+});

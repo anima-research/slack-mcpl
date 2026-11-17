@@ -391,8 +391,9 @@ with only blocks. Bot/integration messages carrying `bot_id`, `app_id` or
 `bot_profile`, without `client_msg_id`, also retain rich text.
 
 Unattributed supplemental units deduplicate against original text. Attributed
-units deduplicate only within the same full source identity, so identical bodies from different authors
-survive. Comparison keys normalize prose whitespace, Slack encodings, combined
+units deduplicate within the same uncapped author name, valid author ID and (for
+shares) channel name or footer. Other source fields such as author_link are not
+identity keys; different identities under these fields survive. Comparison keys normalize prose whitespace, Slack encodings, combined
 bold/italic marker order and newlines directly inside code fences; compare
 channel/user IDs rather than labels; and preserve other code whitespace.
 This is display dedup, not typed equality: a link and identical rendered literal

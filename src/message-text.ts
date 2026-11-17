@@ -66,11 +66,15 @@ export function renderMessageText(
   // Allow container visits along each character's depth-limited path.
   const cap = Math.max(2000, 14 * original.length + 2);
   let budget = cap;
-  const take = (v: unknown): unknown[] => {
+  function* take(v: unknown): Generator<unknown> {
     const items = list(v);
-    if (items.length > cap) truncated = true;
-    return items.slice(0, cap);
-  };
+    for (let i = 0; i < items.length; i++) {
+      // Check before reading the next entry, including when a child spent
+      // the remainder of the shared budget. Never eagerly copy pending lists.
+      if (budget <= 0) { truncated = true; return; }
+      yield items[i];
+    }
+  }
   const visit = () => { if (--budget < 0) { truncated = true; return false; } return true; };
   const renderLimit = Math.max(MAX_MESSAGE_TEXT_APPEND, original.length + 1);
   const bounded = (v: unknown) => { const text = string(v); if (text.length > renderLimit) truncated = true; return prefix(text, renderLimit); };
@@ -79,7 +83,7 @@ export function renderMessageText(
   function rich(v: unknown, depth = 0): string {
     if (!visit() || depth > 12) { truncated = true; return ''; }
     const e = object(v);
-    const children = (separator: string) => join(take(e.elements).map(x => rich(x, depth + 1)), separator);
+    const children = (separator: string) => join(Array.from(take(e.elements), x => rich(x, depth + 1)), separator);
     switch (e.type) {
       case 'text': return styled(escape(bounded(e.text)), e.style);
       case 'user': return validId(e.user_id) ? styled(`<@${e.user_id}>`, e.style) : '';
@@ -95,11 +99,17 @@ export function renderMessageText(
       case 'emoji': return typeof e.name === 'string' ? styled(`:${escape(bounded(e.name))}:${typeof e.skin_tone === 'number' ? ':skin-tone-' + e.skin_tone + ':' : ''}`, e.style) : '';
       case 'broadcast': return ['here', 'channel', 'everyone'].includes(string(e.range)) ? styled(`<!${e.range}>`, e.style) : '';
       case 'rich_text_section': return children('');
-      case 'rich_text_list': return join(take(e.elements).map((x, i) =>
+      case 'rich_text_list': return join(Array.from(take(e.elements), (x, i) =>
         '    '.repeat(Math.max(0, Math.min(12, Number(e.indent) || 0))) +
         (e.style === 'ordered' ? String(i + 1 + (Number(e.offset) || 0)) + '. ' : ['• ', '◦ ', '▪ '][Math.max(0, Math.min(12, Math.floor(Number(e.indent) || 0))) % 3]) + rich(x, depth + 1)));
-      case 'rich_text_quote': return children('').split(LINE_BREAK).map(line => '&gt; ' + line).join('\n');
-      case 'rich_text_preformatted': return '```' + children('') + '```';
+      case 'rich_text_quote': {
+        const body = children('');
+        return body ? body.split(LINE_BREAK).map(line => '&gt; ' + line).join('\n') : '';
+      }
+      case 'rich_text_preformatted': {
+        const body = children('');
+        return body ? '```' + body + '```' : '';
+      }
       case 'rich_text': return children('\n');
       default: return '';
     }
@@ -124,15 +134,15 @@ export function renderMessageText(
     if (!visit()) return '';
     switch (b.type) {
       case 'header': return textObject(b.text);
-      case 'section': return join([textObject(b.text), ...take(b.fields).map(textObject)]);
-      case 'context': return join(take(b.elements).map(textObject), ' ');
+      case 'section': return join([textObject(b.text), ...Array.from(take(b.fields), textObject)]);
+      case 'context': return join(Array.from(take(b.elements), textObject), ' ');
       case 'markdown': return bounded(b.text);
       case 'alert': return textObject(b.text);
       case 'card': return join([textObject(b.title), textObject(b.subtitle), textObject(b.body)]);
       case 'video': return join([textObject(b.title), textObject(b.description)]);
-      case 'table': return join(take(b.rows).map(row => {
+      case 'table': return join(Array.from(take(b.rows), row => {
         if (!visit()) return '';
-        return join(take(row).map(cell => object(cell).type === 'rich_text' ? rich(cell) :
+        return join(Array.from(take(row), cell => object(cell).type === 'rich_text' ? rich(cell) :
           !visit() ? '' : escape(bounded(object(cell).text))), ' | ');
       }));
       case 'actions': case 'input': case 'image': case 'divider': case 'file': return '';
@@ -193,7 +203,7 @@ export function renderMessageText(
       fieldText(a.pretext),
       title ? join([title, escape(bounded(a.title_link))], ' ') : '',
       fieldText(a.text),
-      ...take(a.fields).map(rawField => {
+      ...Array.from(take(a.fields), rawField => {
         if (!visit()) return '';
         const f = object(rawField);
         return join([fieldText(f.title), fieldText(f.value)], ': ');
@@ -214,10 +224,10 @@ export function renderMessageText(
         string(a.footer) ? headerName(string(a.footer)) : 'unknown source';
       header = shared ? `[shared message from ${name}${uid}, ${source}]` : `[attachment from ${name}${uid}]`;
     }
-    // Only unattributed units can mirror the original; full source identity
-    // prevents capped display names from merging distinct senders. Fallback depends on readable output, not notices.
+    // Only unattributed units can mirror the original; uncapped attribution fields
+    // prevent capped display names from merging distinct senders. Fallback depends on readable output, not notices.
     const units = [body || (nested.length ? '' : fieldText(a.fallback)), ...nested, ...placeholders]
-      .filter(value => unique(value, header ? JSON.stringify([shared, a.author_name, a.author_id, shared ? (a.channel_name || a.footer) : undefined]) : ''));
+      .filter(value => unique(value, header ? JSON.stringify([shared, string(a.author_name), validId(a.author_id) ? a.author_id : '', shared ? (string(a.channel_name) || string(a.footer)) : undefined]) : ''));
     if (units.length && header) {
       emit(header + '\n' + join(units).split(LINE_BREAK).map(line => '&gt; ' + line).join('\n'));
     } else {
@@ -232,7 +242,7 @@ export function renderMessageText(
   budget = cap;
   for (const b of take(message.blocks)) {
     if (full()) break;
-    if (skipHumanRichText && object(b).type === 'rich_text') continue;
+    if (skipHumanRichText && object(b).type === 'rich_text') { visit(); continue; }
     append(block(b));
   }
   const suffix = join(appended);
