@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ErrorCode } from '@slack/web-api';
 import { method } from '@animalabs/mcpl-core';
-import { SlackAdapter, type SlackWebLike } from '../src/slack-adapter.js';
+import { SlackAdapter, type SlackWebLike, withCallTime, assertRequestFits, OutOfCallTime } from '../src/slack-adapter.js';
 import { SlackMcplServer } from '../src/server.js';
 import { toolDefinitions } from '../src/tools.js';
 import { featureSetForTool } from '../src/feature-sets.js';
@@ -876,4 +876,43 @@ for (const agentLandsFirst of [false, true]) test(`adoption retires retry of con
   await flush();
   assert.equal(removes, 1);
   assert.equal(present, true);
+});
+
+
+test('manual removal retry does not inherit the expired host deadline', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  let attempts = 0;
+  const f = adapterFixture({ onRemove: async () => {
+    assertRequestFits('reactions.remove', 10_000);
+    if (++attempts === 1) throw refusal('ratelimited');
+  } });
+  t.after(() => f.slack.stop());
+  await f.slack.acknowledge('C1', '1.0');
+  await assert.rejects(withCallTime(Date.now(), () => f.slack.removeReaction('C1', '1.0', 'eyes')));
+  t.mock.timers.tick(60_000);
+  await flush();
+  assert.equal(attempts, 2);
+});
+
+test('unsent manual removal does not exhaust automatic cleanup attempts', async t => {
+  let unsent = true;
+  const f = adapterFixture({ onRemove: async () => { if (unsent) throw new OutOfCallTime('reactions.remove', 25); } });
+  t.after(() => f.slack.stop());
+  await f.slack.acknowledge('C1', '1.0');
+  for (let i = 0; i < 5; i++) await assert.rejects(f.slack.removeReaction('C1', '1.0', 'eyes'));
+  unsent = false;
+  await f.slack.clearAck('C1');
+  assert.equal(f.calls.filter(c => c.startsWith('remove:')).length, 6);
+});
+
+test('malformed or duplicate reaction users do not establish absence', async t => {
+  const h = harness({ historyMessages: [{ ts: '1.0', text: 'hello', reactions: [
+    { name: 'one', count: 2, users: ['U2', 'U2'] },
+    { name: 'two', count: 1, users: [''] },
+  ] }] });
+  t.after(() => h.close());
+  await initialize(h, false);
+  const result = await call(h, 'fetch_history', { channelId: 'C1' });
+  const reactions = JSON.parse(result.content[0]!.text).messages[0].reactions;
+  assert.ok(reactions.every((r: object) => !('own' in r)));
 });
