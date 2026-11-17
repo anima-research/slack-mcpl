@@ -52,7 +52,7 @@ test('DM sends and DM history reads are refused before reaching Slack', async ()
     message:
       "Nothing was sent: direct messages are turned off on this host, so send_dm can't reach anyone. Calling again " +
       "won't change that; whoever runs this host decides whether this bot may send DMs. To reach people, post in a " +
-      'channel with send_message; list_channels marks where this bot may write with writable: true.',
+      'writable channel with send_message. list_channels marks where this bot may write with writable: true.',
   });
   await assert.rejects(adapter.fetchHistory('D1'), { message: `Nothing was read: D1 is a direct message or group DM, ${offHere}` });
   await assert.rejects(adapter.readThread('D1', '1.0', { channelId: 'D1', threadTs: '1.0' }), {

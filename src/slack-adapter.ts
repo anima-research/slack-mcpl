@@ -1479,8 +1479,8 @@ export class SlackAdapter {
 
   async sendDM(userId: string, text: string): Promise<{ messageId: string; channelId: string }> {
     const toChannels = this.hint(
-      'To reach people, post in a channel with send_message; list_channels marks where this bot may write with ' +
-      'writable: true.');
+      'To reach people, post in a writable channel with send_message. ') +
+      this.hint('list_channels marks where this bot may write with writable: true.');
     if (this.disableDms) {
       throw new Error(
         "Nothing was sent: direct messages are turned off on this host, so send_dm can't reach anyone. Calling " +

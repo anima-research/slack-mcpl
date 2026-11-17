@@ -89,7 +89,7 @@ test("a post whose answer names no message is an unknown outcome, joins the next
     checkpoint: one.state!.checkpoint,
     success: true,
     reason: "Rolled back (1/2 messages deleted). May remain: a message in C1 whose id this server doesn't know. No rollback " +
-      'tries these again: delete_message can delete one by its id, which fetch_history shows (fetch_thread, for one in a thread)',
+      'tries these again. Use fetch_history to locate each message, then delete_message with its own id',
   });
   assert.deepEqual(unnamedLines(logged), [
     "[slack-mcpl] Rollback couldn't delete a message in C1: Slack's answer to the post named none, or the post's outcome is unknown",
@@ -111,8 +111,8 @@ test("a reply this server can't name is placed under its thread, beside a messag
   assert.equal(
     (await rollback(one.state!.checkpoint)).reason,
     'Rolled back (0/2 messages deleted). May remain: message 1.2 in C1; a message in the thread under message 1.1 in C1 ' +
-      "whose id this server doesn't know. No rollback tries these again: delete_message can try a message among them " +
-      "again, by its id, and fetch_history shows the id of one this server doesn't know (fetch_thread, for one in a thread)",
+      "whose id this server doesn't know. No rollback tries these again. delete_message can try a message among them " +
+      "again, by its id. Use fetch_thread with the parent thread id to locate each message, then delete_message with its own id",
   );
   assert.deepEqual(unnamedLines(logged), [
     "[slack-mcpl] Rollback couldn't delete a message in the thread under message 1.1 in C1: Slack's answer to the post " +
@@ -130,7 +130,7 @@ test("a post this server can't name stays under may remain beside a message Slac
   assert.equal(
     (await rollback(one.state!.checkpoint)).reason,
     "Rolled back (0/2 messages deleted). May remain: a message in C1 whose id this server doesn't know. No rollback tries " +
-      'these again: delete_message can delete one by its id, which fetch_history shows (fetch_thread, for one in a thread). ' +
+      'these again. Use fetch_history to locate each message, then delete_message with its own id. ' +
       "Slack refused to delete these, and calling again won't change that: message 1.2 in C1",
   );
 });
@@ -312,3 +312,40 @@ test('a publish whose answer names no message is answered as any publish whose o
     /^Rolled back \(0\/2 messages deleted\)\. May remain: a message in C1 whose id this server doesn't know; a message in C1 whose id this server doesn't know\./,
   );
 });
+
+for (const disabled of ['fetch_history', 'fetch_thread', 'delete_message']) {
+  for (const thread of [false, true]) {
+    test(`unnamed rollback selects the correct read for thread=${thread}, disabled=${disabled}`, async t => {
+      api.answerFor('chat.postMessage', named, unnamed);
+      t.after(() => api.answerFor('chat.postMessage'));
+      const h = connectHost(new SlackMcplServer(
+        new SlackAdapter(client as unknown as SlackWebLike, socket, 'UBOT', 'acme'),
+        { disabledTools: [disabled] },
+      ));
+      t.after(() => h.close());
+      await initialize(h, true);
+      await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+      const first = await h.host.sendRequest('tools/call', {
+        name: 'send_message', arguments: { channelId: 'C1', content: 'before' },
+      }) as Result;
+      const post = await h.host.sendRequest('tools/call', {
+        name: thread ? 'reply_message' : 'send_message',
+        arguments: { channelId: 'C1', messageId: '1.1', content: 'unknown' },
+      }) as Result;
+      assert.equal(post.isError, true);
+      const result = await h.host.sendRequest(method.STATE_ROLLBACK, {
+        featureSet: MESSAGING_FEATURE_SET, checkpoint: first.state!.checkpoint,
+      }) as { reason: string };
+      const read = thread ? 'fetch_thread' : 'fetch_history';
+      if (disabled === read || disabled === 'delete_message') {
+        assert.match(result.reason, /Someone with access must locate and delete each message in Slack/);
+        assert.doesNotMatch(result.reason, /Use fetch_/);
+      } else {
+        assert.ok(result.reason.includes(`Use ${read}`), result.reason);
+        assert.match(result.reason, /then delete_message with its own id/);
+        assert.doesNotMatch(result.reason, /Someone with access/);
+      }
+      assert.doesNotMatch(result.reason, new RegExp(disabled));
+    });
+  }
+}

@@ -33,7 +33,7 @@ const refusal = (notDone: string) =>
 const noDm =
   "Nothing was sent: this bot may write only to CALLOWED, none of them a direct message, so send_dm can't reach " +
   "anyone. Calling again won't change that; whoever runs this host decides where it may write. To reach people, " +
-  'post in a channel with send_message; list_channels marks where this bot may write with writable: true.';
+  'post in a writable channel with send_message. list_channels marks where this bot may write with writable: true.';
 
 test('writes outside the allow-list are refused before reaching Slack', async () => {
   const { adapter, calls } = makeAdapter(['CALLOWED']);

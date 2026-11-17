@@ -37,8 +37,9 @@ test('argument, member-unsubscribe and channel-open guidance omit disabled tools
   t.after(() => h.close());
   await initialize(h, true);
   await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
-  for (const [name, args] of [['send_dm', {}], ['send_message', {}], ['reply_message', { channelId: 'C1' }], ['unsubscribe_channel', { channelId: 'C1' }]] as const) {
+  for (const [name, args, expected] of [['send_dm', {}, /userId must be a non-empty string/], ['send_message', {}, /channelId must be a non-empty string/], ['reply_message', { channelId: 'C1', content: 'hi' }, /messageId must be a non-empty string/], ['unsubscribe_channel', { channelId: 'C1' }, /Muted ambient messages in conversation C1/]] as const) {
     const text = await call(h.host, name, args);
+    assert.match(text, expected);
     for (const disabled of disabledTools) assert.ok(!text.includes(disabled), text);
   }
   await assert.rejects(h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'slack:missing' }), err => {
@@ -225,7 +226,7 @@ test('rollback preserves failure details without advertising disabled retry tool
   assert.doesNotMatch(result.reason, /delete_message|fetch_history|fetch_thread/);
   assert.match(result.reason, /May remain/);
   assert.match(result.reason, /100\.1/);
-  assert.match(result.reason, /someone with access/);
+  assert.match(result.reason, /Someone with access/);
 });
 
 for (const disabledTools of [['fetch_history'], ['fetch_thread'], ['delete_message'], ['delete_message', 'fetch_history', 'fetch_thread']]) {
@@ -251,7 +252,13 @@ for (const disabledTools of [['fetch_history'], ['fetch_thread'], ['delete_messa
       for (const name of disabledTools) assert.ok(!result.reason.includes(name), result.reason);
       assert.match(result.reason, /may remain/);
       assert.match(result.reason, /C1/);
-      assert.match(result.reason, /(?:Use .* to locate the message, then delete_message with its id\.|Someone with access must locate and delete the message in Slack\.)/);
+      for (const [read, prefix] of [['fetch_history', 'For top-level sharing messages: '], ['fetch_thread', 'For sharing messages in a thread: ']]) {
+        const expected = disabledTools.includes(read) || disabledTools.includes('delete_message')
+          ? 'Someone with access must locate and delete each message in Slack'
+          : `Use ${read}${read === 'fetch_thread' ? ' with the parent thread id' : ''} to locate each message, then delete_message with its own id`;
+        assert.ok(result.reason.includes(prefix + expected), result.reason);
+      }
+      assert.doesNotMatch(result.reason, /\.\.|, and Use/);
     }
   });
 }
@@ -268,8 +275,9 @@ test('ungrouped tools remain advertised and callable without tool-bearing featur
   const listed = await h.host.sendRequest('tools/list', {}) as { tools: { name: string }[] };
   assert.deepEqual(listed.tools.map(tool => tool.name).sort(), [...survivors].sort());
   for (const name of survivors) {
-    const text = await call(h.host, name, { query: 'alice' });
-    assert.doesNotMatch(text, /capability|not granted|disabled by operator/);
+    const result = await h.host.sendRequest('tools/call', { name, arguments: { query: 'alice' } }) as { isError?: boolean; content: { text: string }[] };
+    assert.notEqual(result.isError, true);
+    assert.doesNotMatch(result.content[0].text, /capability|not granted|disabled by operator/);
   }
 });
 
@@ -298,4 +306,34 @@ test('disabled fetch_history does not suppress automatic backscroll', async t =>
   await fake.socket.emitMessage(MENTION_EVENT);
   await until(() => h.hostSaw.some(r => r.method === method.PUSH_EVENT), 'mention with automatic backscroll');
   assert.match(JSON.stringify(h.hostSaw.find(r => r.method === method.PUSH_EVENT)!.params), /automatic context survives/);
+});
+
+for (const disabled of ['send_message', 'reply_message']) {
+  test(`publish thread remedy is a standalone sentence without ${disabled}`, () => {
+    const text = explainSlackError({ code: 'slack_webapi_platform_error', data: { error: 'thread_not_found' } }, {
+      tool: 'channels/publish', args: { channelId: 'C1', threadTs: '100.1' }, toolEnabled: name => name !== disabled,
+    });
+    assert.doesNotMatch(text, new RegExp(disabled));
+    assert.ok(text.endsWith(disabled === 'send_message'
+      ? 'reply_message posts under a message you choose.'
+      : 'send_message posts in the conversation itself. '), text);
+  });
+}
+
+test('closed edit window names Slack access when posting tools are disabled', () => {
+  const text = explainSlackError({ code: 'slack_webapi_platform_error', data: { error: 'edit_window_closed' } }, {
+    tool: 'edit_message', args: { channelId: 'C1', messageId: '100.1' },
+    toolEnabled: name => !['send_message', 'reply_message'].includes(name),
+  });
+  assert.match(text, /Someone with Slack access can post a correction/);
+  assert.doesNotMatch(text, /send_message|reply_message/);
+});
+
+test('DM refusal retains channel posting advice without list_channels', async t => {
+  const h = connectHost(new SlackMcplServer(fakeSlack({ sendChannels: ['C1'] }).slack, { disabledTools: ['list_channels'] }));
+  t.after(() => h.close());
+  await initialize(h, false);
+  const text = await call(h.host, 'send_dm', { userId: 'U1', content: 'hi' });
+  assert.match(text, /post in a writable channel with send_message\./);
+  assert.doesNotMatch(text, /list_channels/);
 });

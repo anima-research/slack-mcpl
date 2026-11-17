@@ -115,7 +115,7 @@ export function buildServerCapabilities(disabledTools: readonly string[] = []): 
   };
 }
 
-/** Get the feature set that owns a given tool. Returns undefined for always-available tools. */
+/** Get the feature set that owns a given tool. Returns undefined for tools not gated by a feature set. */
 export function featureSetForTool(toolName: string): string | undefined {
   switch (toolName) {
     case 'send_message':
@@ -137,7 +137,7 @@ export function featureSetForTool(toolName: string): string | undefined {
     case 'list_channels':
     case 'refresh_channels':
     case 'find_user':
-      return undefined; // Always available
+      return undefined; // Not gated by a feature set; operator policy still applies
     default:
       return undefined;
   }

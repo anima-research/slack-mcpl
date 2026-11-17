@@ -397,15 +397,15 @@ export class SlackMcplServer {
 
   private toolEnabled = (name: string): boolean => !this.opts.disabledTools?.includes(name);
 
-  /** The tools tools/list offers: send_dm only where a DM can be written, and
-   *  refresh_channels only where MCPL was negotiated, since a plain MCP
-   *  connection has no host to register conversations with. Neither changes
-   *  during a connection, as a grant can. */
   private declarationDisabledTools(): readonly string[] {
     return this.slack.dmsWritable ? this.opts.disabledTools ?? []
       : [...(this.opts.disabledTools ?? []), 'send_dm'];
   }
 
+  /** The tools tools/list offers: send_dm only where a DM can be written, and
+   *  refresh_channels only where MCPL was negotiated, since a plain MCP
+   *  connection has no host to register conversations with. Neither changes
+   *  during a connection, as a grant can. */
   private offeredTools() {
     return toolDefinitions.filter((t) =>
       (t.name !== 'send_dm' || this.slack.dmsWritable) && (t.name !== 'refresh_channels' || this.mcplEnabled)
@@ -1178,7 +1178,7 @@ export class SlackMcplServer {
       // One superseded meanwhile stops without a word; the newer one reports.
       if (isCurrent()) {
         const why = err instanceof GaveUp
-          ? `${err.message}, so registration stopped; refresh_channels can announce the conversations later`
+          ? `${err.message}, so registration stopped; ${toolHint('refresh_channels can announce the conversations later', this.toolEnabled, 'reconnect the host to retry registration')}`
           : (err as Error).message;
         console.error('[slack-mcpl] Failed to enumerate conversations:', why);
       }
@@ -1574,18 +1574,15 @@ export class SlackMcplServer {
     // whether Slack counts a file's sharing message as one isn't known, hence
     // "may".
     const commentsLeft = toDelete.filter((item): item is UploadedFile => item.kind === 'file' && item.comment && !item.shareTs);
-    const reads = [
-      ...(this.toolEnabled('fetch_history') ? ['fetch_history'] : []),
-      ...(this.toolEnabled('fetch_thread') ? ['fetch_thread for a message in a thread'] : []),
-    ].join(' or ');
-    const locate = reads && this.toolEnabled('delete_message')
-      ? `Use ${reads} to locate the message, then delete_message with its id.`
-      : 'Someone with access must locate and delete the message in Slack.';
-    // What the agent can do about an item left, since no rollback tries it
-    // again: one whose delete can pass can be deleted by its id, and one
-    // Slack refused for good can't be, however often it's asked. A post this
-    // server can't name can be deleted by its id, which fetch_history shows,
-    // or fetch_thread for a reply.
+    const locate = (thread: boolean): string => {
+      const read = thread ? 'fetch_thread with the parent thread id' : 'fetch_history';
+      const tool = thread ? 'fetch_thread' : 'fetch_history';
+      return this.toolEnabled(tool) && this.toolEnabled('delete_message')
+        ? `Use ${read} to locate each message, then delete_message with its own id`
+        : 'Someone with access must locate and delete each message in Slack';
+    };
+    // Upload state does not retain the parent thread id. Explain both cases.
+    const locateComments = `For top-level sharing messages: ${locate(false)}. For sharing messages in a thread: ${locate(true)}`;
     const mayRemain = left.filter((item) => !item.forGood);
     const refused = left.filter((item) => item.forGood);
     const named = (items: typeof left) => items.map((item) => item.named).join('; ');
@@ -1593,34 +1590,30 @@ export class SlackMcplServer {
     const unnamedLeft = mayRemain.some((item) => item.unnamed);
     const remedy = [
       ...(namedMessageLeft ? [toolHint('delete_message can try a message among them again, by its id', this.toolEnabled,
-        'someone with access must retry deleting the message in Slack, by its own id')] : []),
-      ...(unnamedLeft
-        ? [this.toolEnabled('fetch_history') && this.toolEnabled('fetch_thread') && this.toolEnabled('delete_message')
-          ? (namedMessageLeft
-            ? "fetch_history shows the id of one this server doesn't know (fetch_thread, for one in a thread)"
-            : 'delete_message can delete one by its id, which fetch_history shows (fetch_thread, for one in a thread)')
-          : locate.replace(/\.$/, '')]
-        : []),
+        'Someone with access must retry deleting the message in Slack, by its own id')] : []),
+      ...(unnamedLeft ? [...new Set(toDelete
+        .filter((item) => item.kind === 'message' && item.messageId === undefined)
+        .map((item) => locate(item.kind === 'message' && !!item.threadTs)))] : []),
       ...(mayRemain.some((item) => item.kind === 'file')
-        ? ["no tool here deletes a file, and whoever runs this host can delete it with Slack's files.delete, by its id"]
+        ? ["No tool here deletes a file, and whoever runs this host can delete it with Slack's files.delete, by its id"]
         : []),
-    ].join(', and ');
+    ].join('. ');
     const notes = [
       ...(left.length > 0
         ? [[
             `Rolled back (${counts} deleted)`,
-            ...(mayRemain.length > 0 ? [`May remain: ${named(mayRemain)}. No rollback tries these again: ${remedy}`] : []),
+            ...(mayRemain.length > 0 ? [`May remain: ${named(mayRemain)}. No rollback tries these again. ${remedy}`] : []),
             ...(refused.length > 0 ? [`Slack refused to delete these, and calling again won't change that: ${named(refused)}`] : []),
           ].join('. ')]
         : []),
       ...(commentsLeft.length === 1
         ? [`The comment of uploaded file ${commentsLeft[0].fileId} may remain in conversation ${commentsLeft[0].channelId}: ` +
           "this server doesn't know the message that shared the file, so no rollback can delete it. " +
-          locate]
+          locateComments]
         : commentsLeft.length > 1
           ? [`The comments of uploaded files ${commentsLeft.map((f) => `${f.fileId} in ${f.channelId}`).join(', ')} may remain: ` +
             "this server doesn't know the messages that shared them, so no rollback can delete them. " +
-            locate]
+            locateComments]
           : []),
     ];
     return {
