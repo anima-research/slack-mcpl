@@ -178,7 +178,7 @@ export function backscrollLine(m: {
 export function backscrollBlock(
   messages: Parameters<typeof backscrollLine>[0][],
   where: { channelName?: string; isDM: boolean },
-  historyGranted: boolean | 'tools' = false,
+  historyGranted: boolean = false,
 ): string {
   const attrs: string[] = [];
   if (where.channelName && !where.isDM) attrs.push(`channel=${quotedLabel(`#${Array.from(where.channelName).slice(0, 100).join('')}`)}`);
@@ -188,9 +188,7 @@ export function backscrollBlock(
   // the older prefix. Both forms count against the same hard byte budget.
   const maxBytes = 32_768;
   const historyAvailable = historyGranted === true;
-  const unavailable = historyGranted === 'tools'
-    ? '; history unavailable: missing host grant tools'
-    : '; history unavailable: missing host grant slack.history';
+  const unavailable = '; history unavailable: host has not selected feature set slack.history';
   const lines: string[] = [];
   const summary = (count: number, before?: string) =>
     `[${count} older backscroll ${count === 1 ? 'message' : 'messages'} not shown${historyAvailable ? '; try fetch_history' + (before ? ' latest=' + before : '; follow nextCursor until the omitted window is reached') : unavailable}]`;
@@ -1792,7 +1790,7 @@ export class SlackMcplServer {
     }
     if (backscroll.length > 0) {
       blocks.push(backscrollBlock(backscroll, { channelName: meta?.name, isDM: msg.isDM },
-        !this.grant.has('tools') ? 'tools' : this.grant.isFeatureSetActive(HISTORY_FEATURE_SET)));
+        this.grant.isFeatureSetActive(HISTORY_FEATURE_SET)));
     }
     // Told with the first message the agent gets from here, addressed or not.
     // Counted as told only once the host has taken that message.

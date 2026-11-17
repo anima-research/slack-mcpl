@@ -290,10 +290,11 @@ import { harness, initialize, FULL_GRANT, until } from './harness.js';
 test('review fragment passes the actual release validator', () => {
   const root = mkdtempSync(join(tmpdir(), 'payload-release-'));
   try {
-    // Permanent copy survives releases; never let unrelated pending entries
-    // or repository version/Unreleased state make this validation pass.
+    // Validate the shipped fragment while pending; the fixture survives release.
+    // Unrelated entries cannot make this validation pass.
     const name = 'readable-message-payloads.added.md';
-    const fragment = readFileSync(join('test/fixtures', name), 'utf8');
+    const pending = join('changelog.d', name);
+    const fragment = readFileSync(existsSync(pending) ? pending : join('test/fixtures', name), 'utf8');
     writeFileSync(join(root, 'package.json'), JSON.stringify({ version: '1.2.3' }));
     writeFileSync(join(root, 'CHANGELOG.md'), '# Changelog\n\n## Unreleased\n');
     mkdirSync(join(root, 'changelog.d'));
@@ -767,7 +768,7 @@ test('payload docs describe preview and provenance policies accurately', () => {
   assert.ok(readme.includes('channel/user IDs rather than labels; preserve internal line breaks in prose\n(normalizing line-ending spellings); and preserve other code whitespace.'));
   const fragmentPath = 'changelog.d/readable-message-payloads.added.md';
   const added = readFileSync(existsSync(fragmentPath) ? fragmentPath : 'test/fixtures/readable-message-payloads.added.md', 'utf8');
-  assert.match(added, /unless original text is non-whitespace and\n  client_msg_id is a string/);
+  assert.ok(added.includes('Skip human rich-text mirrors when ordinary text is non-whitespace; retain blocks-only\n  and bot/integration rich text unless original text is non-whitespace and\n  client_msg_id is a string (including\n  an empty string; null and other non-string values do not suppress app rich text).'));
 });
 
 for (const gap of [' \n', '\t\r\n', '\n']) {

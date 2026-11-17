@@ -18,7 +18,9 @@
   App-as-user posts without bot_id remain eligible live under chat:from-human by default,
   including rendered app bodies; the tag is not proof of human authorship.
   Backscroll omission notices are server notices, not author text; when history is unavailable they name
-  the host grant needed. Yield between batches of text-filtered history candidates.
+  the inactive host-selected `slack.history` feature set, not a capability grant or environment setting.
+  Omission authors are quoted once. Unclosed code fences retain edge breaks,
+  and CR/LF breaks across rich sections remain distinct. Yield between batches of text-filtered history candidates.
   Channel mirrors deduplicate before reused-label expansion; normalized omission
   labels deduplicate before charging their deferred allowance. Rendering cuts
   retain a conservative marker even when their bounded prefixes deduplicate.
@@ -30,3 +32,8 @@
   Classic link previews can appear in reads and match textContains; they are
   skipped only when from_url exactly matches an extracted original URL. App
   unfurls are skipped separately; shares retain their source bodies.
+  Supplemental deduplication preserves internal prose row boundaries and code
+  whitespace, while normalizing equivalent line endings, trailing horizontal
+  prose whitespace and rich-section separators. Closed code fences normalize
+  supported edge line breaks. Rich-container joining is linear; truncated
+  supplemental text preserves complete Slack angle tokens and escaped entities.

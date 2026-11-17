@@ -339,9 +339,9 @@ export async function initialize(h: { host: McplConnection }, mcpl: boolean) {
 
 /** Poll until `predicate` holds — registration/delivery is real async work. */
 export async function until(predicate: () => boolean, what: string, ms = 2000): Promise<void> {
-  const deadline = Date.now() + ms;
+  const deadline = performance.now() + ms;
   while (!predicate()) {
-    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    if (performance.now() > deadline) throw new Error(`timed out waiting for ${what}`);
     await new Promise((r) => setTimeout(r, 5));
   }
 }

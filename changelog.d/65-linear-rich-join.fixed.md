@@ -1,1 +1,0 @@
-- Keep rich-message container joining linear and deduplicate code fences with any supported edge line break.
