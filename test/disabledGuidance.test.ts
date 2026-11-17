@@ -15,13 +15,13 @@ const call = async (host: ReturnType<typeof connectHost>['host'], name: string, 
   return result.content[0].text;
 };
 
-test('manifest and grant omit empty tool-only sets but retain messaging protocol paths', async t => {
+test('manifest and grant omit empty tool-only sets but retain messaging and typing protocol paths', async t => {
   const disabledTools = toolDefinitions.map(tool => tool.name);
   const h = connectHost(new SlackMcplServer(fakeSlack().slack, { disabledTools }));
   t.after(() => h.close());
   const result = await initialize(h, true);
   const experimental = result.capabilities.experimental as { mcpl: { featureSets: object } };
-  assert.deepEqual(Object.keys(experimental.mcpl.featureSets), ['slack.messaging']);
+  assert.deepEqual(Object.keys(experimental.mcpl.featureSets), ['slack.messaging', 'slack.typing']);
   const receipt = await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: [] });
   assert.doesNotMatch(JSON.stringify(receipt), /slack.history|slack.subscriptions/);
   await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
