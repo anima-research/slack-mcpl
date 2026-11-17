@@ -32,6 +32,7 @@
 - Confirmed explicit ACK adoption cancels cleanup still waiting for the
   automatic add, including during shutdown. In-flight removals remain joinable,
   but cannot schedule automatic retries after adoption.
-- Reaction tools distinguish ACK adoption from an unchanged existing reaction;
+- A new explicit ACK-emoji add reports "Reaction added"; an already-present
+  ACK reports "ACK adopted" rather than "Nothing changed". Both adopt the ACK;
   deadline diagnostics include time waiting on background coordination.
 - An unsent manual ACK removal preserves the existing automatic expiry or retry deadline.

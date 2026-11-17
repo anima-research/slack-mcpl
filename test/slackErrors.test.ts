@@ -371,7 +371,7 @@ test("Slack's own failure: a read is tried again, a write's outcome is unknown a
   );
   assert.match(
     await explain('internal_error', 'add_reaction', { channelId: 'C14', messageId: '1.2', emoji: 'eyes' }),
-    /whether the reaction was added is unknown .*Adding it again will not duplicate the reaction: if it's there, add_reaction reports success\. For the configured ACK emoji, an unknown outcome leaves automatic cleanup in control; a confirmed retry adopts the ACK and retires unsent cleanup\./s,
+    /whether the reaction was added is unknown .*Adding it again will not duplicate the reaction: if it's there, add_reaction reports success\. If automatic cleanup is still pending for a configured ACK emoji, an unknown outcome does not retire it; a confirmed retry adopts the ACK and retires unsent cleanup\./s,
   );
   const unavailable = await explain('service_unavailable', 'send_message', { channelId: 'C14' });
   assert.match(unavailable, /whether the message was posted is unknown\. Check fetch_history/);

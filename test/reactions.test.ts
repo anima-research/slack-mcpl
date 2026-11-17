@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { ErrorCode } from '@slack/web-api';
 import { method } from '@animalabs/mcpl-core';
 import { SlackAdapter, type SlackWebLike, withCallTime, assertRequestFits, OutOfCallTime } from '../src/slack-adapter.js';
+import { explainSlackError } from '../src/slack-errors.js';
 import { SlackMcplServer } from '../src/server.js';
 import { toolDefinitions } from '../src/tools.js';
 import { featureSetForTool } from '../src/feature-sets.js';
@@ -23,6 +24,7 @@ for (const name of ['fetch_history', 'fetch_thread']) {
   test(`${name} renders counts, own reactions and a per-message cap without extra Slack reads`, async t => {
     const h = harness({ historyMessages: [{ ts: '1.0', text: 'hello', reactions: [
       { name: 'eyes', count: 7, users: ['UBOT', 'U2'] },
+      {}, { name: '' }, { name: 42 },
       ...Array.from({ length: 22 }, (_, i) => ({ name: `emoji_${i}`, count: 3, users: ['U2', 'U3', 'U4'] })),
     ] }] });
     t.after(() => h.close());
@@ -38,8 +40,8 @@ for (const name of ['fetch_history', 'fetch_thread']) {
     assert.deepEqual(h.reactions, []);
   });
 
-  for (const reactions of [undefined, []]) {
-    test(`${name} is byte-identical without reactions (${reactions === undefined ? 'absent' : 'empty'})`, async t => {
+  for (const reactions of [undefined, [], [{}, { name: '' }, { name: 42 }]]) {
+    test(`${name} is byte-identical without reactions (${reactions === undefined ? 'absent' : reactions.length ? 'invalid-only' : 'empty'})`, async t => {
       const h = harness({ historyMessages: [{ ts: '1.0', text: 'hello', ...(reactions ? { reactions } : {}) }] });
       t.after(() => h.close());
       await initialize(h, false);
@@ -577,6 +579,7 @@ for (const ackReaction of [undefined, 'eyes']) {
     for (const name of ['fetch_history', 'fetch_thread', 'add_reaction', 'remove_reaction']) {
       const description = tools.find(tool => tool.name === name)!.description;
       if (ackReaction) {
+        assert.match(description, /Reaction added for a new reaction, or ACK adopted when already present/);
         assert.match(description, /eyes/);
         assert.match(description, /added best-effort to addressed messages while they are being handled/);
         assert.match(description, /automatic removal is best-effort after the bot's next confirmed post in that conversation, or after 10 minutes, or when the host rejects the message, unless an explicit add confirms adoption/);
@@ -1005,3 +1008,27 @@ test('unsent manual ACK removal preserves the original ten-minute expiry', async
   await flush();
   assert.equal(f.calls.filter(c => c.startsWith('remove:')).length, 2, 'original expiry, not ten minutes after refusal');
 });
+
+test('unknown add advice conditions cleanup on a configured, still-pending ACK', () => {
+  const advice = explainSlackError(refusal('internal_error'), { tool: 'add_reaction', args });
+  assert.match(advice, /If automatic cleanup is still pending for a configured ACK emoji, an unknown outcome does not retire it/);
+});
+
+for (const error of ['channel_not_found', 'missing_scope', 'no_reaction']) {
+  test(`effect-time policy refusal ${error} preserves pending ACK cleanup`, async t => {
+    const f = adapterFixture();
+    t.after(() => f.slack.stop());
+    await f.slack.acknowledge('C1', '1.0');
+    let checks = 0;
+    Object.assign(f.slack, {
+      hasAccessPolicy: true,
+      requireWritableConversation: async () => {
+        if (++checks === 2) throw refusal(error);
+      },
+    });
+    await assert.rejects(f.slack.removeReaction('C1', '1.0', 'eyes'));
+    assert.deepEqual(f.calls, ['add'], 'no removal sent on policy refusal');
+    await f.slack.clearAck('C1');
+    assert.deepEqual(f.calls, ['add', 'remove:1.0:eyes'], 'automatic cleanup remains pending');
+  });
+}

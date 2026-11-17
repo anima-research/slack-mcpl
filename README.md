@@ -131,7 +131,7 @@ Removing the configured ACK emoji waits for a pending ACK add; success or
 removal (or `no_reaction`) while the tool waits, it returns the same successful
 "Nothing changed: message X has no &lt;emoji&gt; reaction from this bot" without
 another Slack call. If cleanup instead gives up after a failure, the tool makes its own removal attempt and reports Slack's answer.
-Manual ACK removals share automatic cleanup's five-attempt budget: transient
+While automatic ACK cleanup is pending, manual removals share its five-attempt budget: transient
 failures retry after one minute; terminal refusals, shutdown and the fifth
 failure retire cleanup. Other emojis and other messages' ACKs are unchanged.
 

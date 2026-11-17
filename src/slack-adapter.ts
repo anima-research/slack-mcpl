@@ -39,7 +39,7 @@ import {
   type SlackHistoryMessage,
 } from './content.js';
 
-/** An acknowledgement reaction is removed after this, replied to or not. */
+/** Automatic acknowledgement cleanup is due after this, unless explicitly adopted. */
 export const ACK_TTL_MS = 10 * 60 * 1000;
 /** A removal that failed in a way that can pass is tried again after this,
  *  up to ACK_MAX_TRIES tries in all. */
@@ -1669,9 +1669,9 @@ export class SlackAdapter {
       } catch (err) {
         retry = attempted && !(err instanceof OutOfCallTime);
         if (entry && retry) entry.tries++;
-        if (entry && slackRefusal(err) === 'no_reaction') entry.gone = true;
+        if (entry && attempted && slackRefusal(err) === 'no_reaction') entry.gone = true;
         // Use the automatic cleanup's retry budget and terminal refusals.
-        if (entry && (refusedForGood(err) || this.stopping || entry.tries >= ACK_MAX_TRIES)) {
+        if (entry && ((attempted && refusedForGood(err)) || this.stopping || entry.tries >= ACK_MAX_TRIES)) {
           this.dropAck(channelId, ts, entry);
         }
         throw err;

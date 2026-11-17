@@ -179,7 +179,7 @@ export const toolDefinitions: ToolDefinition[] = [
       'to bound the range. Substring and exact author-ID predicates are ANDed. Check pagination.scanComplete ' +
       'and stopReason: zero bounded matches does not prove absence. To go on to older messages, call again with ' +
       'the same arguments and cursor set to pagination.nextCursor. ' +
-      'Messages may include up to 20 reactions (name and available Slack count), reactionsOmitted for the rest, and own ' +
+      'Messages may include up to 20 reactions (each with name, available Slack count, and optional own), plus reactionsOmitted for the rest. Each reaction\'s own is ' +
       '(true when the bot is listed, false when absent from a complete user list, omitted when membership is unknown from truncated or missing data).',
     inputSchema: {
       type: 'object',
@@ -201,7 +201,7 @@ export const toolDefinitions: ToolDefinition[] = [
       'Fetch a bounded part of one Slack thread, oldest-first (parent first on a call without oldest or cursor). ' +
       `${PARENT_IDS}. Check pagination.scanComplete and stopReason. To go on to newer replies, call again with the ` +
       'same arguments and cursor set to pagination.nextCursor. ' +
-      'Messages may include up to 20 reactions (name and available Slack count), reactionsOmitted for the rest, and own ' +
+      'Messages may include up to 20 reactions (each with name, available Slack count, and optional own), plus reactionsOmitted for the rest. Each reaction\'s own is ' +
       '(true when the bot is listed, false when absent from a complete user list, omitted when membership is unknown from truncated or missing data).',
     inputSchema: {
       type: 'object',
