@@ -158,3 +158,21 @@ test('canonical dedup uses existing link rendering and escape semantics without 
     assert.equal(result!.content, text === '&amp;lt;' ? text + '\n' + mirror : text);
   }
 });
+
+const senderBlocksWithoutText = [
+  { type: 'section', text: { type: 'mrkdwn', text: '*Header*' } },
+  { type: 'section', text: { type: 'mrkdwn', text: 'Body' } },
+  { type: 'context', elements: [{ type: 'mrkdwn', text: 'Context' }] },
+];
+
+for (const nested of [true, false]) {
+  test(`absent text key: ${nested ? 'colour attachment-nested' : 'top-level'} sender blocks on every path`, async () => {
+    const payload = nested
+      ? { attachments: [{ color: '#36a64f', blocks: senderBlocksWithoutText }] }
+      : { blocks: senderBlocksWithoutText };
+    assert.equal(Object.hasOwn(payload, 'text'), false, 'text must be absent, not empty');
+    const expected = '*Header*\nBody\nContext';
+    const live = await expectText(payload, expected);
+    assert.equal(live!.content, expected, 'raw live content has no leading newline or undefined');
+  });
+}
