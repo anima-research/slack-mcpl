@@ -4,11 +4,11 @@
  * request through the adapter's client, so it keeps the call's time and wait
  * budget like every other request. Backscroll keeps the adapter's own pager.
  */
-import { toolHint } from './tool-guidance.js';
 import { createHash } from 'node:crypto';
 import { formatSlackText, type SlackHistoryMessage } from './content.js';
 import { mimeShown, nameShown, toolResultJson, urlShown } from './framing.js';
 import { isNearMiss } from './near-miss.js';
+import { toolHint } from './tool-guidance.js';
 import type { HistoryMessage } from './slack-adapter.js';
 
 type Kind = 'history' | 'thread';
@@ -141,7 +141,8 @@ export function readOptions(args: Record<string, unknown>, kind: Kind, channelId
     }
     limits[name as keyof typeof READ_LIMITS] = value;
   }
-  const bound = "Take one from fetch_history's ids, or from a message's id=.";
+  const bound = toolHint("Take one from fetch_history's ids, or from a message's id=.", toolEnabled,
+    "Take one from a message's own id=.");
   const oldest = args.oldest === undefined ? undefined : timestamp(args.oldest, 'oldest', bound);
   const latest = args.latest === undefined ? undefined : timestamp(args.latest, 'latest', bound);
   if (oldest && latest && compareTs(oldest, latest) >= 0) throw refused('oldest must precede latest.');
@@ -155,8 +156,8 @@ export function readOptions(args: Record<string, unknown>, kind: Kind, channelId
     const ids = args.authorIds;
     if (!Array.isArray(ids) || ids.length < 1 || ids.length > 50) {
       throw refused(
-        "authorIds must contain 1 to 50 Slack user or bot IDs, as a message's authorId or authorBotId gives them, or find_user's " +
-          'userId.',
+        toolHint("authorIds must contain 1 to 50 Slack user or bot IDs, as a message's authorId or authorBotId gives them, or find_user's " +
+          'userId.', toolEnabled, "authorIds must contain 1 to 50 Slack user or bot IDs, from a message's authorId or authorBotId."),
       );
     }
     // The first malformed entry, by its place, so a call that passes many can
@@ -164,8 +165,9 @@ export function readOptions(args: Record<string, unknown>, kind: Kind, channelId
     const bad = ids.findIndex((id) => typeof id !== 'string' || !AUTHOR_ID.test(id));
     if (bad >= 0) {
       throw refused(
-        `authorIds[${bad}] must be a Slack user or bot ID, as a message's authorId or authorBotId gives it, or find_user's ` +
-          `userId, and this call passed ${passed(ids[bad])}.`,
+        toolHint(`authorIds[${bad}] must be a Slack user or bot ID, as a message's authorId or authorBotId gives it, or find_user's ` +
+          `userId, and this call passed ${passed(ids[bad])}.`, toolEnabled,
+          `authorIds[${bad}] must be a Slack user or bot ID, from a message's authorId or authorBotId, and this call passed ${passed(ids[bad])}.`),
       );
     }
   }

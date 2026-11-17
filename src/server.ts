@@ -64,6 +64,7 @@ import { ChannelManager, mcplChannelId, parseMcplChannelId, toDescriptor } from 
 import { StateTracker, type UploadedFile } from './state.js';
 import { CapabilityGrant } from './grant.js';
 import { McplRpcError, capabilityDenied } from './errors.js';
+import { toolHint } from './tool-guidance.js';
 import { explainSlackError } from './slack-errors.js';
 import { channelShown, mimeShown, nameShown, quotedLabel, senderText, toolResultJson, urlShown } from './framing.js';
 import { CHANNEL_IDS, NOTHING_RETURNED, PARENT_IDS, refuseUnknownArguments } from './history-read.js';
@@ -125,9 +126,7 @@ function dbg(tag: string, info: Record<string, unknown> = {}): void {
 /** Where the value of each argument a tool requires comes from, for a call that didn't give it. */
 const ARGUMENT_SOURCES = {
   channelId: `${CHANNEL_IDS}.`,
-  messageId:
-    "Take it from the message: its id= (reply_message takes its thread= when it shows one, or its rootTs in " +
-    "fetch_history and fetch_thread results), or from fetch_history's ids.",
+  messageId: "Copy the message's own id= from where it arrived, or from fetch_history or fetch_thread results.",
   threadTs: `${PARENT_IDS}.`,
   userId: "find_user returns each person's userId.",
   emoji: 'Pass an emoji name, such as thumbsup.',
@@ -719,8 +718,8 @@ export class SlackMcplServer {
   ): Promise<unknown> {
     switch (name) {
       case 'send_message': {
-        const channelId = this.requireString(args, 'channelId');
-        const content = this.requireString(args, 'content');
+        const channelId = this.requireString(name, args, 'channelId');
+        const content = this.requireString(name, args, 'content');
         const result = await this.posting(content, () => this.slack.sendMessage(channelId, content));
         this.stateTracker.recordSent(result.messageId, channelId, content);
         this.markOutbound(channelId);
@@ -728,9 +727,9 @@ export class SlackMcplServer {
       }
 
       case 'reply_message': {
-        const channelId = this.requireString(args, 'channelId');
-        const content = this.requireString(args, 'content');
-        const threadTs = this.requireString(args, 'messageId');
+        const channelId = this.requireString(name, args, 'channelId');
+        const content = this.requireString(name, args, 'content');
+        const threadTs = this.requireString(name, args, 'messageId');
         const result = await this.posting(content, () => this.slack.sendMessage(channelId, content, { threadTs }));
         this.stateTracker.recordSent(result.messageId, channelId, content);
         this.markOutbound(channelId);
@@ -738,8 +737,8 @@ export class SlackMcplServer {
       }
 
       case 'upload_file': {
-        const channelId = this.requireString(args, 'channelId');
-        const filename = this.requireString(args, 'filename');
+        const channelId = this.requireString(name, args, 'channelId');
+        const filename = this.requireString(name, args, 'filename');
         // An argument given as JSON null is not given, and an optional one
         // given as an empty string names nothing, so it isn't given either.
         // An optional one given as anything but a string is refused, rather
@@ -819,8 +818,8 @@ export class SlackMcplServer {
       }
 
       case 'send_dm': {
-        const userId = this.requireString(args, 'userId');
-        const content = this.requireString(args, 'content');
+        const userId = this.requireString(name, args, 'userId');
+        const content = this.requireString(name, args, 'content');
         const result = await this.posting(content, () => this.slack.sendDM(userId, content));
         this.stateTracker.recordSent(result.messageId, result.channelId, content);
         this.markOutbound(result.channelId);
@@ -828,9 +827,9 @@ export class SlackMcplServer {
       }
 
       case 'add_reaction': {
-        const channelId = this.requireString(args, 'channelId');
-        const messageId = this.requireString(args, 'messageId');
-        const emoji = this.requireString(args, 'emoji');
+        const channelId = this.requireString(name, args, 'channelId');
+        const messageId = this.requireString(name, args, 'messageId');
+        const emoji = this.requireString(name, args, 'emoji');
         try {
           await this.slack.addReaction(channelId, messageId, emoji);
         } catch (err) {
@@ -845,15 +844,15 @@ export class SlackMcplServer {
 
       case 'edit_message':
         await this.slack.editMessage(
-          this.requireString(args, 'channelId'),
-          this.requireString(args, 'messageId'),
-          this.requireString(args, 'content'),
+          this.requireString(name, args, 'channelId'),
+          this.requireString(name, args, 'messageId'),
+          this.requireString(name, args, 'content'),
         );
         return 'Message edited';
 
       case 'delete_message': {
-        const channelId = this.requireString(args, 'channelId');
-        const messageId = this.requireString(args, 'messageId');
+        const channelId = this.requireString(name, args, 'channelId');
+        const messageId = this.requireString(name, args, 'messageId');
         // Gone from Slack, deleted now or already, so no rollback tries to
         // delete it again. Any other failure keeps it recorded, for a
         // rollback to try.
@@ -893,19 +892,19 @@ export class SlackMcplServer {
       // requires, such as channelID, is named as one.
       case 'fetch_history': {
         refuseUnknownArguments(args, 'history');
-        const channelId = this.requireString(args, 'channelId', NOTHING_RETURNED);
+        const channelId = this.requireString(name, args, 'channelId', NOTHING_RETURNED);
         return await this.slack.readHistory(channelId, args);
       }
 
       case 'fetch_thread': {
         refuseUnknownArguments(args, 'thread');
-        const channelId = this.requireString(args, 'channelId', NOTHING_RETURNED);
-        const threadTs = this.requireString(args, 'threadTs', NOTHING_RETURNED);
+        const channelId = this.requireString(name, args, 'channelId', NOTHING_RETURNED);
+        const threadTs = this.requireString(name, args, 'threadTs', NOTHING_RETURNED);
         return await this.slack.readThread(channelId, threadTs, args);
       }
 
       case 'find_user': {
-        const query = this.requireString(args, 'query');
+        const query = this.requireString(name, args, 'query');
         const matches = await this.slack.findUsers(query);
         if (matches.length === 0) {
           return {
@@ -931,7 +930,7 @@ export class SlackMcplServer {
         // The bot token goes only to files.slack.com, never to workspace hosts:
         // parseSlackAttachmentUrl checks the url given, and fetch() drops
         // Authorization on a redirect to another origin (fetchAttachment.test.ts).
-        const url = parseSlackAttachmentUrl(this.requireString(args, 'url'));
+        const url = parseSlackAttachmentUrl(this.requireString(name, args, 'url'));
         const botToken = process.env.SLACK_BOT_TOKEN || '';
         const headers: Record<string, string> = botToken
           ? { Authorization: `Bearer ${botToken}` }
@@ -961,7 +960,7 @@ export class SlackMcplServer {
 
       case 'subscribe_channel': {
         this.ensureSubscriptionsLoaded();
-        const channelId = this.requireString(args, 'channelId');
+        const channelId = this.requireString(name, args, 'channelId');
         return this.subscribe(channelId)
           ? this.opts.subscribeMemberChannels
             ? `Unmuted conversation ${channelId}: its ambient messages arrive again.`
@@ -973,7 +972,7 @@ export class SlackMcplServer {
 
       case 'unsubscribe_channel': {
         this.ensureSubscriptionsLoaded();
-        const channelId = this.requireString(args, 'channelId');
+        const channelId = this.requireString(name, args, 'channelId');
         this.unsubscribedByAgent.add(channelId);
         return this.unsubscribe(channelId)
           ? this.opts.subscribeMemberChannels
@@ -1013,12 +1012,16 @@ export class SlackMcplServer {
     }
   }
 
-  private argumentSource(key: keyof typeof ARGUMENT_SOURCES): string {
-    if (key === 'channelId' && !this.toolEnabled('list_channels')) return "Copy channelId= from an incoming message.";
-    if (key === 'userId' && !this.toolEnabled('find_user')) return 'Copy a user ID from an incoming message.';
-    if ((key === 'messageId' || key === 'threadTs') &&
-        (!this.toolEnabled('fetch_history') || !this.toolEnabled('fetch_thread') || !this.toolEnabled('reply_message'))) {
-      return "Copy id= from the message; for a thread use its thread= when present, otherwise its id=.";
+  private argumentSource(tool: string, key: keyof typeof ARGUMENT_SOURCES): string {
+    if (key === 'channelId') return toolHint(ARGUMENT_SOURCES[key], this.toolEnabled, 'Copy channelId= from an incoming message.');
+    if (key === 'userId') return toolHint(ARGUMENT_SOURCES[key], this.toolEnabled, 'Copy a user ID from an incoming message.');
+    if (key === 'messageId' || key === 'threadTs') {
+      const parent = tool === 'reply_message' || tool === 'fetch_thread' || tool === 'upload_file';
+      return toolHint(
+        parent ? ARGUMENT_SOURCES.threadTs : ARGUMENT_SOURCES.messageId,
+        this.toolEnabled,
+        parent ? "Copy a reply's thread=, or a message's own id= when it shows no thread=." : "Copy the message's own id= from where it arrived.",
+      );
     }
     return ARGUMENT_SOURCES[key];
   }
@@ -1027,6 +1030,7 @@ export class SlackMcplServer {
    *  The refusal opens with `notDone`; the reads pass their own lead, since
    *  every failure of a read opens with it once the read runs. */
   private requireString(
+    tool: string,
     args: Record<string, unknown>,
     key: keyof typeof ARGUMENT_SOURCES,
     notDone = 'Nothing was done',
@@ -1040,7 +1044,7 @@ export class SlackMcplServer {
         : Array.isArray(v) ? 'passed an array'
         : typeof v === 'object' ? 'passed an object'
         : `passed a ${typeof v}`;
-      throw new Error(`${notDone}: ${key} must be a non-empty string, and this call ${passed}. ${this.argumentSource(key)}`);
+      throw new Error(`${notDone}: ${key} must be a non-empty string, and this call ${passed}. ${this.argumentSource(tool, key)}`);
     }
     return v;
   }
@@ -1565,7 +1569,8 @@ export class SlackMcplServer {
     // whether Slack counts a file's sharing message as one isn't known, hence
     // "may".
     const commentsLeft = toDelete.filter((item): item is UploadedFile => item.kind === 'file' && item.comment && !item.shareTs);
-    const ids = "which fetch_history shows, or fetch_thread if the file went into a thread";
+    const ids = toolHint("which fetch_history shows, or fetch_thread if the file went into a thread",
+      this.toolEnabled, "copied from the message's own id=");
     // What the agent can do about an item left, since no rollback tries it
     // again: one whose delete can pass can be deleted by its id, and one
     // Slack refused for good can't be, however often it's asked. A post this
@@ -1577,11 +1582,13 @@ export class SlackMcplServer {
     const namedMessageLeft = mayRemain.some((item) => item.kind === 'message' && !item.unnamed);
     const unnamedLeft = mayRemain.some((item) => item.unnamed);
     const remedy = [
-      ...(namedMessageLeft ? ['delete_message can try a message among them again, by its id'] : []),
+      ...(namedMessageLeft ? [toolHint('delete_message can try a message among them again, by its id', this.toolEnabled,
+        'someone with access must retry deleting the message in Slack, by its own id')] : []),
       ...(unnamedLeft
-        ? [namedMessageLeft
+        ? [toolHint(namedMessageLeft
           ? "fetch_history shows the id of one this server doesn't know (fetch_thread, for one in a thread)"
-          : 'delete_message can delete one by its id, which fetch_history shows (fetch_thread, for one in a thread)']
+          : 'delete_message can delete one by its id, which fetch_history shows (fetch_thread, for one in a thread)',
+          this.toolEnabled, 'someone with access must locate and delete the message in Slack, using its own id=')]
         : []),
       ...(mayRemain.some((item) => item.kind === 'file')
         ? ["no tool here deletes a file, and whoever runs this host can delete it with Slack's files.delete, by its id"]
@@ -1597,12 +1604,14 @@ export class SlackMcplServer {
         : []),
       ...(commentsLeft.length === 1
         ? [`The comment of uploaded file ${commentsLeft[0].fileId} may remain in conversation ${commentsLeft[0].channelId}: ` +
-          "this server doesn't know the message that shared the file, so no rollback can delete it. delete_message " +
-          `may, by that message's id, ${ids}`]
+          "this server doesn't know the message that shared the file, so no rollback can delete it. " +
+          toolHint(`delete_message may, by that message's id, ${ids}`, this.toolEnabled,
+            "Someone with access must locate and delete that message in Slack, using its own id=")]
         : commentsLeft.length > 1
           ? [`The comments of uploaded files ${commentsLeft.map((f) => `${f.fileId} in ${f.channelId}`).join(', ')} may remain: ` +
-            "this server doesn't know the messages that shared them, so no rollback can delete them. delete_message " +
-            `may, by those messages' ids, ${ids}`]
+            "this server doesn't know the messages that shared them, so no rollback can delete them. " +
+            toolHint(`delete_message may, by those messages' ids, ${ids}`, this.toolEnabled,
+              "Someone with access must locate and delete those messages in Slack, using their own id=")]
           : []),
     ];
     return {

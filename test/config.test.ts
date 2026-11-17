@@ -38,9 +38,9 @@ test('disabled tools parse exact comma-separated names, with empty entries ignor
 });
 
 test('unknown disabled tool names return a clean refusal naming the bad value', () => {
-  for (const bad of ['misspelled', 'SEND_MESSAGE', '*', 'fetch_history fetch_thread', 'bad\nname']) {
+  for (const bad of ['slack:send_message', 'slack__send_message', 'misspelled', 'SEND_MESSAGE', '*', 'fetch_history fetch_thread', 'bad\nname']) {
     assert.deepEqual(startupSettings(['--stdio'], { ...tokens, SLACK_DISABLED_TOOLS: `send_message,${bad}` }), {
-      refusal: `Unknown disabled tool: ${JSON.stringify(bad)}`,
+      refusal: `SLACK_DISABLED_TOOLS names an unknown tool: ${JSON.stringify(bad)}; tools are ${toolDefinitions.map(tool => tool.name).join(', ')}`,
     });
   }
 });

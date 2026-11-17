@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { cliInvocation } from './cliHarness.js';
+import { toolDefinitions } from '../src/tools.js';
 import { startupSettings } from '../src/config.js';
 
 /** Start the CLI with no inherited SLACK_* settings or real Slack traffic. */
@@ -20,7 +21,7 @@ test('index refuses a bad disabled tool on one line before contacting Slack', ()
   const run = startWith({ SLACK_DISABLED_TOOLS: 'send_message,bad\nname' });
   assert.equal(run.status, 1, run.stderr);
   assert.equal(run.stdout, '');
-  assert.equal(run.stderr, 'Unknown disabled tool: "bad\\nname"\n');
+  assert.equal(run.stderr, `SLACK_DISABLED_TOOLS names an unknown tool: "bad\\nname"; tools are ${toolDefinitions.map(tool => tool.name).join(', ')}\n`);
 });
 
 test('startup logs that no tools are disabled by default', () => {

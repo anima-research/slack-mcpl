@@ -57,7 +57,8 @@ export const SLACK_TAG_ONTOLOGY: TagOntology = {
 
 export function buildFeatureSets(disabledTools: readonly string[] = []): Record<string, FeatureSetDeclaration> {
   const messagingUses: CapabilityPath[] = [
-    'tools',
+    ...(toolDefinitions.some(tool => featureSetForTool(tool.name) === MESSAGING_FEATURE_SET && !disabledTools.includes(tool.name))
+      ? ['tools' as const] : []),
     'channels.register',
     'channels.lifecycle',
     'channels.publish',

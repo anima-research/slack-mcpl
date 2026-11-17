@@ -1,4 +1,3 @@
-import { toolHint } from './tool-guidance.js';
 /**
  * SlackAdapter — owns the Slack connection and all platform operations.
  *
@@ -25,6 +24,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { WebClient, ErrorCode, LogLevel, type Logger, type WebAPICallResult, type WebClientOptions } from '@slack/web-api';
 import { SocketModeClient } from '@slack/socket-mode';
 import { clock } from './clock.js';
+import { toolHint } from './tool-guidance.js';
 import { NOTHING_RETURNED, SLACK_TS, readBounded, readOptions, type HistoryReadResult, type ReadStop } from './history-read.js';
 import {
   formatSlackText,

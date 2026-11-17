@@ -235,7 +235,7 @@ for (const mcpl of [false, true]) {
 test('disabled-tool options are validated and copied at construction', async t => {
   for (const name of ['misspelled', 'bad\nname']) {
     assert.throws(() => new SlackMcplServer(fakeSlack().slack, { disabledTools: [name] }), {
-      message: `Unknown disabled tool: ${JSON.stringify(name)}`,
+      message: `SLACK_DISABLED_TOOLS names an unknown tool: ${JSON.stringify(name)}; tools are ${toolDefinitions.map(tool => tool.name).join(', ')}`,
     });
   }
   const opts = { disabledTools: ['send_message'] };

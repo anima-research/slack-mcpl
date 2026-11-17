@@ -314,7 +314,10 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
           'connection to Slack.';
   }
   if (code === undefined) return undefined;
-  const messageIds = hint(call.tool === 'reply_message' || call.tool === 'fetch_thread' || call.tool === 'upload_file' ? PARENT_IDS : MESSAGE_IDS, "Copy the message id=, or its thread= for a thread reply");
+  const parent = call.tool === 'reply_message' || call.tool === 'fetch_thread' || call.tool === 'upload_file';
+  const messageIds = hint(parent ? PARENT_IDS : MESSAGE_IDS, parent
+    ? "Copy a reply's thread=, or a message's own id= when it shows no thread="
+    : "Copy the message's own id= from where it arrived");
 
   // channels/publish names no message or thread itself: this server replies in
   // the thread of the last message from the conversation that the host took

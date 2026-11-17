@@ -133,3 +133,123 @@ for (const disabledTools of [[], ['send_dm'], ['subscribe_channel'], ['unsubscri
     await until(() => h.hostSaw.filter(r => r.method === method.PUSH_EVENT).length === 2, 'saved subscription ambient delivery');
   });
 }
+
+for (const disabledTools of [['fetch_history'], ['fetch_thread'], ['reply_message']]) {
+  test(`message targets never use the parent when ${disabledTools} is disabled`, async t => {
+    const h = connectHost(new SlackMcplServer(fakeSlack().slack, { disabledTools }));
+    t.after(() => h.close());
+    await initialize(h, false);
+    for (const name of ['delete_message', 'edit_message', 'add_reaction']) {
+      const text = await call(h.host, name, { channelId: 'C1' });
+      assert.match(text, /own id=/);
+      assert.doesNotMatch(text, /thread=|reply_message/);
+    }
+    if (!disabledTools.includes('reply_message')) {
+      assert.match(await call(h.host, 'reply_message', { channelId: 'C1', content: 'hi' }), /reply's thread=/);
+    }
+    if (!disabledTools.includes('fetch_thread')) {
+      assert.match(await call(h.host, 'fetch_thread', { channelId: 'C1' }), /reply's thread=/);
+    }
+  });
+}
+
+test('Slack timestamp errors distinguish message targets from thread parents', () => {
+  for (const disabled of ['fetch_history', 'fetch_thread']) {
+    for (const code of ['message_not_found', 'bad_timestamp']) {
+      for (const tool of ['delete_message', 'edit_message', 'add_reaction', 'reply_message', 'fetch_thread', 'upload_file']) {
+        const text = explainSlackError(
+          { code: 'slack_webapi_platform_error', data: { error: code } },
+          { tool, args: { channelId: 'C1', messageId: '100.2', threadTs: '100.1' }, toolEnabled: name => name !== disabled },
+        );
+        if (['reply_message', 'fetch_thread', 'upload_file'].includes(tool)) {
+          assert.match(text, /reply's thread=/);
+        } else {
+          assert.match(text, /own id=/);
+          assert.doesNotMatch(text, /thread=/);
+        }
+      }
+    }
+  }
+});
+
+test('messaging receives addressed traffic without tools when its tools are disabled', async t => {
+  // History and always-available tools may remain: only messaging's tools matter.
+  const disabledTools = ['send_message', 'reply_message', 'upload_file', 'send_dm', 'add_reaction', 'edit_message', 'delete_message'];
+  for (const disabled of [disabledTools, toolDefinitions.map(tool => tool.name)]) {
+    const fake = fakeSlack();
+    const h = connectHost(new SlackMcplServer(fake.slack, { disabledTools: disabled }));
+    t.after(() => h.close());
+    await initialize(h, true);
+    assert.ok(!buildFeatureSets(disabled)['slack.messaging'].uses.includes('tools'));
+    await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT.filter(path => path !== 'tools') });
+    await fake.socket.emitMessage(MENTION_EVENT);
+    await until(() => h.hostSaw.some(r => r.method === method.PUSH_EVENT), 'mention without tools capability');
+  }
+  assert.ok(buildFeatureSets(disabledTools.slice(1))['slack.messaging'].uses.includes('tools'));
+});
+
+test('read bounds and author validation do not recommend disabled tools', async t => {
+  const h = connectHost(new SlackMcplServer(fakeSlack().slack, { disabledTools: ['fetch_history'] }));
+  t.after(() => h.close());
+  await initialize(h, false);
+  for (const bound of ['oldest', 'latest']) {
+    const text = await call(h.host, 'fetch_thread', { channelId: 'C1', threadTs: '100.1', [bound]: 'bad' });
+    assert.doesNotMatch(text, /fetch_history/);
+    assert.match(text, /own id=/);
+  }
+  const users = connectHost(new SlackMcplServer(fakeSlack().slack, { disabledTools: ['find_user'] }));
+  t.after(() => users.close());
+  await initialize(users, false);
+  for (const authorIds of [[], ['bad']]) {
+    const text = await call(users.host, 'fetch_history', { channelId: 'C1', authorIds });
+    assert.doesNotMatch(text, /find_user/);
+    assert.match(text, /authorId or authorBotId/);
+  }
+});
+
+test('rollback preserves failure details without advertising disabled retry tools', async t => {
+  const fake = fakeSlack();
+  fake.slack.deleteMessage = async () => { throw new Error('connection lost'); };
+  const h = connectHost(new SlackMcplServer(fake.slack, { disabledTools: ['delete_message', 'fetch_history', 'fetch_thread'] }));
+  t.after(() => h.close());
+  await initialize(h, true);
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  const sent = await h.host.sendRequest('tools/call', {
+    name: 'send_message', arguments: { channelId: 'C1', content: 'hello' },
+  }) as { state: { parent: string } };
+  const result = await h.host.sendRequest(method.STATE_ROLLBACK, {
+    featureSet: 'slack.messaging', checkpoint: sent.state.parent,
+  }) as { reason: string };
+  assert.doesNotMatch(result.reason, /delete_message|fetch_history|fetch_thread/);
+  assert.match(result.reason, /May remain/);
+  assert.match(result.reason, /100\.1/);
+  assert.match(result.reason, /someone with access/);
+});
+
+for (const disabledTools of [['fetch_history'], ['fetch_thread'], ['delete_message'], ['delete_message', 'fetch_history', 'fetch_thread']]) {
+  test(`rollback upload-comment hints respect ${disabledTools}`, async t => {
+    const fake = fakeSlack();
+    let files = 0;
+    fake.slack.uploadFile = async () => ({ fileId: `F${++files}` });
+    const h = connectHost(new SlackMcplServer(fake.slack, { disabledTools }));
+    t.after(() => h.close());
+    await initialize(h, true);
+    await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+    for (const count of [1, 2]) {
+      let parent = '';
+      for (let i = 0; i < count; i++) {
+        const sent = await h.host.sendRequest('tools/call', {
+          name: 'upload_file', arguments: { channelId: 'C1', filename: 'a.txt', content: 'a', comment: 'hello' },
+        }) as { state: { parent: string } };
+        if (i === 0) parent = sent.state.parent;
+      }
+      const result = await h.host.sendRequest(method.STATE_ROLLBACK, {
+        featureSet: 'slack.messaging', checkpoint: parent,
+      }) as { reason: string };
+      for (const name of disabledTools) assert.ok(!result.reason.includes(name), result.reason);
+      assert.match(result.reason, /may remain/);
+      assert.match(result.reason, /C1/);
+      assert.match(result.reason, /own id=/);
+    }
+  });
+}
