@@ -29,11 +29,12 @@ test('policy composition: allowed reaction removal uses fresh info and reactions
   assert.equal(await f.adapter.removeReaction('C1', '1.0', ':eyes:'), true);
   assert.deepEqual(f.calls, [
     { method: 'info', args: { channel: 'C1' } },
+    { method: 'info', args: { channel: 'C1' } },
     { method: 'unreact', args: { channel: 'C1', timestamp: '1.0', name: 'eyes' } },
   ]);
   f.state.conversation.is_member = false;
   await assert.rejects(f.adapter.removeReaction('C1', '1.0', ':eyes:'));
-  assert.deepEqual(f.methods(), ['info', 'unreact', 'info']);
+  assert.deepEqual(f.methods(), ['info', 'info', 'unreact', 'info']);
 });
 
 test('policy composition: reaction removal rechecks after a pending ACK add', { skip: !policyPresent }, async t => {
@@ -59,4 +60,35 @@ test('legacy reaction removal effect and result bytes remain unchanged', async t
   const result = await f.slack.removeReaction('C1', '1.0', ':eyes:');
   assert.equal(JSON.stringify({ result, effects: f.reactions, reads: f.reads }),
     '{"result":true,"effects":["remove:C1:1.0:eyes"],"reads":[]}');
+});
+
+// Exercise the optional composition surface even before #56's fixture lands.
+test('policy composition: revoked membership denies joining successful ACK cleanup', async t => {
+  const f = fakeSlack({ ackReaction: 'eyes' });
+  const policy = f.slack as unknown as {
+    hasAccessPolicy: boolean;
+    requireWritableConversation(id: string, scope: string, notDone: string): Promise<void>;
+    web: { reactions: { remove(): Promise<void> } };
+  };
+  let admitted = true;
+  const checks: unknown[] = [];
+  Object.defineProperty(policy, 'hasAccessPolicy', { value: true });
+  policy.requireWritableConversation = async (id, scope, notDone) => {
+    checks.push({ id, scope, notDone });
+    if (!admitted) throw new Error('No reaction was removed: membership revoked');
+  };
+  let release!: () => void;
+  let effects = 0;
+  policy.web.reactions.remove = async () => { effects++; await new Promise<void>(r => { release = r; }); };
+  t.after(async () => { release?.(); await f.slack.stop(); });
+  await f.slack.acknowledge('C1', '1.0');
+  const clearing = f.slack.clearAck('C1');
+  while (!release) await new Promise(resolve => setImmediate(resolve));
+  admitted = false;
+  const denied = assert.rejects(f.slack.removeReaction('C1', '1.0', 'eyes'), /membership revoked/);
+  await new Promise(resolve => setImmediate(resolve));
+  release();
+  await Promise.all([clearing, denied]);
+  assert.deepEqual(checks, [{ id: 'C1', scope: 'reactions:write', notDone: 'No reaction was removed' }]);
+  assert.equal(effects, 1, 'only the already-running automatic cleanup reaches Slack');
 });

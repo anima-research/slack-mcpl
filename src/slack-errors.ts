@@ -214,7 +214,7 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
     }
     if (call.tool === 'remove_reaction') {
       return `${cause}, so whether the reaction was removed is unknown${note}. Removing it again is safe: ` +
-        'if it is already gone, remove_reaction reports no_reaction and changes nothing.';
+        'if it is already gone, remove_reaction succeeds with "Nothing changed".';
     }
     return (
       `${cause}, so whether the reaction was added is unknown${note}. Adding it again is safe: if it's there, ` +
@@ -405,11 +405,11 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
         : `${lead}: Slack refused the text as too long. Split it into shorter messages and send them in order.`;
     case 'no_reaction':
       return call.tool === 'remove_reaction'
-        ? "No reaction was removed: this bot has no such reaction on that message. Only this bot's own reactions can be removed."
+        ? `${lead}: this bot has no such reaction on that message. Only this bot's own reactions can be removed.`
         : undefined;
     case 'invalid_name': {
       const emoji = given('emoji');
-      // Slack judged the name add_reaction sent: the one given, with every colon
+      // Slack judged the name the reaction tool sent: the one given, with every colon
       // removed. A colon between other characters, as in a skin tone, means
       // the name Slack judged isn't one anyone chose.
       const sent = emoji === undefined ? undefined : reactionName(emoji);
@@ -424,8 +424,8 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
         (inside
           ? " This server removes every colon from a name, so a name with a colon inside, such as a skin tone's, " +
             `can't be ${call.tool === 'remove_reaction' ? 'removed' : 'added'} here. Pass a name Slack's emoji picker shows, such as thumbsup, white_check_mark or eyes.`
-          : " Pass a name Slack's emoji picker shows, such as thumbsup, white_check_mark or eyes; a custom emoji " +
-            'has to be added to the workspace first.')
+          : " Pass a name Slack's emoji picker shows, such as thumbsup, white_check_mark or eyes" +
+            (call.tool === 'remove_reaction' ? '.' : '; a custom emoji has to be added to the workspace first.'))
       );
     }
     case 'restricted_action_thread_only_channel':

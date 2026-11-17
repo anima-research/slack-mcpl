@@ -100,13 +100,13 @@ function adapterFixture(opts: { sendChannels?: string[]; disableDms?: boolean; e
   return { slack, calls, setError: (value?: string) => { error = value; } };
 }
 
-test('remove_reaction maps no_reaction to a fixed error for absent or other-user reactions', async t => {
+test('remove_reaction maps no_reaction to success for absent or other-user reactions', async t => {
   const f = adapterFixture({ error: 'no_reaction' });
   const h = connectHost(new SlackMcplServer(f.slack)); t.after(() => h.close());
   await initialize(h, false);
   const result = await call(h, 'remove_reaction', args);
-  assert.equal(result.isError, true);
-  assert.equal(result.content[0]!.text, "An API error occurred: no_reaction\n\nNo reaction was removed: this bot has no such reaction on that message. Only this bot's own reactions can be removed.");
+  assert.notEqual(result.isError, true);
+  assert.equal(result.content[0]!.text, 'Nothing changed: message 1.0 has no :eyes: reaction from this bot');
 });
 
 for (const code of ['missing_scope', 'channel_not_found', 'invalid_name', 'internal_error']) {
@@ -117,6 +117,10 @@ for (const code of ['missing_scope', 'channel_not_found', 'invalid_name', 'inter
     const result = await call(h, 'remove_reaction', args);
     assert.equal(result.isError, true);
     assert.match(result.content[0]!.text, code === 'internal_error' ? /whether the reaction was removed is unknown/ : /No reaction was removed:/);
+    if (code === 'internal_error') {
+      assert.match(result.content[0]!.text, /remove_reaction succeeds with "Nothing changed"/);
+      assert.doesNotMatch(result.content[0]!.text, /reports no_reaction/);
+    }
   });
 }
 
@@ -242,7 +246,7 @@ test('manual removal joins automatic timer cleanup first, without another Slack 
   release();
   const result = await removed;
   assert.notEqual(result.isError, true);
-  assert.equal(result.content[0]!.text, 'Nothing changed: ACK cleanup for message 1.0 already finished.');
+  assert.equal(result.content[0]!.text, 'Nothing changed: message 1.0 has no :eyes: reaction from this bot');
   assert.deepEqual(f.calls, ['add', 'remove:1.0:eyes']);
   t.mock.timers.tick(20 * 60 * 1000);
   await flush();
@@ -437,7 +441,7 @@ test('joining automatic no_reaction confirms absence without a second Slack call
   release();
   const result = await removed;
   assert.notEqual(result.isError, true);
-  assert.equal(result.content[0]!.text, 'Nothing changed: ACK cleanup for message 1.0 already finished.');
+  assert.equal(result.content[0]!.text, 'Nothing changed: message 1.0 has no :eyes: reaction from this bot');
   assert.deepEqual(f.calls, ['add', 'remove:1.0:eyes']);
 });
 
@@ -463,3 +467,127 @@ test('overlapping manual removals share confirmed ACK removal at the adapter', a
   assert.equal(present, false);
   assert.deepEqual(f.calls, ['add', 'remove:1.0:eyes'], 'exactly one reactions.remove');
 });
+
+for (const alreadyPresent of [true, false]) {
+  test(`agent adopts the ACK through the real server (${alreadyPresent ? 'already_reacted' : 'success'})`, async t => {
+    let present = false;
+    const effects: string[] = [];
+    const web = {
+      reactions: {
+        add: async () => {
+          effects.push('add');
+          if (present) throw refusal('already_reacted');
+          present = true;
+        },
+        remove: async () => { effects.push('remove'); present = false; },
+      },
+    } as unknown as SlackWebLike;
+    const slack = new SlackAdapter(web, { on() {}, async start() {}, async disconnect() {} }, 'UBOT', 'test',
+      undefined, undefined, false, 'eyes');
+    const h = connectHost(new SlackMcplServer(slack));
+    t.after(async () => { await h.close(); await slack.stop(); });
+    await initialize(h, false);
+    await slack.acknowledge('C1', '1.0');
+    if (!alreadyPresent) present = false; // e.g. another client removed the ACK
+    const result = await call(h, 'add_reaction', args);
+    assert.notEqual(result.isError, true);
+    await slack.clearAck('C1'); // next confirmed post's cleanup
+    assert.equal(present, true, 'the adopted reaction must survive cleanup');
+    assert.deepEqual(effects, ['add', 'add']);
+  });
+}
+
+test('agent adoption waits for in-flight ACK removal before re-adding', async t => {
+  let release!: () => void;
+  const f = adapterFixture({ onRemove: () => new Promise<void>(r => { release = r; }) });
+  t.after(async () => { release?.(); await f.slack.stop(); });
+  await f.slack.acknowledge('C1', '1.0');
+  const clearing = f.slack.clearAck('C1');
+  await flush();
+  const adopting = f.slack.addReaction('C1', '1.0', ':eyes:');
+  await flush();
+  assert.deepEqual(f.calls, ['add', 'remove:1.0:eyes']);
+  release();
+  await Promise.all([clearing, adopting]);
+  await f.slack.clearAck('C1');
+  assert.deepEqual(f.calls, ['add', 'remove:1.0:eyes', 'add']);
+});
+
+for (const ackReaction of [undefined, 'eyes']) {
+  test(`offered reaction/read descriptions explain configured ACK (${ackReaction ?? 'unset'})`, async t => {
+    const h = harness({ ackReaction }); t.after(() => h.close());
+    await initialize(h, false);
+    const { tools } = await h.host.sendRequest('tools/list', {}) as { tools: Array<{ name: string; description: string }> };
+    for (const name of ['fetch_history', 'fetch_thread', 'add_reaction', 'remove_reaction']) {
+      const description = tools.find(tool => tool.name === name)!.description;
+      if (ackReaction) {
+        assert.match(description, /eyes/);
+        assert.match(description, /added automatically while a message is being handled/);
+        assert.match(description, /removed after the bot's next confirmed post unless the agent adds it itself/);
+      } else {
+        assert.doesNotMatch(description, /added automatically/);
+      }
+    }
+  });
+}
+
+test('three manual callers single-flight after the first ACK removal fails', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let releaseFirst!: () => void;
+  let releaseSecond!: () => void;
+  let attempts = 0;
+  const f = adapterFixture({ onRemove: async () => {
+    const attempt = ++attempts;
+    if (attempt === 1) {
+      await new Promise<void>(r => { releaseFirst = r; });
+      throw refusal('internal_error');
+    }
+    if (attempt === 2) await new Promise<void>(r => { releaseSecond = r; });
+  } });
+  t.after(async () => { releaseFirst?.(); releaseSecond?.(); await f.slack.stop(); });
+  await f.slack.acknowledge('C1', '1.0');
+  const first = f.slack.removeReaction('C1', '1.0', 'eyes');
+  await flush();
+  const second = f.slack.removeReaction('C1', '1.0', 'eyes');
+  const third = f.slack.removeReaction('C1', '1.0', 'eyes');
+  const settled = Promise.allSettled([first, second, third]);
+  await flush();
+  assert.equal(attempts, 1);
+  releaseFirst();
+  await flush();
+  const duringRetry = attempts;
+  releaseSecond();
+  const results = await settled;
+  assert.equal(duringRetry, 2, 'the third caller must join the second attempt');
+  assert.equal(results[0]!.status, 'rejected');
+  assert.deepEqual(results.slice(1), [{ status: 'fulfilled', value: true }, { status: 'fulfilled', value: false }]);
+  t.mock.timers.tick(20 * 60 * 1000);
+  await flush();
+  assert.equal(attempts, 2, 'no orphaned retry');
+});
+
+for (const name of ['fetch_history', 'fetch_thread']) {
+  test(`${name} empty reaction names do not consume the cap`, async t => {
+    const h = harness({ historyMessages: [{ ts: '1.0', reactions: [
+      ...Array.from({ length: 20 }, () => ({ name: '' })), { name: 'eyes', count: 1, users: ['UBOT'] },
+    ] }] });
+    t.after(() => h.close());
+    await initialize(h, false);
+    const result = await call(h, name, { channelId: 'C1', ...(name === 'fetch_thread' ? { threadTs: '1.0' } : {}) });
+    const message = JSON.parse(result.content[0]!.text).messages[0];
+    assert.deepEqual(message.reactions, [{ name: 'eyes', count: 1, own: true }]);
+    assert.equal(message.reactionsOmitted, undefined);
+  });
+}
+
+for (const emoji of [':eyes:', 'thumbsup::skin-tone-3']) {
+  test(`remove invalid_name gives removal-specific advice for ${emoji}`, async t => {
+    const f = adapterFixture({ error: 'invalid_name' });
+    const h = connectHost(new SlackMcplServer(f.slack)); t.after(() => h.close());
+    await initialize(h, false);
+    const result = await call(h, 'remove_reaction', { ...args, emoji });
+    assert.equal(result.isError, true);
+    assert.doesNotMatch(result.content[0]!.text, /has to be added to the workspace first/);
+    if (emoji.includes('skin-tone')) assert.match(result.content[0]!.text, /can't be removed here/);
+  });
+}
