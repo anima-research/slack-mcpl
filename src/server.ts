@@ -1014,7 +1014,7 @@ export class SlackMcplServer {
 
   private argumentSource(tool: string, key: keyof typeof ARGUMENT_SOURCES): string {
     if (key === 'channelId') return toolHint(ARGUMENT_SOURCES[key], this.toolEnabled, 'Copy channelId= from an incoming message.');
-    if (key === 'userId') return toolHint(ARGUMENT_SOURCES[key], this.toolEnabled, 'Copy a user ID from an incoming message.');
+    if (key === 'userId') return toolHint(ARGUMENT_SOURCES[key], this.toolEnabled, 'Copy a uid: from a mention.' + toolHint(" Or copy a message\'s authorId from fetch_history results.", this.toolEnabled));
     if (key === 'messageId' || key === 'threadTs') {
       const parent = tool === 'reply_message' || tool === 'fetch_thread' || tool === 'upload_file';
       return toolHint(
@@ -1569,8 +1569,13 @@ export class SlackMcplServer {
     // whether Slack counts a file's sharing message as one isn't known, hence
     // "may".
     const commentsLeft = toDelete.filter((item): item is UploadedFile => item.kind === 'file' && item.comment && !item.shareTs);
-    const ids = toolHint("which fetch_history shows, or fetch_thread if the file went into a thread",
-      this.toolEnabled, "copied from the message's own id=");
+    const reads = [
+      ...(this.toolEnabled('fetch_history') ? ['fetch_history'] : []),
+      ...(this.toolEnabled('fetch_thread') ? ['fetch_thread for a message in a thread'] : []),
+    ].join(' or ');
+    const locate = reads && this.toolEnabled('delete_message')
+      ? `Use ${reads} to locate the message, then delete_message with its id.`
+      : 'Someone with access must locate and delete the message in Slack.';
     // What the agent can do about an item left, since no rollback tries it
     // again: one whose delete can pass can be deleted by its id, and one
     // Slack refused for good can't be, however often it's asked. A post this
@@ -1585,10 +1590,7 @@ export class SlackMcplServer {
       ...(namedMessageLeft ? [toolHint('delete_message can try a message among them again, by its id', this.toolEnabled,
         'someone with access must retry deleting the message in Slack, by its own id')] : []),
       ...(unnamedLeft
-        ? [toolHint(namedMessageLeft
-          ? "fetch_history shows the id of one this server doesn't know (fetch_thread, for one in a thread)"
-          : 'delete_message can delete one by its id, which fetch_history shows (fetch_thread, for one in a thread)',
-          this.toolEnabled, 'someone with access must locate and delete the message in Slack, using its own id=')]
+        ? [locate]
         : []),
       ...(mayRemain.some((item) => item.kind === 'file')
         ? ["no tool here deletes a file, and whoever runs this host can delete it with Slack's files.delete, by its id"]
@@ -1605,13 +1607,11 @@ export class SlackMcplServer {
       ...(commentsLeft.length === 1
         ? [`The comment of uploaded file ${commentsLeft[0].fileId} may remain in conversation ${commentsLeft[0].channelId}: ` +
           "this server doesn't know the message that shared the file, so no rollback can delete it. " +
-          toolHint(`delete_message may, by that message's id, ${ids}`, this.toolEnabled,
-            "Someone with access must locate and delete that message in Slack, using its own id=")]
+          locate]
         : commentsLeft.length > 1
           ? [`The comments of uploaded files ${commentsLeft.map((f) => `${f.fileId} in ${f.channelId}`).join(', ')} may remain: ` +
             "this server doesn't know the messages that shared them, so no rollback can delete them. " +
-            toolHint(`delete_message may, by those messages' ids, ${ids}`, this.toolEnabled,
-              "Someone with access must locate and delete those messages in Slack, using their own id=")]
+            locate]
           : []),
     ];
     return {

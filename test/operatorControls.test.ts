@@ -256,7 +256,7 @@ test('disabled-tool options are validated and copied at construction', async t =
 test('index wires SLACK_DISABLED_TOOLS through to the stdio server', { timeout: 30_000 }, async t => {
   const { args, options } = cliInvocation({ SLACK_DISABLED_TOOLS: 'send_message, fetch_history,send_message' }, true);
   const child = spawn(process.execPath, args, { ...options, stdio: ['pipe', 'pipe', 'pipe'] });
-  const exited = once(child, 'exit');
+  const exited = once(child, 'close');
   let stderr = '';
   child.stderr.setEncoding('utf8').on('data', chunk => { stderr += chunk; });
   const host = McplConnection.fromStreams(child.stdout, child.stdin);

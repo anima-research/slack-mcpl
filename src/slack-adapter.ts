@@ -1503,7 +1503,7 @@ export class SlackAdapter {
     if (!channelId) {
       throw new Error(
         `Nothing was sent: Slack opened no DM with user ${userId}. ` +
-          this.hint("Check the id with find_user, which returns each person's userId, and call again.", "Copy the user ID from an incoming message."),
+          this.hint("Check the id with find_user, which returns each person's userId, and call again.", "Copy a uid: from a mention." + this.hint(" Or copy a message's authorId from fetch_history results.")),
       );
     }
     const { messageId } = await this.sendMessage(channelId, text, {}, 'Nothing was sent');

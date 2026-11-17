@@ -249,7 +249,7 @@ for (const disabledTools of [['fetch_history'], ['fetch_thread'], ['delete_messa
       for (const name of disabledTools) assert.ok(!result.reason.includes(name), result.reason);
       assert.match(result.reason, /may remain/);
       assert.match(result.reason, /C1/);
-      assert.match(result.reason, /own id=/);
+      assert.match(result.reason, /(?:Use .* to locate the message, then delete_message with its id\.|Someone with access must locate and delete the message in Slack\.)/);
     }
   });
 }

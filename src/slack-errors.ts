@@ -331,7 +331,7 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
       ? `${lead}: this server replies in the thread of the last message from a conversation that reached you. ` +
           `Here that was the thread under message ${thread} in ${conversation}, and Slack refused it. ` +
           `Another publish to ${conversation} now would go to the same thread. ` +
-          hint('send_message posts in the conversation itself, and reply_message under a message you choose.')
+          hint('send_message posts in the conversation itself. ') + hint('reply_message posts under a message you choose.')
       : undefined;
   }
 
@@ -397,7 +397,7 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
     case 'edit_window_closed':
       return (
         `${lead}: this workspace doesn't allow editing a message this old, and calling again won't change that. ` +
-        hint('To correct it, post a new message, or use reply_message with its id to put the correction under it.')
+        'To correct it, post a new message.' + hint(' Or use reply_message with its id to put the correction under it.')
       );
     case 'msg_too_long':
       return call.tool === 'edit_message'
