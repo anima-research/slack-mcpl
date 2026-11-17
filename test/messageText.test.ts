@@ -157,7 +157,7 @@ for (const shape of ['attachment', 'section', 'rich_text'] as const) {
 
 test('canonical mention dedup resolves labelled/unlabelled attachment and rich_text mentions', async () => {
   for (const [text, mirror] of [['<@U2|alice>', '<@U2>'], ['<@U2>', '<@U2|alice>']]) {
-    const result = await expectText({ text, attachments: [{ text: mirror }], blocks: [
+    const result = await expectText({ text, app_id: 'A1', attachments: [{ text: mirror }], blocks: [
       { type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [{ type: 'user', user_id: 'U2' }] }] },
     ] }, '@alice (uid:U2)');
     assert.equal(result!.content, text, 'raw original must be untouched');
@@ -207,7 +207,7 @@ test('review rich usergroup date and toned emoji preserved and deduplicated', as
   const body = '@S1 Today :thumbsup::skin-tone-2:';
   const blocks = [richBlock(richSection({ type: 'usergroup', usergroup_id: 'S1' }, literal(' '), { type: 'date', fallback: 'Today' }, literal(' '), { type: 'emoji', name: 'thumbsup', skin_tone: 2 }))];
   await expectText({ blocks }, body);
-  assert.equal((await expectText({ text: body, blocks }, body))!.content, body);
+  assert.equal((await expectText({ text: body, app_id: 'A1', blocks }, body))!.content, body);
 });
 
 test('review rich literal escapes cannot become mentions or entities', async () => {
@@ -294,6 +294,10 @@ test('review fragment passes the actual release validator', () => {
     // or repository version/Unreleased state make this validation pass.
     const name = 'readable-message-payloads.added.md';
     const fragment = readFileSync(join('test/fixtures', name), 'utf8');
+    // Until release consumes it, validate the shipped fragment too.
+    if (existsSync(join('changelog.d', name))) {
+      assert.equal(readFileSync(join('changelog.d', name), 'utf8'), fragment);
+    }
     writeFileSync(join(root, 'package.json'), JSON.stringify({ version: '1.2.3' }));
     writeFileSync(join(root, 'CHANGELOG.md'), '# Changelog\n\n## Unreleased\n');
     mkdirSync(join(root, 'changelog.d'));
@@ -631,7 +635,7 @@ test('backscroll truncates raw supplemental entities before formatting', async (
   const body = 'x'.repeat(1985) + '&amp;' + 'z'.repeat(40);
   const result = await shaped({ attachments: [{ text: body }] });
   assert.equal(result.contents[0], 'x'.repeat(1985) + '&' + 'z'.repeat(40));
-  assert.equal(result.contents[2], 'x'.repeat(1985) + '&am' + '[…truncated]');
+  assert.equal(result.contents[2], 'x'.repeat(1985) + '[…truncated]');
 });
 
 test('top-level omission labels retain input order and can displace later readable blocks', () => {
@@ -763,8 +767,64 @@ test('prose dedup retains row boundaries on every delivery path', async () => {
 
 test('payload docs describe preview and provenance policies accurately', () => {
   const readme = readFileSync('README.md', 'utf8');
-  assert.match(readme, /App unfurls are skipped, except message shares\. Classic link previews are\nskipped when/);
-  assert.match(readme, /preserve internal line breaks/);
-  const added = readFileSync('test/fixtures/readable-message-payloads.added.md', 'utf8');
+  assert.ok(readme.includes('App unfurls are skipped, except message shares. Classic link previews are\nskipped when `from_url` matches an extracted original URL, decoding Slack entities\nand trimming trailing sentence punctuation from bare URLs.'));
+  assert.ok(readme.includes('channel/user IDs rather than labels; preserve internal line breaks in prose\n(normalizing line-ending spellings); and preserve other code whitespace.'));
+  const fragmentPath = 'changelog.d/readable-message-payloads.added.md';
+  const added = readFileSync(existsSync(fragmentPath) ? fragmentPath : 'test/fixtures/readable-message-payloads.added.md', 'utf8');
   assert.match(added, /unless original text is non-whitespace and\n  client_msg_id is a string/);
+});
+
+for (const gap of [' \n', '\t\r\n', '\n']) {
+  test(`multiline mirrors ignore line-end gaps ${JSON.stringify(gap)} in both directions`, async () => {
+    const spaced = 'first' + gap + 'second';
+    const compact = 'first\nsecond';
+    for (const [text, mirror] of [[spaced, compact], [compact, spaced]]) {
+      await expectText({text, attachments: [{text: mirror}]}, text);
+      await expectText({text, app_id: 'A1', blocks: [richBlock(richSection(literal(mirror)))]}, text);
+    }
+  });
+}
+
+test('rich section joins reuse a trailing line break, preserving intentional blank rows', async () => {
+  for (const ending of ['\n', '\r\n', '\n\n']) {
+    const text = 'first' + ending + 'second';
+    const blocks = [richBlock(richSection(literal('first' + ending)), richSection(literal('second')))];
+    await expectText({text, app_id: 'A1', blocks}, text);
+    await expectText({blocks}, text);
+    await expectText({text: '', attachments: [{text}], app_id: 'A1', blocks}, text);
+  }
+});
+
+test('bullet comparison normalizes line endings before glyphs', async () => {
+  for (const br of ['\r', '\u2028']) {
+    for (const [a, b] of [['-', '•'], ['•', '-']]) {
+      const text = 'first' + br + a + ' second';
+      await expectText({text, blocks: [section('first' + br + b + ' second')]}, text);
+    }
+  }
+});
+
+test('suffix cuts never split complete Slack angle tokens or entities', () => {
+  for (const token of ['<@U123>', '<https://example.com|label>', '&amp;', '&lt;', '&gt;']) {
+    for (let cut = 1; cut < token.length; cut++) {
+      const lead = 'prefix ';
+      const max = lead.length + cut + '[…truncated]'.length;
+      assert.equal(renderMessageText({blocks: [{type: 'markdown', text: lead + token + ' tail'.repeat(20)}]}, max), lead + '[…truncated]');
+    }
+    const lead = 'x'.repeat(MAX_MESSAGE_TEXT_APPEND - 2);
+    assert.equal(renderMessageText({blocks: [{type: 'markdown', text: lead + token}]}), lead.slice(0, MAX_MESSAGE_TEXT_APPEND - '[…truncated]'.length) + '[…truncated]');
+  }
+});
+
+test('dedup keeps intentional blank prose rows distinct from a single break', async () => {
+  for (const [text, mirror] of [['first\nsecond', 'first\n\nsecond'], ['first\n\nsecond', 'first\nsecond']]) {
+    await expectText({text, attachments: [{text: mirror}]}, text + '\n' + mirror);
+  }
+});
+
+test('channel label expansion cannot leave a partial angle token', () => {
+  const text = '<#C1|' + 'x'.repeat(MAX_MESSAGE_TEXT_APPEND) + '>';
+  const rendered = renderMessageText({text, app_id: 'A1', blocks: [richBlock(richSection(literal('Channel: '), {type: 'channel', channel_id: 'C1'}))]});
+  const suffix = rendered.slice(text.length);
+  assert.equal(suffix, '\nChannel: […truncated]');
 });

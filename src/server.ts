@@ -267,7 +267,8 @@ export class SlackMcplServer {
    *  the host didn't take, unless another conversation is current by then. */
   private lastChannelId: string | null = null;
 
-  /** How many backscroll messages to fetch on first interaction. Tunable via
+  /** How many backscroll messages to fetch for addressed delivery since the
+   *  accepted watermark (rejected delivery does not advance it). Tunable via
    *  SLACK_BACKSCROLL_LIMIT; only integers in [1, 1000] are accepted; otherwise default 50. */
   private get backscrollLimit(): number {
     const raw = process.env.SLACK_BACKSCROLL_LIMIT;

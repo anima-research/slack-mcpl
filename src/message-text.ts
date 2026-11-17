@@ -32,17 +32,30 @@ function normalized(value: string): string {
       if (parts[i + 1] === fence) part = part.replace(/\r?\n$/, '');
       return part;
     }
-    return part.replace(i === 0 ? /(^|\n)([ \t]*)[•◦▪] /g : /(\n)([ \t]*)[•◦▪] /g, '$1$2- ').replace(/_\*([^*_\n]+)\*_/g, '*_$1_*').replace(LINE_BREAK, '\n').replace(/[^\S\n]+/g, ' ');
+    return part.replace(LINE_BREAK, '\n')
+      .replace(i === 0 ? /(^|\n)([ \t]*)[•◦▪] /g : /(\n)([ \t]*)[•◦▪] /g, '$1$2- ')
+      .replace(/_\*([^*_\n]+)\*_/g, '*_$1_*').replace(/[^\S\n]+/g, ' ').replace(/ +(?=\n)/g, '');
   }).join('').trim();
 }
 
-/** Truncate a UTF-16 prefix without splitting a supplementary code point.
+/** Truncate without splitting a supplementary code point, complete angle token,
+ * or Slack entity.
  * Existing malformed input is not repaired; truncation must not create it. */
 function prefix(text: string, limit: number): string {
-  let end = Math.min(text.length, limit);
+  let end = Math.max(0, Math.min(text.length, limit));
   if (end > 0 && end < text.length &&
       text.charCodeAt(end - 1) >= 0xD800 && text.charCodeAt(end - 1) <= 0xDBFF &&
       text.charCodeAt(end) >= 0xDC00 && text.charCodeAt(end) <= 0xDFFF) end--;
+  if (end < text.length) {
+    const open = text.lastIndexOf('<', end - 1);
+    if (open >= 0 && text.lastIndexOf('>', end - 1) < open) {
+      const close = text.indexOf('>', end);
+      if (close >= 0 && !/[<\r\n\u000b\u000c\u0085\u2028\u2029]/.test(text.slice(open + 1, close))) end = open;
+    }
+    const amp = text.lastIndexOf('&', end - 1);
+    if (amp >= 0 && ['&amp;', '&lt;', '&gt;'].some(entity =>
+      text.startsWith(entity, amp) && amp + entity.length > end)) end = amp;
+  }
   return text.slice(0, end);
 }
 
@@ -87,11 +100,13 @@ export function renderMessageText(
     let index = 0;
     for (const value of values) yield render(value, index++);
   }
-  function join(values: Iterable<string>, separator = '\n'): string {
+  function join(values: Iterable<string>, separator = '\n', reuseLineBreak = false): string {
     let result = '';
     for (const value of values) {
       if (!value) continue;
-      const part = (result ? separator : '') + value;
+      // Only rich containers reuse a section's existing break. Never collapse
+      // blank rows in ordinary body text or table joins.
+      const part = (result && !(reuseLineBreak && /[\n\r\u000b\u000c\u0085\u2028\u2029]$/.test(result)) ? separator : '') + value;
       const remaining = renderLimit - result.length;
       result += prefix(part, remaining);
       if (part.length > remaining) { truncated = true; break; }
@@ -103,7 +118,7 @@ export function renderMessageText(
   function rich(v: unknown, depth = 0): string {
     if (!visit() || depth > 12) { truncated = true; return ''; }
     const e = object(v);
-    const children = (separator: string) => join(map(take(e.elements), x => rich(x, depth + 1)), separator);
+    const children = (separator: string) => join(map(take(e.elements), x => rich(x, depth + 1)), separator, e.type === 'rich_text');
     switch (e.type) {
       case 'text': return styled(escape(bounded(e.text)), e.style);
       case 'user': return validId(e.user_id) ? styled(`<@${e.user_id}>`, e.style) : '';
@@ -336,7 +351,8 @@ export function renderMessageText(
     const label = match && channelLabels.get(match[1]);
     const remaining = Math.max(0, renderLimit - expandedLength);
     // Bound before constructing the expansion, not after allocating it.
-    const value = label ? `<#${match![1]}|${prefix(label, remaining)}>` : token;
+    const value = label ? (token.length + 1 + label.length <= remaining ? `<#${match![1]}|${label}>` : '') : token;
+    if (label && !value) truncated = true;
     if (value.length > remaining) truncated = true;
     const shown = prefix(value, remaining);
     expandedLength += shown.length;

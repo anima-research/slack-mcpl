@@ -407,6 +407,9 @@ Comparison keys normalize horizontal prose whitespace, Slack encodings, combined
 bold/italic marker order and newlines directly inside code fences; compare
 channel/user IDs rather than labels; preserve internal line breaks in prose
 (normalizing line-ending spellings); and preserve other code whitespace.
+Line-end horizontal prose whitespace is ignored in keys. Rich-section joining
+reuses a trailing line break rather than adding a phantom blank row; intentional
+blank rows remain distinct.
 This is display dedup, not typed equality: a link and identical rendered literal
 may collapse, while differing markup may appear twice for bots/integrations.
 Angle tokens use a linear scan; unclosed, malformed (such as `<http://|label>`)
@@ -445,7 +448,7 @@ UTF-16 length + 2) work units, charging visits/list entries and reserving room f
 rich mirror containers. Reused channel labels instead spend a separate output
 allowance of max(16,384, original UTF-16 length + 1) code units.
 Traversal cuts and nesting (12 levels) also carry that marker; it reports
-unvisited payload, not a guarantee that readable text was omitted; cuts preserve code points. Unsupported blocks remain omitted on explicit reads; the 16,384-unit explicit-read
+unvisited payload, not a guarantee that readable text was omitted; cuts preserve code points, complete Slack angle tokens and Slack entities. Unsupported blocks remain omitted on explicit reads; the 16,384-unit explicit-read
 cap cannot be bypassed by rereading through history or threads. Original text is
 never truncated. The compact markers do not distinguish recoverable content:
 backscroll cuts may expose more on explicit reads, but unsupported blocks and
