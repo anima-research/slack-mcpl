@@ -828,3 +828,37 @@ test('channel label expansion cannot leave a partial angle token', () => {
   const suffix = rendered.slice(text.length);
   assert.equal(suffix, '\nChannel: […truncated]');
 });
+
+test('rich-container joining inspects only linear regex input', () => {
+  const count = 2048;
+  const original = 'x'.repeat(count);
+  const section = { type: 'rich_text_section', elements: [{ type: 'text', text: 'a' }] };
+  const payload = { text: original, bot_id: 'B1', blocks: [{ type: 'rich_text', elements: Array(count).fill(section) }] };
+  const test = RegExp.prototype.test;
+  let inspected = 0;
+  // Count work rather than elapsed time: testing an accumulated join would
+  // inspect roughly count² code units despite the bounded final output.
+  RegExp.prototype.test = function (value: string) {
+    inspected += value.length;
+    return test.call(this, value);
+  };
+  let rendered: string;
+  try {
+    rendered = renderMessageText(payload);
+  } finally {
+    RegExp.prototype.test = test;
+  }
+  assert.equal(rendered, original + '\n' + Array(count).fill('a').join('\n'));
+  assert.ok(inspected < 100 * count, `regex input must be linear: ${inspected} for ${count} sections`);
+});
+
+test('fence comparison removes every supported edge break without changing code content', () => {
+  for (const edge of ['\n', '\r\n', '\r', '\v', '\f', '\u0085', '\u2028', '\u2029']) {
+    const text = '```' + edge + 'foo' + edge + '```';
+    assert.equal(renderMessageText({
+      text, bot_id: 'B1', blocks: [{ type: 'rich_text', elements: [
+        { type: 'rich_text_preformatted', elements: [{ type: 'text', text: 'foo' }] },
+      ] }],
+    }), text, JSON.stringify(edge));
+  }
+});

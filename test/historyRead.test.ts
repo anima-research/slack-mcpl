@@ -985,7 +985,7 @@ test('a read stopped by a rate limit stays within maxBytes with the longest seco
   assert.ok(Buffer.byteLength(JSON.stringify(out)) <= 2048, String(Buffer.byteLength(JSON.stringify(out))));
 });
 
-test('absent text filter yields between candidate batches before shaping', async () => {
+test('nonmatching textContains filter yields between candidate batches before shaping', async () => {
   const { readBounded } = await import('../src/history-read.js');
   let yielded = false;
   let visited = 0;

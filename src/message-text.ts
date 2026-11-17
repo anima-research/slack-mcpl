@@ -15,6 +15,9 @@ const escape = (v: string) => v.replace(/&/g, '&amp;').replace(/</g, '&lt;').rep
 const unescape = (v: string) => v.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
 const ID = new RegExp(`^${SLACK_ID}$`);
 const CHANNEL_LABEL = new RegExp(`^<#(${SLACK_ID})\\|([^>]+)>$`);
+const CHANNEL_REFERENCE = new RegExp(`^<#(${SLACK_ID})>$`);
+const FENCE_START_BREAK = new RegExp(`^(?:${LINE_BREAK.source})`);
+const FENCE_END_BREAK = new RegExp(`(?:${LINE_BREAK.source})$`);
 const REFERENCE = new RegExp(`^<([@#])(${SLACK_ID})(?:\\|[^>]*)?>$`);
 const validId = (v: unknown): v is string => typeof v === 'string' && ID.test(v);
 
@@ -28,8 +31,8 @@ function normalized(value: string): string {
     if (i % 2) { if (!fence) { fence = part; openedAt = i; } else if (part === fence) fence = ''; return part; }
     if (fence) {
       if (fence.length < 3) return part;
-      if (i === openedAt + 1) part = part.replace(/^\r?\n/, '');
-      if (parts[i + 1] === fence) part = part.replace(/\r?\n$/, '');
+      if (i === openedAt + 1) part = part.replace(FENCE_START_BREAK, '');
+      if (parts[i + 1] === fence) part = part.replace(FENCE_END_BREAK, '');
       return part;
     }
     return part.replace(LINE_BREAK, '\n')
@@ -101,18 +104,25 @@ export function renderMessageText(
     for (const value of values) yield render(value, index++);
   }
   function join(values: Iterable<string>, separator = '\n', reuseLineBreak = false): string {
-    let result = '';
+    const pieces: string[] = [];
+    let length = 0;
+    let endsInBreak = false;
     for (const value of values) {
       if (!value) continue;
       // Only rich containers reuse a section's existing break. Never collapse
-      // blank rows in ordinary body text or table joins.
-      const part = (result && !(reuseLineBreak && /[\n\r\u000b\u000c\u0085\u2028\u2029]$/.test(result)) ? separator : '') + value;
-      const remaining = renderLimit - result.length;
-      result += prefix(part, remaining);
+      // blank rows in ordinary body text or table joins. Inspect only the last
+      // appended code unit, never the growing concatenation.
+      const part = (length && !(reuseLineBreak && endsInBreak) ? separator : '') + value;
+      const remaining = renderLimit - length;
+      const piece = prefix(part, remaining);
+      pieces.push(piece);
+      length += piece.length;
+      endsInBreak = /[\n\r\u000b\u000c\u0085\u2028\u2029]/.test(piece.slice(-1));
       if (part.length > remaining) { truncated = true; break; }
     }
-    return result;
+    return pieces.join('');
   }
+
   const textObject = (v: unknown) => v == null || !visit() ? '' : object(v).type === 'plain_text' ? escape(bounded(object(v).text)) : bounded(object(v).text);
   const listTextObject = (v: unknown) => v == null ? (visit(), '') : textObject(v);
   function rich(v: unknown, depth = 0): string {
@@ -347,7 +357,7 @@ export function renderMessageText(
   const suffix = mapSlackAngles(joined, (token, start) => {
     expandedLength += start - previousEnd;
     previousEnd = start + token.length;
-    const match = /^<#([A-Z0-9]+)>$/.exec(token);
+    const match = CHANNEL_REFERENCE.exec(token);
     const label = match && channelLabels.get(match[1]);
     const remaining = Math.max(0, renderLimit - expandedLength);
     // Bound before constructing the expansion, not after allocating it.

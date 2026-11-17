@@ -224,11 +224,12 @@ export function classifyExtension(name: string): { mimeType: string; isImage: bo
 }
 
 const USER_ANGLE = new RegExp(`^<@(${SLACK_ID})(?:\\|([^>]*))?>$`);
+const USERGROUP_ANGLE = new RegExp(`^<!subteam\\^(${SLACK_ID})(?:\\|([^>]*))?>$`);
 const CHANNEL_ANGLE = new RegExp(`^<#(${SLACK_ID})(?:\\|([^>]*))?>$`);
 
 // Slack message text uses mrkdwn escapes: <@U123> user mentions,
 // <#C123|name> channel mentions, <!here>/<!channel> broadcasts, and
-// <url|label> links. Rewrite them into a readable shape
+// <http(s)://url|label> links. Rewrite them into a readable shape
 // (`@name (uid:U123)` and `#name`, with a name that isn't plain quoted),
 // resolving user IDs via the provided map (best-effort: an unresolved ID shows
 // the label Slack sent with it, else the raw ID).
@@ -244,7 +245,7 @@ export function formatSlackText(text: string, userNames: Map<string, string>): s
       const [, id, name] = match;
       return name ? channelShown(unescapeSlack(name)).replace(/&/g, '&amp;') : `#${id}`;
     }
-    if ((match = /^<!subteam\^([A-Z0-9]+)(?:\|([^>]*))?>$/.exec(token))) {
+    if ((match = USERGROUP_ANGLE.exec(token))) {
       return '@' + nameShown(unescapeSlack(match[2] || match[1]).replace(/^@/, '')).replace(/&/g, '&amp;');
     }
     if ((match = /^<!(here|channel|everyone)(?:\|[^>]*)?>$/.exec(token))) return '@' + match[1];
