@@ -177,3 +177,15 @@ test('backscroll channel framing cannot exceed the byte budget', () => {
   const rendered = backscrollBlock([], { channelName: '🙂'.repeat(40_000), isDM: false });
   assert.ok(Buffer.byteLength(rendered) <= 32768);
 });
+
+test('backscroll keeps an exactly fitting complete window without summary reservation', () => {
+  const msg = { id: '1.0', authorName: 'A', timestamp: new Date(0), content: '', attachments: [] };
+  for (const older of [[], [{ ...msg, id: '0.0', content: 'short' }]]) {
+    const base = backscrollBlock([...older, msg], { isDM: false });
+    const content = 'x'.repeat(32768 - Buffer.byteLength(base));
+    const result = backscrollBlock([...older, { ...msg, content }], { isDM: false });
+    assert.equal(Buffer.byteLength(result), 32768);
+    assert.ok(result.includes(content));
+    assert.doesNotMatch(result, /omitted|not shown/);
+  }
+});

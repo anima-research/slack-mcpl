@@ -388,20 +388,21 @@ Blocks-only messages still render rich text, including an app posting as a user
 with only blocks. Bot/integration messages carrying `bot_id`, `app_id` or
 `bot_profile`, without `client_msg_id`, also retain rich text.
 
-All rendered supplemental units deduplicate against original text and earlier
-units with the same attribution, so identical bodies from different authors
+Unattributed supplemental units deduplicate against original text. Attributed
+units deduplicate only within the same full source identity, so identical bodies from different authors
 survive. Comparison keys normalize prose whitespace, Slack encodings, combined
 bold/italic marker order and newlines directly inside code fences; compare
 channel/user IDs rather than labels; and preserve other code whitespace.
 This is display dedup, not typed equality: a link and identical rendered literal
 may collapse, while differing markup may appear twice for bots/integrations.
 Angle tokens use a linear scan; unclosed tokens remain literal. The original
-Slack text is preserved in raw metadata, while display text is formatted.
+Slack text is preserved in channels/incoming raw metadata, while display text is formatted.
+push/event does not expose rawContent. Nested angle openers restart the token scan.
 
 Only original Slack text creates mentions, addressing, wake or auto-subscription.
 Quoted/shared/block mentions are display content only. Name resolution includes
 original-text mentions plus at most **20 unique supplemental IDs per message**;
-others display raw IDs, even if cached. Live `metadata.rawContent` remains original
+others display raw IDs, even if cached. Live channels/incoming `metadata.rawContent` remains original
 Slack text; `content`/`cleanContent` include supplemental text. History
 `textContains` searches rendered content with user-ID mentions; threads have no
 filters.

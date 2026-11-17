@@ -190,13 +190,17 @@ export function backscrollBlock(
   const summary = (count: number, before?: string) =>
     `[${count} older backscroll ${count === 1 ? 'message' : 'messages'} not shown; fetch_history${before ? ' latest=' + before : ''} has ${count === 1 ? 'it' : 'them'}]`;
   const frame = (count: number) => `<backscroll ${[...attrs, `count="${count}"`].join(' ')}>\n\n</backscroll>`;
+  const rendered = messages.map(backscrollLine);
+  const complete = [`<backscroll ${[...attrs, `count="${messages.length}"`].join(' ')}>`,
+    ...rendered, '</backscroll>'].join('\n');
+  if (Buffer.byteLength(complete) <= maxBytes) return complete;
   let bytes = 0;
   let oldest = messages.length;
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i];
-    const line = backscrollLine(message);
+    const line = rendered[i];
     const size = Buffer.byteLength(line);
-    const reserved = Buffer.byteLength(frame(lines.length + 1)) +
+    const reserved = Buffer.byteLength(frame(lines.length + 1)) - 1 +
       (i ? Buffer.byteLength(summary(i, message.id)) + 1 : 0);
     let shown = line;
     if (bytes + size + 1 + reserved > maxBytes) {
