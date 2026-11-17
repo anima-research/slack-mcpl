@@ -9,6 +9,9 @@
   preserve rich styles and prefer readable fallback over omission placeholders.
   Mark backscroll messages exceeding the remaining byte budget in position
   and summarize older context outside the bounded newest window.
-- Format long labelled Slack links (including 2 KiB dashboard URLs) with a
-  linear angle-token scan.
-- Keep bare-URL trailing-punctuation trimming linear on long messages.
+  Use linear scans for angle tokens and bare URLs, including long labelled links.
+  Malformed nested angle tokens now restart at the inner opener; this also affects
+  original-text mention extraction and formatting.
+  Size rich mirror traversal to original text, normalize prose bullet spellings,
+  preserve code newlines inside fences, and keep distinct full attribution identities.
+  Bound backscroll channel labels as well as message content.

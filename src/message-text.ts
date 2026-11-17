@@ -22,10 +22,17 @@ const validId = (v: unknown): v is string => typeof v === 'string' && ID.test(v)
 // but retain significant whitespace inside code spans.
 function normalized(value: string): string {
   let fence = '';
-  return value.split(/(`+)/).map((part, i) => {
-    if (i % 2) { if (!fence) fence = part; else if (part === fence) fence = ''; return part; }
-    if (fence) return fence.length >= 3 ? part.replace(/^\r?\n|\r?\n$/g, '') : part;
-    return part.replace(/_\*([^*_\n]+)\*_/g, '*_$1_*').replace(/\s+/g, ' ');
+  let openedAt = -1;
+  const parts = value.split(/(`+)/);
+  return parts.map((part, i) => {
+    if (i % 2) { if (!fence) { fence = part; openedAt = i; } else if (part === fence) fence = ''; return part; }
+    if (fence) {
+      if (fence.length < 3) return part;
+      if (i === openedAt + 1) part = part.replace(/^\r?\n/, '');
+      if (parts[i + 1] === fence) part = part.replace(/\r?\n$/, '');
+      return part;
+    }
+    return part.replace(/(^|\n)([ \t]*)[•◦▪] /g, '$1$2- ').replace(/_\*([^*_\n]+)\*_/g, '*_$1_*').replace(/\s+/g, ' ');
   }).join('').trim();
 }
 
@@ -56,11 +63,12 @@ export function renderMessageText(
     return token;
   });
   let truncated = false;
-  let budget = 2000;
+  const cap = Math.max(2000, original.length);
+  let budget = cap;
   const take = (v: unknown): unknown[] => {
     const items = list(v);
-    if (items.length > 2000) truncated = true;
-    return items.slice(0, 2000);
+    if (items.length > cap) truncated = true;
+    return items.slice(0, cap);
   };
   const visit = () => { if (--budget < 0) { truncated = true; return false; } return true; };
   const renderLimit = Math.max(MAX_MESSAGE_TEXT_APPEND, original.length + 1);
@@ -150,7 +158,7 @@ export function renderMessageText(
     if (rawSeen.has(value)) return false;
     rawSeen.add(value);
     const key = keyFor(value);
-    if (key && key !== originalKey && !seen.has(key)) {
+    if (key && (attribution !== '' || key !== originalKey) && !seen.has(key)) {
       seen.add(key);
       return true;
     }
@@ -205,10 +213,10 @@ export function renderMessageText(
         string(a.footer) ? headerName(string(a.footer)) : 'unknown source';
       header = shared ? `[shared message from ${name}${uid}, ${source}]` : `[attachment from ${name}${uid}]`;
     }
-    // Dedup against original text and within the same attribution, never
-    // erase another sender. Fallback depends on readable output, not notices.
+    // Only unattributed units can mirror the original; full source identity
+    // prevents capped display names from merging distinct senders. Fallback depends on readable output, not notices.
     const units = [body || (nested.length ? '' : fieldText(a.fallback)), ...nested, ...placeholders]
-      .filter(value => unique(value, header));
+      .filter(value => unique(value, header ? JSON.stringify([shared, a.author_name, a.author_id, a.channel_name, a.footer]) : ''));
     if (units.length && header) {
       emit(header + '\n' + join(units).split(LINE_BREAK).map(line => '> ' + line).join('\n'));
     } else {

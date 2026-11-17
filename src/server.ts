@@ -180,7 +180,7 @@ export function backscrollBlock(
   where: { channelName?: string; isDM: boolean },
 ): string {
   const attrs: string[] = [];
-  if (where.channelName && !where.isDM) attrs.push(`channel=${quotedLabel(`#${where.channelName}`)}`);
+  if (where.channelName && !where.isDM) attrs.push(`channel=${quotedLabel(`#${Array.from(where.channelName).slice(0, 100).join('')}`)}`);
   if (where.isDM) attrs.push('dm="true"');
   // Keep a contiguous newest window. An oversized body gets an in-position
   // placeholder rather than a silent gap; if even that cannot fit, summarize

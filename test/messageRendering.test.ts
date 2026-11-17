@@ -146,3 +146,34 @@ test('bare URL trailing punctuation trimming preserves interior punctuation', ()
     assert.equal(renderMessageText({text, attachments: [{from_url: 'http://' + url, text: 'PREVIEW'}]}), text);
   }
 });
+
+test('large bot rich-text mirrors fit traversal before comparison (R4-1)', () => {
+  for (const size of [290, 400]) {
+    const lines = Array.from({ length: size }, (_, n) => `- \`cmd${n}\` does *thing${n}* see <https://ex.com/${n}|doc${n}>`);
+    const text = lines.join('\n');
+    const blocks = [{ type: 'rich_text', elements: [{ type: 'rich_text_list', style: 'bullet', elements:
+      lines.map((_, n) => ({ type: 'rich_text_section', elements: [
+        { type: 'text', text: `cmd${n}`, style: { code: true } },
+        { type: 'text', text: ' does ' },
+        { type: 'text', text: `thing${n}`, style: { bold: true } },
+        { type: 'text', text: ' see ' },
+        { type: 'link', url: `https://ex.com/${n}`, text: `doc${n}` },
+      ] })),
+    }] }];
+    for (const budget of [2000, 16384]) assert.equal(renderMessageText({ text, bot_id: 'B1', blocks }, budget), text);
+  }
+});
+
+test('attributed content is not the original author and capped names are not identities', () => {
+  const name = 'x'.repeat(100);
+  const rendered = renderMessageText({ text: 'same', attachments: [
+    { author_name: name + 'A', text: 'same' },
+    { author_name: name + 'B', text: 'same' },
+  ] });
+  assert.equal(rendered.split('same').length - 1, 3);
+});
+
+test('backscroll channel framing cannot exceed the byte budget', () => {
+  const rendered = backscrollBlock([], { channelName: '🙂'.repeat(40_000), isDM: false });
+  assert.ok(Buffer.byteLength(rendered) <= 32768);
+});

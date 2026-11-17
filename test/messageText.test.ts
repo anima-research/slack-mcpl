@@ -342,8 +342,8 @@ test('bot rich combined emphasis uses italic inside bold', async () => {
   }
 });
 
-test('attributed attachment deduplicates its body against original text before wrapping', async () => {
-  await expectText({text: 'Build 42 failed', attachments: [{author_name: 'Jenkins', text: 'Build 42 failed'}]}, 'Build 42 failed');
+test('attributed attachment preserves another author even when original text matches', async () => {
+  await expectText({text: 'Build 42 failed', attachments: [{author_name: 'Jenkins', text: 'Build 42 failed'}]}, 'Build 42 failed\n[attachment from Jenkins]\n> Build 42 failed');
 });
 test('attributed attachment deduplicates its inner body and blocks before wrapping', async () => {
   await expectText({attachments: [{author_name: 'CI', text: 'Body', blocks: [section('Body')]}]}, '[attachment from CI]\n> Body');
@@ -430,6 +430,8 @@ test('emphasis and fence comparison normalization leaves literal code and interi
     ['`_*word*_`', '`*_word_*`'],
     ['```a  b```', '```a b```'],
     ['```a\nb```', '```ab```'],
+    ['```a\n`\nb```', '```a`b```'],
+    ['```const s = `\nhi\n`;```', '```const s = `hi`;```'],
   ]) {
     await expectText({text, attachments: [{text: body}]}, text + '\n' + body);
   }
