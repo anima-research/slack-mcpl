@@ -263,3 +263,9 @@ export const toolDefinitions: ToolDefinition[] = [
     },
   },
 ];
+
+/** Shared exact-name validation for environment and embedded-server callers. */
+export function validateDisabledTools(names: readonly string[]): void {
+  const unknown = names.find(name => !toolDefinitions.some(tool => tool.name === name));
+  if (unknown !== undefined) throw new Error(`Unknown disabled tool: ${JSON.stringify(unknown)}`);
+}

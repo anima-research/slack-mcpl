@@ -57,7 +57,7 @@ import {
   type SlackMessageData,
   type SlackWait,
 } from './slack-adapter.js';
-import { toolDefinitions } from './tools.js';
+import { toolDefinitions, validateDisabledTools } from './tools.js';
 import { withToolClasses } from './tool-classes.js';
 import { buildFeatureSets, buildServerCapabilities, featureSetForTool, MESSAGING_FEATURE_SET, TYPING_FEATURE_SET } from './feature-sets.js';
 import { ChannelManager, mcplChannelId, parseMcplChannelId, toDescriptor } from './channels.js';
@@ -259,11 +259,11 @@ export class SlackMcplServer {
     private slack: SlackAdapter,
     private opts: { subscribeMemberChannels?: boolean; disabledTools?: readonly string[] } = {},
   ) {
-    const names = new Set(toolDefinitions.map(tool => tool.name));
-    const unknownTool = opts.disabledTools?.find(name => !names.has(name));
-    if (unknownTool !== undefined) throw new Error(`Unknown disabled tool: ${JSON.stringify(unknownTool)}`);
+    validateDisabledTools(opts.disabledTools ?? []);
     // Caller-owned options must not change the operator policy after startup.
     this.opts = { ...opts, disabledTools: [...(opts.disabledTools ?? [])] };
+    this.slack.toolEnabled = this.toolEnabled;
+    this.grant.setDeclarations(buildFeatureSets(this.opts.disabledTools));
     // Once for the server's life: the adapter keeps every handler it's
     // given, and each forwards to whichever connection is being served, so
     // one per connection forwarded each message once per connection served.
@@ -367,7 +367,7 @@ export class SlackMcplServer {
     // the host publishes text-only turns to the conversational locus via
     // channels/publish, so no contextHooks are declared here (same rationale
     // as discord-mcpl; see LOCUS-ROUTING-DESIGN.md).
-    const serverCaps: McplCapabilities = buildServerCapabilities();
+    const serverCaps: McplCapabilities = buildServerCapabilities(this.opts.disabledTools);
 
     const capabilities: InitializeCapabilities = {
       tools: {},
@@ -396,6 +396,8 @@ export class SlackMcplServer {
     // unavailable. Plain MCP tool calls are unaffected; see callTool below.
   }
 
+  private toolEnabled = (name: string): boolean => !this.opts.disabledTools?.includes(name);
+
   /** The tools tools/list offers: send_dm only where a DM can be written, and
    *  refresh_channels only where MCPL was negotiated, since a plain MCP
    *  connection has no host to register conversations with. Neither changes
@@ -403,7 +405,7 @@ export class SlackMcplServer {
   private offeredTools() {
     return toolDefinitions.filter((t) =>
       (t.name !== 'send_dm' || this.slack.dmsWritable) && (t.name !== 'refresh_channels' || this.mcplEnabled)
-      && !this.opts.disabledTools?.includes(t.name));
+      && this.toolEnabled(t.name));
   }
 
   private requireMcpl(): void {
@@ -569,7 +571,7 @@ export class SlackMcplServer {
       // without the host's slack: prefix, since the tools the explanation
       // points to take that id.
       const sent = req.method === method.CHANNELS_PUBLISH
-        ? explainSlackError(err, { tool: 'channels/publish', args: published })
+        ? explainSlackError(err, { tool: 'channels/publish', args: published, toolEnabled: this.toolEnabled })
         : e.message;
       conn.sendError(req.id, -32603, sent);
     }
@@ -651,8 +653,8 @@ export class SlackMcplServer {
       throw capabilityDenied('tools');
     }
 
-    if (this.opts.disabledTools?.includes(name)) {
-      return { content: [textContent(`Tool '${name}' is disabled by operator configuration`)], isError: true };
+    if (!this.toolEnabled(name)) {
+      return { content: [textContent(`Tool '${name}' is disabled by operator configuration, so nothing ran. Calling again won't change that; whoever runs this host decides which tools are available.`)], isError: true };
     }
 
     // Check feature set permission
@@ -690,7 +692,7 @@ export class SlackMcplServer {
       return { content };
     } catch (err) {
       return {
-        content: [textContent(explainSlackError(err, { tool: name, args }))],
+        content: [textContent(explainSlackError(err, { tool: name, args, toolEnabled: this.toolEnabled }))],
         isError: true,
       };
     }
@@ -975,7 +977,7 @@ export class SlackMcplServer {
         this.unsubscribedByAgent.add(channelId);
         return this.unsubscribe(channelId)
           ? this.opts.subscribeMemberChannels
-            ? `Muted ambient messages in conversation ${channelId} until you subscribe_channel it again. Mentions and DMs from there will still arrive.`
+            ? `Muted ambient messages in conversation ${channelId} ${this.toolEnabled('subscribe_channel') ? 'until you subscribe_channel it again' : 'until the operator changes the subscription'}. Mentions and DMs from there will still arrive.`
             : `Unsubscribed from ambient messages in conversation ${channelId}. Mentions and DMs from there will still arrive.`
           : this.opts.subscribeMemberChannels
             ? `Conversation ${channelId} is already muted.`
@@ -1006,9 +1008,19 @@ export class SlackMcplServer {
       default:
         throw new Error(
           `There's no tool named "${name}" here, so nothing ran. This server's tools are: ` +
-            `${this.offeredTools().map((t) => t.name).join(', ')}.`,
+            `${this.offeredTools().map((t) => t.name).join(', ') || 'none'}.`,
         );
     }
+  }
+
+  private argumentSource(key: keyof typeof ARGUMENT_SOURCES): string {
+    if (key === 'channelId' && !this.toolEnabled('list_channels')) return "Copy channelId= from an incoming message.";
+    if (key === 'userId' && !this.toolEnabled('find_user')) return 'Copy a user ID from an incoming message.';
+    if ((key === 'messageId' || key === 'threadTs') &&
+        (!this.toolEnabled('fetch_history') || !this.toolEnabled('fetch_thread') || !this.toolEnabled('reply_message'))) {
+      return "Copy id= from the message; for a thread use its thread= when present, otherwise its id=.";
+    }
+    return ARGUMENT_SOURCES[key];
   }
 
   /** A string argument a tool requires, refused when it's missing or empty.
@@ -1028,7 +1040,7 @@ export class SlackMcplServer {
         : Array.isArray(v) ? 'passed an array'
         : typeof v === 'object' ? 'passed an object'
         : `passed a ${typeof v}`;
-      throw new Error(`${notDone}: ${key} must be a non-empty string, and this call ${passed}. ${ARGUMENT_SOURCES[key]}`);
+      throw new Error(`${notDone}: ${key} must be a non-empty string, and this call ${passed}. ${this.argumentSource(key)}`);
     }
     return v;
   }
@@ -1394,9 +1406,13 @@ export class SlackMcplServer {
   /** For a channels/open that found nothing registered: how this server's
    *  conversations come to be registered with the host, or that they can't. */
   private howChannelsRegister(): string {
-    return this.grant.has('channels.register')
-      ? `refresh_channels registers the conversations this bot is in${this.slack.dmsDisabled ? ', channels only while direct messages are turned off' : ''}; open one by the id it announces.`
-      : "This host hasn't granted this server channels.register, so this server can't register conversations with it.";
+    if (!this.grant.has('channels.register')) {
+      return "This host hasn't granted this server channels.register, so this server can't register conversations with it.";
+    }
+    if (!this.toolEnabled('refresh_channels')) {
+      return 'Open a conversation by an id already registered with the host; the operator has disabled manual refresh.';
+    }
+    return `refresh_channels registers the conversations this bot is in${this.slack.dmsDisabled ? ', channels only while direct messages are turned off' : ''}; open one by the id it announces.`;
   }
 
   /** `published` gets the conversation and thread the post goes to, before
@@ -1625,7 +1641,7 @@ export class SlackMcplServer {
    *  fetch_attachment rather than inlined here. */
   private attachmentNote(attachments: AttachmentRef[]): string {
     const lines = attachments.map((a) =>
-      `- ${nameShown(a.name)} (${mimeShown(a.mimeType)})${a.isImage ? ' — image' : ''}, fetchable via fetch_attachment: ${urlShown(a.path)}`,
+      `- ${nameShown(a.name)} (${mimeShown(a.mimeType)})${a.isImage ? ' — image' : ''}, ${this.toolEnabled('fetch_attachment') ? 'fetchable via fetch_attachment' : 'attachment URL'}: ${urlShown(a.path)}`,
     );
     return `[attachments: ${attachments.length}]\n${lines.join('\n')}`;
   }

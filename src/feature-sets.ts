@@ -31,6 +31,8 @@
 
 import type { CapabilityPath, FeatureSetDeclaration, McplManifest, TagOntology } from '@animalabs/mcpl-core';
 
+import { toolDefinitions } from './tools.js';
+
 export const MESSAGING_FEATURE_SET = 'slack.messaging';
 export const TYPING_FEATURE_SET = 'slack.typing';
 export const HISTORY_FEATURE_SET = 'slack.history';
@@ -53,7 +55,7 @@ export const SLACK_TAG_ONTOLOGY: TagOntology = {
   open: true,
 };
 
-export function buildFeatureSets(): Record<string, FeatureSetDeclaration> {
+export function buildFeatureSets(disabledTools: readonly string[] = []): Record<string, FeatureSetDeclaration> {
   const messagingUses: CapabilityPath[] = [
     'tools',
     'channels.register',
@@ -63,7 +65,7 @@ export function buildFeatureSets(): Record<string, FeatureSetDeclaration> {
     'pushEvents',
   ];
 
-  return {
+  const sets: Record<string, FeatureSetDeclaration> = {
     [MESSAGING_FEATURE_SET]: {
       description: 'Send, read, react to messages in Slack conversations',
       uses: messagingUses,
@@ -88,9 +90,16 @@ export function buildFeatureSets(): Record<string, FeatureSetDeclaration> {
       uses: ['tools'],
     },
   };
+  // Messaging also owns non-tool protocol paths, so it survives an empty tool surface.
+  for (const name of [HISTORY_FEATURE_SET, SUBSCRIPTIONS_FEATURE_SET]) {
+    if (!toolDefinitions.some(tool => featureSetForTool(tool.name) === name && !disabledTools.includes(tool.name))) {
+      delete sets[name];
+    }
+  }
+  return sets;
 }
 
-export function buildServerCapabilities(): McplManifest {
+export function buildServerCapabilities(disabledTools: readonly string[] = []): McplManifest {
   return {
     version: '0.5',
     pushEvents: true,
@@ -101,7 +110,7 @@ export function buildServerCapabilities(): McplManifest {
       incoming: true,
       typing: true,
     },
-    featureSets: buildFeatureSets(),
+    featureSets: buildFeatureSets(disabledTools),
   };
 }
 

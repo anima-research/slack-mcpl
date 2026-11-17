@@ -31,6 +31,7 @@
  * unchanged, except that a read's failure still says that no messages were
  * returned.
  */
+import { toolHint } from './tool-guidance.js';
 import { ErrorCode } from '@slack/web-api';
 import { connectionNeverMade, reactionName } from './content.js';
 import { NOTHING_RETURNED, PARENT_IDS, TS_FORM } from './history-read.js';
@@ -51,6 +52,7 @@ import {
  *  host's publish, and the arguments it names Slack's objects by. */
 export interface SlackCall {
   tool: string;
+  toolEnabled?: (name: string) => boolean;
   args: Record<string, unknown>;
 }
 
@@ -126,6 +128,7 @@ export function explainSlackError(err: unknown, call: SlackCall): string {
 }
 
 function explanation(err: unknown, call: SlackCall): string | undefined {
+  const hint = (text: string, fallback = '') => toolHint(text, call.toolEnabled ?? (() => true), fallback);
   const e = err as {
     code?: unknown;
     retryAfter?: number;
@@ -177,7 +180,7 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
         `second${seconds === 1 ? '' : 's'} before trying again.${startsOver("Slack's limit")}`;
   const invite =
     "Someone in that conversation has to invite the bot (in Slack, /invite and the bot's name); until then, " +
-    "calling again gets the same answer. list_channels shows the conversations it's in.";
+    "calling again gets the same answer. " + hint("list_channels shows the conversations it's in.");
   /** A write whose outcome is unknown, and how to check it before trying again. */
   const unknown = (cause: string, note = ''): string => {
     if (POSTS.has(call.tool)) {
@@ -190,12 +193,12 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
           : `fetch_history for ${conversation}`;
       if (call.tool === 'upload_file') {
         return (
-          `${cause}, so whether the file was shared is unknown${note}. Check ${where} before uploading again, so ` +
+          `${cause}, so whether the file was shared is unknown${note}. Check ${hint(where, 'the conversation in Slack (ask someone with access)')} before uploading again, so ` +
           "it isn't shared twice."
         );
       }
       return (
-        `${cause}, so whether the message was posted is unknown${note}. Check ${where} before posting again, so ` +
+        `${cause}, so whether the message was posted is unknown${note}. Check ${hint(where, 'the conversation in Slack (ask someone with access)')} before posting again, so ` +
         "it isn't posted twice."
       );
     }
@@ -203,12 +206,13 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
     // and only the agent knows whether the message it names is a thread reply.
     const where = "if it's in the channel itself, and fetch_thread does, with its thread's id, if it's a thread reply";
     if (call.tool === 'edit_message') {
-      return `${cause}, so whether the edit took is unknown${note}. fetch_history shows ${theMessage} as it is now ${where}.`;
+      return `${cause}, so whether the edit took is unknown${note}. ${hint(`fetch_history shows ${theMessage} as it is now ${where}.`, 'Ask someone with Slack access to check the message before retrying.')}`;
     }
     if (call.tool === 'delete_message') {
       return (
-        `${cause}, so whether ${theMessage} was deleted is unknown${note}. fetch_history shows whether it's still ` +
-        `there ${where}. Deleting it again is safe: once it's gone, Slack answers message_not_found.`
+        `${cause}, so whether ${theMessage} was deleted is unknown${note}. ` +
+        hint(`fetch_history shows whether it's still there ${where}. `, 'Ask someone with Slack access to check the message. ') +
+        "Deleting it again is safe: once it's gone, Slack answers message_not_found."
       );
     }
     return (
@@ -310,7 +314,7 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
           'connection to Slack.';
   }
   if (code === undefined) return undefined;
-  const messageIds = call.tool === 'reply_message' || call.tool === 'fetch_thread' || call.tool === 'upload_file' ? PARENT_IDS : MESSAGE_IDS;
+  const messageIds = hint(call.tool === 'reply_message' || call.tool === 'fetch_thread' || call.tool === 'upload_file' ? PARENT_IDS : MESSAGE_IDS, "Copy the message id=, or its thread= for a thread reply");
 
   // channels/publish names no message or thread itself: this server replies in
   // the thread of the last message from the conversation that the host took
@@ -324,7 +328,7 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
       ? `${lead}: this server replies in the thread of the last message from a conversation that reached you. ` +
           `Here that was the thread under message ${thread} in ${conversation}, and Slack refused it. ` +
           `Another publish to ${conversation} now would go to the same thread. ` +
-          'send_message posts in the conversation itself, and reply_message under a message you choose.'
+          hint('send_message posts in the conversation itself, and reply_message under a message you choose.')
       : undefined;
   }
 
@@ -332,13 +336,12 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
     case 'channel_not_found':
       return (
         `${lead}: Slack doesn't know ${conversation}, or this bot can't see it. ${RECALLED}, or it's a ` +
-        "private conversation this bot isn't in. list_channels shows the conversations this bot can use, " +
-        'with their ids.'
+        "private conversation this bot isn't in. " + hint('list_channels shows the conversations this bot can use, with their ids.')
       );
     case 'invalid_channel_id':
       return (
         `${lead}: ${channel ?? 'the conversation given'} isn't a Slack conversation id. ${RECALLED}. ` +
-        'list_channels shows the conversations this bot can use, with their ids.'
+        hint('list_channels shows the conversations this bot can use, with their ids.')
       );
     case 'not_in_channel':
       if (call.tool === 'upload_file') {
@@ -372,14 +375,14 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
       return `${lead}: ${ts} isn't a message id, ${TS_FORM}. ${messageIds}.`;
     case 'thread_not_found':
       if (!thread) return undefined;
-      return `${lead}: Slack has no thread under message ${thread} in ${conversation}. ${RECALLED}. ${PARENT_IDS}.`;
+      return `${lead}: Slack has no thread under message ${thread} in ${conversation}. ${RECALLED}. ${hint(PARENT_IDS, "Copy thread= from a reply, or id= from the parent message")}.`;
     case 'invalid_ts_latest':
     case 'invalid_ts_oldest': {
       const bound = code === 'invalid_ts_latest' ? 'latest' : 'oldest';
       const value = given(bound);
       return (
         `${lead}: ${bound}${value ? ` ${value}` : ''} isn't a message id, ${TS_FORM}. Take one from ` +
-        "fetch_history's ids, or from a message's id=."
+        hint("fetch_history's ids, or from a message's id=.", "a message's id=.")
       );
     }
     case 'cant_update_message':
@@ -391,12 +394,12 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
     case 'edit_window_closed':
       return (
         `${lead}: this workspace doesn't allow editing a message this old, and calling again won't change that. ` +
-        'To correct it, post a new message, or use reply_message with its id to put the correction under it.'
+        hint('To correct it, post a new message, or use reply_message with its id to put the correction under it.')
       );
     case 'msg_too_long':
       return call.tool === 'edit_message'
         ? `${lead}: Slack takes at most 4,000 characters of text in an edit, and this text is longer. Shorten ` +
-            'it, or edit in a shorter version and post the rest with reply_message.'
+            hint('it, or edit in a shorter version and post the rest with reply_message.', 'it.')
         : `${lead}: Slack refused the text as too long. Split it into shorter messages and send them in order.`;
     case 'invalid_name': {
       const emoji = given('emoji');
@@ -423,12 +426,11 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
       return call.tool === 'upload_file'
         ? `${lead}: ${conversation} takes messages only as thread replies. Pass messageId, the id of the message ` +
           'whose thread the file goes in.'
-        : `${lead}: ${conversation} takes messages only as thread replies. Use reply_message with the id of the ` +
-          "message you're answering.";
+        : `${lead}: ${conversation} takes messages only as thread replies. ` + hint("Use reply_message with the id of the message you're answering.");
     case 'restricted_action_non_threadable_channel':
       return call.tool === 'upload_file'
         ? `${lead}: ${conversation} doesn't take thread replies. Upload without messageId instead.`
-        : `${lead}: ${conversation} doesn't take thread replies. Post with send_message instead.`;
+        : `${lead}: ${conversation} doesn't take thread replies. ` + hint('Post with send_message instead.');
     case 'restricted_action':
     case 'restricted_action_read_only_channel':
     case 'restricted_action_thread_locked':
@@ -508,8 +510,7 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
         : undefined;
     case 'user_not_found':
       return (
-        `${lead}: Slack has no user ${userId ?? 'by the id given'}. ${RECALLED}. find_user returns each ` +
-        "person's userId."
+        `${lead}: Slack has no user ${userId ?? 'by the id given'}. ${RECALLED}. ` + hint("find_user returns each person's userId.")
       );
     case 'user_not_visible':
       return (

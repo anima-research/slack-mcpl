@@ -198,7 +198,7 @@ for (const mcpl of [false, true]) {
         name, arguments: { channelId: 'C1', content: 'must not post' },
       }) as { isError?: boolean; content: { text: string }[] };
       assert.equal(result.isError, true);
-      assert.equal(result.content[0].text, `Tool '${name}' is disabled by operator configuration`);
+      assert.equal(result.content[0].text, `Tool '${name}' is disabled by operator configuration, so nothing ran. Calling again won't change that; whoever runs this host decides which tools are available.`);
     }
     assert.deepEqual(fake.posts, []);
     assert.deepEqual(fake.reads, []);
@@ -227,7 +227,7 @@ for (const mcpl of [false, true]) {
     for (const { name } of toolDefinitions) {
       const result = await h.host.sendRequest('tools/call', { name, arguments: {} }) as { isError?: boolean; content: { text: string }[] };
       assert.equal(result.isError, true);
-      assert.equal(result.content[0].text, `Tool '${name}' is disabled by operator configuration`);
+      assert.equal(result.content[0].text, `Tool '${name}' is disabled by operator configuration, so nothing ran. Calling again won't change that; whoever runs this host decides which tools are available.`);
     }
   });
 }
@@ -287,7 +287,7 @@ test('disabled reaction and deletion tools do not block automatic acknowledgemen
       name, arguments: { channelId: 'C1', messageId: '111.1', emoji: 'eyes' },
     }) as { isError?: boolean; content: { text: string }[] };
     assert.equal(result.isError, true);
-    assert.equal(result.content[0].text, `Tool '${name}' is disabled by operator configuration`);
+    assert.equal(result.content[0].text, `Tool '${name}' is disabled by operator configuration, so nothing ran. Calling again won't change that; whoever runs this host decides which tools are available.`);
   }
   assert.deepEqual(fake.reactions, []);
   assert.deepEqual(fake.deletedMessages, []);

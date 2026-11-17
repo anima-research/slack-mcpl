@@ -59,7 +59,7 @@ async function main(): Promise<void> {
   );
   console.error(
     `[slack-mcpl] writes: ${sendChannels?.length ? `only ${sendChannels.join(', ')}` : 'anywhere'}; ` +
-      `DMs: ${disableDms ? 'off' : 'on'}; tools off: ${[...new Set(disabledTools)].join(', ') || 'none'}`,
+      `DMs: ${disableDms ? 'off' : 'on'}; tools off: ${disabledTools.join(', ') || 'none'}`,
   );
 
   // Clear pending acknowledgement reactions and thread statuses before exiting,

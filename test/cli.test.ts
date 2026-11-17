@@ -20,7 +20,7 @@ test('index refuses a bad disabled tool on one line before contacting Slack', ()
   const run = startWith({ SLACK_DISABLED_TOOLS: 'send_message,bad\nname' });
   assert.equal(run.status, 1, run.stderr);
   assert.equal(run.stdout, '');
-  assert.equal(run.stderr, 'SLACK_DISABLED_TOOLS names an unknown tool: "bad\\nname"\n');
+  assert.equal(run.stderr, 'Unknown disabled tool: "bad\\nname"\n');
 });
 
 test('startup logs that no tools are disabled by default', () => {
@@ -52,6 +52,7 @@ test('startup reads every setting from the command line and the environment', ()
     SLACK_DISABLE_DMS: 'yes',
     SLACK_SUBSCRIBE_MEMBER_CHANNELS: '1',
     SLACK_ACK_REACTION: ':eyes:',
+    SLACK_DISABLED_TOOLS: 'send_dm,upload_file',
   };
   assert.deepEqual(startupSettings(['--tcp', '4100'], env), {
     settings: {
@@ -61,7 +62,7 @@ test('startup reads every setting from the command line and the environment', ()
       appToken: 'xapp-1',
       dmUsers: ['U1', 'U2'],
       sendChannels: ['C1', 'C2'],
-      disabledTools: [],
+      disabledTools: ['send_dm', 'upload_file'],
       disableDms: true,
       subscribeMemberChannels: true,
       ackReaction: 'eyes',
@@ -100,4 +101,13 @@ test('a SLACK_DM_USERS that names no user is refused with one line, DMs on or of
   const unset = startupSettings(['--stdio'], tokens);
   assert.ok('settings' in unset, JSON.stringify(unset));
   assert.equal(unset.settings.dmUsers, undefined);
+});
+
+test('empty disabled-tools restrictions fail before contacting Slack', () => {
+  for (const raw of ['', ' , \t, ']) {
+    const run = startWith({ SLACK_DISABLED_TOOLS: raw });
+    assert.equal(run.status, 1);
+    assert.equal(run.stdout, '');
+    assert.equal(run.stderr, 'SLACK_DISABLED_TOOLS is set but names no tool; unset it to keep every tool\n');
+  }
 });

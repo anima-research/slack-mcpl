@@ -4,6 +4,7 @@
  * request through the adapter's client, so it keeps the call's time and wait
  * budget like every other request. Backscroll keeps the adapter's own pager.
  */
+import { toolHint } from './tool-guidance.js';
 import { createHash } from 'node:crypto';
 import { formatSlackText, type SlackHistoryMessage } from './content.js';
 import { mimeShown, nameShown, toolResultJson, urlShown } from './framing.js';
@@ -121,15 +122,15 @@ export function refuseUnknownArguments(args: Record<string, unknown>, kind: Kind
 
 /** A read's arguments, checked before Slack is asked. */
 export type ReadOptions = ReturnType<typeof readOptions>;
-export function readOptions(args: Record<string, unknown>, kind: Kind, channelId: string, threadTs?: string) {
+export function readOptions(args: Record<string, unknown>, kind: Kind, channelId: string, threadTs?: string, toolEnabled: (name: string) => boolean = () => true) {
   refuseUnknownArguments(args, kind);
   if (!/^[CGD][A-Z0-9]+$/.test(channelId)) {
     throw refused(
       `channelId must be a Slack conversation id, such as C0123456789, and this call passed ${passed(channelId)}. ` +
-        `${CHANNEL_IDS}.`,
+        `${toolHint(CHANNEL_IDS, toolEnabled, "Copy channelId= from an incoming message")}.`,
     );
   }
-  if (kind === 'thread') timestamp(threadTs, 'threadTs', `${PARENT_IDS}.`);
+  if (kind === 'thread') timestamp(threadTs, 'threadTs', `${toolHint(PARENT_IDS, toolEnabled, 'Copy thread= from a reply, or id= from its parent')}.`);
   const limits = {} as Record<keyof typeof READ_LIMITS, number>;
   for (const [name, bounds] of Object.entries(READ_LIMITS)) {
     const value = args[name] === undefined
@@ -216,7 +217,7 @@ function cursorPosition(cursor: unknown, queryHash: string): string {
 }
 
 /** A message as the read tools return it. */
-export function historyRecord(m: HistoryMessage) {
+export function historyRecord(m: HistoryMessage, attachmentToolEnabled = true) {
   return {
     id: m.id,
     ...(m.authorId ? { authorId: m.authorId } : {}),
@@ -230,7 +231,7 @@ export function historyRecord(m: HistoryMessage) {
     ...(m.attachments.length > 0
       ? {
           attachments: m.attachments.map((a) =>
-            `${nameShown(a.name)}${a.mimeType ? ` (${mimeShown(a.mimeType)})` : ''}${a.url ? ` — fetchable via fetch_attachment: ${urlShown(a.url)}` : ''}`,
+            `${nameShown(a.name)}${a.mimeType ? ` (${mimeShown(a.mimeType)})` : ''}${a.url ? ` — ${attachmentToolEnabled ? 'fetchable via fetch_attachment' : 'attachment URL'}: ${urlShown(a.url)}` : ''}`,
           ),
         }
       : {}),
@@ -260,6 +261,7 @@ export interface ReadSource {
   page(at: string | undefined, limit: number): Promise<{ messages?: unknown; has_more?: unknown; response_metadata?: unknown }>;
   shape(messages: SlackHistoryMessage[]): Promise<HistoryMessage[]>;
   writable: boolean;
+  attachmentToolEnabled?: boolean;
   stopped(err: unknown): ReadStop | undefined;
 }
 
@@ -351,7 +353,7 @@ export async function readBounded(opts: ReadOptions, source: ReadSource): Promis
         if (scanned >= opts.maxScanned) { stopReason = 'scan_limit'; break pages; }
         const record = shaped.get(m);
         if (record) {
-          const returned = historyRecord(record);
+          const returned = historyRecord(record, source.attachmentToolEnabled);
           const bytes = Buffer.byteLength(toolResultJson(returned));
           if (skeleton + recordBytes + records.length + bytes > opts.maxBytes) {
             // Held back whole, and neither scanned nor matched here: the
