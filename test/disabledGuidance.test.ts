@@ -63,9 +63,11 @@ test('mention attachment and history attachment guidance preserve URLs without a
   assert.doesNotMatch(push, /fetchable via fetch_attachment/);
   assert.match(push, /attachment URL/);
   assert.match(push, /shot.png/);
+  assert.ok(push.includes(files[0].url_private));
   const history = await call(h.host, 'fetch_history', { channelId: 'C1' });
   assert.doesNotMatch(history, /fetchable via fetch_attachment/);
   assert.match(history, /attachment URL/);
+  assert.ok(history.includes(files[0].url_private));
   assert.match(history, /fetch_attachment is user content/);
 });
 
@@ -269,4 +271,31 @@ test('ungrouped tools remain advertised and callable without tool-bearing featur
     const text = await call(h.host, name, { query: 'alice' });
     assert.doesNotMatch(text, /capability|not granted|disabled by operator/);
   }
+});
+
+
+for (const policy of [{ disableDms: true }, { sendChannels: ['C1'] }]) {
+  test(`DM policy does not leave tool-free messaging dependent on tools: ${JSON.stringify(policy)}`, async t => {
+    const disabledTools = ['send_message', 'reply_message', 'upload_file', 'add_reaction', 'edit_message', 'delete_message'];
+    const fake = fakeSlack(policy);
+    const h = connectHost(new SlackMcplServer(fake.slack, { disabledTools }));
+    t.after(() => h.close());
+    const init = await initialize(h, true);
+    const manifest = init.capabilities.experimental as { mcpl: { featureSets: Record<string, { uses: string[] }> } };
+    assert.ok(!manifest.mcpl.featureSets['slack.messaging'].uses.includes('tools'));
+    await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT.filter(path => path !== 'tools') });
+    await fake.socket.emitMessage({ ...MENTION_EVENT, channel_type: 'channel' });
+    await until(() => h.hostSaw.some(r => r.method === method.PUSH_EVENT), 'mention under DM policy');
+  });
+}
+
+test('disabled fetch_history does not suppress automatic backscroll', async t => {
+  const fake = fakeSlack({ historyMessages: [{ ts: '99.1', user: 'U2', text: 'automatic context survives' }] });
+  const h = connectHost(new SlackMcplServer(fake.slack, { disabledTools: ['fetch_history'] }));
+  t.after(() => h.close());
+  await initialize(h, true);
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await fake.socket.emitMessage(MENTION_EVENT);
+  await until(() => h.hostSaw.some(r => r.method === method.PUSH_EVENT), 'mention with automatic backscroll');
+  assert.match(JSON.stringify(h.hostSaw.find(r => r.method === method.PUSH_EVENT)!.params), /automatic context survives/);
 });

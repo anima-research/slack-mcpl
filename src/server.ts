@@ -262,7 +262,7 @@ export class SlackMcplServer {
     // Caller-owned options must not change the operator policy after startup.
     this.opts = { ...opts, disabledTools: [...(opts.disabledTools ?? [])] };
     this.slack.toolEnabled = this.toolEnabled;
-    this.grant.setDeclarations(buildFeatureSets(this.opts.disabledTools));
+    this.grant.setDeclarations(buildFeatureSets(this.declarationDisabledTools()));
     // Once for the server's life: the adapter keeps every handler it's
     // given, and each forwards to whichever connection is being served, so
     // one per connection forwarded each message once per connection served.
@@ -366,7 +366,7 @@ export class SlackMcplServer {
     // the host publishes text-only turns to the conversational locus via
     // channels/publish, so no contextHooks are declared here (same rationale
     // as discord-mcpl; see LOCUS-ROUTING-DESIGN.md).
-    const serverCaps: McplCapabilities = buildServerCapabilities(this.opts.disabledTools);
+    const serverCaps: McplCapabilities = buildServerCapabilities(this.declarationDisabledTools());
 
     const capabilities: InitializeCapabilities = {
       tools: {},
@@ -401,6 +401,11 @@ export class SlackMcplServer {
    *  refresh_channels only where MCPL was negotiated, since a plain MCP
    *  connection has no host to register conversations with. Neither changes
    *  during a connection, as a grant can. */
+  private declarationDisabledTools(): readonly string[] {
+    return this.slack.dmsWritable ? this.opts.disabledTools ?? []
+      : [...(this.opts.disabledTools ?? []), 'send_dm'];
+  }
+
   private offeredTools() {
     return toolDefinitions.filter((t) =>
       (t.name !== 'send_dm' || this.slack.dmsWritable) && (t.name !== 'refresh_channels' || this.mcplEnabled)

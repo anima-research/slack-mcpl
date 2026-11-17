@@ -138,7 +138,9 @@ Uploads belong to `slack.messaging` checkpoints, so rollback attempts to
 delete them along with later messages: the file, through Slack's file
 deletion API, and the message that shared it, which holds the comment, when
 Slack's answer named that message. When it didn't, the rollback's answer says
-the comment may remain, and that `delete_message` may delete it. An upload
+the comment may remain, with a `delete_message` remedy when deletion and a
+history read tool are enabled; otherwise someone with Slack access must locate
+and delete the sharing message. An upload
 that failed after Slack gave the file its ID is rolled back the same way.
 Rollback is best-effort and reports partial failures by kind, naming each
 message and file it couldn't delete, with its conversation, and apart from

@@ -22,3 +22,6 @@
   and valid tool names when configuration is refused.
 - Keep inbound messaging available without the tools capability when all messaging
   tools are disabled, even if tools in other feature sets remain enabled.
+
+- Messaging does not require tools when operator controls and DM policy leave
+  it with no offered tools; protocol delivery remains available.
