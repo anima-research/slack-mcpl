@@ -900,16 +900,17 @@ export class SlackAdapter {
     // Best effort: clear reactions and statuses together before going away.
     // index.ts gives shutdown five seconds; no new starts while that runs.
     this.stopping = true;
-    for (const adopted of this.ackAdopted.values()) {
-      for (const timer of adopted.values()) clearTimeout(timer);
-    }
-    this.ackAdopted.clear();
     await Promise.all([this.resetThreadStatuses(), ...[...this.ackPending.keys()].map((c) => this.clearAck(c))]);
     // A removal that failed just before stop() began has armed its retry, and
     // the clear above only joined it. Nothing is tried again after a stop.
     for (const [channelId, pending] of [...this.ackPending]) {
       for (const [ts, entry] of [...pending]) this.dropAck(channelId, ts, entry);
     }
+    // An adoption joined above can finish while shutdown is waiting.
+    for (const adopted of this.ackAdopted.values()) {
+      for (const timer of adopted.values()) clearTimeout(timer);
+    }
+    this.ackAdopted.clear();
     if (this.socketStarted) {
       await this.socket.disconnect().catch(() => {});
       this.socketStarted = false;
