@@ -146,11 +146,17 @@ test('tiny supplemental caps also bound the truncation marker', () => {
   }
 });
 
-test('nested omission keys have bounded label length and retained bytes before normalization', () => {
+test('nested omission comparisons have bounded label length and traversal work', () => {
   // Observe work entering comparison, rather than relying on wall-clock speed.
   const split = String.prototype.split;
+  const add = Set.prototype.add;
   for (const cap of [2000, 16_384]) {
     let bytes = 0;
+    let retainedBytes = 0;
+    Set.prototype.add = function (value: unknown) {
+      if (typeof value === 'string' && value.startsWith('[') && value.endsWith(' omitted]')) retainedBytes += value.length;
+      return add.call(this, value);
+    };
     let longest = 0;
     String.prototype.split = function (this: string, separator: any, limit?: number): any {
       if (separator instanceof RegExp && separator.source === '(`+)') {
@@ -170,9 +176,14 @@ test('nested omission keys have bounded label length and retained bytes before n
       ] }] }, cap);
     } finally {
       String.prototype.split = split;
+      Set.prototype.add = add;
     }
+    assert.ok(retainedBytes <= 2 * cap, `retained raw and normalized omission keys: ${retainedBytes}`);
     assert.ok(longest > 0 && longest <= 610, `largest omission key: ${longest}`);
-    assert.ok(bytes <= cap, `retained omission keys: ${bytes} > ${cap}`);
+    // Rejected labels now compare before allowance checks so normalized duplicates
+    // cannot report false truncation. Comparisons are bounded by visits and
+    // label length, not retained output bytes (accepted labels compare twice).
+    assert.ok(bytes <= 2 * 1000 * 610, `bounded omission comparison work: ${bytes}`);
     assert.ok(output.startsWith('Readable after omissions'));
     assert.ok(output.endsWith('[…truncated]'));
     assert.ok(output.length <= cap);
@@ -233,11 +244,13 @@ test('live delivery uses cached supplemental names without optional lookups', as
 
 
 test('block-heavy backscroll yields before completing a full window', async () => {
-  const rows = Array.from({length: 1000}, (_, i) => ({ts: `${i + 1}.000001`, blocks: [{type: 'markdown', text: 'x'.repeat(16000)}]}));
+  let rendered = 0;
+  const rows = Array.from({length: 1000}, (_, i) => ({ts: `${i + 1}.000001`, blocks: [{type: 'markdown', get text() { rendered++; return 'x'.repeat(16000); }}]}));
   const adapter = new SlackAdapter({conversations: {history: async () => ({messages: rows})}} as any, {on() {}} as any, 'UBOT', 'example');
   let finished = false;
   const pending = adapter.fetchHistory('C1', {limit: 1000}).then(result => { finished = true; return result; });
   await new Promise<void>(resolve => setImmediate(resolve));
+  assert.ok(rendered > 0 && rendered < 1000, 'rendering has started but yields before the full window');
   assert.equal(finished, false, 'Socket Mode gets an event-loop turn during rendering');
   assert.equal((await pending).messages.length, 1000);
 });

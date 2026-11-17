@@ -1003,5 +1003,6 @@ test('absent text filter yields between candidate batches before shaping', async
     stopped: () => undefined,
   });
   clearImmediate(timer!);
+  assert.equal(yielded, true, 'candidate scanning yields even without a shape callback');
   assert.equal(result.pagination.scanned, 24);
 });

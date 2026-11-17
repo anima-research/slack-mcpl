@@ -268,12 +268,12 @@ export class SlackMcplServer {
   private lastChannelId: string | null = null;
 
   /** How many backscroll messages to fetch on first interaction. Tunable via
-   *  SLACK_BACKSCROLL_LIMIT; values outside [1, 1000] use default 50. */
+   *  SLACK_BACKSCROLL_LIMIT; only integers in [1, 1000] are accepted; otherwise default 50. */
   private get backscrollLimit(): number {
     const raw = process.env.SLACK_BACKSCROLL_LIMIT;
     if (!raw) return 50;
-    const n = parseInt(raw, 10);
-    return Number.isFinite(n) && n > 0 && n <= 1000 ? n : 50;
+    const n = Number(raw);
+    return Number.isInteger(n) && n > 0 && n <= 1000 ? n : 50;
   }
 
   /** Conversations muted with unsubscribe_channel while every member channel

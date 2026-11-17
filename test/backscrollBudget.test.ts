@@ -1,13 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { backscrollBlock } from '../src/server.js';
+import { backscrollBlock, SlackMcplServer } from '../src/server.js';
 
 const message = (id: number, content: string) => ({id: `${id}.000001`, timestamp: new Date(id * 1000), authorName: 'Ann', content, attachments: []});
 test('oversized backscroll message has an in-position omission placeholder', () => {
   const rows = [message(1, 'old one'), message(2, 'old two'), message(3, 'x'.repeat(33000)), message(4, 'newest')];
   const block = backscrollBlock(rows, {isDM: false}, true);
   assert.ok(Buffer.byteLength(block) <= 32768);
-  assert.match(block, /\[backscroll notice: message omitted \(\d+ bytes\); timestamp=1970-01-01T00:00:03.000Z id=3.000001; author="Ann"; try fetch_history; follow nextCursor until this id is reached\]/);
+  assert.match(block, /\[backscroll notice: message omitted \(\d+ bytes\); timestamp=1970-01-01T00:00:03\.000Z id=3\.000001; author="Ann"; try fetch_history; follow nextCursor until this id is reached\]/);
+  assert.equal(block.split('\n').length, 6, 'four row positions plus opening and closing frame');
+  assert.ok(block.includes('old one'));
+  assert.ok(block.indexOf('old one') < block.indexOf('old two'));
   assert.ok(block.includes('old two'));
   assert.ok(block.indexOf('old two') < block.indexOf('message omitted'));
   assert.ok(block.indexOf('message omitted') < block.indexOf('newest'));
@@ -21,7 +24,7 @@ test('thousand-message backscroll keeps a contiguous newest window including pla
   const ids = [...block.matchAll(/id=(\d+)\.000001/g)].map(m => Number(m[1]));
   assert.ok(ids.length > 0 && ids.length < 1000);
   assert.deepEqual(ids, Array.from({length: ids.length}, (_, i) => 1001 - ids.length + i));
-  assert.match(block.split('\n')[1], new RegExp(`^\\[${1000 - ids.length} older backscroll messages not shown; try fetch_history latest=${ids[0]}.000001\\]$`));
+  assert.match(block.split('\n')[1], new RegExp(`^\\[${1000 - ids.length} older backscroll messages not shown; try fetch_history latest=${ids[0]}\\.000001\\]$`));
   assert.equal((block.match(/bytes\).*; try fetch_history/g) || []).length, ids.length);
 });
 test('older backscroll summary uses singular when one message is outside the window', () => {
@@ -29,7 +32,7 @@ test('older backscroll summary uses singular when one message is outside the win
   const rows = Array.from({length: 3}, (_, i) => ({...message(i + 1, 'x'.repeat(40000)), authorName: 'A'.repeat(12000)}));
   const block = backscrollBlock(rows, {isDM: true}, true);
   assert.ok(Buffer.byteLength(block) <= 32768);
-  assert.match(block, /1 older backscroll message not shown; try fetch_history latest=2.000001/);
+  assert.match(block, /1 older backscroll message not shown; try fetch_history latest=2\.000001/);
 });
 
 test('configured thousand-message backscroll is bounded on first-interaction delivery', async (t) => {
@@ -119,4 +122,22 @@ test('an empty retained window still gives pagination instructions', () => {
   assert.match(block, /count="0"/);
   assert.match(block, /follow nextCursor until the omitted window is reached/);
   assert.ok(Buffer.byteLength(block) <= 32768);
+});
+
+
+test('backscroll limit accepts only whole values in range', (t) => {
+  const previous = process.env.SLACK_BACKSCROLL_LIMIT;
+  t.after(() => {
+    if (previous === undefined) delete process.env.SLACK_BACKSCROLL_LIMIT;
+    else process.env.SLACK_BACKSCROLL_LIMIT = previous;
+  });
+  const server = Object.create(SlackMcplServer.prototype) as any;
+  for (const raw of ['1000.9', '12oops', '0', '1001', '-1', 'NaN', '']) {
+    process.env.SLACK_BACKSCROLL_LIMIT = raw;
+    assert.equal(server.backscrollLimit, 50, raw);
+  }
+  for (const raw of ['1', '50', '1000']) {
+    process.env.SLACK_BACKSCROLL_LIMIT = raw;
+    assert.equal(server.backscrollLimit, Number(raw), raw);
+  }
 });

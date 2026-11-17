@@ -38,7 +38,7 @@ async function expectText(payload: Record<string, unknown>, expected: string, bo
   const result = await shaped(payload, bot);
   const original = formatSlackText(typeof payload.text === 'string' ? payload.text : '', new Map([['U1', 'alice']]));
   const originalIds = new Set(extractSlackUserIds(typeof payload.text === 'string' ? payload.text : ''));
-  // Every path uses cached names or raw IDs; only U1 is cached in this helper.
+  // Every path uses cached names or raw IDs; U1 and IDs mentioned in original text are cached in this helper.
   let backscroll = expected.replace(/@alice \(uid:([A-Z0-9]+)\)/g,
     (mention, id) => originalIds.has(id) || id === 'U1' ? mention : `@${id} (uid:${id})`);
   if (backscroll.length - original.length > 2000) {
@@ -724,4 +724,26 @@ test('history filters agree with rendered channel labels, usergroups and truncat
     assert.ok(all.messages[0].content.includes(textContains));
     assert.deepEqual((await adapter.readHistory('C1', {textContains})).messages, all.messages);
   }
+});
+
+test('discarded bounded duplicate units do not report truncation', () => {
+  const padded = 'hello' + ' '.repeat(17000);
+  for (const payload of [
+    {attachments: [{text: padded}]},
+    {attachments: [{fallback: padded}]},
+    {attachments: [{blocks: [{type: 'markdown', text: padded}]}]},
+    {blocks: [{type: 'markdown', text: padded}]},
+    {blocks: [{type: 'section', fields: [{text: 'hello'}, {text: ' '.repeat(17000)}]}]},
+  ]) assert.equal(renderMessageText({text: 'hello', ...payload}), 'hello');
+  assert.match(renderMessageText({text: 'hello', blocks: [{type: 'markdown', text: 'distinct'.repeat(3000)}]}), /\[…truncated\]$/);
+});
+
+test('null client_msg_id is not client provenance for app rich text', () => {
+  assert.equal(renderMessageText({text: 'summary', app_id: 'A1', client_msg_id: null,
+    blocks: [{type: 'rich_text', elements: [{type: 'rich_text_section', elements: [{type: 'text', text: 'details'}]}]}],
+  }), 'summary\ndetails');
+});
+
+test('normalized duplicate omission labels do not spend deferred allowance', () => {
+  assert.equal(renderMessageText({attachments: [{blocks: [{type: 'poll'}, {type: 'poll '}]}]}, 15), '[poll omitted]');
 });

@@ -65,6 +65,7 @@ export function renderMessageText(
     return token;
   });
   let truncated = false;
+  let workTruncated = false;
   // Allow container visits along each character's depth-limited path.
   const cap = Math.max(2000, 14 * original.length + 2);
   let budget = cap;
@@ -73,11 +74,11 @@ export function renderMessageText(
     for (let i = 0; i < items.length; i++) {
       // Check before reading the next entry, including when a child spent
       // the remainder of the shared budget. Never eagerly copy pending lists.
-      if (budget <= 0) { truncated = true; return; }
+      if (budget <= 0) { workTruncated = true; return; }
       yield items[i];
     }
   }
-  const visit = () => { if (--budget < 0) { truncated = true; return false; } return true; };
+  const visit = () => { if (--budget < 0) { workTruncated = true; return false; } return true; };
   const renderLimit = Math.max(MAX_MESSAGE_TEXT_APPEND, original.length + 1);
   const bounded = (v: unknown) => { const text = string(v); if (text.length > renderLimit) truncated = true; return prefix(text, renderLimit); };
   // Consume children lazily: each expansion
@@ -194,7 +195,7 @@ export function renderMessageText(
   }), new Map()));
   const originalKey = keyFor(original);
   const scopes = new Map<string, { seen: Set<string>; rawSeen: Set<string> }>();
-  function unique(value: string, attribution = ''): boolean {
+  function unique(value: string, attribution = '', remember = true): boolean {
     let scope = scopes.get(attribution);
     if (!scope) {
       scope = { seen: new Set(), rawSeen: new Set() };
@@ -202,10 +203,10 @@ export function renderMessageText(
     }
     const { seen, rawSeen } = scope;
     if (rawSeen.has(value)) return false;
-    rawSeen.add(value);
+    if (remember) rawSeen.add(value);
     const key = keyFor(value);
     if (key && (attribution !== '' || key !== originalKey) && !seen.has(key)) {
-      seen.add(key);
+      if (remember) seen.add(key);
       return true;
     }
     return false;
@@ -214,7 +215,16 @@ export function renderMessageText(
     appendedLength += value.length + (appended.length ? 1 : 0);
     appended.push(value);
   }
-  function append(value: string) { if (unique(value)) emit(value); }
+  // Rendering cuts belong to the unit retained after deduplication. Traversal
+  // exhaustion is separate: unvisited units may still contain distinct text.
+  function unit(render: () => string, attribution = '', remember = true): string {
+    const previous = truncated;
+    truncated = false;
+    const value = render();
+    const retained = unique(value, attribution, remember);
+    truncated = previous || (truncated && (retained || !value.trim()));
+    return retained ? value : '';
+  }
   const urls = new Set<string>();
   const bareOriginal = mapSlackAngles(original, token => {
     const match = /^<(https?:\/\/[^|>]+)(?:\|[^>]*)?>$/.exec(token);
@@ -233,17 +243,6 @@ export function renderMessageText(
     // Classic attachment fields carry Slack tokens/entities independently of
     // mrkdwn_in (which governs basic styling, passed through here either way).
     const fieldText = bounded;
-    const title = fieldText(a.title);
-    const body = join((function* () {
-      yield fieldText(a.pretext);
-      yield title ? join([title, escape(bounded(a.title_link))], ' ') : '';
-      yield fieldText(a.text);
-      yield* map(take(a.fields), rawField => {
-        if (!visit()) return '';
-        const f = object(rawField);
-        return join([fieldText(f.title), fieldText(f.value)], ': ');
-      });
-    })());
     const shared = a.is_share === true || a.is_msg_unfurl === true;
     let header = '';
     if (shared || string(a.author_name)) {
@@ -256,33 +255,45 @@ export function renderMessageText(
     }
     // Keep distinct source messages even when their displayed headers match.
     const identity = header ? JSON.stringify([header, string(a.channel_id), (typeof a.ts === 'number' && Number.isFinite(a.ts) ? String(a.ts) : string(a.ts))]) : '';
+    let hasBody = false;
+    const body = unit(() => {
+      const title = fieldText(a.title);
+      const value = join((function* () {
+        yield fieldText(a.pretext);
+        yield title ? join([title, escape(bounded(a.title_link))], ' ') : '';
+        yield fieldText(a.text);
+        yield* map(take(a.fields), rawField => {
+          if (!visit()) return '';
+          const f = object(rawField);
+          return join([fieldText(f.title), fieldText(f.value)], ': ');
+        });
+      })());
+      hasBody = !!value.trim();
+      return value;
+    }, identity);
     const nested: string[] = [];
     const placeholders: string[] = [];
     let omissionBytes = 0;
     const omissionLimit = Math.max(0, Math.min(maxAppend, renderLimit));
     let nestedLength = 0;
     let hasReadableNested = false;
-    const units = body.trim() && unique(body, identity) ? [body] : [];
+    const units = body.trim() ? [body] : [];
     for (const rawBlock of take(a.blocks)) {
-      const value = block(rawBlock);
+      const omitted = placeholder(rawBlock);
+      const value = unit(() => {
+        const rendered = block(rawBlock);
+        if (!omitted && rendered.trim()) hasReadableNested = true;
+        return rendered;
+      }, identity, !omitted);
       if (value.trim()) {
-        const omitted = placeholder(rawBlock);
-        if (!omitted) hasReadableNested = true;
         // Deferred notices get their own allowance so they cannot displace
         // readable blocks or retain unbounded keys while waiting for them.
-        if (omitted) {
-          const scope = scopes.get(identity);
-          if (scope?.rawSeen.has(value)) continue;
-          // Original-text mirrors must not consume the deferred allowance.
-          // Avoid normalizing every rejected label once the allowance is full.
-          if (!identity && originalKey && keyFor(value) === originalKey) continue;
-        }
         const omissionCost = value.length + (placeholders.length ? 1 : 0);
         if (omitted && omissionBytes + omissionCost > omissionLimit) {
           truncated = true;
           continue;
         }
-        if (!unique(value, identity)) continue;
+        if (omitted) unique(value, identity);
         (omitted ? placeholders : nested).push(value);
         if (omitted) omissionBytes += omissionCost;
         // Deferred omission labels must not crowd out later readable blocks.
@@ -291,9 +302,9 @@ export function renderMessageText(
       }
     }
     // Deduplicate mirrors within the same attribution and source message.
-    if (!body.trim() && !hasReadableNested) {
-      const fallback = fieldText(a.fallback);
-      if (unique(fallback, identity)) units.push(fallback);
+    if (!hasBody && !hasReadableNested) {
+      const fallback = unit(() => fieldText(a.fallback), identity);
+      if (fallback) units.push(fallback);
     }
     for (const value of nested) units.push(value);
     for (const value of placeholders) units.push(value);
@@ -306,13 +317,14 @@ export function renderMessageText(
   // Slack clients supply rich_text mirrors. Trust provenance, not heuristics;
   // blocks-only messages (including apps posting as users) still need rendering.
   const skipHumanRichText = original.trim() !== '' &&
-    (message.client_msg_id !== undefined || (!message.bot_id && !message.app_id && !message.bot_profile));
+    (typeof message.client_msg_id === 'string' || (!message.bot_id && !message.app_id && !message.bot_profile));
   // Attachments must not consume the top-level mirror comparison allowance.
   budget = cap;
   for (const b of take(message.blocks)) {
     if (full()) break;
     if (skipHumanRichText && object(b).type === 'rich_text') { visit(); continue; }
-    append(block(b));
+    const value = unit(() => block(b));
+    if (value) emit(value);
   }
   let expandedLength = 0;
   const joined = join(appended);
@@ -333,7 +345,7 @@ export function renderMessageText(
   const addition = (original && suffix ? '\n' : '') + suffix;
   if (addition.length > maxAppend) truncated = true;
   const marker = prefix('[…truncated]', Math.max(0, maxAppend));
-  return original + (truncated
+  return original + (truncated || workTruncated
     ? prefix(addition || (original ? '\n' : ''), maxAppend - marker.length) + marker
     : addition);
 }
