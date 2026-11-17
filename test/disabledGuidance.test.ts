@@ -253,3 +253,20 @@ for (const disabledTools of [['fetch_history'], ['fetch_thread'], ['delete_messa
     }
   });
 }
+
+test('ungrouped tools remain advertised and callable without tool-bearing feature sets', async t => {
+  const survivors = ['list_channels', 'find_user', 'refresh_channels'];
+  const disabledTools = toolDefinitions.map(tool => tool.name).filter(name => !survivors.includes(name));
+  const h = connectHost(new SlackMcplServer(fakeSlack().slack, { disabledTools }));
+  t.after(() => h.close());
+  const init = await initialize(h, true);
+  assert.deepEqual(init.capabilities.tools, {});
+  assert.ok(Object.values(buildFeatureSets(disabledTools)).every(set => !set.uses.includes('tools')));
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  const listed = await h.host.sendRequest('tools/list', {}) as { tools: { name: string }[] };
+  assert.deepEqual(listed.tools.map(tool => tool.name).sort(), [...survivors].sort());
+  for (const name of survivors) {
+    const text = await call(h.host, name, { query: 'alice' });
+    assert.doesNotMatch(text, /capability|not granted|disabled by operator/);
+  }
+});
