@@ -766,8 +766,8 @@ test('payload docs describe preview and provenance policies accurately', () => {
   const readme = readFileSync('README.md', 'utf8');
   assert.ok(readme.includes('App unfurls are skipped, except message shares. Classic link previews are\nskipped when `from_url` matches an extracted original URL, decoding Slack entities\nand trimming trailing sentence punctuation from bare URLs.'));
   assert.ok(readme.includes('channel/user IDs rather than labels; preserve internal line breaks in prose\n(normalizing line-ending spellings); and preserve other code whitespace.'));
-  const fragmentPath = 'changelog.d/readable-message-payloads.added.md';
-  const added = readFileSync(existsSync(fragmentPath) ? fragmentPath : 'test/fixtures/readable-message-payloads.added.md', 'utf8');
+  // Historical policy belongs to this fixture, not a possibly reused slug.
+  const added = readFileSync('test/fixtures/readable-message-payloads.added.md', 'utf8');
   assert.ok(added.includes('Skip human rich-text mirrors when ordinary text is non-whitespace; retain blocks-only\n  and bot/integration rich text unless original text is non-whitespace and\n  client_msg_id is a string (including\n  an empty string; null and other non-string values do not suppress app rich text).'));
 });
 

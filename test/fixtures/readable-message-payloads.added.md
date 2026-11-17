@@ -12,7 +12,8 @@
   an empty string; null and other non-string values do not suppress app rich text). Bound supplemental traversal and output with
   visible truncation markers, and prioritize attachment-nested readable blocks over their omission labels.
   Top-level blocks retain input order, including omission labels.
-  Supplemental-only mentions use cached names or raw IDs without lookups
+  Supplemental mentions use cached names or raw IDs (even when the same ID has
+  an original-text fallback label), without extra lookups
   in live messages, backscroll and explicit history/thread reads. Authors and original-text
   mentions retain their lookups, which can delay live delivery, reaction ack and wake.
   App-as-user posts without bot_id remain eligible live under chat:from-human by default,
@@ -27,7 +28,9 @@
   Only unattributed units deduplicate against original text; attributed units
   compare within the displayed header plus channel ID and timestamp when supplied;
   missing keys fall back to the displayed attribution, not full source identity.
-  Yield between batches of backscroll rendering.
+  Yield between batches of backscroll rendering; stop abandoned shaping and
+  further name-lookup batches when delivery gives up. Reference comparison keys
+  escape literal NULs so prose cannot collide with mention identities.
   Omission hints explain cursor pagination, including when no placeholder fits.
   Classic link previews can appear in reads and match textContains; they are
   skipped only when from_url exactly matches an extracted original URL. App

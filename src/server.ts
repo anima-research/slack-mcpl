@@ -1660,7 +1660,7 @@ export class SlackMcplServer {
    *  Slack call. A late result is ignored; the client may still finish its call.
    *  A give-up or a failure is logged, since the message goes without what it
    *  looked up. */
-  private async deliveryLookup<T>(lookup: Promise<T>, what: string): Promise<T> {
+  private async deliveryLookup<T>(lookup: Promise<T>, what: string, onGiveUp?: () => void): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     let gaveUp = false;
     try {
@@ -1672,6 +1672,7 @@ export class SlackMcplServer {
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => {
             gaveUp = true;
+            onGiveUp?.();
             console.error(`[slack-mcpl] Gave up on ${what} after 5 s; delivering without it`);
             reject(new Error(`Gave up on ${what} after 5 s`));
           }, 5000);
@@ -1740,11 +1741,13 @@ export class SlackMcplServer {
     let meta: Awaited<ReturnType<typeof this.slack.getConversationMeta>> | undefined;
     let backscroll: Awaited<ReturnType<typeof this.slack.fetchHistory>>['messages'] = [];
     if (isFirstInteraction && isAddressed) {
+      const backscrollAbort = new AbortController();
       try {
         const res = await this.deliveryLookup(this.slack.fetchHistory(msg.channelId, {
           limit: this.backscrollLimit,
+          signal: backscrollAbort.signal,
           latest: msg.id, // never include the triggering message itself
-        }), `the backscroll for message ${msg.id} in ${msg.channelId}`);
+        }), `the backscroll for message ${msg.id} in ${msg.channelId}`, () => backscrollAbort.abort());
         // Drop the bot's own past messages — already in the agent's
         // chronicle as assistant turns, no need to re-echo.
         backscroll = res.messages.filter((m) => m.authorId !== this.slack.botUserId);

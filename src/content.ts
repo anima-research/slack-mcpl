@@ -326,6 +326,7 @@ export async function resolveSlackUserNames(
   client: SlackUserInfoClient,
   cache: Map<string, string>,
   userIds: string[],
+  signal?: AbortSignal,
 ): Promise<Map<string, unknown>> {
   const failed = new Map<string, unknown>();
   const unresolved = Array.from(new Set(userIds)).filter(id => id && !cache.has(id));
@@ -334,6 +335,7 @@ export async function resolveSlackUserNames(
   // rate limit for users.info.
   const CONCURRENCY = 8;
   for (let i = 0; i < unresolved.length; i += CONCURRENCY) {
+    signal?.throwIfAborted();
     await Promise.all(unresolved.slice(i, i + CONCURRENCY).map(async (id) => {
       try {
         const { user } = await client.users.info({ user: id });

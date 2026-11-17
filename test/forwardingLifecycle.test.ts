@@ -29,6 +29,7 @@ function fixture(
   const handlers: Array<(msg: SlackMessageData) => void> = [];
   const posts: Array<{ channel: string; threadTs?: string }> = [];
   const histories: string[] = [];
+  const historySignals: Array<AbortSignal | undefined> = [];
   const cleared: string[] = [];
   const acknowledged: string[] = [];
   const slack = {
@@ -42,8 +43,9 @@ function fixture(
       await beforeMeta();
       return { id, name: 'general', kind: 'channel', isMember: true };
     },
-    async fetchHistory(channel: string) {
+    async fetchHistory(channel: string, opts: { signal?: AbortSignal } = {}) {
       histories.push(channel);
+      historySignals.push(opts.signal);
       return { messages: await history(channel), truncated: false };
     },
     async acknowledge(channel: string, ts: string) { acknowledged.push(`${channel}/${ts}`); },
@@ -55,7 +57,7 @@ function fixture(
   } as unknown as SlackAdapter;
   const server = new SlackMcplServer(slack);
   return {
-    server, slack, handlers, histories, posts, cleared, acknowledged,
+    server, slack, handlers, histories, historySignals, posts, cleared, acknowledged,
     emit(id: string, channelId = 'C1', overrides: Partial<SlackMessageData> = {}) {
       const msg: SlackMessageData = {
         channelId, id, authorId: 'U2', authorName: 'Ann', content: 'hello', cleanContent: 'hello',
@@ -629,9 +631,11 @@ for (const lookup of ['history', 'name', 'location'] as const) {
       t.mock.timers.tick(4999);
       await settle();
       assert.equal(peer.deliveries().length, before, 'still waiting just short of five seconds');
+      if (lookup === 'history') assert.equal(f.historySignals[0]?.aborted, false);
       t.mock.timers.tick(1);
       for (let i = 0; i < 50 && peer.deliveries().length < before + 2; i++) await settle();
       assert.equal(peer.deliveries().length, before + 2, 'optional data cannot hold the conversation indefinitely');
+      if (lookup === 'history') assert.equal(f.historySignals[0]?.aborted, true, 'give-up cancels backscroll shaping');
       const [first, second] = peer.deliveries().slice(before).map(pushText);
       assert.equal(/<backscroll/.test(first), lookup === 'name');
       assert.doesNotMatch(second, /<backscroll/);

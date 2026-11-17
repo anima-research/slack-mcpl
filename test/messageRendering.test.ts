@@ -84,20 +84,21 @@ test('socket ack precedes any renderer access', async () => {
   assert.ok(accesses.every(Boolean), 'render before ack');
 });
 test('supplemental IDs use cached names or raw IDs across all delivery paths', async () => {
-  for (const path of ['live', 'history', 'backscroll']) {
+  for (const path of ['live', 'history', 'thread', 'backscroll']) {
     const calls: string[] = []; let handler: any;
-    const row = { user: 'UAUTH', ts: '100.000001', text: '<@UORIG|original>', blocks: [section(Array.from({length: 30}, (_, i) => `<@U${i}|label>`).join(' '))] };
-    const adapter = new SlackAdapter({users: {info: async ({user}: any) => { calls.push(user); if (user === 'UORIG') throw new Error('temporary lookup failure'); return {user: {name: 'resolved'}};}}, conversations: {history: async () => ({messages: [row]})}} as any, {on(_: string, h: any){handler = h;}} as any, 'UBOT', 'example');
+    const row = { user: 'UAUTH', ts: '100.000001', text: '<@UORIG|original>', blocks: [section('Please ask <@UORIG|supplemental> ' + Array.from({length: 30}, (_, i) => `<@U${i}|label>`).join(' '))] };
+    const adapter = new SlackAdapter({users: {info: async ({user}: any) => { calls.push(user); if (user === 'UORIG') throw new Error('temporary lookup failure'); return {user: {name: 'resolved'}};}}, conversations: {history: async () => ({messages: [row]}), replies: async () => ({messages: [row]})}} as any, {on(_: string, h: any){handler = h;}} as any, 'UBOT', 'example');
     (adapter as any).userNameCache.set('U20', 'CachedName');
     const delivered = new Promise<any>(resolve => adapter.onMessage(resolve));
     let output: string;
     if (path === 'live') { handler({event: {...row, type: 'message', channel: 'C1'}, ack: async () => {}}); output = (await delivered).cleanContent; }
-    else output = (path === 'history' ? await adapter.readHistory('C1', {}) : await adapter.fetchHistory('C1')).messages[0].content;
+    else output = (path === 'history' ? await adapter.readHistory('C1', {}) : path === 'thread' ? await adapter.readThread('C1', row.ts, {}) : await adapter.fetchHistory('C1')).messages[0].content;
     assert.equal(calls.length, 2, calls.join(','));
     assert.match(output, /@U0 \(uid:U0\)/);
     assert.ok(calls.includes('UORIG'));
     assert.match(output, /@CachedName \(uid:U20\)/);
     assert.match(output, /@original \(uid:UORIG\)/, 'original fallback labels survive transient lookup failures');
+    assert.match(output, /Please ask @UORIG \(uid:UORIG\)/, 'supplemental occurrences of the same ID cannot use fallback labels');
   }
 });
 test('backscroll supplemental lines capped at 2000; total block <=32KiB with explicit older summary', async () => {
@@ -294,4 +295,46 @@ test('duplicate deferred omission labels do not falsely truncate', () => {
 test('rich usergroups have readable ID and label fallbacks', () => {
   assert.equal(clean({blocks: [{type: 'rich_text', elements: [{type: 'usergroup', usergroup_id: 'S123'}]}]}), '@S123');
   assert.equal(formatSlackText('<!subteam^S123|@ops>', new Map()), '@ops');
+});
+
+
+test('reference keys cannot collide with literal NUL markers in either direction', () => {
+  for (const [reference, label] of [['<#C1>', 'channel:C1'], ['<@U1>', 'user:U1']]) {
+    for (const literal of [`\0${label}\0`, `\0${label};`, `\0literal;${label};`, `\0\0${label};`]) {
+      for (const [text, extra] of [[literal, reference], [reference, literal]]) {
+        assert.equal(renderMessageText({text, blocks: [section(extra)]}), text + '\n' + extra);
+      }
+    }
+  }
+});
+
+test('abandoned backscroll stops at its next rendering yield before name lookups', async () => {
+  const controller = new AbortController();
+  let rendered = 0;
+  let lookedUp = 0;
+  const messages = Array.from({length: 25}, (_, i) => ({
+    ts: `${100 + i}.000001`, user: `U${i}`, blocks: [{type: 'markdown', get text() {
+      if (++rendered === 1) setImmediate(() => controller.abort());
+      return 'body';
+    }}],
+  }));
+  const adapter = new SlackAdapter({
+    conversations: {history: async () => ({messages})},
+    users: {info: async () => { lookedUp++; return {}; }},
+  } as any, {on(){}} as any, 'UBOT', 'example');
+  await assert.rejects(adapter.fetchHistory('C1', {signal: controller.signal}), {name: 'AbortError'});
+  assert.equal(rendered, 10);
+  assert.equal(lookedUp, 0);
+});
+
+test('abandoned backscroll starts no further name lookup batches', async () => {
+  const controller = new AbortController();
+  let lookedUp = 0;
+  const messages = Array.from({length: 17}, (_, i) => ({ts: `${100 + i}.000001`, user: `U${i}`, text: 'body'}));
+  const adapter = new SlackAdapter({
+    conversations: {history: async () => ({messages})},
+    users: {info: async () => { lookedUp++; controller.abort(); return {}; }},
+  } as any, {on(){}} as any, 'UBOT', 'example');
+  await assert.rejects(adapter.fetchHistory('C1', {signal: controller.signal}), {name: 'AbortError'});
+  assert.equal(lookedUp, 8, 'only the already-started batch may finish');
 });

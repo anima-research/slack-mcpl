@@ -223,10 +223,12 @@ export function renderMessageText(
   const appended: string[] = [];
   let appendedLength = original ? 1 : 0;
   const full = () => { if (appendedLength <= maxAppend) return false; truncated = true; return true; };
-  // Format keys only. Return raw Slack text so the adapter formats output once.
-  const keyFor = (value: string) => normalized(formatSlackText(mapSlackAngles(value, token => {
+  // Format keys only. Escape literal NULs before adding reference markers:
+  // their distinct tags make the encoding unambiguous for arbitrary text.
+  // Return raw Slack text so the adapter formats output once.
+  const keyFor = (value: string) => normalized(formatSlackText(mapSlackAngles(value.replace(/\x00/g, '\x00literal;'), token => {
     const match = REFERENCE.exec(token);
-    return match ? `\x00${match[1] === '@' ? 'user' : 'channel'}:${match[2]}\x00` : token;
+    return match ? `\x00${match[1] === '@' ? 'user' : 'channel'}:${match[2]};` : token;
   }), new Map()));
   const originalKey = keyFor(original);
   const scopes = new Map<string, { seen: Set<string>; rawSeen: Set<string> }>();

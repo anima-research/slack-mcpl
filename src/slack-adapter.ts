@@ -1586,7 +1586,7 @@ export class SlackAdapter {
    *  readThread asks). */
   async fetchHistory(
     channelId: string,
-    opts: { limit?: number; oldest?: string; latest?: string } = {},
+    opts: { limit?: number; oldest?: string; latest?: string; signal?: AbortSignal } = {},
   ): Promise<{ messages: HistoryMessage[]; truncated: boolean }> {
     await this.assertNotDm(channelId, 'Nothing was read');
     const { messages, truncated } = await fetchSlackHistory(this.web, {
@@ -1595,24 +1595,29 @@ export class SlackAdapter {
       ...(opts.latest !== undefined ? { latest: opts.latest } : {}),
       maxMessages: opts.limit ?? 50,
     });
-    return { messages: await this.shapeHistory(messages, 2000), truncated };
+    return { messages: await this.shapeHistory(messages, 2000, opts.signal), truncated };
   }
 
-  private async shapeHistory(messages: SlackHistoryMessage[], maxAppend = MAX_MESSAGE_TEXT_APPEND): Promise<HistoryMessage[]> {
+  private async shapeHistory(messages: SlackHistoryMessage[], maxAppend = MAX_MESSAGE_TEXT_APPEND, signal?: AbortSignal): Promise<HistoryMessage[]> {
     // Supplemental-only mentions never spend the read's call budget or grow
     // the name cache. All delivery paths use an existing name or the raw ID.
+    signal?.throwIfAborted();
     const ids = new Set<string>();
     const texts: string[] = [];
     for (let index = 0; index < messages.length; index++) {
       // Large backscroll windows must not monopolize Socket Mode's loop.
-      if (index > 0 && index % 10 === 0) await new Promise<void>(resolve => setImmediate(resolve));
+      if (index > 0 && index % 10 === 0) {
+        await new Promise<void>(resolve => setImmediate(resolve));
+        signal?.throwIfAborted();
+      }
       texts.push(renderMessageText(messages[index], maxAppend));
     }
     for (const msg of messages) {
       if (msg.user) ids.add(msg.user);
       for (const id of extractSlackUserIds(msg.text ?? '')) ids.add(id);
     }
-    await this.resolveUserNames(Array.from(ids));
+    await this.resolveUserNames(Array.from(ids), signal);
+    signal?.throwIfAborted();
 
     return messages.map((msg, index) => {
       const id = String(msg.ts ?? '');
@@ -1625,7 +1630,7 @@ export class SlackAdapter {
       authorId: msg.user,
       ...(msg.bot_id ? { authorBotId: msg.bot_id } : {}),
       authorName: msg.user ? (this.userNameCache.get(msg.user) ?? msg.user) : (msg.username ?? 'bot'),
-      content: formatSlackText(texts[index], displayNames(msg.text ?? '', texts[index], this.userNameCache)),
+      content: formatMessageText(msg.text ?? '', texts[index], this.userNameCache),
       threadTs: msg.thread_ts && msg.thread_ts !== msg.ts ? msg.thread_ts : undefined,
       rootTs: reported ?? id,
       // Missing means unknown, not none.
@@ -1726,7 +1731,7 @@ export class SlackAdapter {
       authorName,
       ...(text !== (event.text ?? '') ? { rawContent: event.text ?? '' } : {}),
       content: text,
-      cleanContent: formatSlackText(text, displayNames(event.text ?? '', text, this.userNameCache)),
+      cleanContent: formatMessageText(event.text ?? '', text, this.userNameCache),
       mentionIds,
       // Personal mention of the bot — hosts use this to gate wake policy.
       // @here/@channel broadcasts deliberately don't count.
@@ -1742,23 +1747,20 @@ export class SlackAdapter {
 
   /** Resolve user IDs into this adapter's cache (shared logic in content.ts).
    *  Returns the error of each lookup left uncached. */
-  private async resolveUserNames(userIds: Array<string | undefined>): Promise<Map<string, unknown>> {
+  private async resolveUserNames(userIds: Array<string | undefined>, signal?: AbortSignal): Promise<Map<string, unknown>> {
     return resolveSlackUserNames(
       this.web,
       this.userNameCache,
       userIds.filter((id): id is string => !!id),
+      signal,
     );
   }
 }
 
-/** Supplemental-only mentions use cached names or raw IDs, never lookups. */
-function displayNames(original: string, rendered: string, cache: Map<string, string>): Map<string, string> {
-  const names = new Map(extractSlackUserIds(rendered).map(id => [id, id]));
-  const originalIds = new Set(extractSlackUserIds(original));
-  for (const id of names.keys()) {
-    if (cache.has(id)) names.set(id, cache.get(id)!);
-    // Original mentions retain Slack's fallback label on transient failure.
-    else if (originalIds.has(id)) names.delete(id);
-  }
-  return names;
+/** The renderer preserves original text as a prefix. Format that prefix
+ * separately so only original occurrences retain Slack's fallback labels. */
+function formatMessageText(original: string, rendered: string, cache: Map<string, string>): string {
+  const supplemental = rendered.slice(original.length);
+  const names = new Map(extractSlackUserIds(supplemental).map(id => [id, cache.get(id) ?? id]));
+  return formatSlackText(original, cache) + formatSlackText(supplemental, names);
 }
