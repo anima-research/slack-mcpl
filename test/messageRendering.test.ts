@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { setImmediate } from 'node:timers/promises';
 import { renderMessageText } from '../src/message-text.js';
 import { formatSlackText } from '../src/content.js';
 import { SlackAdapter } from '../src/slack-adapter.js';
@@ -47,7 +48,7 @@ test('dedup uses channel ID and preserves backtick whitespace; literal mention l
   assert.equal(renderMessageText({ text: '*_word_*', bot_id: 'B1', attachments: [
     {blocks: [{type: 'rich_text', elements: [{type: 'rich_text_section', elements: [{type: 'text', text: 'word', style: {bold: true, italic: true}}]}]}]},
     {text: '_*word*_'},
-  ] }), '*_word_*\n_*word*_');
+  ] }), '*_word_*');
 });
 test('structured attachment blocks take precedence over fallback; rich structure is displayed', () => {
   assert.equal(renderMessageText({ attachments: [{fallback: 'Heading\nBody', blocks: [section('Heading'), section('Body')]}] }), 'Heading\nBody');
@@ -105,7 +106,7 @@ test('backscroll supplemental lines capped at 2000; total block <=32KiB with exp
   assert.ok(Buffer.byteLength(block) <= 32_768);
   const count = Number(block.match(/count="(\d+)"/)![1]);
   assert.ok(count > 0 && count < 50);
-  assert.match(block, /older backscroll messages not shown; fetch_history before/);
+  assert.match(block, /older backscroll messages not shown; fetch_history latest=/);
   assert.match(block, /message omitted \(\d+ bytes\); fetch_history has it/);
   assert.match(block, /id=49\]/);
   assert.doesNotMatch(block, /id=0\]/);
@@ -127,4 +128,21 @@ test('large bot rich blocks retain distinct words within the supplemental limit'
   const output = renderMessageText({text, bot_id: 'B1', blocks: [rich('UNIQUE ' + text)]});
   assert.ok(output.includes('UNIQUE'));
   assert.ok(output.length <= text.length + 16384);
+});
+
+test('long non-trailing URL punctuation stays bounded across repeated renders', {timeout: 5000}, async (t) => {
+  const text = 'http://a' + '.'.repeat(39990) + 'x';
+  for (let i = 0; i < 20; i++) {
+    t.signal.throwIfAborted();
+    assert.equal(renderMessageText({text, client_msg_id: 'human'}), text);
+    // Let the runner enforce its timeout even when rendering blocks the loop.
+    await setImmediate();
+  }
+});
+
+test('bare URL trailing punctuation trimming preserves interior punctuation', () => {
+  for (const [suffix, url] of [['.', 'a'], ['?!', 'a'], ['', 'a'], ['..b.', 'a..b']]) {
+    const text = 'http://a' + suffix;
+    assert.equal(renderMessageText({text, attachments: [{from_url: 'http://' + url, text: 'PREVIEW'}]}), text);
+  }
 });

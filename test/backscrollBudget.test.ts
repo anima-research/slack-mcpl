@@ -20,7 +20,7 @@ test('thousand-message backscroll keeps a contiguous newest window including pla
   const ids = [...block.matchAll(/id=(\d+)\.000001/g)].map(m => Number(m[1]));
   assert.ok(ids.length > 0 && ids.length < 1000);
   assert.deepEqual(ids, Array.from({length: ids.length}, (_, i) => 1001 - ids.length + i));
-  assert.match(block.split('\n')[1], new RegExp(`^\\[${1000 - ids.length} older backscroll messages not shown; fetch_history before ${ids[0]}.000001 has them\\]$`));
+  assert.match(block.split('\n')[1], new RegExp(`^\\[${1000 - ids.length} older backscroll messages not shown; fetch_history latest=${ids[0]}.000001 has them\\]$`));
   assert.equal((block.match(/fetch_history has it/g) || []).length, ids.length);
 });
 test('older backscroll summary uses singular when one message is outside the window', () => {
@@ -28,7 +28,7 @@ test('older backscroll summary uses singular when one message is outside the win
   const rows = Array.from({length: 3}, (_, i) => ({...message(i + 1, 'x'.repeat(40000)), authorName: 'A'.repeat(12000)}));
   const block = backscrollBlock(rows, {isDM: true});
   assert.ok(Buffer.byteLength(block) <= 32768);
-  assert.match(block, /1 older backscroll message not shown; fetch_history before 2.000001 has it/);
+  assert.match(block, /1 older backscroll message not shown; fetch_history latest=2.000001 has it/);
 });
 
 test('configured thousand-message backscroll is bounded on first-interaction delivery', async (t) => {
@@ -58,4 +58,17 @@ test('configured thousand-message backscroll is bounded on first-interaction del
   assert.equal(older + ids.length, 1000, 'configured fetch limit reaches the production frame');
   assert.deepEqual(ids, Array.from({length: ids.length}, (_, i) => older + i + 1));
   assert.equal((block.match(/fetch_history has it/g) || []).length, ids.length);
+});
+
+test('backscroll placeholders also preserve positions of messages that fit the full budget individually', () => {
+  const rows = Array.from({length: 50}, (_, i) => message(i + 1, 'x'.repeat(1000)));
+  for (const row of rows) {
+    assert.doesNotMatch(backscrollBlock([row], {isDM: false}), /message omitted/);
+  }
+  const block = backscrollBlock(rows, {isDM: false});
+  assert.ok(Buffer.byteLength(block) <= 32768);
+  assert.match(block, /message omitted/);
+  assert.match(block, /older backscroll messages not shown; fetch_history latest=/);
+  const ids = [...block.matchAll(/id=(\d+)\.000001/g)].map(m => Number(m[1]));
+  assert.deepEqual(ids, Array.from({length: ids.length}, (_, i) => 51 - ids.length + i));
 });
