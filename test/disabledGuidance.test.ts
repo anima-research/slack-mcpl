@@ -45,6 +45,9 @@ test('argument, member-unsubscribe and channel-open guidance omit disabled tools
   for (const [name, args, expected] of [['send_dm', {}, /userId must be a non-empty string/], ['send_message', {}, /channelId must be a non-empty string/], ['reply_message', { channelId: 'C1', content: 'hi' }, /messageId must be a non-empty string/], ['unsubscribe_channel', { channelId: 'C1' }, /Muted ambient messages in conversation C1/]] as const) {
     const text = await call(h.host, name, args);
     assert.match(text, expected);
+    if (name === 'send_dm') assert.match(text, /uid:/);
+    if (name === 'send_message') assert.match(text, /channelId= from an incoming/);
+    if (name === 'reply_message') assert.match(text, /thread=/);
     for (const disabled of disabledTools) assert.ok(!text.includes(disabled), text);
   }
   await assert.rejects(h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'slack:missing' }), err => {
@@ -90,7 +93,10 @@ test('Slack error hints omit disabled alternatives without losing unknown-write 
       assert.match(explanation, /Slack doesn't know conversation C1/);
       assert.match(explanation, /Copy channelId from an incoming channel message/);
     }
-    if (code === 'user_not_found') assert.match(explanation, /Slack has no user/);
+    if (code === 'user_not_found') {
+      assert.match(explanation, /Slack has no user/);
+      assert.match(explanation, /Copy a uid: from a mention/);
+    }
     if (code.startsWith('restricted_action')) {
       assert.match(explanation, /conversation C1.*thread replies/);
       assert.match(explanation, code.endsWith('non_threadable_channel')
@@ -453,6 +459,45 @@ test('disabled subscribe mute advice distinguishes memory from persisted state',
       await initialize(h, false);
       const text = await call(h.host, 'unsubscribe_channel', { channelId: 'C1' });
       assert.equal(text.includes('or this server restarts'), !persisted);
+      if (persisted) assert.match(text, /restart may restore delivery if saving failed/);
+    } finally { await h.close(); }
+  }
+});
+
+test('disabled refresh waits only while automatic listing is in flight', async t => {
+  const fake = fakeSlack();
+  let finish!: () => void;
+  fake.slack.listConversations = async () => {
+    await new Promise<void>(resolve => { finish = resolve; });
+    return { conversations: [], leftOut: [] };
+  };
+  const server = new SlackMcplServer(fake.slack, { disabledTools: ['refresh_channels'] });
+  const h = connectHost(server);
+  t.after(() => h.close());
+  await initialize(h, true);
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await until(() => !!finish, 'listing starts');
+  await assert.rejects(h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'slack:C2' }), /Wait for automatic registration/);
+  finish();
+  // Inspect the existing lifecycle marker to synchronize with the empty listing's completion.
+  await until(() => (server as unknown as { registering?: number }).registering === undefined, 'listing finishes');
+  await assert.rejects(h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'slack:C2' }), err => {
+    assert.match(String(err), /Reconnect the host to list conversations again/);
+    assert.doesNotMatch(String(err), /Wait for automatic/);
+    return true;
+  });
+});
+
+test('reconnected hosts retain policy-adjusted messaging grant declarations', async () => {
+  const fake = fakeSlack();
+  const server = new SlackMcplServer(fake.slack, { disabledTools: toolDefinitions.map(tool => tool.name) });
+  for (let connection = 0; connection < 2; connection++) {
+    const h = connectHost(server);
+    try {
+      await initialize(h, true);
+      await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT.filter(path => path !== 'tools') });
+      await fake.socket.emitMessage(MENTION_EVENT);
+      await until(() => h.hostSaw.some(r => r.method === method.PUSH_EVENT), 'delivery without tools after serve/reset');
     } finally { await h.close(); }
   }
 });

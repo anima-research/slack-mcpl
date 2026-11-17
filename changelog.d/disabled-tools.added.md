@@ -36,3 +36,24 @@
   by removing the ID from subscribed or adding it to muted (member-channel
   mode); undo unsubscribe by adding it to subscribed or removing it from muted.
   Without a subscriptions file, these changes last only until restart.
+
+- Join optional recovery sentences without trailing or doubled spaces. Edit-window
+  refusals name send_message for corrections and the parent thread ID for reply_message;
+  policy refusals retain Slack-access alternatives when posting tools are disabled.
+- Retain uploaded comments' parent thread IDs for rollback recovery, distinguish
+  top-level messages from replies, and honor host grants in rollback remedies.
+- Clarify unavailable attachment content, failed registration recovery, and bot
+  message IDs; preserve user lookup guidance for malformed author values.
+  Undeclared feature sets no longer report themselves active.
+- Thread-only refusals recommend reply_message with a parent thread ID; DM
+  policy refusals recommend send_message in a writable channel by default.
+
+- Rollback recommends message deletion only for stored message IDs. Unidentified
+  posts and upload comments require manual checking, not generic deletion.
+
+- Rollback requires manual checks for unidentified posts and upload comments;
+  never delete messages on the strength of these notices. Keep publish and DM
+  alternatives grammatical independently.
+
+- With manual refresh disabled, channel-open guidance recommends waiting only while automatic registration is running; otherwise reconnect to list again. Persisted mute advice warns that a failed save may restore delivery on restart.
+- When editing an array-form subscriptions file, edit the array directly in default mode. For member-channel mutes, convert e.g. `["C1"]` to `{"subscribed":["C1"],"muted":["C2"]}`, preserving all subscribed IDs.

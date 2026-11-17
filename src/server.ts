@@ -981,7 +981,7 @@ export class SlackMcplServer {
         this.unsubscribedByAgent.add(channelId);
         return this.unsubscribe(channelId)
           ? this.opts.subscribeMemberChannels
-            ? `Muted ambient messages in conversation ${channelId} ${this.toolEnabled('subscribe_channel') ? 'until you subscribe_channel it again' : (this.subscriptionsFile() ? 'until the operator changes the subscription' : 'until the operator changes the subscription or this server restarts')}. Mentions and DMs from there will still arrive.`
+            ? `Muted ambient messages in conversation ${channelId} ${this.toolEnabled('subscribe_channel') ? 'until you subscribe_channel it again' : (this.subscriptionsFile() ? 'until the operator changes the subscription (restart may restore delivery if saving failed)' : 'until the operator changes the subscription or this server restarts')}. Mentions and DMs from there will still arrive.`
             : `Unsubscribed from ambient messages in conversation ${channelId}. Mentions and DMs from there will still arrive.`
           : this.opts.subscribeMemberChannels
             ? `Conversation ${channelId} is already muted.`
@@ -1419,7 +1419,9 @@ export class SlackMcplServer {
       return "This host hasn't granted this server channels.register, so this server can't register conversations with it.";
     }
     if (!this.toolEnabled('refresh_channels')) {
-      return 'The operator has disabled manual refresh. Wait for automatic registration; if it failed, ask the operator to check Slack access and reconnect.';
+      return this.registering !== undefined
+        ? 'The operator has disabled manual refresh. Wait for automatic registration; if it fails or does not find the conversation, reconnect the host to list again.'
+        : 'The operator has disabled manual refresh. Reconnect the host to list conversations again; if registration failed, ask the operator to check Slack access first.';
     }
     return `refresh_channels registers the conversations this bot is in${this.slack.dmsDisabled ? ', channels only while direct messages are turned off' : ''}; open one by the id it announces.`;
   }

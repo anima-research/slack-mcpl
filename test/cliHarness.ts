@@ -11,9 +11,15 @@ export function cliInvocation(vars: Record<string, string>, allowSlackStartup = 
         if (method === 'auth.test') return { ok: true, user_id: 'UBOT', team: 'test' };
         if (method === 'users.list') return { ok: true, members: [] };
       }
+      console.error('Unexpected Slack API call: ' + method);
       throw new Error('Unexpected Slack API call: ' + method);
     };
-    SocketModeClient.prototype.start = async () => {};
+    SocketModeClient.prototype.start = async () => {
+      if (!${allowSlackStartup}) {
+        console.error('Unexpected Slack Socket Mode start');
+        throw new Error('Unexpected Slack Socket Mode start');
+      }
+    };
     SocketModeClient.prototype.disconnect = async () => {};
     process.argv = [process.execPath, 'src/index.ts', '--stdio'];
     await import('./src/index.ts');

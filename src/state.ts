@@ -25,7 +25,7 @@ export interface SentMessage {
   messageId?: string;
   channelId: string;
   /** For a post this server can't name, the thread it went into, if any:
-   *  fetch_thread finds a reply there, where fetch_history doesn't. */
+   *  a manual check must not treat this context as a deletion target. */
   threadTs?: string;
   content: string;
   timestamp: string;
@@ -87,7 +87,7 @@ export class StateTracker {
   }
 
   /** Record a post this server can't name (SentMessage's messageId), with its
-   *  conversation and thread, where a rollback says the agent can find it. */
+   *  conversation and thread, where rollback requests a manual check, not identification or deletion. */
   recordUnnamed(channelId: string, content: string, threadTs?: string): void {
     this.sentItems.push({
       kind: 'message',

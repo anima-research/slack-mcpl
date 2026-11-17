@@ -2,7 +2,7 @@
  * A post this server can't name: Slack's answer named no message (no ts), or
  * the post failed in a way that may have posted it. Its call answers as an
  * unknown outcome, never as a success with an empty id, and a rollback past it
- * says it may remain, with where the agent can find its id, rather than send a
+ * says it may remain, with context for a manual check, not a deletion target, rather than send a
  * delete with an empty ts. A post that can't have gone out, such as one Slack
  * refused, leaves nothing to say. Driven through the real client against a
  * local endpoint that answers as Slack does.

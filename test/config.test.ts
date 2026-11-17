@@ -48,7 +48,7 @@ test('unknown disabled tool names return a clean refusal naming the bad value', 
 test('a present disabled-tools value must name at least one tool', () => {
   for (const raw of ['', ' , \t, ']) {
     assert.deepEqual(startupSettings(['--stdio'], { ...tokens, SLACK_DISABLED_TOOLS: raw }), {
-      refusal: 'SLACK_DISABLED_TOOLS is set but names no tool; unset it to keep every tool',
+      refusal: `SLACK_DISABLED_TOOLS is set but names no tool: ${JSON.stringify(raw)}; unset it to keep every tool; tools are ${toolDefinitions.map(tool => tool.name).join(', ')}`,
     });
   }
 });

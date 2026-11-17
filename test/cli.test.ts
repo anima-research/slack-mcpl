@@ -109,6 +109,6 @@ test('empty disabled-tools restrictions fail before contacting Slack', () => {
     const run = startWith({ SLACK_DISABLED_TOOLS: raw });
     assert.equal(run.status, 1);
     assert.equal(run.stdout, '');
-    assert.equal(run.stderr, 'SLACK_DISABLED_TOOLS is set but names no tool; unset it to keep every tool\n');
+    assert.equal(run.stderr, `SLACK_DISABLED_TOOLS is set but names no tool: ${JSON.stringify(raw)}; unset it to keep every tool; tools are ${toolDefinitions.map(tool => tool.name).join(', ')}\n`);
   }
 });

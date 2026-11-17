@@ -1,4 +1,4 @@
-import { validateDisabledTools } from './tools.js';
+import { toolDefinitions, validateDisabledTools } from './tools.js';
 
 /** Parse an operator switch. An absent value is off; a present value must
  *  say yes or no so a broken environment template cannot disable a guard. */
@@ -51,7 +51,7 @@ export function startupSettings(
   }
   const disabledTools = [...new Set(list(env.SLACK_DISABLED_TOOLS) ?? [])];
   if (env.SLACK_DISABLED_TOOLS !== undefined && disabledTools.length === 0) {
-    return { refusal: 'SLACK_DISABLED_TOOLS is set but names no tool; unset it to keep every tool' };
+    return { refusal: `SLACK_DISABLED_TOOLS is set but names no tool: ${JSON.stringify(env.SLACK_DISABLED_TOOLS)}; unset it to keep every tool; tools are ${toolDefinitions.map(tool => tool.name).join(', ')}` };
   }
   try {
     validateDisabledTools(disabledTools);
