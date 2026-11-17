@@ -118,8 +118,8 @@ test('attribution dedup uses displayed source kind and capped names', () => {
   ]});
   assert.equal((output.match(/body/g) || []).length, 2);
   assert.equal((renderMessageText({attachments: [
-    {...shared, author_name: 'A'.repeat(100) + 'x'},
-    {...shared, author_name: 'A'.repeat(100) + 'y'},
+    {...shared, author_name: 'A'.repeat(99) + 'xx'},
+    {...shared, author_name: 'A'.repeat(99) + 'yy'},
   ]}).match(/body/g) || []).length, 1);
 });
 

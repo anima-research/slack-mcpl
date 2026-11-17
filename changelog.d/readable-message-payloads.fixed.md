@@ -21,8 +21,8 @@
   containers, keep malformed angle tokens within logical lines, and quote every
   logical line safely. Avoid redundant hidden-source attachment copies and
   unnecessary history rendering after author/scan/match limits.
-  Stop pending list iteration when traversal is exhausted, ignore invalid attribution
-  fields in dedup keys, and retain fallback for empty rich quotes/code blocks.
+  Stop pending list iteration when traversal is exhausted, ignore non-string attribution names
+  in dedup keys, and retain fallback for empty rich quotes/code blocks.
   Classic unfurl suppression requires an exact extracted URL match, with no URL
   canonicalization: slash, case, default-port or fragment differences retain
   previews, which can consume the full supplemental allowance.
@@ -33,4 +33,4 @@
   Charge nested attachment output after deduplication; preserve exact-cap content.
   Mark output, traversal and depth cuts; bound repeated channel-label expansion.
   Retain whitespace-body fallback and identify shared source channel IDs.
-  Render non-HTTP rich links as readable labels and addresses.
+  Render non-HTTP rich links as literal angle tokens, matching original text.

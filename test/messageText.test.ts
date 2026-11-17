@@ -536,10 +536,10 @@ test('shared attachment identifies a source channel ID without a name', () => {
     '[shared message from unknown, #C123]\n&gt; body');
 });
 
-test('non-HTTP rich links display a readable label and address', async () => {
+test('non-HTTP rich links match original literal angle tokens', async () => {
   await expectText({ blocks: [richBlock(richSection({
     type: 'link', url: 'mailto:alice@example.com', text: 'Email Alice',
-  }))] }, 'Email Alice (mailto:alice@example.com)');
+  }))] }, '<mailto:alice@example.com|Email Alice>');
 });
 
 test('bot shares retain distinct source timestamps while deduplicating mirrors', async () => {
@@ -557,13 +557,13 @@ test('bot mailto rich mirror deduplicates against its original angle token', asy
     { type: 'link', url: 'mailto:a@example.com', text: 'a@example.com' },
   ))] };
   assert.equal(renderMessageText(payload), text);
-  await expectText(payload, 'Mail a@example.com (mailto:a@example.com)', true);
+  await expectText(payload, text, true);
 });
 
 test('non-HTTP rich URLs preserve literal bars and identical labels', () => {
   assert.equal(renderMessageText({ blocks: [richBlock(richSection(
     { type: 'link', url: 'custom:one|two', text: 'custom:one|two' },
-  ))] }), 'custom:one|two');
+  ))] }), '&lt;custom:one|two|custom:one|two&gt;');
 });
 
 test('capped attribution fields visibly mark shortening', () => {
@@ -572,4 +572,45 @@ test('capped attribution fields visibly mark shortening', () => {
   }] });
   assert.ok(output.includes('a'.repeat(99) + '…'));
   assert.ok(output.includes('b'.repeat(99) + '…'));
+});
+
+test('ordinary non-HTTP tokens retain main formatting and literal history filters', async () => {
+  const text = 'Mail <mailto:alice@example.com|Alice> <mailto:alice@example.com> <tel:+123|Call> <tel:+123> <slack://channel|Open>';
+  await expectText({ text }, text);
+  const adapter = new SlackAdapter({
+    conversations: { history: async () => ({ messages: [{ ts: '100.000001', text }] }) },
+  } as any, { on() {} } as any, 'UBOT', 'example');
+  const result = await adapter.readHistory('C1', { textContains: '<mailto:alice@example.com|Alice>' });
+  assert.equal(result.messages.length, 1);
+  assert.equal(result.messages[0].content, text);
+});
+
+test('source identity isolates channel IDs behind identical displayed headers', () => {
+  const share = { is_share: true, author_name: 'Alice', channel_name: 'ops', ts: '123.1', text: 'Body' };
+  const result = renderMessageText({ attachments: [
+    { ...share, channel_id: 'C1' }, { ...share, channel_id: 'C2' },
+  ] });
+  assert.equal((result.match(/Body/g) || []).length, 2);
+});
+
+test('numeric source timestamps retain identity and match their string form', () => {
+  const share = { is_share: true, channel_id: 'C1', text: 'Body' };
+  const result = renderMessageText({ attachments: [
+    { ...share, ts: 123.1 }, { ...share, ts: '123.1' }, { ...share, ts: 123.2 },
+  ] });
+  assert.equal((result.match(/Body/g) || []).length, 2);
+});
+
+test('angle URL removal never synthesizes a bare URL for unfurl suppression', () => {
+  const text = 'https://example.<https://other.example|label>com';
+  assert.equal(renderMessageText({ text, attachments: [
+    { from_url: 'https://example.com', text: 'Keep preview' },
+  ] }), text + '\nKeep preview');
+});
+
+test('backscroll truncates raw supplemental entities before formatting', async () => {
+  const body = 'x'.repeat(1985) + '&amp;' + 'z'.repeat(40);
+  const result = await shaped({ attachments: [{ text: body }] });
+  assert.equal(result.contents[0], 'x'.repeat(1985) + '&' + 'z'.repeat(40));
+  assert.equal(result.contents[2], 'x'.repeat(1985) + '&am' + '[…truncated]');
 });

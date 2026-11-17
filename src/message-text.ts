@@ -57,6 +57,7 @@ export function renderMessageText(
   maxAppend = MAX_MESSAGE_TEXT_APPEND,
 ): string {
   const original = string(message.text);
+  if (!list(message.attachments).length && !list(message.blocks).length) return original;
   const channelLabels = new Map<string, string>();
   mapSlackAngles(original, token => {
     const match = CHANNEL_LABEL.exec(token);
@@ -117,7 +118,8 @@ export function renderMessageText(
       case 'link': {
         const url = escape(bounded(e.url));
         const label = escape(bounded(e.text));
-        if (url && !/^https?:\/\//.test(url)) return styled(label && label !== url ? `${label} (${url})` : url, e.style);
+        // Preserve main's literal non-HTTP angle form, without creating tokens.
+        if (url && !/^https?:\/\//.test(url)) return styled(`&lt;${url}${label ? '|' + label : ''}&gt;`, e.style);
         const angleUrl = url.replace(/\|/g, '%7C');
         return styled(url ? (label && label !== url ? `<${angleUrl}|${label}>` : `<${angleUrl}>`) : label, e.style);
       }
@@ -212,7 +214,7 @@ export function renderMessageText(
   const bareOriginal = mapSlackAngles(original, token => {
     const match = /^<(https?:\/\/[^|>]+)(?:\|[^>]*)?>$/.exec(token);
     if (match) urls.add(unescape(match[1]));
-    return match ? '' : token;
+    return match ? ' ' : token;
   });
   for (const match of bareOriginal.matchAll(/https?:\/\/[^\s<>]+/g)) urls.add(unescape(match[0].replace(/(?<![.,;:!?])[.,;:!?]+$/, '')));
   for (const raw of take(message.attachments)) {
@@ -248,7 +250,7 @@ export function renderMessageText(
       header = shared ? `[shared message from ${name}${uid}, ${source}]` : `[attachment from ${name}${uid}]`;
     }
     // Keep distinct source messages even when their displayed headers match.
-    const identity = header ? JSON.stringify([header, string(a.channel_id), string(a.ts)]) : '';
+    const identity = header ? JSON.stringify([header, string(a.channel_id), (typeof a.ts === 'number' && Number.isFinite(a.ts) ? String(a.ts) : string(a.ts))]) : '';
     const nested: string[] = [];
     const placeholders: string[] = [];
     let nestedLength = 0;

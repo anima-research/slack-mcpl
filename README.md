@@ -413,7 +413,8 @@ Supplemental attachment/shared/block mentions are display content only; quoted
 mentions in original text still participate in addressing. Name resolution includes
 original-text mentions plus at most **20 unique supplemental IDs per message**;
 others display raw IDs, even if cached. Live channels/incoming `metadata.rawContent` remains original
-Slack text; `content`/`cleanContent` include supplemental text. History
+Slack text; live `content` blocks include supplemental text (the adapter's
+internal `cleanContent` field is not exposed on the wire). History
 `textContains` searches rendered content with user-ID mentions; threads have no
 filters.
 
