@@ -3,7 +3,7 @@
   Preserve original Slack text for channels/incoming raw metadata and mention/wake decisions.
   Search rendered history content, retain shared messages, and mark bounded
   supplemental output visibly when truncated.
-  Skip top-level human rich_text when non-empty text accompanies client_msg_id
+  Skip top-level human rich_text when non-whitespace text accompanies client_msg_id
   or no bot/app provenance; keep blocks-only and bot/integration rich text.
   Deduplicate attachment units within attribution, format classic Slack fields,
   preserve rich styles and prefer readable fallback over omission placeholders.
@@ -30,3 +30,7 @@
   multiline mentions do not trigger mention-based wake or auto-subscription.
   Ignore non-string author names and absent optional text objects; bound even
   truncation markers by tiny supplemental caps. DM addressing remains text-independent.
+  Charge nested attachment output after deduplication; preserve exact-cap content.
+  Mark output, traversal and depth cuts; bound repeated channel-label expansion.
+  Retain whitespace-body fallback and identify shared source channel IDs.
+  Render non-HTTP rich links as readable labels and addresses.

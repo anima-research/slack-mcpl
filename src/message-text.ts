@@ -104,10 +104,19 @@ export function renderMessageText(
     switch (e.type) {
       case 'text': return styled(escape(bounded(e.text)), e.style);
       case 'user': return validId(e.user_id) ? styled(`<@${e.user_id}>`, e.style) : '';
-      case 'channel': return validId(e.channel_id) ? styled(`<#${e.channel_id}${channelLabels.has(e.channel_id) ? '|' + channelLabels.get(e.channel_id) : ''}>`, e.style) : '';
+      case 'channel': {
+        if (!validId(e.channel_id)) return '';
+        const label = channelLabels.get(e.channel_id) ?? '';
+        // Reused original labels can dwarf the payload. Charge their expansion
+        // even when a later block-level comparison discards the duplicate.
+        if (label.length > budget) { budget = 0; truncated = true; return ''; }
+        budget -= label.length;
+        return styled(`<#${e.channel_id}${label ? '|' + label : ''}>`, e.style);
+      }
       case 'link': {
         const url = escape(bounded(e.url)).replace(/\|/g, '%7C');
         const label = escape(bounded(e.text));
+        if (url && !/^https?:\/\//.test(url)) return styled(label && label !== url ? `${label} (${url})` : url, e.style);
         return styled(url ? (label && label !== url ? `<${url}|${label}>` : `<${url}>`) : label, e.style);
       }
       case 'usergroup': return validId(e.usergroup_id) ? styled(`<!subteam^${e.usergroup_id}>`, e.style) : '';
@@ -226,30 +235,39 @@ export function renderMessageText(
         return join([fieldText(f.title), fieldText(f.value)], ': ');
       });
     })());
-    const nested: string[] = [];
-    const placeholders: string[] = [];
-    let nestedLength = 0;
-    for (const rawBlock of take(a.blocks)) {
-      const value = block(rawBlock);
-      if (value.trim()) {
-        (placeholder(rawBlock) ? placeholders : nested).push(value);
-        nestedLength += value.length + (nested.length + placeholders.length > 1 ? 1 : 0);
-        if (nestedLength > renderLimit) { truncated = true; break; }
-      }
-    }
     const shared = a.is_share === true || a.is_msg_unfurl === true;
     let header = '';
     if (shared || string(a.author_name)) {
       const name = string(a.author_name) ? headerName(string(a.author_name)) : 'unknown';
       const uid = validId(a.author_id) ? ` (uid:${headerName(a.author_id)})` : '';
       const source = string(a.channel_name) ? headerChannel(string(a.channel_name)) :
+        validId(a.channel_id) ? headerChannel(a.channel_id) :
         string(a.footer) ? headerName(string(a.footer)) : 'unknown source';
       header = shared ? `[shared message from ${name}${uid}, ${source}]` : `[attachment from ${name}${uid}]`;
     }
+    const nested: string[] = [];
+    const placeholders: string[] = [];
+    let nestedLength = 0;
+    let hasReadableNested = false;
+    const units = body.trim() && unique(body, header) ? [body] : [];
+    for (const rawBlock of take(a.blocks)) {
+      const value = block(rawBlock);
+      if (value.trim()) {
+        const omitted = placeholder(rawBlock);
+        if (!omitted) hasReadableNested = true;
+        if (!unique(value, header)) continue;
+        (omitted ? placeholders : nested).push(value);
+        nestedLength += value.length + (nested.length + placeholders.length > 1 ? 1 : 0);
+        if (nestedLength > renderLimit) { truncated = true; break; }
+      }
+    }
     // Deduplicate within the displayed attribution, including its source kind
     // (#channel versus footer), escaping and caps.
-    const units = [body.trim() ? body : (nested.length ? '' : fieldText(a.fallback)), ...nested, ...placeholders]
-      .filter(value => unique(value, header));
+    if (!body.trim() && !hasReadableNested) {
+      const fallback = fieldText(a.fallback);
+      if (unique(fallback, header)) units.push(fallback);
+    }
+    units.push(...nested, ...placeholders);
     if (units.length && header) {
       emit(header + '\n' + join(units).split(LINE_BREAK).map(line => '&gt; ' + line).join('\n'));
     } else {
@@ -258,7 +276,7 @@ export function renderMessageText(
   }
   // Slack clients supply rich_text mirrors. Trust provenance, not heuristics;
   // blocks-only messages (including apps posting as users) still need rendering.
-  const skipHumanRichText = original !== '' &&
+  const skipHumanRichText = original.trim() !== '' &&
     (message.client_msg_id !== undefined || (!message.bot_id && !message.app_id && !message.bot_profile));
   // Attachments must not consume the top-level mirror comparison allowance.
   budget = cap;

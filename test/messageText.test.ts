@@ -499,3 +499,45 @@ test('whitespace-only attachment bodies and nested sections retain fallback', as
     await expectText({ attachments: [attachment] }, 'Failure details');
   }
 });
+
+test('nested duplicates do not consume the emitted render allowance', () => {
+  const text = 'x'.repeat(8192);
+  assert.equal(renderMessageText({ attachments: [{ blocks: [
+    { type: 'markdown', text }, { type: 'markdown', text },
+    { type: 'markdown', text: 'distinct' },
+  ] }] }), text + '\ndistinct');
+});
+
+test('channel label expansion is bounded across separately deduplicated blocks', () => {
+  const text = '<#C1|' + 'x'.repeat(40_000) + '>';
+  for (const attachments of [false, true]) {
+    for (const limit of [2000, MAX_MESSAGE_TEXT_APPEND]) {
+      let reads = 0;
+      const blocks = Array.from({ length: 1000 }, () => richBlock(richSection({
+        get type() { reads++; return 'channel'; }, channel_id: 'C1',
+      })));
+      const result = renderMessageText({ text, bot_id: 'B1', ...(attachments
+        ? { attachments: blocks.map(b => ({ blocks: [b] })) } : { blocks }) }, limit);
+      assert.ok(result.startsWith(text));
+      assert.ok(result.endsWith('[…truncated]'));
+      assert.ok(reads <= 15, 'expansion work must not scale with duplicate block count');
+    }
+  }
+});
+
+test('whitespace human text does not suppress readable rich text', () => {
+  assert.equal(renderMessageText({ text: '   ', blocks: [richBlock(richSection({
+    type: 'text', text: 'Please investigate',
+  }))] }), '   \nPlease investigate');
+});
+
+test('shared attachment identifies a source channel ID without a name', () => {
+  assert.equal(renderMessageText({ attachments: [{ is_share: true, channel_id: 'C123', text: 'body' }] }),
+    '[shared message from unknown, #C123]\n&gt; body');
+});
+
+test('non-HTTP rich links display a readable label and address', async () => {
+  await expectText({ blocks: [richBlock(richSection({
+    type: 'link', url: 'mailto:alice@example.com', text: 'Email Alice',
+  }))] }, 'Email Alice (mailto:alice@example.com)');
+});

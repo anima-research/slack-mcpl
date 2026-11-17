@@ -419,13 +419,14 @@ skipped when `from_url` matches an extracted original URL, decoding Slack entiti
 and trimming trailing sentence punctuation from bare URLs. Labelled Slack URL
 targets are compared exactly. No URL canonicalization is performed: trailing
 slashes, scheme/host case, default ports and fragments can prevent a match. Such
-previews remain visible and can consume the entire supplemental allowance; loose
-matches never hide potentially distinct content.
+previews remain visible and can consume the entire supplemental allowance. Bare
+URL punctuation trimming is heuristic and can hide a distinct punctuation-ending URL.
 
 The supplemental suffix cap is **pre-formatting**: 16,384 UTF-16 code units including
 separator and a single final `[…truncated]` marker. It does **not** bound delivered
 size: names and formatting may expand it. Each of attachment and top-level traversal allows max(2,000, 14 × original
-UTF-16 length + 2) visits/list entries, reserving room for rich mirror containers.
+UTF-16 length + 2) work units, charging visits/list entries and reused channel-label
+characters, reserving room for rich mirror containers.
 Traversal cuts and nesting (12 levels) also carry that marker; it reports
 unvisited payload, not a guarantee that readable text was omitted; cuts preserve code points. Original text is
 never truncated. Backscroll uses a lower **2,000 UTF-16 code unit supplemental cap per
