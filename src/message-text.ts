@@ -19,7 +19,7 @@ const REFERENCE = new RegExp(`^<([@#])(${SLACK_ID})(?:\\|[^>]*)?>$`);
 const validId = (v: unknown): v is string => typeof v === 'string' && ID.test(v);
 
 // Comparison keys only: normalize prose and equivalent emphasis/fence spellings,
-// but retain significant whitespace inside code spans.
+// but retain internal prose line breaks and significant whitespace in code spans.
 function normalized(value: string): string {
   let fence = '';
   let openedAt = -1;
@@ -32,7 +32,7 @@ function normalized(value: string): string {
       if (parts[i + 1] === fence) part = part.replace(/\r?\n$/, '');
       return part;
     }
-    return part.replace(i === 0 ? /(^|\n)([ \t]*)[•◦▪] /g : /(\n)([ \t]*)[•◦▪] /g, '$1$2- ').replace(/_\*([^*_\n]+)\*_/g, '*_$1_*').replace(/\s+/g, ' ');
+    return part.replace(i === 0 ? /(^|\n)([ \t]*)[•◦▪] /g : /(\n)([ \t]*)[•◦▪] /g, '$1$2- ').replace(/_\*([^*_\n]+)\*_/g, '*_$1_*').replace(LINE_BREAK, '\n').replace(/[^\S\n]+/g, ' ');
   }).join('').trim();
 }
 

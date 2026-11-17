@@ -403,10 +403,10 @@ units deduplicate by source channel ID and message timestamp when present, plus
 the displayed attribution header (including capped
 author name, valid author ID and, for shares, channel or footer). Other source fields such as author_link are not
 identity keys; names differing only beyond the display cap may deduplicate.
-Comparison keys normalize prose whitespace (including line breaks, so distinct
-list/line structures can collapse), Slack encodings, combined
+Comparison keys normalize horizontal prose whitespace, Slack encodings, combined
 bold/italic marker order and newlines directly inside code fences; compare
-channel/user IDs rather than labels; and preserve other code whitespace.
+channel/user IDs rather than labels; preserve internal line breaks in prose
+(normalizing line-ending spellings); and preserve other code whitespace.
 This is display dedup, not typed equality: a link and identical rendered literal
 may collapse, while differing markup may appear twice for bots/integrations.
 Angle tokens use a linear scan; unclosed, malformed (such as `<http://|label>`)
@@ -428,7 +428,7 @@ internal `cleanContent` field is not exposed on the wire). History
 `textContains` searches rendered content with user-ID mentions; threads have no
 filters.
 
-App/link previews are skipped, except message shares. Classic previews are
+App unfurls are skipped, except message shares. Classic link previews are
 skipped when `from_url` matches an extracted original URL, decoding Slack entities
 and trimming trailing sentence punctuation from bare URLs. Labelled Slack URL
 targets are compared exactly. No URL canonicalization is performed: trailing

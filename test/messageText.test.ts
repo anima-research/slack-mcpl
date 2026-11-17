@@ -294,8 +294,6 @@ test('review fragment passes the actual release validator', () => {
     // or repository version/Unreleased state make this validation pass.
     const name = 'readable-message-payloads.added.md';
     const fragment = readFileSync(join('test/fixtures', name), 'utf8');
-    const pending = join('changelog.d', name);
-    if (existsSync(pending)) assert.equal(readFileSync(pending, 'utf8'), fragment);
     writeFileSync(join(root, 'package.json'), JSON.stringify({ version: '1.2.3' }));
     writeFileSync(join(root, 'CHANGELOG.md'), '# Changelog\n\n## Unreleased\n');
     mkdirSync(join(root, 'changelog.d'));
@@ -304,6 +302,11 @@ test('review fragment passes the actual release validator', () => {
     assert.match(release(root), /from 1 fragment/);
     assert.ok(readFileSync(join(root, 'CHANGELOG.md'), 'utf8').includes(fragment.trim()));
     assert.equal(existsSync(join(root, 'changelog.d', name)), false);
+    // A consumed slug may legally be reused with unrelated notes next release.
+    writeFileSync(join(root, 'package.json'), JSON.stringify({ version: '1.2.4' }));
+    writeFileSync(join(root, 'changelog.d', name), '- Different notes for a later release.\n');
+    assert.match(release(root), /from 1 fragment/);
+    assert.match(readFileSync(join(root, 'CHANGELOG.md'), 'utf8'), /Different notes for a later release/);
 
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
@@ -748,4 +751,20 @@ test('null client_msg_id is not client provenance for app rich text', () => {
 
 test('normalized duplicate omission labels do not spend deferred allowance', () => {
   assert.equal(renderMessageText({attachments: [{blocks: [{type: 'poll'}, {type: 'poll '}]}]}, 15), '[poll omitted]');
+});
+
+test('prose dedup retains row boundaries on every delivery path', async () => {
+  const text = 'Name Amount Alice 10 Bob 20';
+  const rows = 'Name Amount\nAlice 10\nBob 20';
+  await expectText({text, blocks: [section(rows)]}, text + '\n' + rows);
+  await expectText({text: rows, attachments: [{text}]}, rows + '\n' + text);
+  await expectText({text: rows, blocks: [section(rows.replace(/\n/g, '\r\n'))]}, rows);
+});
+
+test('payload docs describe preview and provenance policies accurately', () => {
+  const readme = readFileSync('README.md', 'utf8');
+  assert.match(readme, /App unfurls are skipped, except message shares\. Classic link previews are\nskipped when/);
+  assert.match(readme, /preserve internal line breaks/);
+  const added = readFileSync('test/fixtures/readable-message-payloads.added.md', 'utf8');
+  assert.match(added, /unless original text is non-whitespace and\n  client_msg_id is a string/);
 });

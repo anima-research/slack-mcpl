@@ -7,7 +7,8 @@
   fallback; deduplicate supplemental bot mirrors and repeated units within
   the same source message. Keep distinct source timestamps separate for attributed attachments.
   Skip human rich-text mirrors when ordinary text is non-whitespace; retain blocks-only
-  and bot/integration rich text unless client_msg_id is a string (including
+  and bot/integration rich text unless original text is non-whitespace and
+  client_msg_id is a string (including
   an empty string; null and other non-string values do not suppress app rich text). Bound supplemental traversal and output with
   visible truncation markers, and prioritize attachment-nested readable blocks over their omission labels.
   Top-level blocks retain input order, including omission labels.
@@ -16,11 +17,7 @@
   mentions retain their lookups, which can delay live delivery, reaction ack and wake.
   App-as-user posts without bot_id remain eligible live under chat:from-human by default,
   including rendered app bodies; the tag is not proof of human authorship.
-  Malformed nested angle tokens restart at the inner opener; malformed and
-  multiline angle tokens otherwise remain literal, and multiline mentions
-  do not trigger mention-based wake or auto-subscription.
-  Render usergroup references as @label or @ID. Backscroll omission notices
-  are server notices, not author text; when history is unavailable they name
+  Backscroll omission notices are server notices, not author text; when history is unavailable they name
   the host grant needed. Yield between batches of text-filtered history candidates.
   Channel mirrors deduplicate before reused-label expansion; normalized omission
   labels deduplicate before charging their deferred allowance. Rendering cuts
