@@ -315,3 +315,46 @@ test('review server shared mentions neither wake nor auto-subscribe; raw metadat
 test('review docs pin the real nested-before-top-level order', () => {
   assert.match(readFileSync('README.md', 'utf8'), /then that attachment's nested blocks, then top-level blocks/);
 });
+
+// Non-rich supplemental units have no structural provenance: punctuation
+// differences must survive on every production shaping path.
+for (const [text, body] of [
+  ['a_b', 'ab'],
+  ['a*b', 'ab'],
+  ['a~b', 'ab'],
+  ['a`b', 'ab'],
+  ['a`b`c', 'abc'],
+  ['• Ordinary sentence', 'Ordinary sentence'],
+  ['> Ordinary sentence', 'Ordinary sentence'],
+  ['*word*', 'word'],
+  ['_word_', 'word'],
+  ['~word~', 'word'],
+] as const) {
+  test('round 2 distinct punctuation is content: ' + text, async () => {
+    for (const supplement of [
+      { attachments: [{ text: body }] },
+      { blocks: [section(body)] },
+      { attachments: [{ fields: [{ value: body }] }] },
+    ]) {
+      const result = await shaped({ text, ...supplement });
+      assert.deepEqual(result.contents, [text + '\n' + body, text + '\n' + body, text + '\n' + body]);
+      assert.equal(result.received[0].content, text + '\n' + body);
+    }
+  });
+}
+
+test('round 2 rich structure does not erase literal or unbalanced punctuation', async () => {
+  for (const text of ['a_b', 'a*b', 'a~b', 'a`b', '*word', '_word', '~word']) {
+    const body = text.replace(/[_*~`]/g, '');
+    const result = await shaped({ text, blocks: [richBlock(richSection(literal(body)))] });
+    assert.equal(result.received[0].content, text + '\n' + body);
+  }
+  await expectText({ text: 'word', blocks: [richBlock(richSection(literal('*word*')))] }, 'word\n*word*');
+});
+
+test('round 2 balanced bold italic mirror order works in both directions', async () => {
+  for (const text of ['*_word_*', '_*word*_']) {
+    const result = await shaped({ text, blocks: [richBlock(richSection({ ...literal('word'), style: { bold: true, italic: true } }))] });
+    assert.equal(result.received[0].content, text);
+  }
+});

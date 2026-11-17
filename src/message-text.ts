@@ -39,18 +39,19 @@ export function renderMessageText(
   const bounded = (v: unknown) => { const text = string(v); if (text.length > renderLimit) truncated = true; return prefix(text, renderLimit); };
   const join = (v: string[], separator = '\n') => bounded(v.filter(Boolean).join(separator));
   const textObject = (v: unknown) => !visit() ? '' : bounded(object(v).text);
-  function rich(v: unknown, depth = 0): string {
+  function rich(v: unknown, depth = 0, mirror = false): string {
     if (!visit() || depth > 12) { truncated = true; return ''; }
     const e = object(v);
-    const children = (separator: string) => join(take(e.elements).map(x => rich(x, depth + 1)), separator);
+    const children = (separator: string) => join(take(e.elements).map(x => rich(x, depth + 1, mirror)), separator);
     switch (e.type) {
       case 'text': {
         let value = bounded(e.text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
         const style = object(e.style);
         if (style.code === true) value = '`' + value + '`';
         else {
-          if (style.bold === true) value = '*' + value + '*';
+          if (!mirror && style.bold === true) value = '*' + value + '*';
           if (style.italic === true) value = '_' + value + '_';
+          if (mirror && style.bold === true) value = '*' + value + '*';
           if (style.strike === true) value = '~' + value + '~';
         }
         return value;
@@ -67,9 +68,12 @@ export function renderMessageText(
       case 'emoji': return typeof e.name === 'string' ? `:${bounded(e.name)}:${typeof e.skin_tone === 'number' ? ':skin-tone-' + e.skin_tone + ':' : ''}` : '';
       case 'broadcast': return typeof e.range === 'string' ? `<!${bounded(e.range)}>` : '';
       case 'rich_text_section': return children('');
-      case 'rich_text_list': return children('\n');
-      case 'rich_text_quote': return children('');
-      case 'rich_text_preformatted': return children('');
+      case 'rich_text_list': return mirror
+        ? join(take(e.elements).map((x, i) =>
+          (e.style === 'ordered' ? String(i + 1) + '. ' : '• ') + rich(x, depth + 1, true)))
+        : children('\n');
+      case 'rich_text_quote': return mirror ? children('').split('\n').map(line => '> ' + line).join('\n') : children('');
+      case 'rich_text_preformatted': return mirror ? '```\n' + children('') + '\n```' : children('');
       case 'rich_text': return children('\n');
       default: return '';
     }
@@ -89,11 +93,29 @@ export function renderMessageText(
   // Format keys only. Return raw Slack text so the adapter formats output once.
   const keyFor = (value: string) => normalized(formatSlackText(
     value.replace(/<@([^|>]+)(?:\|[^>]*)?>/g, '<@$1>'), userNames,
-  ).replace(/^\s*(?:[•*+-] |\d+\. |>|&gt;)\s?/gm, '').replace(/```(?:[\w-]+)?\n/g, '').replace(/```|`|[*_~]/g, ''));
-  const seen = new Set([keyFor(original)]);
-  function append(value: string) {
+  ));
+  // Only rich-text mirrors have known structure. Plain attachment/section
+  // punctuation must never be mistaken for presentation markup.
+  const richKey = (value: string) => keyFor(value)
+    // Slack may mirror a preformatted span with fences rather than backticks.
+    .replace(/^```\s*([^`]*?)\s*```$/u, '`$1`')
+    .replace(/(^|[^\p{L}\p{N}_])([*_~]{1,3})(?=\S)(.*?\S)([*_~]{1,3})(?=$|[^\p{L}\p{N}_])/gu,
+      (whole, before: string, open: string, body: string, close: string) => {
+        if (new Set(open).size !== open.length || [...open].reverse().join('') !== close) return whole;
+        const markers = [...open].sort();
+        return before + markers.join('') + body + markers.reverse().join('');
+      });
+  const originalKey = keyFor(original);
+  const seen = new Set<string>();
+  function append(value: string, mirror?: string) {
     const key = keyFor(value);
-    if (key && !seen.has(key)) { appended.push(value); seen.add(key); }
+    const matchesOriginal = mirror === undefined ? key === originalKey : richKey(mirror) === richKey(original);
+    if (key && !matchesOriginal && !seen.has(key)) { appended.push(value); seen.add(key); }
+  }
+  function appendBlock(raw: unknown) {
+    const value = block(raw);
+    const mirror = object(raw).type === 'rich_text' ? rich(raw, 0, true) : undefined;
+    append(value, budget >= 0 ? mirror : undefined);
   }
   const urls = new Set(Array.from(original.replace(/<(https?:\/\/[^|>]+)(?:\|[^>]*)?>/g, '$1').matchAll(/https?:\/\/[^\s<>]+/g), m => m[0]));
   for (const raw of take(message.attachments)) {
@@ -116,9 +138,9 @@ export function renderMessageText(
       }),
     ]);
     append(body || bounded(a.fallback));
-    for (const b of take(a.blocks)) append(block(b));
+    for (const b of take(a.blocks)) appendBlock(b);
   }
-  for (const b of take(message.blocks)) append(block(b));
+  for (const b of take(message.blocks)) appendBlock(b);
   const suffix = join(appended);
   const addition = (original && suffix ? '\n' : '') + suffix;
   if (addition.length > MAX_MESSAGE_TEXT_APPEND) truncated = true;
