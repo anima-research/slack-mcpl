@@ -743,3 +743,96 @@ for (const alreadyPresent of [false, true]) {
     assert.equal((slack as unknown as { ackAdopted: Map<string, unknown> }).ackAdopted.size, 0);
   });
 }
+
+for (const prior of ['none', 'cleaned', 'removing'] as const) {
+  for (const agentLandsFirst of prior === 'removing' ? [false] : [false, true]) {
+    test(`ACK during server adoption preserves reaction (${prior}, agent lands ${agentLandsFirst ? 'first' : 'last'})`, async t => {
+      t.mock.timers.enable({ apis: ['setTimeout'] });
+      let present = false;
+      let adds = 0;
+      let removes = 0;
+      let releaseAdd: (() => void) | undefined;
+      let releaseRemove: (() => void) | undefined;
+      const agentAdd = prior === 'none' ? 1 : 2;
+      const web = { reactions: {
+        add: async () => {
+          const isAgent = ++adds === agentAdd;
+          const land = () => {
+            const existed = present;
+            present = true;
+            return existed;
+          };
+          let existed = false;
+          if (isAgent) {
+            if (agentLandsFirst) existed = land();
+            await new Promise<void>(resolve => { releaseAdd = resolve; });
+            if (!agentLandsFirst) existed = land();
+          } else existed = land();
+          if (existed) throw refusal('already_reacted');
+        },
+        remove: async () => {
+          removes++;
+          if (prior === 'removing' && removes === 1) {
+            await new Promise<void>(resolve => { releaseRemove = resolve; });
+          }
+          present = false;
+        },
+      } } as unknown as SlackWebLike;
+      const slack = new SlackAdapter(web, { on() {}, async start() {}, async disconnect() {} }, 'UBOT', 'test',
+        undefined, undefined, false, 'eyes');
+      const h = connectHost(new SlackMcplServer(slack));
+      t.after(async () => { releaseAdd?.(); releaseRemove?.(); await h.close(); await slack.stop(); });
+      await initialize(h, false);
+      if (prior !== 'none') await slack.acknowledge('C1', '1.0');
+      let clearing: Promise<void> | undefined;
+      if (prior === 'cleaned') await slack.clearAck('C1');
+      if (prior === 'removing') {
+        clearing = slack.clearAck('C1');
+        await flush();
+        assert.ok(releaseRemove);
+      }
+      const adding = call(h, 'add_reaction', args);
+      await flush();
+      if (prior === 'removing') {
+        assert.equal(releaseAdd, undefined, 'adoption must wait for the old cleanup');
+        releaseRemove!();
+        await clearing;
+        await flush();
+      }
+      assert.ok(releaseAdd, 'agent add must be in flight');
+      await slack.acknowledge('C1', '1.0');
+      releaseAdd();
+      const result = await adding;
+      assert.notEqual(result.isError, true);
+      assert.match(result.content[0]!.text, agentLandsFirst ? /^Reaction added$/ : /^Nothing changed:/);
+      const removalsBeforeCleanup = removes;
+      await slack.clearAck('C1');
+      t.mock.timers.tick(10 * 60 * 1000);
+      await flush();
+      assert.equal(present, true, 'cleanup must not remove the adopted reaction');
+      assert.equal(removes, removalsBeforeCleanup, 'no automatic removal after adoption');
+      assert.equal(adds, agentAdd + 1);
+    });
+  }
+}
+
+test('adoption marker is armed only for a confirmed explicit configured ACK emoji', async t => {
+  let error: string | undefined;
+  const web = { reactions: { add: async () => { if (error) throw refusal(error); } } } as unknown as SlackWebLike;
+  const slack = new SlackAdapter(web, { on() {}, async start() {}, async disconnect() {} }, 'UBOT', 'test',
+    undefined, undefined, false, 'eyes');
+  t.after(() => slack.stop());
+  const markers = (slack as unknown as { ackAdopted: Map<string, Map<string, unknown>> }).ackAdopted;
+  for (const emoji of ['thumbsup', 'eyes::skin-tone-2']) {
+    await slack.addReaction('C1', '1.0', emoji);
+    assert.equal(markers.size, 0, emoji);
+  }
+  error = 'ratelimited';
+  await assert.rejects(slack.addReaction('C1', '1.0', ':eyes:'), /ratelimited/);
+  assert.equal(markers.size, 0, 'failed add');
+  error = undefined;
+  await slack.addReaction('C1', '1.0', 'eyes', { automatic: true });
+  assert.equal(markers.size, 0, 'automatic ACK');
+  await slack.addReaction('C1', '1.0', ':eyes:');
+  assert.deepEqual([...markers].map(([channel, messages]) => [channel, [...messages.keys()]]), [['C1', ['1.0']]]);
+});

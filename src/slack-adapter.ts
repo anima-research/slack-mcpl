@@ -1144,6 +1144,10 @@ export class SlackAdapter {
 
   private markAdopted(channelId: string, ts: string): void {
     if (this.stopping) return;
+    // An acknowledge() during the add may have installed an entry the caller
+    // never saw. Slack confirmed our reaction; retire its pending cleanup too.
+    const current = this.ackPending.get(channelId)?.get(ts);
+    if (current && !current.removing) this.dropAck(channelId, ts, current);
     let adopted = this.ackAdopted.get(channelId);
     if (!adopted) this.ackAdopted.set(channelId, (adopted = new Map()));
     clearTimeout(adopted.get(ts));
