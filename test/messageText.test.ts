@@ -47,7 +47,9 @@ async function expectText(payload: Record<string, unknown>, expected: string, bo
   assert.deepEqual(result.contents, [expected, expected, backscroll]);
   if (bot) assert.equal(result.received.length, 0, 'existing live bot exclusion');
   else {
-    assert.equal(result.received[0].cleanContent, expected);
+    const liveExpected = expected.replace(/@alice \(uid:([A-Z0-9]+)\)/g,
+      (mention, id) => originalIds.has(id) || id === 'U1' ? mention : `@${id} (uid:${id})`);
+    assert.equal(result.received[0].cleanContent, liveExpected);
     return result.received[0];
   }
 }
@@ -310,7 +312,12 @@ test('review server shared mentions neither wake nor auto-subscribe; raw metadat
     await until(() => h.hostSaw.some(r => r.method === method.CHANNELS_REGISTER), 'registration');
     const event = { type: 'message', channel: 'C1', channel_type: 'channel', user: 'U1', ts: '100.1', text: 'Notification', attachments: [{ is_share: true, text: '<@UBOT> Details' }] };
     await h.socket.emitMessage(event);
+    // Wait for both queues, rather than trusting emitMessage's convenience delay.
+    await (h.server as any).slack.inbound.get('C1');
+    await (h.server as any).forwarding.get('C1');
     assert.equal(h.hostSaw.filter(r => r.method === method.PUSH_EVENT).length, 0, 'unsubscribed ambient shared mention is silent');
+    const listed: any = await h.host.sendRequest('tools/call', {name: 'list_subscriptions', arguments: {}});
+    assert.deepEqual(JSON.parse(listed.content[0].text).channels, [], 'shared mention must not auto-subscribe');
     await h.host.sendRequest('tools/call', { name: 'subscribe_channel', arguments: { channelId: 'C1' } });
     await h.socket.emitMessage({ ...event, ts: '100.2' });
     await until(() => h.hostSaw.some(r => r.method === method.PUSH_EVENT), 'ambient delivery');
@@ -616,4 +623,31 @@ test('backscroll truncates raw supplemental entities before formatting', async (
   const result = await shaped({ attachments: [{ text: body }] });
   assert.equal(result.contents[0], 'x'.repeat(1985) + '&' + 'z'.repeat(40));
   assert.equal(result.contents[2], 'x'.repeat(1985) + '&am' + '[…truncated]');
+});
+
+test('top-level omission labels retain input order and can displace later readable blocks', () => {
+  const output = renderMessageText({blocks: [
+    ...Array.from({length: 30}, (_, i) => ({type: 'unknown' + i})),
+    {type: 'markdown', text: 'Later readable section'},
+  ]}, 100);
+  assert.ok(output.startsWith('[unknown0 omitted]'));
+  assert.ok(!output.includes('Later readable section'));
+  assert.ok(output.endsWith('[…truncated]'));
+  assert.ok(output.length <= 100);
+});
+
+test('live app-as-user rich bodies keep the from-human tag', async () => {
+  const h = harness();
+  try {
+    await initialize(h, true);
+    await h.host.sendRequest(method.FEATURE_SETS_UPDATE, {effectiveCapabilities: FULL_GRANT});
+    await until(() => h.hostSaw.some(r => r.method === method.CHANNELS_REGISTER), 'registration');
+    await h.socket.emitMessage({type: 'message', channel: 'C1', user: 'U1', ts: '101.1',
+      text: '<@UBOT> Summary', app_id: 'A1',
+      blocks: [{type: 'rich_text', elements: [{type: 'rich_text_section', elements: [{type: 'text', text: 'App body'}]}]}]});
+    await until(() => h.hostSaw.some(r => r.method === method.PUSH_EVENT), 'app delivery');
+    const push: any = h.hostSaw.find(r => r.method === method.PUSH_EVENT)!.params;
+    assert.ok(push.tags.includes('chat:from-human'));
+    assert.ok(JSON.stringify(push.payload.content).includes('App body'));
+  } finally { await h.close(); }
 });

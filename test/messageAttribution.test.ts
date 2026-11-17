@@ -196,19 +196,43 @@ test('backscroll never waits for supplemental-only mention lookups across rows',
     conversations: { history: async () => ({ messages: rows }) },
   } as any, { on() {} } as any, 'UBOT', 'example');
   const pending = adapter.fetchHistory('C1');
-  // All immediately available history must be returned without waiting for
-  // optional names, well inside the server's five-second backscroll deadline.
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    const result = await Promise.race([
-      pending,
-      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('backscroll waited for supplemental names')), 500); }),
-    ]);
-    assert.equal(result.messages.length, 50);
-    assert.deepEqual(calls, ['UORIGINAL']);
-    assert.ok(result.messages.every(row => row.content.includes('@original')));
-    assert.ok(result.messages.some(row => row.content.includes('U0X0')));
-  } finally {
-    clearTimeout(timer);
+  // Immediate API answers and shaping settle before the next loop turn,
+  // independent of how long this CPU-constrained runner takes to render.
+  const result = await Promise.race([
+    pending,
+    new Promise<never>((_, reject) => setImmediate(() => reject(new Error('backscroll waited for supplemental names')))),
+  ]);
+  assert.equal(result.messages.length, 50);
+  assert.deepEqual(calls, ['UORIGINAL']);
+  assert.ok(result.messages.every(row => row.content.includes('@original')));
+  assert.ok(result.messages.some(row => row.content.includes('U0X0')));
+});
+
+test('live delivery uses cached supplemental names without optional lookups', async () => {
+  let handler: any;
+  const calls: string[] = [];
+  const delivered: any[] = [];
+  const adapter = new SlackAdapter({users: {info: async ({user}: {user: string}) => {
+    calls.push(user);
+    if (user === 'UOPTIONAL') return new Promise(() => {});
+    return {user: {name: user.toLowerCase()}};
+  }}} as any, {on(_: string, h: any) {handler = h;}} as any, 'UBOT', 'example');
+  adapter.onMessage(message => delivered.push(message));
+  const emit = async (event: Record<string, unknown>) => {
+    handler({ack: async () => {}, event: {type: 'message', channel: 'D1', ts: '100.1', ...event}});
+    // Immediate lookups and the delivery chain drain before the next loop turn.
+    await new Promise<void>(resolve => setImmediate(resolve));
+  };
+  await emit({user: 'UCACHED', text: 'prime author cache'});
+  for (const text of ['', '<@UBOT>']) {
+    await emit({user: 'UAUTHOR', text, blocks: [{type: 'markdown', text: '<@UCACHED> <@UOPTIONAL|label>'}]});
+    const message = delivered.at(-1);
+    assert.equal(delivered.length, text ? 3 : 2, 'optional lookup must not hold delivery');
+    assert.equal(message.authorName, 'uauthor');
+    assert.ok(message.cleanContent.includes('@ucached'));
+    assert.ok(message.cleanContent.includes('@UOPTIONAL'));
+    assert.ok(!message.cleanContent.includes('@label'));
+    assert.equal(message.mentionsBot, !!text);
   }
+  assert.deepEqual(calls, ['UCACHED', 'UAUTHOR', 'UBOT']);
 });
