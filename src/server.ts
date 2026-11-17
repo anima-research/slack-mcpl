@@ -1821,8 +1821,9 @@ export class SlackMcplServer {
     }
 
     // MCPL RFC-001 event tags — reserved chat:* core, umbrellas included.
-    // The host's wake gate routes on these. Other bots' messages never get
-    // here (the adapter self-filters bot_id), so from-human is uniform.
+    // The host's wake gate routes on these. Messages with a bot_id never get
+    // here (the adapter self-filters them); every delivered message carries a
+    // user, apps posting as one included, so from-human is uniform.
     const eventTags: string[] = (() => {
       const t = new Set<string>();
       if (msg.mentionsBot) t.add('chat:mention');

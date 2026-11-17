@@ -129,9 +129,14 @@ export function renderMessageText(
       case 'emoji': return typeof e.name === 'string' ? styled(`:${escape(bounded(e.name))}:${typeof e.skin_tone === 'number' ? ':skin-tone-' + e.skin_tone + ':' : ''}`, e.style) : '';
       case 'broadcast': return ['here', 'channel', 'everyone'].includes(string(e.range)) ? styled(`<!${e.range}>`, e.style) : '';
       case 'rich_text_section': return children('');
-      case 'rich_text_list': return join(map(take(e.elements), (x, i) =>
-        '    '.repeat(Math.max(0, Math.min(12, Number(e.indent) || 0))) +
-        (e.style === 'ordered' ? String(i + 1 + (Number(e.offset) || 0)) + '. ' : ['• ', '◦ ', '▪ '][Math.max(0, Math.min(12, Math.floor(Number(e.indent) || 0))) % 3]) + rich(x, depth + 1)));
+      case 'rich_text_list': {
+        // Payload fields are unvalidated: only finite numbers count, never coercion.
+        const finite = (n: unknown) => typeof n === 'number' && Number.isFinite(n) ? n : 0;
+        const indent = Math.max(0, Math.min(12, finite(e.indent)));
+        const offset = finite(e.offset);
+        return join(map(take(e.elements), (x, i) => '    '.repeat(indent) +
+          (e.style === 'ordered' ? String(i + 1 + offset) + '. ' : ['• ', '◦ ', '▪ '][Math.floor(indent) % 3]) + rich(x, depth + 1)));
+      }
       case 'rich_text_quote': {
         const body = children('');
         return body ? body.split(LINE_BREAK).map(line => '&gt; ' + line).join('\n') : '';

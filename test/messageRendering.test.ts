@@ -137,7 +137,9 @@ test('long non-trailing URL punctuation stays bounded across repeated renders', 
   const text = 'http://a' + '.'.repeat(39990) + 'x';
   for (let i = 0; i < 20; i++) {
     t.signal.throwIfAborted();
-    assert.equal(renderMessageText({text, client_msg_id: 'human'}), text);
+    // The attachment takes rendering past the text-only return into the
+    // bare-URL scan; an app unfurl adds nothing, so the text comes back as is.
+    assert.equal(renderMessageText({text, client_msg_id: 'human', attachments: [{is_app_unfurl: true, text: 'PREVIEW'}]}), text);
     // Let the runner enforce its timeout even when rendering blocks the loop.
     await setImmediate();
   }

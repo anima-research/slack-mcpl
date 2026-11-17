@@ -62,3 +62,24 @@ test('bots retain plain per-unit display dedup', () => {
     rich(section(literal('run (https://review.invalid/a)'))),
   ]}), 'summary\n<https://review.invalid/a|run>');
 });
+
+test('addressed message with uncoercible rich-list indent and offset is still delivered', async (t) => {
+  const { method } = await import('@animalabs/mcpl-core');
+  const { harness, initialize, FULL_GRANT, until } = await import('./harness.js');
+  const h = harness();
+  t.after(() => h.close());
+  await initialize(h, true);
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, {effectiveCapabilities: FULL_GRANT});
+  await until(() => h.hostSaw.some(r => r.method === method.CHANNELS_REGISTER), 'registration');
+  // Number() throws on both: a non-callable toString, and recursion through nesting.
+  let deep: unknown = 1;
+  for (let i = 0; i < 100_000; i++) deep = [deep];
+  const list = (fields: Record<string, unknown>) => ({type: 'rich_text_list', ...fields, elements: [section(literal('item'))]});
+  await h.socket.emitMessage({type: 'message', channel: 'C1', user: 'U1', ts: '2000.000001', text: '<@UBOT> hi', attachments: [{blocks: [rich(
+    list({style: 'bullet', indent: {toString: null}}), list({style: 'ordered', indent: deep, offset: deep}),
+    list({style: 'ordered', indent: 1, offset: 2}))]}]});
+  await until(() => h.hostSaw.some(r => r.method === method.PUSH_EVENT), 'delivery');
+  const push = h.hostSaw.find(r => r.method === method.PUSH_EVENT)!.params as {payload: {content: Array<{text: string}>}};
+  const text = push.payload.content.map(c => c.text).join('\n');
+  assert.match(text, /hi\n\s*• item\n\s*1\. item\n\s* {4}3\. item/);
+});
