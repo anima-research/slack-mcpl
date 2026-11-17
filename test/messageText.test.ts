@@ -38,13 +38,15 @@ async function expectText(payload: Record<string, unknown>, expected: string, bo
   const originalIds = new Set(extractSlackUserIds(typeof payload.text === 'string' ? payload.text : ''));
   // Backscroll deliberately leaves supplemental-only mentions as raw IDs.
   let backscroll = expected.replace(/@alice \(uid:([A-Z0-9]+)\)/g,
-    (mention, id) => originalIds.has(id) ? mention : `@${id} (uid:${id})`);
+    (mention, id) => originalIds.has(id) || id === 'U1' ? mention : `@${id} (uid:${id})`);
   if (backscroll.length - original.length > 2000) {
     let suffix = backscroll.slice(original.length, original.length + 2000 - '[…truncated]'.length);
     if (/[\uD800-\uDBFF]$/.test(suffix)) suffix = suffix.slice(0, -1);
     backscroll = original + suffix + '[…truncated]';
   }
-  assert.deepEqual(result.contents, [expected, expected, backscroll]);
+  const readExpected = expected.replace(/@alice \(uid:([A-Z0-9]+)\)/g,
+    (mention, id) => originalIds.has(id) || id === 'U1' ? mention : `@${id} (uid:${id})`);
+  assert.deepEqual(result.contents, [readExpected, readExpected, backscroll]);
   if (bot) assert.equal(result.received.length, 0, 'existing live bot exclusion');
   else {
     const liveExpected = expected.replace(/@alice \(uid:([A-Z0-9]+)\)/g,
@@ -200,7 +202,7 @@ test('review supplemental fragments dedup independently', async () => {
 });
 
 test('review rich usergroup date and toned emoji preserved and deduplicated', async () => {
-  const body = '<!subteam^S1> Today :thumbsup::skin-tone-2:';
+  const body = '@S1 Today :thumbsup::skin-tone-2:';
   const blocks = [richBlock(richSection({ type: 'usergroup', usergroup_id: 'S1' }, literal(' '), { type: 'date', fallback: 'Today' }, literal(' '), { type: 'emoji', name: 'thumbsup', skin_tone: 2 }))];
   await expectText({ blocks }, body);
   assert.equal((await expectText({ text: body, blocks }, body))!.content, body);
@@ -341,7 +343,8 @@ test('review docs pin the real nested-before-top-level order', () => {
 });
 
 // Non-rich supplemental units have no structural provenance: punctuation
-// differences must survive on every production shaping path.
+// differences below survive on every shaping path. Equivalent bullet glyphs
+// (•, ◦, ▪) are intentionally normalized, including for non-rich units.
 for (const [text, body] of [
   ['a_b', 'ab'],
   ['a*b', 'ab'],
@@ -491,7 +494,7 @@ test('repeated rich channel labels stop rendering before materializing oversized
     assert.ok(result.startsWith(text));
     assert.ok(result.endsWith('[…truncated]'));
     assert.ok(result.length <= text.length + limit);
-    assert.ok(reads <= 2, 'must stop expanding repeated labels at the render budget');
+    assert.ok(reads <= Math.ceil((text.length + 1) / '<#C1>'.length), 'short ID tokens still stop at the render budget');
   }
 });
 
@@ -528,9 +531,8 @@ test('channel label expansion is bounded across separately deduplicated blocks',
       })));
       const result = renderMessageText({ text, bot_id: 'B1', ...(attachments
         ? { attachments: blocks.map(b => ({ blocks: [b] })) } : { blocks }) }, limit);
-      assert.ok(result.startsWith(text));
-      assert.ok(result.endsWith('[…truncated]'));
-      assert.ok(reads <= 15, 'expansion work must not scale with duplicate block count');
+      assert.equal(result, text, 'all mirrors are discarded before label expansion');
+      assert.equal(reads, 1000, 'visit short IDs rather than expanding duplicate labels');
     }
   }
 });
@@ -650,4 +652,58 @@ test('live app-as-user rich bodies keep the from-human tag', async () => {
     assert.ok(push.tags.includes('chat:from-human'));
     assert.ok(JSON.stringify(push.payload.content).includes('App body'));
   } finally { await h.close(); }
+});
+
+test('explicit history/thread reads never look up supplemental-only IDs, even beyond the byte limit', async () => {
+  for (const kind of ['history', 'thread'] as const) {
+    const calls: string[] = [];
+    const messages = Array.from({length: 30}, (_, i) => ({
+      ts: `${100 + i}.000001`, user: 'UAUTHOR', text: '<@UORIGINAL> body',
+      attachments: [{text: Array.from({length: 20}, (_, j) => `<@UEXTRA${i}X${j}>`).join(' ')}],
+    }));
+    const adapter = new SlackAdapter({
+      users: {info: async ({user}: {user: string}) => { calls.push(user); return {user: {name: 'name-' + user}}; }},
+      conversations: {history: async () => ({messages}), replies: async () => ({messages})},
+    } as any, {on() {}} as any, 'UBOT', 'example');
+    (adapter as any).userNameCache.set('UEXTRA0X0', 'cached');
+    const result = kind === 'history'
+      ? await adapter.readHistory('C1', {maxBytes: 3000})
+      : await adapter.readThread('C1', '100.000001', {maxBytes: 3000});
+    assert.equal(result.pagination.stopReason, 'byte_limit');
+    assert.deepEqual(calls.sort(), ['UAUTHOR', 'UORIGINAL']);
+    assert.equal((adapter as any).userNameCache.size, 3, 'no supplemental entries or refusals retained');
+    const content = result.messages.map(m => m.content).join('\n');
+    assert.match(content, /@UEXTRA/);
+    if (kind === 'thread') assert.match(content, /@cached \(uid:UEXTRA0X0\)/);
+  }
+});
+
+test('malformed nested/multiline mentions pin live addressing policy', async () => {
+  for (const [text, ids, mentionsBot] of [
+    ['<@U1|x<@UBOT>>', ['UBOT'], true],
+    ['<@UBOT|a\nb>', [], false],
+  ] as const) {
+    const result = await shaped({text});
+    assert.deepEqual(result.received[0].mentionIds, ids);
+    assert.equal(result.received[0].mentionsBot, mentionsBot);
+  }
+});
+
+test('blocks-only channel metadata preserves the empty original rawContent', async () => {
+  const h = harness();
+  try {
+    await initialize(h, true);
+    await h.host.sendRequest(method.FEATURE_SETS_UPDATE, {effectiveCapabilities: FULL_GRANT});
+    await until(() => h.hostSaw.some(r => r.method === method.CHANNELS_REGISTER), 'registration');
+    await h.host.sendRequest('tools/call', {name: 'subscribe_channel', arguments: {channelId: 'C1'}});
+    await h.host.sendRequest(method.CHANNELS_OPEN, {channelId: 'slack:C1', type: 'slack', address: {channelId: 'C1'}});
+    await h.socket.emitMessage({type: 'message', channel: 'C1', user: 'U1', ts: '100.9', blocks: [section('block body')]});
+    await until(() => h.hostSaw.some(r => r.method === method.CHANNELS_INCOMING), 'blocks-only channel delivery');
+    const incoming: any = h.hostSaw.find(r => r.method === method.CHANNELS_INCOMING)!.params;
+    assert.equal(incoming.messages[0].metadata.rawContent, '');
+  } finally { await h.close(); }
+});
+
+test('non-rich comparison intentionally treats bullet glyph variants as equivalent', () => {
+  assert.equal(renderMessageText({text: '• x', attachments: [{text: '◦ x'}]}), '• x');
 });

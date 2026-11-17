@@ -49,7 +49,7 @@ for (const {name, text, block} of fixtures) test(`bot reconstructed ${name} rend
 });
 test('blocks-only app-as-user rich text survives all four delivery paths', async () => {
   for (const text of [undefined, '']) {
-    assert.deepEqual(await paths({text, client_msg_id: 'client', blocks: [rich(section(literal('app body')))]}), Array(4).fill('app body'));
+    assert.deepEqual(await paths({text, app_id: 'A1', client_msg_id: 'client', blocks: [rich(section(literal('app body')))]}), Array(4).fill('app body'));
   }
 });
 test('bots retain plain per-unit display dedup', () => {

@@ -189,7 +189,7 @@ export function backscrollBlock(
   const maxBytes = 32_768;
   const lines: string[] = [];
   const summary = (count: number, before?: string) =>
-    `[${count} older backscroll ${count === 1 ? 'message' : 'messages'} not shown${historyGranted ? '; try fetch_history' + (before ? ' latest=' + before : '') : ''}]`;
+    `[${count} older backscroll ${count === 1 ? 'message' : 'messages'} not shown${historyGranted ? '; try fetch_history' + (before ? ' latest=' + before : '') : '; history unavailable until the host enables slack.history'}]`;
   const frame = (count: number) => `<backscroll ${[...attrs, `count="${count}"`].join(' ')}>\n\n</backscroll>`;
   const rendered = messages.map(backscrollLine);
   const complete = [`<backscroll ${[...attrs, `count="${messages.length}"`].join(' ')}>`,
@@ -205,7 +205,7 @@ export function backscrollBlock(
       (i ? Buffer.byteLength(summary(i, message.id)) + 1 : 0);
     let shown = line;
     if (bytes + size + 1 + reserved > maxBytes) {
-      shown = backscrollLine({...message, attachments: [], content: `message omitted (${size} bytes)${historyGranted ? '; try fetch_history' : ''}`});
+      shown = `[backscroll notice: message omitted (${size} bytes); timestamp=${message.timestamp.toISOString()}${message.threadTs ? ' thread=' + message.threadTs : ''} id=${message.id}; author=${quotedLabel(nameShown(message.authorName))}${historyGranted ? '; try fetch_history' : '; history unavailable until the host enables slack.history'}]`;
     }
     const shownBytes = Buffer.byteLength(shown) + 1;
     if (bytes + shownBytes + reserved > maxBytes) break;

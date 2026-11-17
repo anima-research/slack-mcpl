@@ -4,6 +4,7 @@
  * request through the adapter's client, so it keeps the call's time and wait
  * budget like every other request. Backscroll keeps the adapter's own pager.
  */
+import { setImmediate } from 'node:timers/promises';
 import { createHash } from 'node:crypto';
 import { renderMessageText } from './message-text.js';
 import { formatSlackText, type SlackHistoryMessage } from './content.js';
@@ -345,9 +346,12 @@ export async function readBounded(opts: ReadOptions, source: ReadSource): Promis
         (needle === undefined || fold(formatSlackText(renderMessageText(m), BY_ID)).includes(needle));
       // Stop before rendering rows excluded by the author, scan or match limit.
       const matches: SlackHistoryMessage[] = [];
+      let candidates = 0;
       for (const { m } of rows.slice(0, opts.maxScanned - scanned)) {
         if (matches.length >= opts.limit - records.length) break;
         if (isMatch(m)) matches.push(m);
+        // Yield between bounded candidates, including when no text matches.
+        if (needle !== undefined && ++candidates % 8 === 0) await setImmediate();
       }
       const shaped = new Map((await source.shape(matches)).map((m, i) => [matches[i]!, m]));
       for (const [i, { m, ts }] of rows.entries()) {

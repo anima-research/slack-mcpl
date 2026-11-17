@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { setImmediate } from 'node:timers/promises';
+import { Worker } from 'node:worker_threads';
 import { renderMessageText } from '../src/message-text.js';
 import { formatSlackText } from '../src/content.js';
 import { SlackAdapter } from '../src/slack-adapter.js';
@@ -83,7 +83,7 @@ test('socket ack precedes any renderer access', async () => {
   assert.ok(accesses.length > 0);
   assert.ok(accesses.every(Boolean), 'render before ack');
 });
-test('twenty supplemental IDs resolved on explicit history; none on live or backscroll', async () => {
+test('supplemental IDs use cached names or raw IDs across all delivery paths', async () => {
   for (const path of ['live', 'history', 'backscroll']) {
     const calls: string[] = []; let handler: any;
     const row = { user: 'UAUTH', ts: '100.000001', text: '<@UORIG|original>', blocks: [section(Array.from({length: 30}, (_, i) => `<@U${i}|label>`).join(' '))] };
@@ -93,10 +93,10 @@ test('twenty supplemental IDs resolved on explicit history; none on live or back
     let output: string;
     if (path === 'live') { handler({event: {...row, type: 'message', channel: 'C1'}, ack: async () => {}}); output = (await delivered).cleanContent; }
     else output = (path === 'history' ? await adapter.readHistory('C1', {}) : await adapter.fetchHistory('C1')).messages[0].content;
-    assert.equal(calls.length, path === 'history' ? 22 : 2, calls.join(','));
-    assert.match(output, path === 'history' ? /@resolved \(uid:U0\)/ : /@U0 \(uid:U0\)/);
+    assert.equal(calls.length, 2, calls.join(','));
+    assert.match(output, /@U0 \(uid:U0\)/);
     assert.ok(calls.includes('UORIG'));
-    assert.match(output, path === 'live' ? /@CachedName \(uid:U20\)/ : /@U20 \(uid:U20\)/);
+    assert.match(output, /@CachedName \(uid:U20\)/);
     assert.match(output, /@original \(uid:UORIG\)/, 'original fallback labels survive transient lookup failures');
   }
 });
@@ -111,7 +111,7 @@ test('backscroll supplemental lines capped at 2000; total block <=32KiB with exp
   const count = Number(block.match(/count="(\d+)"/)![1]);
   assert.ok(count > 0 && count < 50);
   assert.match(block, /older backscroll messages not shown; try fetch_history latest=/);
-  assert.match(block, /message omitted \(\d+ bytes\); try fetch_history/);
+  assert.match(block, /message omitted \(\d+ bytes\).*; try fetch_history/);
   assert.match(block, /id=49\]/);
   assert.doesNotMatch(block, /id=0\]/);
 });
@@ -134,14 +134,31 @@ test('large bot rich blocks retain distinct words within the supplemental limit'
   assert.ok(output.length <= text.length + 16384);
 });
 
-test('long non-trailing URL punctuation stays bounded across repeated renders', async () => {
-  const text = 'http://a' + '.'.repeat(39990) + 'x';
-  for (let i = 0; i < 20; i++) {
-    // The attachment takes rendering past the text-only return into the
-    // bare-URL scan; an app unfurl adds nothing, so the text comes back as is.
-    assert.equal(renderMessageText({text, client_msg_id: 'human', attachments: [{is_app_unfurl: true, text: 'PREVIEW'}]}), text);
-    await setImmediate();
-  }
+test('URL punctuation matcher completes in an interruptible worker', async () => {
+  const worker = new Worker(new URL('./fixtures/url-punctuation-worker.mjs', import.meta.url));
+  try {
+    await new Promise<void>((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout>;
+      const fail = (error: Error) => { clearTimeout(timer); reject(error); };
+      worker.once('error', fail);
+      worker.once('exit', code => fail(new Error(`matcher worker exited early: ${code}`)));
+      worker.on('message', message => {
+        if (message === 'ready') {
+          // Exclude TS loader startup. This is a hard interruption, not a
+          // same-thread timing assertion: the restored /[.,;:!?]+$/ matcher
+          // attempts ~500 billion comparisons on this bounded input.
+          clearTimeout(timer);
+          timer = setTimeout(() => fail(new Error('URL matcher exceeded hard worker deadline')), 10_000);
+          worker.postMessage(1_000_000);
+        } else {
+          clearTimeout(timer);
+          if (message === 'done') resolve();
+          else fail(new Error(String(message)));
+        }
+      });
+      timer = setTimeout(() => fail(new Error('matcher worker failed to start')), 60_000);
+    });
+  } finally { await worker.terminate(); }
 });
 
 test('bare URL trailing punctuation trimming preserves interior punctuation', () => {
@@ -252,4 +269,25 @@ test('nested omission labels do not preempt later readable attachment blocks', (
   const result = renderMessageText({attachments: [{blocks: [...blocks, section('USEFUL')]}]});
   assert.match(result, /^USEFUL\n/);
   assert.ok(result.length <= 16384);
+});
+
+test('duplicate rich channel labels do not spend the traversal budget', () => {
+  const text = '<#C1|' + 'label'.repeat(1000) + '>';
+  const mirror = {type: 'rich_text', elements: [{type: 'rich_text_section', elements: [{type: 'channel', channel_id: 'C1'}]}]};
+  assert.equal(renderMessageText({text, bot_id: 'B1', blocks: Array(20).fill(mirror)}), text);
+  const distinct = {type: 'rich_text', elements: [{type: 'rich_text_section', elements: [{type: 'text', text: 'extra '}, {type: 'channel', channel_id: 'C1'}]}]};
+  assert.equal(renderMessageText({text, bot_id: 'B1', blocks: [distinct]}), text + '\nextra ' + text);
+});
+
+test('duplicate deferred omission labels do not falsely truncate', () => {
+  const blocks = Array.from({length: 18}, (_, i) => ({type: String(i).padStart(100, 'x')}));
+  const message = {attachments: [{blocks: [...blocks, blocks[0]]}]};
+  const expected = blocks.map(b => `[${b.type} omitted]`).join('\n');
+  assert.equal(expected.length, 1997);
+  assert.equal(renderMessageText(message, 2000), expected);
+});
+
+test('rich usergroups have readable ID and label fallbacks', () => {
+  assert.equal(clean({blocks: [{type: 'rich_text', elements: [{type: 'usergroup', usergroup_id: 'S123'}]}]}), '@S123');
+  assert.equal(formatSlackText('<!subteam^S123|@ops>', new Map()), '@ops');
 });

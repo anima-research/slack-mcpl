@@ -244,6 +244,9 @@ export function formatSlackText(text: string, userNames: Map<string, string>): s
       const [, id, name] = match;
       return name ? channelShown(unescapeSlack(name)).replace(/&/g, '&amp;') : `#${id}`;
     }
+    if ((match = /^<!subteam\^([A-Z0-9]+)(?:\|([^>]*))?>$/.exec(token))) {
+      return '@' + nameShown(unescapeSlack(match[2] || match[1]).replace(/^@/, '')).replace(/&/g, '&amp;');
+    }
     if ((match = /^<!(here|channel|everyone)(?:\|[^>]*)?>$/.exec(token))) return '@' + match[1];
     if ((match = /^<(https?:\/\/[^|>]+)(?:\|([^>]*))?>$/.exec(token))) {
       return match[2] === undefined ? match[1] : `${match[2]} (${match[1]})`;

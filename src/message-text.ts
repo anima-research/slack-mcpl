@@ -80,7 +80,7 @@ export function renderMessageText(
   const visit = () => { if (--budget < 0) { truncated = true; return false; } return true; };
   const renderLimit = Math.max(MAX_MESSAGE_TEXT_APPEND, original.length + 1);
   const bounded = (v: unknown) => { const text = string(v); if (text.length > renderLimit) truncated = true; return prefix(text, renderLimit); };
-  // Consume children lazily: each expansion (including reused channel labels)
+  // Consume children lazily: each expansion
   // spends the remaining output allowance before another child is rendered.
   function* map<T>(values: Iterable<T>, render: (value: T, index: number) => string): Generator<string> {
     let index = 0;
@@ -106,15 +106,9 @@ export function renderMessageText(
     switch (e.type) {
       case 'text': return styled(escape(bounded(e.text)), e.style);
       case 'user': return validId(e.user_id) ? styled(`<@${e.user_id}>`, e.style) : '';
-      case 'channel': {
-        if (!validId(e.channel_id)) return '';
-        const label = channelLabels.get(e.channel_id) ?? '';
-        // Reused original labels can dwarf the payload. Charge their expansion
-        // even when a later block-level comparison discards the duplicate.
-        if (label.length > budget) { budget = 0; truncated = true; return ''; }
-        budget -= label.length;
-        return styled(`<#${e.channel_id}${label ? '|' + label : ''}>`, e.style);
-      }
+      // Expand original channel labels only after deduplication. Mirrors must
+      // not spend traversal/output allowance repeatedly expanding the same label.
+      case 'channel': return validId(e.channel_id) ? styled(`<#${e.channel_id}>`, e.style) : '';
       case 'link': {
         const url = escape(bounded(e.url));
         const label = escape(bounded(e.text));
@@ -276,6 +270,7 @@ export function renderMessageText(
         if (!omitted) hasReadableNested = true;
         // Deferred notices get their own allowance so they cannot displace
         // readable blocks or retain unbounded keys while waiting for them.
+        if (omitted && scopes.get(identity)?.rawSeen.has(value)) continue;
         const omissionCost = value.length + (placeholders.length ? 1 : 0);
         if (omitted && omissionBytes + omissionCost > omissionLimit) {
           truncated = true;
@@ -313,7 +308,22 @@ export function renderMessageText(
     if (skipHumanRichText && object(b).type === 'rich_text') { visit(); continue; }
     append(block(b));
   }
-  const suffix = join(appended);
+  let expandedLength = 0;
+  const joined = join(appended);
+  let previousEnd = 0;
+  const suffix = mapSlackAngles(joined, (token, start) => {
+    expandedLength += start - previousEnd;
+    previousEnd = start + token.length;
+    const match = /^<#([A-Z0-9]+)>$/.exec(token);
+    const label = match && channelLabels.get(match[1]);
+    const remaining = Math.max(0, renderLimit - expandedLength);
+    // Bound before constructing the expansion, not after allocating it.
+    const value = label ? `<#${match![1]}|${prefix(label, remaining)}>` : token;
+    if (value.length > remaining) truncated = true;
+    const shown = prefix(value, remaining);
+    expandedLength += shown.length;
+    return shown;
+  });
   const addition = (original && suffix ? '\n' : '') + suffix;
   if (addition.length > maxAppend) truncated = true;
   const marker = prefix('[…truncated]', Math.max(0, maxAppend));

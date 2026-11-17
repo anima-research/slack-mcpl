@@ -7,7 +7,7 @@ test('oversized backscroll message has an in-position omission placeholder', () 
   const rows = [message(1, 'old one'), message(2, 'old two'), message(3, 'x'.repeat(33000)), message(4, 'newest')];
   const block = backscrollBlock(rows, {isDM: false}, true);
   assert.ok(Buffer.byteLength(block) <= 32768);
-  assert.match(block, /\[1970-01-01T00:00:03.000Z id=3.000001\] Ann: message omitted \(\d+ bytes\); try fetch_history/);
+  assert.match(block, /\[backscroll notice: message omitted \(\d+ bytes\); timestamp=1970-01-01T00:00:03.000Z id=3.000001; author="Ann"; try fetch_history\]/);
   assert.ok(block.indexOf('old two') < block.indexOf('message omitted'));
   assert.ok(block.indexOf('message omitted') < block.indexOf('newest'));
   assert.match(block, /count="4"/);
@@ -21,7 +21,7 @@ test('thousand-message backscroll keeps a contiguous newest window including pla
   assert.ok(ids.length > 0 && ids.length < 1000);
   assert.deepEqual(ids, Array.from({length: ids.length}, (_, i) => 1001 - ids.length + i));
   assert.match(block.split('\n')[1], new RegExp(`^\\[${1000 - ids.length} older backscroll messages not shown; try fetch_history latest=${ids[0]}.000001\\]$`));
-  assert.equal((block.match(/bytes\); try fetch_history/g) || []).length, ids.length);
+  assert.equal((block.match(/bytes\).*; try fetch_history/g) || []).length, ids.length);
 });
 test('older backscroll summary uses singular when one message is outside the window', () => {
   // Large names also count against both placeholder and framing budgets.
@@ -57,7 +57,7 @@ test('configured thousand-message backscroll is bounded on first-interaction del
   const ids = [...block.matchAll(/id=(\d+)\.000001/g)].map(m => Number(m[1]));
   assert.equal(older + ids.length, 1000, 'configured fetch limit reaches the production frame');
   assert.deepEqual(ids, Array.from({length: ids.length}, (_, i) => older + i + 1));
-  assert.equal((block.match(/bytes\); try fetch_history/g) || []).length, ids.length);
+  assert.equal((block.match(/bytes\).*; try fetch_history/g) || []).length, ids.length);
 });
 
 test('backscroll placeholders also preserve positions of messages that fit the full budget individually', () => {
@@ -96,4 +96,13 @@ test('omission markers do not promise history access or whole oversized messages
   }
   const rows = Array.from({length: 1000}, (_, i) => message(i, 'x'.repeat(33000)));
   assert.doesNotMatch(backscrollBlock(rows, {isDM: false}), /fetch_history/);
+});
+
+test('ungranted history omission notices explicitly name the missing host grant', () => {
+  const rows = Array.from({length: 1000}, (_, i) => message(i + 1, 'x'.repeat(33000)));
+  const block = backscrollBlock(rows, {isDM: false}, false);
+  assert.match(block, /older backscroll messages not shown; history unavailable until the host enables slack.history/);
+  assert.match(block, /backscroll notice: message omitted.*history unavailable until the host enables slack.history/);
+  assert.doesNotMatch(block, /Ann: message omitted|try fetch_history/);
+  assert.ok(Buffer.byteLength(block) <= 32768);
 });

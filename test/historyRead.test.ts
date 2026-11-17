@@ -984,3 +984,24 @@ test('a read stopped by a rate limit stays within maxBytes with the longest seco
   assert.equal(out.pagination.retryAfterSeconds, Number.MAX_SAFE_INTEGER);
   assert.ok(Buffer.byteLength(JSON.stringify(out)) <= 2048, String(Buffer.byteLength(JSON.stringify(out))));
 });
+
+test('absent text filter yields between candidate batches before shaping', async () => {
+  const { readBounded } = await import('../src/history-read.js');
+  let yielded = false;
+  let timer: ReturnType<typeof setImmediate>;
+  const result = await readBounded(readOptions({textContains: 'absent'}, 'history', 'C1'), {
+    page: async () => {
+      timer = setImmediate(() => { yielded = true; });
+      return {messages: Array.from({length: 24}, (_, i) => ({ts: `${100 + i}.000001`, blocks: [{type: 'markdown', text: 'candidate'}]}))};
+    },
+    shape: async messages => {
+      assert.equal(messages.length, 0);
+      assert.equal(yielded, true, 'other event-loop work runs even when every candidate misses');
+      return [];
+    },
+    writable: true,
+    stopped: () => undefined,
+  });
+  clearImmediate(timer!);
+  assert.equal(result.pagination.scanned, 24);
+});

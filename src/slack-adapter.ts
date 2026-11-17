@@ -1595,18 +1595,17 @@ export class SlackAdapter {
       ...(opts.latest !== undefined ? { latest: opts.latest } : {}),
       maxMessages: opts.limit ?? 50,
     });
-    return { messages: await this.shapeHistory(messages, 2000, false), truncated };
+    return { messages: await this.shapeHistory(messages, 2000), truncated };
   }
 
-  private async shapeHistory(messages: SlackHistoryMessage[], maxAppend = MAX_MESSAGE_TEXT_APPEND, supplementalNames = true): Promise<HistoryMessage[]> {
-    // Backscroll has a batch-wide delivery deadline: optional supplemental
-    // names must not hold otherwise available history hostage. Keep raw IDs.
-    // Explicit history/thread reads retain supplemental display-name lookups.
+  private async shapeHistory(messages: SlackHistoryMessage[], maxAppend = MAX_MESSAGE_TEXT_APPEND): Promise<HistoryMessage[]> {
+    // Supplemental-only mentions never spend the read's call budget or grow
+    // the name cache. All delivery paths use an existing name or the raw ID.
     const ids = new Set<string>();
     const texts = messages.map(msg => renderMessageText(msg, maxAppend));
-    for (const [index, msg] of messages.entries()) {
+    for (const msg of messages) {
       if (msg.user) ids.add(msg.user);
-      for (const id of displayMentionIds(msg.text ?? '', texts[index], supplementalNames)) ids.add(id);
+      for (const id of extractSlackUserIds(msg.text ?? '')) ids.add(id);
     }
     await this.resolveUserNames(Array.from(ids));
 
@@ -1621,7 +1620,7 @@ export class SlackAdapter {
       authorId: msg.user,
       ...(msg.bot_id ? { authorBotId: msg.bot_id } : {}),
       authorName: msg.user ? (this.userNameCache.get(msg.user) ?? msg.user) : (msg.username ?? 'bot'),
-      content: formatSlackText(texts[index], displayNames(msg.text ?? '', texts[index], this.userNameCache, supplementalNames)),
+      content: formatSlackText(texts[index], displayNames(msg.text ?? '', texts[index], this.userNameCache)),
       threadTs: msg.thread_ts && msg.thread_ts !== msg.ts ? msg.thread_ts : undefined,
       rootTs: reported ?? id,
       // Missing means unknown, not none.
@@ -1722,7 +1721,7 @@ export class SlackAdapter {
       authorName,
       ...(text !== (event.text ?? '') ? { rawContent: event.text ?? '' } : {}),
       content: text,
-      cleanContent: formatSlackText(text, displayNames(event.text ?? '', text, this.userNameCache, 'cached')),
+      cleanContent: formatSlackText(text, displayNames(event.text ?? '', text, this.userNameCache)),
       mentionIds,
       // Personal mention of the bot — hosts use this to gate wake policy.
       // @here/@channel broadcasts deliberately don't count.
@@ -1747,24 +1746,14 @@ export class SlackAdapter {
   }
 }
 
-/** Supplemental mentions are display-only and may add at most twenty lookups. */
-function displayMentionIds(original: string, rendered: string, supplemental = true): string[] {
-  const originals = extractSlackUserIds(original);
-  if (!supplemental) return originals;
-  const known = new Set(originals);
-  const suffix = extractSlackUserIds(rendered.slice(original.length)).filter(id => !known.has(id));
-  return [...originals, ...suffix.slice(0, 20)];
-}
-function displayNames(original: string, rendered: string, cache: Map<string, string>, supplemental: boolean | 'cached' = true): Map<string, string> {
+/** Supplemental-only mentions use cached names or raw IDs, never lookups. */
+function displayNames(original: string, rendered: string, cache: Map<string, string>): Map<string, string> {
   const names = new Map(extractSlackUserIds(rendered).map(id => [id, id]));
   const originalIds = new Set(extractSlackUserIds(original));
-  const ids = supplemental === 'cached' ? extractSlackUserIds(rendered) :
-    displayMentionIds(original, rendered, supplemental);
-  for (const id of ids) {
+  for (const id of names.keys()) {
     if (cache.has(id)) names.set(id, cache.get(id)!);
-    // Original mentions and explicit-read lookups retain Slack's fallback
-    // label on transient failure; cache-only supplemental mentions keep IDs.
-    else if (supplemental !== 'cached' || originalIds.has(id)) names.delete(id);
+    // Original mentions retain Slack's fallback label on transient failure.
+    else if (originalIds.has(id)) names.delete(id);
   }
   return names;
 }
