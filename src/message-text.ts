@@ -310,6 +310,7 @@ export function renderMessageText(
     }, identity);
     const nested: string[] = [];
     const placeholders: string[] = [];
+    const omissionKeys = new Set<string>();
     let omissionBytes = 0;
     const omissionLimit = Math.max(0, Math.min(maxAppend, renderLimit));
     let nestedLength = 0;
@@ -323,6 +324,8 @@ export function renderMessageText(
         return rendered;
       }, identity, !omitted);
       if (value.trim()) {
+        const omissionKey = omitted ? keyFor(value) : '';
+        if (omitted && omissionKeys.has(omissionKey)) continue;
         // Deferred notices get their own allowance so they cannot displace
         // readable blocks or retain unbounded keys while waiting for them.
         const omissionCost = value.length + (placeholders.length ? 1 : 0);
@@ -330,7 +333,8 @@ export function renderMessageText(
           truncated = true;
           continue;
         }
-        if (omitted) unique(value, identity);
+        // Do not mark deferred text seen until readable blocks have their turn.
+        if (omitted) omissionKeys.add(omissionKey);
         (omitted ? placeholders : nested).push(value);
         if (omitted) omissionBytes += omissionCost;
         // Deferred omission labels must not crowd out later readable blocks.
@@ -344,7 +348,7 @@ export function renderMessageText(
       if (fallback) units.push(fallback);
     }
     for (const value of nested) units.push(value);
-    for (const value of placeholders) units.push(value);
+    for (const value of placeholders) if (unique(value, identity)) units.push(value);
     if (units.length && header) {
       emit(header + '\n' + join(units).split(LINE_BREAK).map(line => '&gt; ' + line).join('\n'));
     } else {

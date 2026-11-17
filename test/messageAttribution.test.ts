@@ -178,11 +178,12 @@ test('nested omission comparisons have bounded label length and traversal work',
       String.prototype.split = split;
       Set.prototype.add = add;
     }
-    assert.ok(retainedBytes <= 2 * cap, `retained raw and normalized omission keys: ${retainedBytes}`);
+    // Deferred keys plus the raw/normalized keys remembered at emission.
+    assert.ok(retainedBytes <= 3 * cap, `retained raw and normalized omission keys: ${retainedBytes}`);
     assert.ok(longest > 0 && longest <= 610, `largest omission key: ${longest}`);
     // Rejected labels now compare before allowance checks so normalized duplicates
     // cannot report false truncation. Comparisons are bounded by visits and
-    // label length, not retained output bytes (accepted labels compare twice).
+    // label length, not retained output bytes (accepted labels compare three times).
     assert.ok(bytes <= 2 * 1000 * 610, `bounded omission comparison work: ${bytes}`);
     assert.ok(output.startsWith('Readable after omissions'));
     assert.ok(output.endsWith('[…truncated]'));

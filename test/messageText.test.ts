@@ -754,6 +754,14 @@ test('normalized duplicate omission labels do not spend deferred allowance', () 
   assert.equal(renderMessageText({attachments: [{blocks: [{type: 'poll'}, {type: 'poll '}]}]}, 15), '[poll omitted]');
 });
 
+test('deferred omission notices cannot move a readable block behind later text', () => {
+  assert.equal(renderMessageText({attachments: [{blocks: [
+    {type: 'foo'},
+    {type: 'header', text: {type: 'plain_text', text: '[foo omitted]'}},
+    {type: 'header', text: {type: 'plain_text', text: 'next'}},
+  ]}]}), '[foo omitted]\nnext');
+});
+
 test('prose dedup retains row boundaries on every delivery path', async () => {
   const text = 'Name Amount Alice 10 Bob 20';
   const rows = 'Name Amount\nAlice 10\nBob 20';
