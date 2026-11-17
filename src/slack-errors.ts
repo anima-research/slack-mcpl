@@ -218,7 +218,7 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
     }
     return (
       `${cause}, so whether the reaction was added is unknown${note}. Adding it again will not duplicate the reaction: if it's there, ` +
-      'add_reaction reports success. If automatic cleanup is still pending for a configured ACK emoji, an unknown outcome does not retire it; a confirmed retry adopts the ACK and retires unsent cleanup.'
+      'add_reaction reports success.'
     );
   };
 

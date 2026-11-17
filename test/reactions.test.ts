@@ -982,9 +982,11 @@ test('adopted entry keeps sent removal joinable and cannot start another automat
   assert.equal(removes, 1, 'manual removal joins the sent operation after adoption');
   removal();
   await clearing;
-  assert.equal(await manual, false);
+  await flush();
+  removal();
+  assert.equal(await manual, true);
   await slack.clearAck('C1');
-  assert.equal(removes, 1);
+  assert.equal(removes, 2);
 });
 
 test('unsent manual ACK removal preserves the original ten-minute expiry', async t => {
@@ -1009,9 +1011,10 @@ test('unsent manual ACK removal preserves the original ten-minute expiry', async
   assert.equal(f.calls.filter(c => c.startsWith('remove:')).length, 2, 'original expiry, not ten minutes after refusal');
 });
 
-test('unknown add advice conditions cleanup on a configured, still-pending ACK', () => {
+test('unknown add advice does not invent configured ACK state', () => {
   const advice = explainSlackError(refusal('internal_error'), { tool: 'add_reaction', args });
-  assert.match(advice, /If automatic cleanup is still pending for a configured ACK emoji, an unknown outcome does not retire it/);
+  assert.doesNotMatch(advice, /ACK|cleanup|adopt/);
+  assert.match(advice, /Adding it again will not duplicate/);
 });
 
 for (const error of ['channel_not_found', 'missing_scope', 'no_reaction']) {
@@ -1032,3 +1035,61 @@ for (const error of ['channel_not_found', 'missing_scope', 'no_reaction']) {
     assert.deepEqual(f.calls, ['add', 'remove:1.0:eyes'], 'automatic cleanup remains pending');
   });
 }
+
+for (const stopping of [false, true]) {
+  for (const failure of ['policy', 'budget']) {
+    test(`${stopping ? 'stop' : 'clearAck'} takes over an unsent manual ${failure} failure`, async t => {
+      let release!: () => void;
+      let budget = failure === 'budget';
+      const f = adapterFixture({
+        slowAdd: new Promise<void>(r => { release = r; }),
+        onRemove: async () => {
+          if (budget) {
+            budget = false;
+            throw new OutOfCallTime('reactions.remove', 25);
+          }
+        },
+      });
+      t.after(() => f.slack.stop());
+      let checks = 0;
+      if (failure === 'policy') Object.assign(f.slack, {
+        hasAccessPolicy: true,
+        requireWritableConversation: async () => {
+          if (++checks === 2) throw refusal('missing_scope');
+        },
+      });
+      const ack = f.slack.acknowledge('C1', '1.0');
+      const manual = assert.rejects(f.slack.removeReaction('C1', '1.0', 'eyes'));
+      await flush();
+      const clear = stopping ? f.slack.stop() : f.slack.clearAck('C1');
+      await flush();
+      release();
+      await Promise.all([ack, manual, clear]);
+      assert.equal(f.calls.filter(c => c.startsWith('remove:')).length, failure === 'budget' ? 2 : 1);
+      await f.slack.clearAck('C1');
+      assert.equal(f.calls.filter(c => c.startsWith('remove:')).length, failure === 'budget' ? 2 : 1);
+    });
+  }
+}
+
+test('unsent manual refusal preserves an armed retry deadline', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  let unsent = false;
+  const f = adapterFixture({ error: 'internal_error', onRemove: async () => {
+    if (unsent) throw new OutOfCallTime('reactions.remove', 25);
+  } });
+  t.after(() => f.slack.stop());
+  await f.slack.acknowledge('C1', '1.0');
+  await f.slack.clearAck('C1');
+  t.mock.timers.tick(20_000);
+  f.setError();
+  unsent = true;
+  await assert.rejects(f.slack.removeReaction('C1', '1.0', 'eyes'), OutOfCallTime);
+  unsent = false;
+  t.mock.timers.tick(39_999);
+  await flush();
+  assert.equal(f.calls.filter(c => c.startsWith('remove:')).length, 2);
+  t.mock.timers.tick(1);
+  await flush();
+  assert.equal(f.calls.filter(c => c.startsWith('remove:')).length, 3);
+});

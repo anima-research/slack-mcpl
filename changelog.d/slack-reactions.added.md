@@ -36,3 +36,8 @@
   ACK reports "ACK adopted" rather than "Nothing changed". Both adopt the ACK;
   deadline diagnostics include time waiting on background coordination.
 - An unsent manual ACK removal preserves the existing automatic expiry or retry deadline.
+
+- ACK cleanup takes over when a joined manual removal was never sent, including
+  shutdown. Manual policy refusals preserve expiry and retry deadlines.
+  Reaction results qualify cancellation as pending cleanup only; unknown-add
+  advice recommends a safe retry without assuming configured ACK state.

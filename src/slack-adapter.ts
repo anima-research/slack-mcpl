@@ -168,7 +168,8 @@ type AckEntry = {
   timerDue: number;
   added: Promise<boolean>;
   tries: number;
-  removing?: Promise<void>;
+  // Resolves false only when a manual removal failed before sending.
+  removing?: Promise<boolean>;
   /** An agent's add owns the entry until Slack answers; failure keeps cleanup pending. */
   adopting?: Promise<void>;
   /** Slack confirmed removal or answered no_reaction; dropping cleanup alone proves neither. */
@@ -1324,7 +1325,7 @@ export class SlackAdapter {
       // Posts, expiry, and shutdown share one removal, including the wait
       // for reactions.add. Reserve it before any asynchronous work settles.
       if (!entry.removing) {
-        const removing = this.removeAck(channelId, t, entry).finally(() => {
+        const removing = this.removeAck(channelId, t, entry).then(() => true).finally(() => {
           if (entry.removing !== removing) return;
           entry.removing = undefined;
           if (entry.owner === 'agent') this.dropAck(channelId, t, entry);
@@ -1334,7 +1335,10 @@ export class SlackAdapter {
         });
         entry.removing = removing;
       }
-      return entry.removing;
+      // An unsent manual refusal does not satisfy a post/expiry/stop clear.
+      // Re-enter after its finalizer releases the reservation; joiners share
+      // the new automatic attempt rather than each sending a removal.
+      if (!(await entry.removing)) await this.clearAck(channelId, t);
     }));
   }
 
@@ -1645,8 +1649,9 @@ export class SlackAdapter {
     while (entry?.removing || entry?.adopting) {
       await (entry.removing ?? entry.adopting);
       // A terminal failure also drops cleanup. Only Slack-confirmed absence
-      // makes another removal redundant; otherwise ask and report its answer.
-      if (entry.gone) {
+      // makes another removal redundant, unless adoption may have recreated
+      // the reaction while that response was in flight.
+      if (entry.gone && entry.owner !== 'agent') {
         if (policy.hasAccessPolicy) await policy.requireWritableConversation(channelId, 'reactions:write', 'No reaction was removed');
         return false;
       }
@@ -1671,7 +1676,7 @@ export class SlackAdapter {
         if (entry && retry) entry.tries++;
         if (entry && attempted && slackRefusal(err) === 'no_reaction') entry.gone = true;
         // Use the automatic cleanup's retry budget and terminal refusals.
-        if (entry && ((attempted && refusedForGood(err)) || this.stopping || entry.tries >= ACK_MAX_TRIES)) {
+        if (entry && retry && (refusedForGood(err) || this.stopping || entry.tries >= ACK_MAX_TRIES)) {
           this.dropAck(channelId, ts, entry);
         }
         throw err;
@@ -1681,7 +1686,7 @@ export class SlackAdapter {
     clearTimeout(entry.timer);
     const removed = remove();
     // clearAck must stay best-effort even when it joins a manual removal.
-    const removing = removed.then(() => {}, () => {}).finally(() => {
+    const removing = removed.then(() => true, () => retry).finally(() => {
       if (entry.removing !== removing) return;
       entry.removing = undefined;
       if (entry.owner === 'agent') this.dropAck(channelId, ts, entry);

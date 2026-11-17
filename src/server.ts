@@ -829,7 +829,7 @@ export class SlackMcplServer {
           // The reaction the call asks for is there, which is its intent.
           if (slackRefusal(err) === 'already_reacted') {
             return reactionName(emoji) === this.slack.ackReactionName
-              ? `Message ${messageId} already has this bot's ${emoji} reaction. ACK adopted; unsent automatic cleanup and retries cancelled.`
+              ? `Message ${messageId} already has this bot's ${emoji} reaction. ACK adopted; any pending unsent automatic cleanup and retries cancelled.`
               : `Nothing changed: message ${messageId} already has this bot's ${emoji} reaction.`;
           }
           throw err;
