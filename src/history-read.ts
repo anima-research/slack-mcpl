@@ -341,7 +341,7 @@ export async function readBounded(opts: ReadOptions, source: ReadSource): Promis
         : -1;
       if (end >= 0) rows.splice(end);
       const isMatch = (m: SlackHistoryMessage) =>
-        (needle === undefined || fold(formatSlackText(renderMessageText(m, BY_ID), BY_ID)).includes(needle)) &&
+        (needle === undefined || fold(formatSlackText(renderMessageText(m), BY_ID)).includes(needle)) &&
         (!opts.authorIds.length || [m.user, m.bot_id].some((id) => id !== undefined && opts.authorIds.includes(id)));
       // Shape only matches; resolve their display names after content filtering.
       const matches = rows.filter(({ m }) => isMatch(m)).slice(0, opts.limit - records.length).map(({ m }) => m);

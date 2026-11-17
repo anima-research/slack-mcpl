@@ -1,6 +1,6 @@
 import { formatSlackText } from './content.js';
-import { mapSlackAngles } from './slack-angle.js';
-import { LINE_BREAK } from './framing.js';
+import { mapSlackAngles, SLACK_ID } from './slack-angle.js';
+import { LINE_BREAK, nameShown, channelShown } from './framing.js';
 
 /** Readable Slack payload text. Never changes the original text; only the
  * suffix is bounded (16,384 UTF-16 code units including its separator).
@@ -13,7 +13,10 @@ const list = (v: unknown): unknown[] => Array.isArray(v) ? v : [];
 const string = (v: unknown): string => typeof v === 'string' ? v : '';
 const escape = (v: string) => v.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 const unescape = (v: string) => v.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
-const validId = (v: unknown): v is string => typeof v === 'string' && /^[A-Z0-9]+$/.test(v);
+const ID = new RegExp(`^${SLACK_ID}$`);
+const CHANNEL_LABEL = new RegExp(`^<#(${SLACK_ID})\\|([^>]+)>$`);
+const REFERENCE = new RegExp(`^<([@#])(${SLACK_ID})(?:\\|[^>]*)?>$`);
+const validId = (v: unknown): v is string => typeof v === 'string' && ID.test(v);
 
 // Normalize prose whitespace, but retain significant whitespace in code spans.
 function normalized(value: string): string {
@@ -34,30 +37,19 @@ function prefix(text: string, limit: number): string {
   return text.slice(0, end);
 }
 
-/** Attribution fields cannot introduce delimiters, controls or logical lines.
- * Cap encoded fields too, without splitting an entity or supplementary point. */
-function headerField(value: string): string {
-  const parts: string[] = [];
-  let length = 0;
-  for (const char of value) {
-    const safe = /[\p{Cc}\p{Cf}\u2028\u2029]/u.test(char) ? ' ' :
-      char === '[' ? '&#91;' : char === ']' ? '&#93;' : escape(char);
-    if (length + safe.length > 100) break;
-    parts.push(safe);
-    length += safe.length;
-  }
-  return parts.join('');
-}
+// Apply the same name rule as sender framing, then protect its literal output
+// from the adapter's single Slack-formatting pass. Cap before name escaping.
+const headerName = (value: string) => escape(nameShown(prefix(value, 100)));
+const headerChannel = (value: string) => escape(channelShown(prefix(value, 100)));
 
 export function renderMessageText(
-  message: { text?: unknown; attachments?: unknown; blocks?: unknown; bot_id?: unknown; client_msg_id?: unknown },
-  _userNames: Map<string, string> = new Map(),
+  message: { text?: unknown; attachments?: unknown; blocks?: unknown; bot_id?: unknown; app_id?: unknown; bot_profile?: unknown; client_msg_id?: unknown },
   maxAppend = MAX_MESSAGE_TEXT_APPEND,
 ): string {
   const original = string(message.text);
   const channelLabels = new Map<string, string>();
   mapSlackAngles(original, token => {
-    const match = /^<#([A-Z0-9]+)\|([^>]+)>$/.exec(token);
+    const match = CHANNEL_LABEL.exec(token);
     if (match) channelLabels.set(match[1], match[2]);
     return token;
   });
@@ -87,15 +79,16 @@ export function renderMessageText(
         return styled(url ? (label && label !== url ? `<${url}|${label}>` : `<${url}>`) : label, e.style);
       }
       case 'usergroup': return validId(e.usergroup_id) ? styled(`<!subteam^${e.usergroup_id}>`, e.style) : '';
-      case 'date': return escape(bounded(e.fallback));
+      case 'team': return validId(e.team_id) ? styled(`<!team^${e.team_id}>`, e.style) : '';
+      case 'date': return styled(escape(bounded(e.fallback)), e.style);
       case 'emoji': return typeof e.name === 'string' ? styled(`:${escape(bounded(e.name))}:${typeof e.skin_tone === 'number' ? ':skin-tone-' + e.skin_tone + ':' : ''}`, e.style) : '';
-      case 'broadcast': return ['here', 'channel', 'everyone'].includes(string(e.range)) ? `<!${e.range}>` : '';
+      case 'broadcast': return ['here', 'channel', 'everyone'].includes(string(e.range)) ? styled(`<!${e.range}>`, e.style) : '';
       case 'rich_text_section': return children('');
       case 'rich_text_list': return join(take(e.elements).map((x, i) =>
         '    '.repeat(Math.max(0, Math.min(12, Number(e.indent) || 0))) +
-        (e.style === 'ordered' ? String(i + 1 + (Number(e.offset) || 0)) + '. ' : '• ') + rich(x, depth + 1)));
+        (e.style === 'ordered' ? String(i + 1 + (Number(e.offset) || 0)) + '. ' : ['• ', '◦ ', '▪ '][Math.max(0, Math.min(12, Math.floor(Number(e.indent) || 0))) % 3]) + rich(x, depth + 1)));
       case 'rich_text_quote': return children('').split('\n').map(line => '> ' + line).join('\n');
-      case 'rich_text_preformatted': return '```\n' + children('') + '\n```';
+      case 'rich_text_preformatted': return '```' + children('') + '```';
       case 'rich_text': return children('\n');
       default: return '';
     }
@@ -103,10 +96,16 @@ export function renderMessageText(
   function styled(value: string, raw: unknown): string {
     const style = object(raw);
     if (style.code === true) return '`' + value + '`';
-    if (style.bold === true) value = '*' + value + '*';
     if (style.italic === true) value = '_' + value + '_';
+    if (style.bold === true) value = '*' + value + '*';
     if (style.strike === true) value = '~' + value + '~';
     return value;
+  }
+  const silent = new Set(['actions', 'input', 'image', 'divider', 'file']);
+  const readable = new Set(['rich_text', 'header', 'section', 'context', 'markdown', 'alert', 'card', 'video', 'table']);
+  function placeholder(raw: unknown): boolean {
+    const type = object(raw).type;
+    return typeof type === 'string' && !silent.has(type) && !readable.has(type);
   }
   function block(raw: unknown): string {
     const b = object(raw);
@@ -125,7 +124,7 @@ export function renderMessageText(
         return join(take(row).map(cell => object(cell).type === 'rich_text' ? rich(cell) :
           !visit() ? '' : escape(bounded(object(cell).text))), ' | ');
       }));
-      case 'actions': case 'input': case 'image': case 'divider': return '';
+      case 'actions': case 'input': case 'image': case 'divider': case 'file': return '';
       default: return typeof b.type === 'string' ? `[${escape(bounded(b.type))} omitted]` : '';
     }
   }
@@ -134,21 +133,27 @@ export function renderMessageText(
   const full = () => { if (appendedLength <= maxAppend) return false; truncated = true; return true; };
   // Format keys only. Return raw Slack text so the adapter formats output once.
   const keyFor = (value: string) => normalized(formatSlackText(mapSlackAngles(value, token => {
-    const match = /^<([@#])([A-Z0-9]+)(?:\|[^>]*)?>$/.exec(token);
+    const match = REFERENCE.exec(token);
     return match ? `\x00${match[1] === '@' ? 'user' : 'channel'}:${match[2]}\x00` : token;
   }), new Map()));
   const originalKey = keyFor(original);
   const seen = new Set<string>();
   const rawSeen = new Set<string>();
-  function append(value: string) {
-    if (rawSeen.has(value)) return;
+  function unique(value: string): boolean {
+    if (rawSeen.has(value)) return false;
     rawSeen.add(value);
     const key = keyFor(value);
     if (key && key !== originalKey && !seen.has(key)) {
-      appendedLength += value.length + (appended.length ? 1 : 0);
-      appended.push(value); seen.add(key);
+      seen.add(key);
+      return true;
     }
+    return false;
   }
+  function emit(value: string) {
+    appendedLength += value.length + (appended.length ? 1 : 0);
+    appended.push(value);
+  }
+  function append(value: string) { if (unique(value)) emit(value); }
   const urls = new Set<string>();
   const bareOriginal = mapSlackAngles(original, token => {
     const match = /^<(https?:\/\/[^|>]+)(?:\|[^>]*)?>$/.exec(token);
@@ -164,35 +169,44 @@ export function renderMessageText(
     if (a.is_share !== true && a.is_msg_unfurl !== true &&
         (a.is_app_unfurl === true || (typeof a.from_url === 'string' &&
           urls.has(a.from_url)))) continue;
-    const title = bounded(a.title);
+    const mrkdwn = new Set(list(a.mrkdwn_in));
+    const fieldText = (v: unknown, kind?: string) => kind && mrkdwn.has(kind) ? bounded(v) : escape(bounded(v));
+    const title = fieldText(a.title);
     const body = join([
-      bounded(a.pretext),
-      title ? join([title, bounded(a.title_link)], ' ') : '',
-      bounded(a.text),
+      fieldText(a.pretext, 'pretext'),
+      title ? join([title, escape(bounded(a.title_link))], ' ') : '',
+      fieldText(a.text, 'text'),
       ...take(a.fields).map(rawField => {
         if (!visit()) return '';
         const f = object(rawField);
-        return join([bounded(f.title), bounded(f.value)], ': ');
+        return join([fieldText(f.title), fieldText(f.value, 'fields')], ': ');
       }),
     ]);
-    const nested = take(a.blocks).map(block).filter(Boolean);
-    const value = join([body || (nested.length ? '' : bounded(a.fallback)), ...nested]);
+    const nested: string[] = [];
+    const placeholders: string[] = [];
+    for (const rawBlock of take(a.blocks)) {
+      const value = block(rawBlock);
+      if (value) (placeholder(rawBlock) ? placeholders : nested).push(value);
+    }
+    // Fallback depends on readable output, not omission notices. Dedup each
+    // logical unit before attribution so a header never hides a duplicate.
+    const units = [body || (nested.length ? '' : fieldText(a.fallback)), ...nested, ...placeholders].filter(unique);
     const shared = a.is_share === true || a.is_msg_unfurl === true;
-    if (value && (shared || a.author_name)) {
-      const name = headerField(string(a.author_name)) || 'unknown';
-      const uid = validId(a.author_id) ? ` (uid:${headerField(a.author_id)})` : '';
-      const source = headerField(string(a.footer)) || headerField(string(a.channel_name)) || 'unknown source';
+    if (units.length && (shared || a.author_name)) {
+      const name = string(a.author_name) ? headerName(string(a.author_name)) : 'unknown';
+      const uid = validId(a.author_id) ? ` (uid:${headerName(a.author_id)})` : '';
+      const source = string(a.footer) ? headerName(string(a.footer)) :
+        string(a.channel_name) ? headerChannel(string(a.channel_name)) : 'unknown source';
       const header = shared ? `[shared message from ${name}${uid}, ${source}]` : `[attachment from ${name}${uid}]`;
-      append(header + '\n' + value.split(LINE_BREAK).map(line => '> ' + line).join('\n'));
+      emit(header + '\n' + join(units).split(LINE_BREAK).map(line => '> ' + line).join('\n'));
     } else {
-      append(body || (nested.length ? '' : bounded(a.fallback)));
-      for (const value of nested) append(value);
+      for (const value of units) emit(value);
     }
   }
   // Slack clients supply rich_text mirrors. Trust provenance, not heuristics;
   // blocks-only messages (including apps posting as users) still need rendering.
   const skipHumanRichText = original !== '' &&
-    (message.client_msg_id !== undefined || !message.bot_id);
+    (message.client_msg_id !== undefined || (!message.bot_id && !message.app_id && !message.bot_profile));
   for (const b of take(message.blocks)) {
     if (full()) break;
     if (skipHumanRichText && object(b).type === 'rich_text') continue;

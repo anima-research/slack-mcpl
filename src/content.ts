@@ -7,7 +7,7 @@
  * Salvaged from zulip-mcp PR #8 (multi-platform branch), Slack halves only.
  */
 
-import { mapSlackAngles } from './slack-angle.js';
+import { mapSlackAngles, SLACK_ID } from './slack-angle.js';
 import { channelShown, mimeShown, nameShown } from './framing.js';
 
 // Anthropic refuses images larger than this; mirror their cap server-side
@@ -223,6 +223,9 @@ export function classifyExtension(name: string): { mimeType: string; isImage: bo
   return { mimeType: 'application/octet-stream', isImage: false };
 }
 
+const USER_ANGLE = new RegExp(`^<@(${SLACK_ID})(?:\\|([^>]*))?>$`);
+const CHANNEL_ANGLE = new RegExp(`^<#(${SLACK_ID})(?:\\|([^>]*))?>$`);
+
 // Slack message text uses mrkdwn escapes: <@U123> user mentions,
 // <#C123|name> channel mentions, <!here>/<!channel> broadcasts, and
 // <url|label> links. Rewrite them into a readable shape
@@ -232,12 +235,12 @@ export function classifyExtension(name: string): { mimeType: string; isImage: bo
 export function formatSlackText(text: string, userNames: Map<string, string>): string {
   const formatted = mapSlackAngles(text, token => {
     let match: RegExpExecArray | null;
-    if ((match = /^<@([A-Z0-9]+)(?:\|([^>]*))?>$/.exec(token))) {
+    if ((match = USER_ANGLE.exec(token))) {
       const [, id, fallback] = match;
       const name = userNames.get(id) || (fallback && unescapeSlack(fallback)) || id;
       return `@${nameShown(name).replace(/&/g, '&amp;')} (uid:${id})`;
     }
-    if ((match = /^<#([A-Z0-9]+)(?:\|([^>]*))?>$/.exec(token))) {
+    if ((match = CHANNEL_ANGLE.exec(token))) {
       const [, id, name] = match;
       return name ? channelShown(unescapeSlack(name)).replace(/&/g, '&amp;') : `#${id}`;
     }
@@ -266,7 +269,7 @@ export function reactionName(emoji: string): string {
 export function extractSlackUserIds(text: string): string[] {
   const ids = new Set<string>();
   mapSlackAngles(text, token => {
-    const match = /^<@([A-Z0-9]+)(?:\|[^>]*)?>$/.exec(token);
+    const match = USER_ANGLE.exec(token);
     if (match) ids.add(match[1]);
     return token;
   });
