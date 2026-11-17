@@ -181,7 +181,13 @@ export function renderMessageText(
           !visit() ? '' : escape(bounded(object(cell).text))), ' | ');
       }));
       case 'actions': case 'input': case 'image': case 'divider': case 'file': return '';
-      default: return typeof b.type === 'string' ? `[${escape(bounded(b.type))} omitted]` : '';
+      default: {
+        if (typeof b.type !== 'string') return '';
+        // Unsupported type labels are metadata, not message bodies. Bound
+        // before escaping or computing comparison keys.
+        if (b.type.length > 100) truncated = true;
+        return `[${escape(headerPrefix(b.type))} omitted]`;
+      }
     }
   }
   const appended: string[] = [];
@@ -258,6 +264,8 @@ export function renderMessageText(
     const identity = header ? JSON.stringify([header, string(a.channel_id), (typeof a.ts === 'number' && Number.isFinite(a.ts) ? String(a.ts) : string(a.ts))]) : '';
     const nested: string[] = [];
     const placeholders: string[] = [];
+    let omissionBytes = 0;
+    const omissionLimit = Math.max(0, Math.min(maxAppend, renderLimit));
     let nestedLength = 0;
     let hasReadableNested = false;
     const units = body.trim() && unique(body, identity) ? [body] : [];
@@ -266,8 +274,16 @@ export function renderMessageText(
       if (value.trim()) {
         const omitted = placeholder(rawBlock);
         if (!omitted) hasReadableNested = true;
+        // Deferred notices get their own allowance so they cannot displace
+        // readable blocks or retain unbounded keys while waiting for them.
+        const omissionCost = value.length + (placeholders.length ? 1 : 0);
+        if (omitted && omissionBytes + omissionCost > omissionLimit) {
+          truncated = true;
+          continue;
+        }
         if (!unique(value, identity)) continue;
         (omitted ? placeholders : nested).push(value);
+        if (omitted) omissionBytes += omissionCost;
         // Deferred omission labels must not crowd out later readable blocks.
         if (!omitted) nestedLength += value.length + (nested.length > 1 ? 1 : 0);
         if (nestedLength > renderLimit) { truncated = true; break; }
@@ -278,7 +294,8 @@ export function renderMessageText(
       const fallback = fieldText(a.fallback);
       if (unique(fallback, identity)) units.push(fallback);
     }
-    units.push(...nested, ...placeholders);
+    for (const value of nested) units.push(value);
+    for (const value of placeholders) units.push(value);
     if (units.length && header) {
       emit(header + '\n' + join(units).split(LINE_BREAK).map(line => '&gt; ' + line).join('\n'));
     } else {

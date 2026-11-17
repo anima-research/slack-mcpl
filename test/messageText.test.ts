@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { SlackAdapter, type SlackMessageData } from '../src/slack-adapter.js';
-import { formatSlackText } from '../src/content.js';
+import { formatSlackText, extractSlackUserIds } from '../src/content.js';
 import { renderMessageText, MAX_MESSAGE_TEXT_APPEND } from '../src/message-text.js';
 
 // Exercise the public production entry points, not just the renderer.
@@ -35,9 +35,12 @@ async function shaped(payload: Record<string, unknown>, bot = false) {
 async function expectText(payload: Record<string, unknown>, expected: string, bot = false) {
   const result = await shaped(payload, bot);
   const original = formatSlackText(typeof payload.text === 'string' ? payload.text : '', new Map([['U1', 'alice']]));
-  let backscroll = expected;
-  if (expected.length - original.length > 2000) {
-    let suffix = expected.slice(original.length, original.length + 2000 - '[…truncated]'.length);
+  const originalIds = new Set(extractSlackUserIds(typeof payload.text === 'string' ? payload.text : ''));
+  // Backscroll deliberately leaves supplemental-only mentions as raw IDs.
+  let backscroll = expected.replace(/@alice \(uid:([A-Z0-9]+)\)/g,
+    (mention, id) => originalIds.has(id) ? mention : `@${id} (uid:${id})`);
+  if (backscroll.length - original.length > 2000) {
+    let suffix = backscroll.slice(original.length, original.length + 2000 - '[…truncated]'.length);
     if (/[\uD800-\uDBFF]$/.test(suffix)) suffix = suffix.slice(0, -1);
     backscroll = original + suffix + '[…truncated]';
   }

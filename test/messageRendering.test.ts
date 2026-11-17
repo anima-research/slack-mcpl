@@ -83,7 +83,7 @@ test('socket ack precedes any renderer access', async () => {
   assert.ok(accesses.length > 0);
   assert.ok(accesses.every(Boolean), 'render before ack');
 });
-test('only twenty supplemental IDs resolved per message on live and history paths', async () => {
+test('twenty supplemental IDs resolved on live and explicit history; none on backscroll', async () => {
   for (const path of ['live', 'history', 'backscroll']) {
     const calls: string[] = []; let handler: any;
     const row = { user: 'UAUTH', ts: '100.000001', text: '<@UORIG|original>', blocks: [section(Array.from({length: 30}, (_, i) => `<@U${i}|label>`).join(' '))] };
@@ -93,7 +93,8 @@ test('only twenty supplemental IDs resolved per message on live and history path
     let output: string;
     if (path === 'live') { handler({event: {...row, type: 'message', channel: 'C1'}, ack: async () => {}}); output = (await delivered).cleanContent; }
     else output = (path === 'history' ? await adapter.readHistory('C1', {}) : await adapter.fetchHistory('C1')).messages[0].content;
-    assert.equal(calls.length, 22, calls.join(','));
+    assert.equal(calls.length, path === 'backscroll' ? 2 : 22, calls.join(','));
+    assert.match(output, path === 'backscroll' ? /@U0 \(uid:U0\)/ : /@resolved \(uid:U0\)/);
     assert.ok(calls.includes('UORIG'));
     assert.match(output, /@U20 \(uid:U20\)/);
     assert.match(output, /@original \(uid:UORIG\)/, 'original fallback labels survive transient lookup failures');

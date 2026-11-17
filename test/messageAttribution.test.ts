@@ -145,3 +145,70 @@ test('tiny supplemental caps also bound the truncation marker', () => {
     assert.ok(!/[\uD800-\uDBFF]$/.test(output));
   }
 });
+
+test('nested omission keys have bounded label length and retained bytes before normalization', () => {
+  // Observe work entering comparison, rather than relying on wall-clock speed.
+  const split = String.prototype.split;
+  for (const cap of [2000, 16_384]) {
+    let bytes = 0;
+    let longest = 0;
+    String.prototype.split = function (this: string, separator: any, limit?: number): any {
+      if (separator instanceof RegExp && separator.source === '(`+)') {
+        const value = String(this);
+        if (value.startsWith('[') && value.endsWith(' omitted]')) {
+          bytes += value.length;
+          longest = Math.max(longest, value.length);
+        }
+      }
+      return split.call(this, separator, limit);
+    } as typeof split;
+    let output: string;
+    try {
+      output = renderMessageText({ attachments: [{ blocks: [
+        ...Array.from({ length: 1000 }, (_, i) => ({ type: i + 'x'.repeat(16_000) })),
+        { type: 'markdown', text: 'Readable after omissions' },
+      ] }] }, cap);
+    } finally {
+      String.prototype.split = split;
+    }
+    assert.ok(longest > 0 && longest <= 610, `largest omission key: ${longest}`);
+    assert.ok(bytes <= cap, `retained omission keys: ${bytes} > ${cap}`);
+    assert.ok(output.startsWith('Readable after omissions'));
+    assert.ok(output.endsWith('[…truncated]'));
+    assert.ok(output.length <= cap);
+  }
+});
+
+test('backscroll never waits for supplemental-only mention lookups across rows', async () => {
+  const calls: string[] = [];
+  const rows = Array.from({ length: 50 }, (_, row) => ({
+    ts: `${100 + row}.000001`,
+    text: 'Original <@UORIGINAL>',
+    username: 'integration',
+    attachments: [{ text: Array.from({ length: 20 }, (_, col) => `<@U${row}X${col}>`).join(' ') }],
+  }));
+  const adapter = new SlackAdapter({
+    users: { info: async ({ user }: { user: string }) => {
+      calls.push(user);
+      if (user !== 'UORIGINAL') return new Promise(() => {}); // Optional lookups never settle.
+      return { user: { name: 'original' } };
+    } },
+    conversations: { history: async () => ({ messages: rows }) },
+  } as any, { on() {} } as any, 'UBOT', 'example');
+  const pending = adapter.fetchHistory('C1');
+  // All immediately available history must be returned without waiting for
+  // optional names, well inside the server's five-second backscroll deadline.
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const result = await Promise.race([
+      pending,
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('backscroll waited for supplemental names')), 500); }),
+    ]);
+    assert.equal(result.messages.length, 50);
+    assert.deepEqual(calls, ['UORIGINAL']);
+    assert.ok(result.messages.every(row => row.content.includes('@original')));
+    assert.ok(result.messages.some(row => row.content.includes('U0X0')));
+  } finally {
+    clearTimeout(timer);
+  }
+});

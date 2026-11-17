@@ -1595,16 +1595,18 @@ export class SlackAdapter {
       ...(opts.latest !== undefined ? { latest: opts.latest } : {}),
       maxMessages: opts.limit ?? 50,
     });
-    return { messages: await this.shapeHistory(messages, 2000), truncated };
+    return { messages: await this.shapeHistory(messages, 2000, false), truncated };
   }
 
-  private async shapeHistory(messages: SlackHistoryMessage[], maxAppend = MAX_MESSAGE_TEXT_APPEND): Promise<HistoryMessage[]> {
-    // Pre-resolve author + mentioned user names in one pass.
+  private async shapeHistory(messages: SlackHistoryMessage[], maxAppend = MAX_MESSAGE_TEXT_APPEND, supplementalNames = true): Promise<HistoryMessage[]> {
+    // Backscroll has a batch-wide delivery deadline: optional supplemental
+    // names must not hold otherwise available history hostage. Keep raw IDs.
+    // Explicit history/thread reads retain supplemental display-name lookups.
     const ids = new Set<string>();
     const texts = messages.map(msg => renderMessageText(msg, maxAppend));
     for (const [index, msg] of messages.entries()) {
       if (msg.user) ids.add(msg.user);
-      for (const id of displayMentionIds(msg.text ?? '', texts[index])) ids.add(id);
+      for (const id of displayMentionIds(msg.text ?? '', texts[index], supplementalNames)) ids.add(id);
     }
     await this.resolveUserNames(Array.from(ids));
 
@@ -1619,7 +1621,7 @@ export class SlackAdapter {
       authorId: msg.user,
       ...(msg.bot_id ? { authorBotId: msg.bot_id } : {}),
       authorName: msg.user ? (this.userNameCache.get(msg.user) ?? msg.user) : (msg.username ?? 'bot'),
-      content: formatSlackText(texts[index], displayNames(msg.text ?? '', texts[index], this.userNameCache)),
+      content: formatSlackText(texts[index], displayNames(msg.text ?? '', texts[index], this.userNameCache, supplementalNames)),
       threadTs: msg.thread_ts && msg.thread_ts !== msg.ts ? msg.thread_ts : undefined,
       rootTs: reported ?? id,
       // Missing means unknown, not none.
@@ -1745,15 +1747,16 @@ export class SlackAdapter {
 }
 
 /** Supplemental mentions are display-only and may add at most twenty lookups. */
-function displayMentionIds(original: string, rendered: string): string[] {
+function displayMentionIds(original: string, rendered: string, supplemental = true): string[] {
   const originals = extractSlackUserIds(original);
+  if (!supplemental) return originals;
   const known = new Set(originals);
   const suffix = extractSlackUserIds(rendered.slice(original.length)).filter(id => !known.has(id));
   return [...originals, ...suffix.slice(0, 20)];
 }
-function displayNames(original: string, rendered: string, cache: Map<string, string>): Map<string, string> {
+function displayNames(original: string, rendered: string, cache: Map<string, string>, supplemental = true): Map<string, string> {
   const names = new Map(extractSlackUserIds(rendered).map(id => [id, id]));
-  for (const id of displayMentionIds(original, rendered)) {
+  for (const id of displayMentionIds(original, rendered, supplemental)) {
     if (cache.has(id)) names.set(id, cache.get(id)!);
     else names.delete(id); // Allowed lookups retain Slack's fallback label on transient failure.
   }
