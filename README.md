@@ -387,15 +387,16 @@ and entities regardless of `mrkdwn_in`; basic styling passes through verbatim.
 
 #### Limits
 
-When `text` contains non-whitespace and either `client_msg_id` is present or all of
+When `text` contains non-whitespace and either `client_msg_id` is a string (including an empty string) or all of
 `bot_id`, `app_id` and `bot_profile` are absent,
 **top-level human `rich_text` is not rendered**: it is treated as the client's
 mirror. Even a differing rich block is ignored. Other block types and attachment-nested rich text still render.
 Blocks-only messages still render rich text, including an app posting as a user
 with only blocks. App-as-user posts without `bot_id` remain eligible for live
-delivery under `chat:from-human`, including their rendered app bodies; this tag
+delivery under `chat:from-human` by default, including their rendered app bodies; this tag
 is not proof of human authorship. Bot/integration messages carrying `bot_id`, `app_id` or
-`bot_profile`, without `client_msg_id`, also retain rich text.
+`bot_profile`, without a string-valued `client_msg_id`, also retain rich text.
+Null and other non-string client IDs do not suppress app rich text.
 
 Unattributed supplemental units deduplicate against original text. Attributed
 units deduplicate by source channel ID and message timestamp when present, plus
@@ -449,8 +450,10 @@ cap cannot be bypassed by rereading through history or threads. Original text is
 never truncated. The compact markers do not distinguish recoverable content:
 backscroll cuts may expose more on explicit reads, but unsupported blocks and
 explicit-read supplemental cuts cannot be recovered by repeating those reads.
-Display-equivalent unsupported labels can still cause a truncation marker if
-their raw forms exceed the deferred notice allowance before normalized dedup.
+Unsupported labels are normalized and deduplicated before charging the deferred
+notice allowance; label-length and traversal limits still apply. A cut unit whose retained prefix
+deduplicates can hide a distinct tail without a marker; a cut whitespace-only
+unit can instead produce a conservative marker.
 Backscroll uses a lower **2,000 UTF-16 code unit supplemental cap per
 message**, and the framed backscroll block has an overall **32 KiB byte budget**.
 It keeps a contiguous newest window. Messages that exceed the remaining byte
@@ -484,7 +487,7 @@ Switches take `true`/`false` (also `1`/`0`, `yes`/`no`); any other value stops t
 | `SLACK_DISABLE_DMS` | no | `true` drops incoming DMs and group DMs, refuses every write to them and both history reads on them, and leaves them out of `conversations.list`, so they are neither listed nor registered; `send_dm` is not offered. Only a conversation Slack confirms as a channel passes: a group DM ID looks like a channel ID, and a user ID posts into that user's DM. An unknown ID is asked about until Slack confirms it. One Slack won't describe is refused; when the question can't be answered just now (a rate limit, a failure on the way or on Slack's side, or too little of the call's time), nothing is written, and the error says why and that the call can be made again. Incoming events pass only when Slack marks them `channel` or `group`. Takes `true` or `false` (also `1`/`0`, `yes`/`no`); unset is off, and any other value, empty included, stops startup |
 | `SLACK_ACK_REACTION` | no | Emoji name (e.g. `eyes`) put on a message that addresses the bot. It means "received": it is removed at the bot's next post in that conversation that Slack confirms, after 10 minutes, or at once if the host does not accept the message. A removal that fails in a way that can pass (a rate limit, an HTTP error, a network failure, or Slack's own failure such as `internal_error`) is tried again every minute, up to 5 tries in all; one Slack refuses is dropped. An add that fails isn't tried again. One that may have landed is removed as usual: `already_reacted` says it's there, and Slack's failure while handling it (`internal_error`, `fatal_error`, `service_unavailable`), an HTTP error, an answer not in Slack's form or one the client can't read, or a failure in transit after the request may have reached Slack leaves it unknown. One Slack refused, rate-limited or received only in part (`request_timeout`), one whose connection was never made, and one this server refused itself, such as outside `SLACK_SEND_CHANNELS`, isn't there. On SIGTERM, SIGINT or the host closing stdin, pending reactions are removed (5 s at most); a crash cannot, so removal is best-effort. For a typing signal see **Typing** above. |
 | `SLACK_SUBSCRIPTIONS_FILE` | no | JSON file persisting ambient subscriptions across restarts: an array of IDs, or `{subscribed, muted}` while anything is muted (older versions read the object form as empty) |
-| `SLACK_BACKSCROLL_LIMIT` | no | Messages fetched for an addressed interaction before host acceptance when no accepted interaction has recorded a watermark (rejection can therefore discard fetched backscroll; an accepted ambient message prevents later initial backscroll; default 50; only integers in [1, 1,000] are accepted, otherwise falls back to 50); shown in a newest contiguous window within 32 KiB including framing, in-position omission placeholders and a leading summary for older messages that cannot fit |
+| `SLACK_BACKSCROLL_LIMIT` | no | Messages fetched for an addressed interaction before host acceptance when no accepted interaction has recorded a watermark (rejection can therefore discard fetched backscroll; an accepted ambient message prevents later initial backscroll; default 50; only decimal-digit integers in [1, 1,000] are accepted, otherwise falls back to 50); shown in a newest contiguous window within 32 KiB including framing, in-position omission placeholders and a leading summary for older messages that cannot fit |
 | `SLACK_MCPL_DEBUG_LOG` | no | Absolute path for a diagnostic file log |
 
 ## Tests

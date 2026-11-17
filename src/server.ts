@@ -271,7 +271,7 @@ export class SlackMcplServer {
    *  SLACK_BACKSCROLL_LIMIT; only integers in [1, 1000] are accepted; otherwise default 50. */
   private get backscrollLimit(): number {
     const raw = process.env.SLACK_BACKSCROLL_LIMIT;
-    if (!raw) return 50;
+    if (!raw || !/^[0-9]+$/.test(raw)) return 50;
     const n = Number(raw);
     return Number.isInteger(n) && n > 0 && n <= 1000 ? n : 50;
   }

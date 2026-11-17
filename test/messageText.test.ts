@@ -292,7 +292,7 @@ test('review fragment passes the actual release validator', () => {
   try {
     // Permanent copy survives releases; never let unrelated pending entries
     // or repository version/Unreleased state make this validation pass.
-    const name = 'readable-message-payloads.fixed.md';
+    const name = 'readable-message-payloads.added.md';
     const fragment = readFileSync(join('test/fixtures', name), 'utf8');
     const pending = join('changelog.d', name);
     if (existsSync(pending)) assert.equal(readFileSync(pending, 'utf8'), fragment);
@@ -635,7 +635,8 @@ test('top-level omission labels retain input order and can displace later readab
     ...Array.from({length: 30}, (_, i) => ({type: 'unknown' + i})),
     {type: 'markdown', text: 'Later readable section'},
   ]}, 100);
-  assert.ok(output.startsWith('[unknown0 omitted]'));
+  assert.deepEqual(output.match(/\[unknown\d+ omitted\]/g),
+    Array.from({length: 4}, (_, i) => `[unknown${i} omitted]`));
   assert.ok(!output.includes('Later readable section'));
   assert.ok(output.endsWith('[…truncated]'));
   assert.ok(output.length <= 100);
