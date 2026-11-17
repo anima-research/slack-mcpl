@@ -94,3 +94,22 @@ test('ordinary text and file shaped output stays identical with absent or empty 
   assert.equal(before.received[0].cleanContent, 'Hello & @alice (uid:U1)');
   await expectText({ ...payload, attachments: [{ text: 'Extra' }] }, 'Hello & @alice (uid:U1)\nExtra');
 });
+
+test('Notification placeholder retains the top-level section body on every path', async () => {
+  await expectText({ text: 'Notification', blocks: [
+    { type: 'section', text: { type: 'mrkdwn', text: '*Readable body*' } },
+  ] }, 'Notification\n*Readable body*');
+});
+
+test('colour attachment renders its nested blocks through the shared block renderer', async () => {
+  await expectText({ text: 'Notification', attachments: [
+    { color: '#00ff00', blocks: [{ type: 'section', text: { type: 'mrkdwn', text: '*Readable body*' } }] },
+  ] }, 'Notification\n*Readable body*');
+});
+
+test('explicit empty text plus attachments has no leading blank line', async () => {
+  const result = await expectText({ text: '', attachments: [{ text: 'Body' }] }, 'Body');
+  assert.equal(result!.content, 'Body');
+  const blocks = await expectText({ text: '', blocks: [{ type: 'section', text: { type: 'mrkdwn', text: 'Body' } }] }, 'Body');
+  assert.equal(blocks!.content, 'Body');
+});
