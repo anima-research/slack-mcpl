@@ -81,8 +81,8 @@ async function server(t: { after(fn: () => Promise<void>): void }) {
  *  message this server doesn't know. */
 const commentMayRemain =
   "The comment of uploaded file F1 may remain in conversation C1: this server doesn't know the message that shared " +
-  "the file, so no rollback can delete it. delete_message may, by that message's id, which fetch_history shows, or " +
-  'fetch_thread if the file went into a thread';
+  "the file, so no rollback can delete it. Use fetch_history or fetch_thread for a message in a thread to locate the message, then delete_message with its id." +
+  '';
 
 /** Methods called from `from` on, the upload's own bytes request included,
  *  less the listing a grant starts in the background. */
@@ -487,7 +487,7 @@ test("a rollback that leaves one upload's file names it, and still notes another
   assert.equal((await rollback(before.state!.checkpoint)).reason,
     "Rolled back (1/1 messages and 1/2 files deleted). Slack refused to delete these, and calling again won't change that: file F1 in C1. The comment of uploaded file F2 may " +
       "remain in conversation C1: this server doesn't know the message that shared the file, so no rollback can delete it. " +
-      "delete_message may, by that message's id, which fetch_history shows, or fetch_thread if the file went into a thread");
+      "Use fetch_history or fetch_thread for a message in a thread to locate the message, then delete_message with its id.");
 });
 
 test('a file Slack says is gone, or no longer visible to this bot, counts as deleted, and its sharing message is still deleted', { timeout: 5000 }, async (t) => {
@@ -571,8 +571,8 @@ test("the comments of two uploads whose sharing messages this server doesn't kno
   await call('upload_file', { channelId: 'C1', filename: 'b.txt', content: 'b', comment: 'Two' });
   assert.equal((await rollback(before.state!.checkpoint)).reason,
     "The comments of uploaded files F1 in C1, F2 in C1 may remain: this server doesn't know the messages that shared " +
-      "them, so no rollback can delete them. delete_message may, by those messages' ids, which fetch_history shows, " +
-      'or fetch_thread if the file went into a thread');
+      "them, so no rollback can delete them. Use fetch_history or fetch_thread for a message in a thread to locate the message, then delete_message with its id." +
+      '');
 });
 
 test("an upload's acknowledgement removal keeps its own tries, outside the upload's call", { timeout: 5000 }, async (t) => {

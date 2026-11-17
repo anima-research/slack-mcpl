@@ -1590,7 +1590,11 @@ export class SlackMcplServer {
       ...(namedMessageLeft ? [toolHint('delete_message can try a message among them again, by its id', this.toolEnabled,
         'someone with access must retry deleting the message in Slack, by its own id')] : []),
       ...(unnamedLeft
-        ? [locate]
+        ? [this.toolEnabled('fetch_history') && this.toolEnabled('fetch_thread') && this.toolEnabled('delete_message')
+          ? (namedMessageLeft
+            ? "fetch_history shows the id of one this server doesn't know (fetch_thread, for one in a thread)"
+            : 'delete_message can delete one by its id, which fetch_history shows (fetch_thread, for one in a thread)')
+          : locate.replace(/\.$/, '')]
         : []),
       ...(mayRemain.some((item) => item.kind === 'file')
         ? ["no tool here deletes a file, and whoever runs this host can delete it with Slack's files.delete, by its id"]

@@ -229,7 +229,7 @@ test("another author's message can be neither edited nor deleted, and the text s
 test('a closed edit window offers a new message instead', async () => {
   const text = await explain('edit_window_closed', 'edit_message', { channelId: 'C7', messageId: '1.1' });
   assert.match(text, /this workspace doesn't allow editing a message this old, and calling again won't change that/);
-  assert.match(text, /post a new message, or use reply_message with its id/);
+  assert.match(text, /post a new message\. Or use reply_message with its id/);
 });
 
 test("text that's too long: an edit names Slack's limit, a send asks for shorter messages", async () => {

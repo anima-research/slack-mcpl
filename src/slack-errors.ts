@@ -331,7 +331,7 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
       ? `${lead}: this server replies in the thread of the last message from a conversation that reached you. ` +
           `Here that was the thread under message ${thread} in ${conversation}, and Slack refused it. ` +
           `Another publish to ${conversation} now would go to the same thread. ` +
-          hint('send_message posts in the conversation itself. ') + hint('reply_message posts under a message you choose.')
+          hint('send_message posts in the conversation itself, ') + hint('and reply_message under a message you choose.')
       : undefined;
   }
 
