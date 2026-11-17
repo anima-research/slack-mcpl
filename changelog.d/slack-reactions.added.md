@@ -23,9 +23,9 @@
   This also applies after automatic cleanup has finished. Redelivered events
   cannot recreate cleanup for that message for 10 minutes in this process only,
   not across restarts.
-- Preserve an agent's explicit ACK-emoji reaction when a delivery installs
-  automatic cleanup while the agent's add is in flight. Confirmed adoption
-  now retires that newly pending cleanup as well.
+- Explicit ACK adoption also covers a delivery installing automatic cleanup
+  while the agent's add is in flight: confirmed adoption retires that newly
+  pending cleanup.
 - Automatic ACK retries run outside the triggering tool call's deadline; unsent
   manual refusals do not consume the cleanup retry budget. A concurrent removal
   already sent before adoption may still land, but its failure will not retry.
@@ -35,7 +35,8 @@
 - A new explicit ACK-emoji add reports "Reaction added"; an already-present
   ACK reports "ACK adopted" rather than "Nothing changed". Both adopt the ACK;
   deadline diagnostics include time waiting on background coordination.
-- An unsent manual ACK removal preserves the existing automatic expiry or retry deadline.
+- An unsent manual ACK removal preserves the existing automatic expiry or retry deadline
+  using monotonic time, unaffected by wall-clock adjustments.
 
 - ACK cleanup takes over when a joined manual removal was never sent, including
   shutdown. Manual policy refusals preserve expiry and retry deadlines.

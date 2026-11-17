@@ -119,7 +119,9 @@ Like additions, removals are not undone by rollback.
 When `SLACK_ACK_REACTION` is set, that emoji is added automatically while a
 message is being handled and removed after the bot's next confirmed post in
 that conversation (or on expiry/rejection/shutdown). It appears in reads as
-this bot's own reaction, not a separate reaction type. The read and reaction
+a normal reaction, with `own: true` when Slack's user list includes the known
+bot ID; ownership is omitted when the bot ID is unknown or the list is
+incomplete and omits the bot. The read and reaction
 tool descriptions name the configured emoji. If the agent adds it itself,
 success or `already_reacted` adopts the reaction and cancels unsent automatic cleanup and retries, not a removal already sent.
 Failed adds do not adopt. Redelivery cannot recreate cleanup for that message for

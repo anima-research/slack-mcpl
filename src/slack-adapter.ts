@@ -20,6 +20,7 @@
  * Event handling salvaged from zulip-mcp PR #8's SlackAdapter.
  */
 
+import { performance } from 'node:perf_hooks';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { WebClient, ErrorCode, LogLevel, type Logger, type WebAPICallResult, type WebClientOptions } from '@slack/web-api';
 import { SocketModeClient } from '@slack/socket-mode';
@@ -853,6 +854,7 @@ export class SlackAdapter {
      *  empty list, is unknown, so a listing asks for every type. */
     scopes?: string[],
   ) {
+    this.botUserId = typeof botUserId === 'string' && botUserId.trim() ? botUserId : null;
     this.scopes = reportedScopes({ scopes });
     const omitted = this.leftOutTypes();
     if (omitted.length) this.logLeftOut(omitted, '');
@@ -1170,7 +1172,7 @@ export class SlackAdapter {
 
   private armAck(channelId: string, ts: string, ms: number): ReturnType<typeof setTimeout> {
     const entry = this.ackPending.get(channelId)?.get(ts);
-    if (entry) entry.timerDue = Date.now() + ms;
+    if (entry) entry.timerDue = performance.now() + ms;
     const timer = setTimeout(() => void outsideCallTime(() => this.clearAck(channelId, ts)), ms);
     timer.unref?.();
     return timer;
@@ -1303,7 +1305,7 @@ export class SlackAdapter {
     // Recorded before the add resolves, so a reply Slack confirms first still removes it.
     let pending = this.ackPending.get(channelId);
     if (!pending) this.ackPending.set(channelId, (pending = new Map()));
-    const entry: AckEntry = { owner: 'automatic', timer: this.armAck(channelId, ts, ACK_TTL_MS), timerDue: Date.now() + ACK_TTL_MS, added, tries: 0 };
+    const entry: AckEntry = { owner: 'automatic', timer: this.armAck(channelId, ts, ACK_TTL_MS), timerDue: performance.now() + ACK_TTL_MS, added, tries: 0 };
     pending.set(ts, entry);
     if (!(await added)) this.dropAck(channelId, ts, entry); // not there, so nothing to remove
   }
@@ -1692,7 +1694,7 @@ export class SlackAdapter {
       if (entry.owner === 'agent') this.dropAck(channelId, ts, entry);
       if (this.ackPending.get(channelId)?.get(ts) === entry) {
         // An unsent removal must not shorten (or restart) the existing expiry.
-        entry.timer = this.armAck(channelId, ts, retry ? ACK_RETRY_MS : Math.max(0, entry.timerDue - Date.now()));
+        entry.timer = this.armAck(channelId, ts, retry ? ACK_RETRY_MS : Math.max(0, entry.timerDue - performance.now()));
       }
     });
     entry.removing = removing;

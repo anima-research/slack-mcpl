@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { performance } from 'node:perf_hooks';
 import assert from 'node:assert/strict';
 import { ErrorCode } from '@slack/web-api';
 import { method } from '@animalabs/mcpl-core';
@@ -212,14 +213,19 @@ test('thread replies have their own reactions, without an omitted count below th
   assert.equal(reply.reactionsOmitted, undefined);
 });
 
-test('an unknown bot user ID marks no reaction as own', async () => {
-  const web = { conversations: { history: async () => ({ messages: [
-    { ts: '1.0', reactions: [{ name: 'eyes', count: 1, users: ['UBOT'] }] },
-  ] }) } } as unknown as SlackWebLike;
-  const slack = new SlackAdapter(web, { on() {}, async start() {}, async disconnect() {} }, null, 'test');
-  const result = await slack.readHistory('C1', {});
-  assert.deepEqual(result.messages[0]!.reactions, [{ name: 'eyes', count: 1 }]);
+for (const botId of [null, '', '   ', 123, {}]) {
+  test(`an unknown bot user ID (${JSON.stringify(botId)}) omits ownership in both reads`, async () => {
+    const web = { conversations: { history: async () => ({ messages: [
+      { ts: '1.0', reactions: [{ name: 'eyes', count: 1, users: ['UBOT'] }] },
+    ] }) } } as unknown as SlackWebLike;
+    web.conversations.replies = web.conversations.history;
+    const slack = new SlackAdapter(web, { on() {}, async start() {}, async disconnect() {} }, botId as string | null, 'test');
+    assert.equal(slack.botUserId, null);
+    for (const result of [await slack.readHistory('C1', {}), await slack.readThread('C1', '1.0', {})]) {
+      assert.deepEqual(result.messages[0]!.reactions, [{ name: 'eyes', count: 1 }]);
+    }
 });
+}
 
 /** Drain asynchronous work started by timer callbacks or JSON-RPC dispatch. */
 async function flush() {
@@ -989,27 +995,33 @@ test('adopted entry keeps sent removal joinable and cannot start another automat
   assert.equal(removes, 2);
 });
 
-test('unsent manual ACK removal preserves the original ten-minute expiry', async t => {
-  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
-  let unsent = true;
-  const f = adapterFixture({ onRemove: async () => {
-    if (unsent) throw new OutOfCallTime('reactions.remove', 25);
-  } });
-  t.after(() => f.slack.stop());
-  await f.slack.acknowledge('C1', '1.0');
-  t.mock.timers.tick(30_000);
-  await assert.rejects(f.slack.removeReaction('C1', '1.0', 'eyes'), OutOfCallTime);
-  unsent = false;
-  t.mock.timers.tick(60_000);
-  await flush();
-  assert.equal(f.calls.filter(c => c.startsWith('remove:')).length, 1, 'no early cleanup');
-  t.mock.timers.tick(510_000 - 1);
-  await flush();
-  assert.equal(f.calls.filter(c => c.startsWith('remove:')).length, 1);
-  t.mock.timers.tick(1);
-  await flush();
-  assert.equal(f.calls.filter(c => c.startsWith('remove:')).length, 2, 'original expiry, not ten minutes after refusal');
+for (const wallStep of [-300_000, 0, 300_000]) {
+  test(`unsent manual ACK removal preserves the original ten-minute expiry (wall step ${wallStep})`, async t => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+    let elapsed = 0;
+    t.mock.method(performance, 'now', () => elapsed);
+    const tick = (ms: number) => { elapsed += ms; t.mock.timers.tick(ms); };
+    let unsent = true;
+    const f = adapterFixture({ onRemove: async () => {
+      if (unsent) throw new OutOfCallTime('reactions.remove', 25);
+    } });
+    t.after(() => f.slack.stop());
+    await f.slack.acknowledge('C1', '1.0');
+    tick(30_000);
+    t.mock.timers.setTime(Date.now() + wallStep);
+    await assert.rejects(f.slack.removeReaction('C1', '1.0', 'eyes'), OutOfCallTime);
+    unsent = false;
+    tick(60_000);
+    await flush();
+    assert.equal(f.calls.filter(c => c.startsWith('remove:')).length, 1, 'no early cleanup');
+    tick(510_000 - 1);
+    await flush();
+    assert.equal(f.calls.filter(c => c.startsWith('remove:')).length, 1);
+    tick(1);
+    await flush();
+    assert.equal(f.calls.filter(c => c.startsWith('remove:')).length, 2, 'original expiry, not ten minutes after refusal');
 });
+}
 
 test('unknown add advice does not invent configured ACK state', () => {
   const advice = explainSlackError(refusal('internal_error'), { tool: 'add_reaction', args });
@@ -1072,24 +1084,30 @@ for (const stopping of [false, true]) {
   }
 }
 
-test('unsent manual refusal preserves an armed retry deadline', async t => {
-  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
-  let unsent = false;
-  const f = adapterFixture({ error: 'internal_error', onRemove: async () => {
-    if (unsent) throw new OutOfCallTime('reactions.remove', 25);
-  } });
-  t.after(() => f.slack.stop());
-  await f.slack.acknowledge('C1', '1.0');
-  await f.slack.clearAck('C1');
-  t.mock.timers.tick(20_000);
-  f.setError();
-  unsent = true;
-  await assert.rejects(f.slack.removeReaction('C1', '1.0', 'eyes'), OutOfCallTime);
-  unsent = false;
-  t.mock.timers.tick(39_999);
-  await flush();
-  assert.equal(f.calls.filter(c => c.startsWith('remove:')).length, 2);
-  t.mock.timers.tick(1);
-  await flush();
-  assert.equal(f.calls.filter(c => c.startsWith('remove:')).length, 3);
+for (const wallStep of [-300_000, 0, 300_000]) {
+  test(`unsent manual refusal preserves an armed retry deadline (wall step ${wallStep})`, async t => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+    let elapsed = 0;
+    t.mock.method(performance, 'now', () => elapsed);
+    const tick = (ms: number) => { elapsed += ms; t.mock.timers.tick(ms); };
+    let unsent = false;
+    const f = adapterFixture({ error: 'internal_error', onRemove: async () => {
+      if (unsent) throw new OutOfCallTime('reactions.remove', 25);
+    } });
+    t.after(() => f.slack.stop());
+    await f.slack.acknowledge('C1', '1.0');
+    await f.slack.clearAck('C1');
+    tick(20_000);
+    f.setError();
+    unsent = true;
+    t.mock.timers.setTime(Date.now() + wallStep);
+    await assert.rejects(f.slack.removeReaction('C1', '1.0', 'eyes'), OutOfCallTime);
+    unsent = false;
+    tick(39_999);
+    await flush();
+    assert.equal(f.calls.filter(c => c.startsWith('remove:')).length, 2);
+    tick(1);
+    await flush();
+    assert.equal(f.calls.filter(c => c.startsWith('remove:')).length, 3);
 });
+}
