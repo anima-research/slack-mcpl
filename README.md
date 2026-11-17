@@ -254,8 +254,9 @@ Both tools return `messages`, each with `id`, `author`, `timestamp`, `content`,
 optional `threadTs` and attachment hints, as before, and add:
 
 - `authorId` when Slack supplies a user ID, and `authorBotId` when supplied.
-  Authors' and mentioned users' names are looked up as before, and an author
-  whose name can't be had is shown by their ID.
+  Authors' and original-text mentions' names are looked up as before;
+  supplemental-only mentions use cached names or raw IDs, without lookups.
+  An author whose name can't be had is shown by their ID.
 - `rootTs`, the thread a message belongs to: its parent's ts, as Slack reports
   it on a reply or a broadcast reply, or the message's own. `threadTs`
   continues to identify a reply's parent. `replyCount` is included only when
@@ -400,7 +401,9 @@ Unattributed supplemental units deduplicate against original text. Attributed
 units deduplicate by source channel ID and message timestamp when present, plus
 the displayed attribution header (including capped
 author name, valid author ID and, for shares, channel or footer). Other source fields such as author_link are not
-identity keys; names differing only beyond the display cap may deduplicate. Comparison keys normalize prose whitespace, Slack encodings, combined
+identity keys; names differing only beyond the display cap may deduplicate.
+Comparison keys normalize prose whitespace (including line breaks, so distinct
+list/line structures can collapse), Slack encodings, combined
 bold/italic marker order and newlines directly inside code fences; compare
 channel/user IDs rather than labels; and preserve other code whitespace.
 This is display dedup, not typed equality: a link and identical rendered literal
@@ -431,6 +434,8 @@ targets are compared exactly. No URL canonicalization is performed: trailing
 slashes, scheme/host case, default ports and fragments can prevent a match. Such
 previews remain visible and can consume the entire supplemental allowance. Bare
 URL punctuation trimming is heuristic and can hide a distinct punctuation-ending URL.
+It does not trim closing parentheses: `(https://example.com/a)` can retain a
+preview whose `from_url` is `https://example.com/a`.
 
 The supplemental suffix cap is **pre-formatting**: 16,384 UTF-16 code units including
 separator and a single final `[…truncated]` marker. It does **not** bound delivered
@@ -441,7 +446,12 @@ allowance of max(16,384, original UTF-16 length + 1) code units.
 Traversal cuts and nesting (12 levels) also carry that marker; it reports
 unvisited payload, not a guarantee that readable text was omitted; cuts preserve code points. Unsupported blocks remain omitted on explicit reads; the 16,384-unit explicit-read
 cap cannot be bypassed by rereading through history or threads. Original text is
-never truncated. Backscroll uses a lower **2,000 UTF-16 code unit supplemental cap per
+never truncated. The compact markers do not distinguish recoverable content:
+backscroll cuts may expose more on explicit reads, but unsupported blocks and
+explicit-read supplemental cuts cannot be recovered by repeating those reads.
+Display-equivalent unsupported labels can still cause a truncation marker if
+their raw forms exceed the deferred notice allowance before normalized dedup.
+Backscroll uses a lower **2,000 UTF-16 code unit supplemental cap per
 message**, and the framed backscroll block has an overall **32 KiB byte budget**.
 It keeps a contiguous newest window. Messages that exceed the remaining byte
 budget (even if they fit the full budget on their own) get an in-position
@@ -453,6 +463,12 @@ is shown (otherwise use the triggering message's ID from the location header).
 These are recovery hints, not guarantees: history tools have their own result
 limits. Placeholders, this summary and framing all count against the byte budget,
 preserving positions instead of leaving silent gaps.
+
+Backscroll yields between rendering batches, not during the later whole-window
+mention scans and formatting. Its lower suffix cap does not lower intermediate
+render limits (max(16,384, original UTF-16 length + 1)). Human rich-text-only
+mirrors also still incur original-text scanning/key construction before being
+skipped. These output limits are not per-window CPU or latency guarantees.
 
 ## Environment
 

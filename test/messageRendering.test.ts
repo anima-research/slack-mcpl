@@ -113,7 +113,7 @@ test('backscroll supplemental lines capped at 2000; total block <=32KiB with exp
   assert.match(block, /older backscroll messages not shown; try fetch_history latest=/);
   assert.match(block, /message omitted \(\d+ bytes\).*; try fetch_history/);
   assert.match(block, /id=49\]/);
-  assert.doesNotMatch(block, /id=0\]/);
+  assert.doesNotMatch(block, /id=0(?:\]|;)/);
 });
 
 for (const unit of ['<@U1|', '<https://x/']) test(`unclosed angle candidates remain literal at the text limit ${unit}`, () => {

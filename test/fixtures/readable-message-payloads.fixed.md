@@ -28,5 +28,7 @@
   Deduplicate channel mirrors before expanding reused labels, and repeated
   omission labels before charging their deferred allowance.
   Only unattributed units deduplicate against original text; attributed units
-  retain their source identity. Yield between batches of backscroll rendering.
+  compare within the displayed header plus channel ID and timestamp when supplied;
+  missing keys fall back to the displayed attribution, not full source identity.
+  Yield between batches of backscroll rendering.
   Omission hints explain cursor pagination, including when no placeholder fits.

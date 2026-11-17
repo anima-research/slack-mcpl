@@ -72,6 +72,8 @@ test('backscroll placeholders also preserve positions of messages that fit the f
   assert.match(block, /message omitted/);
   assert.match(block, /older backscroll messages not shown; try fetch_history latest=/);
   const ids = [...block.matchAll(/id=(\d+)\.000001/g)].map(m => Number(m[1]));
+  assert.ok(ids.length > 0 && ids.length < rows.length, 'retain a nonempty newest window');
+  assert.equal(ids.at(-1), 50, 'retain the newest message position');
   assert.deepEqual(ids, Array.from({length: ids.length}, (_, i) => 51 - ids.length + i));
 });
 
