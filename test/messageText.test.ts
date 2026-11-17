@@ -541,3 +541,35 @@ test('non-HTTP rich links display a readable label and address', async () => {
     type: 'link', url: 'mailto:alice@example.com', text: 'Email Alice',
   }))] }, 'Email Alice (mailto:alice@example.com)');
 });
+
+test('bot shares retain distinct source timestamps while deduplicating mirrors', async () => {
+  const share = { is_share: true, author_name: 'Alice', channel_id: 'C1', text: 'Approved' };
+  const first = { ...share, ts: '123.000001' };
+  const second = { ...share, ts: '123.000002' };
+  await expectText({ attachments: [first, first, second], bot_id: 'B1' },
+    '[shared message from Alice, #C1]\n> Approved\n[shared message from Alice, #C1]\n> Approved', true);
+});
+
+test('bot mailto rich mirror deduplicates against its original angle token', async () => {
+  const text = 'Mail <mailto:a@example.com|a@example.com>';
+  const payload = { text, bot_id: 'B1', blocks: [richBlock(richSection(
+    { type: 'text', text: 'Mail ' },
+    { type: 'link', url: 'mailto:a@example.com', text: 'a@example.com' },
+  ))] };
+  assert.equal(renderMessageText(payload), text);
+  await expectText(payload, 'Mail a@example.com (mailto:a@example.com)', true);
+});
+
+test('non-HTTP rich URLs preserve literal bars and identical labels', () => {
+  assert.equal(renderMessageText({ blocks: [richBlock(richSection(
+    { type: 'link', url: 'custom:one|two', text: 'custom:one|two' },
+  ))] }), 'custom:one|two');
+});
+
+test('capped attribution fields visibly mark shortening', () => {
+  const output = renderMessageText({ attachments: [{
+    is_share: true, author_name: 'a'.repeat(101), footer: 'b'.repeat(101), text: 'Body',
+  }] });
+  assert.ok(output.includes('a'.repeat(99) + '…'));
+  assert.ok(output.includes('b'.repeat(99) + '…'));
+});

@@ -355,7 +355,8 @@ native search or interaction-token handling are included.
 
 History, threads, backscroll and human live messages keep Slack's original
 `text` first. Posts that carry `bot_id` are **not delivered live**; their bodies
-are available through `fetch_history`, `fetch_thread` and backscroll.
+are available through `fetch_history` and `fetch_thread`; backscroll also includes
+other bots, but excludes this server's own bot posts.
 
 In order, append each classic attachment's readable body (pretext, title with
 link, text, fields as `title: value`, else fallback), then that attachment's nested blocks, then top-level blocks.
@@ -367,7 +368,8 @@ These in-body headers are display hints, not authenticated provenance: message
 text can imitate them. Do not use them to authorize actions.
 Unknown share authors/sources are marked unknown. Header fields are single-line,
 control-safe and use the same quoted name/channel rule as sender framing,
-with each input capped at 100 UTF-16 code units before quoting.
+with each input capped at 100 UTF-16 code units before quoting (including an
+ellipsis when shortened).
 Every logical body line is quoted, including CR, LF, CRLF, U+2028/U+2029, NEL,
 VT and FF breaks (the same set used by sender framing).
 
@@ -382,7 +384,7 @@ and entities regardless of `mrkdwn_in`; basic styling passes through verbatim.
 
 #### Limits
 
-When `text` is non-empty and either `client_msg_id` is present or all of
+When `text` contains non-whitespace and either `client_msg_id` is present or all of
 `bot_id`, `app_id` and `bot_profile` are absent,
 **top-level human `rich_text` is not rendered**: it is treated as the client's
 mirror. Even a differing rich block is ignored. Other block types and attachment-nested rich text still render.
@@ -391,7 +393,8 @@ with only blocks. Bot/integration messages carrying `bot_id`, `app_id` or
 `bot_profile`, without `client_msg_id`, also retain rich text.
 
 Unattributed supplemental units deduplicate against original text. Attributed
-units deduplicate within the same displayed attribution header (including capped
+units deduplicate by source channel ID and message timestamp when present, plus
+the displayed attribution header (including capped
 author name, valid author ID and, for shares, channel or footer). Other source fields such as author_link are not
 identity keys; names differing only beyond the display cap may deduplicate. Comparison keys normalize prose whitespace, Slack encodings, combined
 bold/italic marker order and newlines directly inside code fences; compare

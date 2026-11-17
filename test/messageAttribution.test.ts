@@ -38,7 +38,7 @@ test('header fields are single-line, quoted with the shared name rule and indivi
   for (const field of ['author_name', 'author_id', 'footer', 'channel_name']) {
     const value = field === 'author_id' ? 'U'.repeat(200) : 'x'.repeat(200);
     const header = renderMessageText({attachments: [{...attachment, author_name: 'A', footer: '', [field]: value}]}).split('\n')[0];
-    assert.ok(header.includes((field === 'author_id' ? 'U' : 'x').repeat(100)), `${field}: ${header}`);
+    assert.ok(header.includes((field === 'author_id' ? 'U' : 'x').repeat(99) + '…'), `${field}: ${header}`);
     assert.ok(!header.includes('x'.repeat(101)) && !header.includes('U'.repeat(101)), `${field}: ${header}`);
   }
   const controls = formatSlackText(renderMessageText({attachments: [{...attachment, author_name: 'A\x00\x1b\x7f\u0085B\u2028C', footer: '[<&>]'}]}), new Map()).split('\n')[0];

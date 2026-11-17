@@ -48,8 +48,9 @@ function prefix(text: string, limit: number): string {
 
 // Apply the same name rule as sender framing, then protect its literal output
 // from the adapter's single Slack-formatting pass. Cap before name escaping.
-const headerName = (value: string) => escape(nameShown(prefix(value, 100)));
-const headerChannel = (value: string) => escape(channelShown(prefix(value, 100)));
+const headerPrefix = (value: string) => value.length > 100 ? prefix(value, 99) + '…' : value;
+const headerName = (value: string) => escape(nameShown(headerPrefix(value)));
+const headerChannel = (value: string) => escape(channelShown(headerPrefix(value)));
 
 export function renderMessageText(
   message: { text?: unknown; attachments?: unknown; blocks?: unknown; bot_id?: unknown; app_id?: unknown; bot_profile?: unknown; client_msg_id?: unknown },
@@ -114,10 +115,11 @@ export function renderMessageText(
         return styled(`<#${e.channel_id}${label ? '|' + label : ''}>`, e.style);
       }
       case 'link': {
-        const url = escape(bounded(e.url)).replace(/\|/g, '%7C');
+        const url = escape(bounded(e.url));
         const label = escape(bounded(e.text));
         if (url && !/^https?:\/\//.test(url)) return styled(label && label !== url ? `${label} (${url})` : url, e.style);
-        return styled(url ? (label && label !== url ? `<${url}|${label}>` : `<${url}>`) : label, e.style);
+        const angleUrl = url.replace(/\|/g, '%7C');
+        return styled(url ? (label && label !== url ? `<${angleUrl}|${label}>` : `<${angleUrl}>`) : label, e.style);
       }
       case 'usergroup': return validId(e.usergroup_id) ? styled(`<!subteam^${e.usergroup_id}>`, e.style) : '';
       case 'team': return validId(e.team_id) ? styled(`team ${e.team_id}`, e.style) : '';
@@ -245,27 +247,28 @@ export function renderMessageText(
         string(a.footer) ? headerName(string(a.footer)) : 'unknown source';
       header = shared ? `[shared message from ${name}${uid}, ${source}]` : `[attachment from ${name}${uid}]`;
     }
+    // Keep distinct source messages even when their displayed headers match.
+    const identity = header ? JSON.stringify([header, string(a.channel_id), string(a.ts)]) : '';
     const nested: string[] = [];
     const placeholders: string[] = [];
     let nestedLength = 0;
     let hasReadableNested = false;
-    const units = body.trim() && unique(body, header) ? [body] : [];
+    const units = body.trim() && unique(body, identity) ? [body] : [];
     for (const rawBlock of take(a.blocks)) {
       const value = block(rawBlock);
       if (value.trim()) {
         const omitted = placeholder(rawBlock);
         if (!omitted) hasReadableNested = true;
-        if (!unique(value, header)) continue;
+        if (!unique(value, identity)) continue;
         (omitted ? placeholders : nested).push(value);
         nestedLength += value.length + (nested.length + placeholders.length > 1 ? 1 : 0);
         if (nestedLength > renderLimit) { truncated = true; break; }
       }
     }
-    // Deduplicate within the displayed attribution, including its source kind
-    // (#channel versus footer), escaping and caps.
+    // Deduplicate mirrors within the same attribution and source message.
     if (!body.trim() && !hasReadableNested) {
       const fallback = fieldText(a.fallback);
-      if (unique(fallback, header)) units.push(fallback);
+      if (unique(fallback, identity)) units.push(fallback);
     }
     units.push(...nested, ...placeholders);
     if (units.length && header) {
