@@ -561,8 +561,8 @@ test('bot shares retain distinct source timestamps while deduplicating mirrors',
   const share = { is_share: true, author_name: 'Alice', channel_id: 'C1', text: 'Approved' };
   const first = { ...share, ts: '123.000001' };
   const second = { ...share, ts: '123.000002' };
-  await expectText({ attachments: [first, first, second], bot_id: 'B1' },
-    '[shared message from Alice, #C1]\n> Approved\n[shared message from Alice, #C1]\n> Approved', true);
+  await expectText({ attachments: [first, first, { text: 'Source boundary' }, second], bot_id: 'B1' },
+    '[shared message from Alice, #C1]\n> Approved\nSource boundary\n[shared message from Alice, #C1]\n> Approved', true);
 });
 
 test('bot mailto rich mirror deduplicates against its original angle token', async () => {
@@ -611,9 +611,10 @@ test('source identity isolates channel IDs behind identical displayed headers', 
 test('numeric source timestamps retain identity and match their string form', () => {
   const share = { is_share: true, channel_id: 'C1', text: 'Body' };
   const result = renderMessageText({ attachments: [
-    { ...share, ts: 123.1 }, { ...share, ts: '123.1' }, { ...share, ts: 123.2 },
+    { ...share, ts: 123.1 }, { ...share, ts: '123.1' },
+    { text: 'Source boundary' }, { ...share, ts: 123.2 },
   ] });
-  assert.equal((result.match(/Body/g) || []).length, 2);
+  assert.equal(result, '[shared message from unknown, #C1]\n&gt; Body\nSource boundary\n[shared message from unknown, #C1]\n&gt; Body');
 });
 
 test('angle URL removal never synthesizes a bare URL for unfurl suppression', () => {
@@ -727,15 +728,15 @@ test('history filters agree with rendered channel labels, usergroups and truncat
   }
 });
 
-test('discarded bounded duplicate units do not report truncation', () => {
-  const padded = 'hello' + ' '.repeat(17000);
+test('cut duplicate prefixes preserve a marker for potentially distinct tails', () => {
+  const padded = 'hello' + ' '.repeat(17000) + 'IMPORTANT';
   for (const payload of [
     {attachments: [{text: padded}]},
     {attachments: [{fallback: padded}]},
     {attachments: [{blocks: [{type: 'markdown', text: padded}]}]},
     {blocks: [{type: 'markdown', text: padded}]},
-    {blocks: [{type: 'section', fields: [{text: 'hello'}, {text: ' '.repeat(17000)}]}]},
-  ]) assert.equal(renderMessageText({text: 'hello', ...payload}), 'hello');
+    {blocks: [{type: 'section', fields: [{text: 'hello'}, {text: ' '.repeat(17000) + 'IMPORTANT'}]}]},
+  ]) assert.equal(renderMessageText({text: 'hello', ...payload}), 'hello\n[…truncated]');
   assert.match(renderMessageText({text: 'hello', blocks: [{type: 'markdown', text: 'distinct'.repeat(3000)}]}), /\[…truncated\]$/);
 });
 

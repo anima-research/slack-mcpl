@@ -215,14 +215,14 @@ export function renderMessageText(
     appendedLength += value.length + (appended.length ? 1 : 0);
     appended.push(value);
   }
-  // Rendering cuts belong to the unit retained after deduplication. Traversal
-  // exhaustion is separate: unvisited units may still contain distinct text.
+  // A duplicate retained prefix says nothing about an unseen tail. Preserve
+  // rendering cuts even when deduplication discards the bounded prefix.
   function unit(render: () => string, attribution = '', remember = true): string {
     const previous = truncated;
     truncated = false;
     const value = render();
     const retained = unique(value, attribution, remember);
-    truncated = previous || (truncated && (retained || !value.trim()));
+    truncated = previous || truncated;
     return retained ? value : '';
   }
   const urls = new Set<string>();

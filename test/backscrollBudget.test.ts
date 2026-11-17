@@ -22,7 +22,7 @@ test('thousand-message backscroll keeps a contiguous newest window including pla
   const block = backscrollBlock(rows, {isDM: false, channelName: 'ops'}, true);
   assert.ok(Buffer.byteLength(block) <= 32768);
   const ids = [...block.matchAll(/id=(\d+)\.000001/g)].map(m => Number(m[1]));
-  assert.ok(ids.length > 0 && ids.length < 1000);
+  assert.equal(ids.length, 183, 'maximal retained placeholder window for this fixed frame');
   assert.deepEqual(ids, Array.from({length: ids.length}, (_, i) => 1001 - ids.length + i));
   assert.match(block.split('\n')[1], new RegExp(`^\\[${1000 - ids.length} older backscroll messages not shown; try fetch_history latest=${ids[0]}\\.000001\\]$`));
   assert.equal((block.match(/bytes\).*; try fetch_history/g) || []).length, ids.length);
@@ -59,7 +59,7 @@ test('configured thousand-message backscroll is bounded on first-interaction del
   assert.match(block, /\[\d+ older backscroll messages not shown/);
   const older = Number(block.match(/\[(\d+) older backscroll messages not shown/)![1]);
   const ids = [...block.matchAll(/id=(\d+)\.000001/g)].map(m => Number(m[1]));
-  assert.ok(ids.length > 0, 'retain in-position placeholders');
+  assert.equal(ids.length, 184, 'retain the full fixed-fixture placeholder window');
   assert.equal(older + ids.length, 1000, 'configured fetch limit reaches the production frame');
   assert.deepEqual(ids, Array.from({length: ids.length}, (_, i) => older + i + 1));
   assert.equal((block.match(/bytes\).*; try fetch_history/g) || []).length, ids.length);
@@ -75,7 +75,7 @@ test('backscroll placeholders also preserve positions of messages that fit the f
   assert.match(block, /message omitted/);
   assert.match(block, /older backscroll messages not shown; try fetch_history latest=/);
   const ids = [...block.matchAll(/id=(\d+)\.000001/g)].map(m => Number(m[1]));
-  assert.ok(ids.length > 0 && ids.length < rows.length, 'retain a nonempty newest window');
+  assert.equal(ids.length, 32, 'retain every row position that fits this fixed frame');
   assert.equal(ids.at(-1), 50, 'retain the newest message position');
   assert.deepEqual(ids, Array.from({length: ids.length}, (_, i) => 51 - ids.length + i));
 });
@@ -105,14 +105,14 @@ test('omission markers do not promise history access or whole oversized messages
   const defaultBlock = backscrollBlock(rows, {isDM: false});
   assert.doesNotMatch(defaultBlock, /fetch_history/);
   assert.match(defaultBlock, /backscroll notice: message omitted/);
-  assert.match(defaultBlock, /history unavailable until the host enables slack.history/);
+  assert.match(defaultBlock, /history unavailable until the host enables slack\.history/);
 });
 
 test('ungranted history omission notices explicitly name the missing host grant', () => {
   const rows = Array.from({length: 1000}, (_, i) => message(i + 1, 'x'.repeat(33000)));
   const block = backscrollBlock(rows, {isDM: false}, false);
-  assert.match(block, /older backscroll messages not shown; history unavailable until the host enables slack.history/);
-  assert.match(block, /backscroll notice: message omitted.*history unavailable until the host enables slack.history/);
+  assert.match(block, /older backscroll messages not shown; history unavailable until the host enables slack\.history/);
+  assert.match(block, /backscroll notice: message omitted.*history unavailable until the host enables slack\.history/);
   assert.doesNotMatch(block, /Ann: message omitted|try fetch_history/);
   assert.ok(Buffer.byteLength(block) <= 32768);
 });
@@ -136,7 +136,7 @@ test('backscroll limit accepts only whole values in range', (t) => {
     process.env.SLACK_BACKSCROLL_LIMIT = raw;
     assert.equal(server.backscrollLimit, 50, raw);
   }
-  for (const raw of ['1', '50', '1000']) {
+  for (const raw of ['1', '0001', '0050', '50', '1000']) {
     process.env.SLACK_BACKSCROLL_LIMIT = raw;
     assert.equal(server.backscrollLimit, Number(raw), raw);
   }

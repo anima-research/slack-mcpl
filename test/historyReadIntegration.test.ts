@@ -95,6 +95,10 @@ test('fake history honors exclusive and inclusive time windows before paging', a
   }))});
   const exclusive = await slack.readHistory('C1', {oldest: '1.000001', latest: '4.000001', limit: 10});
   assert.deepEqual(exclusive.messages.map(m => m.id), ['2.000001', '3.000001']);
+  const fakeExclusive = await (slack as any).web.conversations.history({
+    channel: 'C1', oldest: '1.000001', latest: '4.000001', inclusive: false, limit: 10,
+  });
+  assert.deepEqual(fakeExclusive.messages.map((m: any) => m.ts), ['3.000001', '2.000001']);
   const inclusive = await (slack as any).web.conversations.history({
     channel: 'C1', oldest: '1.000001', latest: '4.000001', inclusive: true, limit: 2,
   });

@@ -451,9 +451,8 @@ never truncated. The compact markers do not distinguish recoverable content:
 backscroll cuts may expose more on explicit reads, but unsupported blocks and
 explicit-read supplemental cuts cannot be recovered by repeating those reads.
 Unsupported labels are normalized and deduplicated before charging the deferred
-notice allowance; label-length and traversal limits still apply. A cut unit whose retained prefix
-deduplicates can hide a distinct tail without a marker; a cut whitespace-only
-unit can instead produce a conservative marker.
+notice allowance; label-length and traversal limits still apply. Cuts keep a conservative marker even when the retained prefix deduplicates
+or is whitespace-only, since the unseen tail may be distinct.
 Backscroll uses a lower **2,000 UTF-16 code unit supplemental cap per
 message**, and the framed backscroll block has an overall **32 KiB byte budget**.
 It keeps a contiguous newest window. Messages that exceed the remaining byte

@@ -11,9 +11,6 @@
   an empty string; null and other non-string values do not suppress app rich text). Bound supplemental traversal and output with
   visible truncation markers, and prioritize attachment-nested readable blocks over their omission labels.
   Top-level blocks retain input order, including omission labels.
-  Bound framed backscroll to 32 KiB, replacing oversized messages in position
-  and summarizing the older prefix. Suggest fetch_history only when granted,
-  without promising recovery beyond its result limits.
   Supplemental-only mentions use cached names or raw IDs without lookups
   in live messages, backscroll and explicit history/thread reads. Authors and original-text
   mentions retain their lookups, which can delay live delivery, reaction ack and wake.
@@ -27,11 +24,12 @@
   the host grant needed. Yield between batches of text-filtered history candidates.
   Channel mirrors deduplicate before reused-label expansion; normalized omission
   labels deduplicate before charging their deferred allowance. Rendering cuts
-  from discarded nonempty duplicate units do not add truncation markers.
+  retain a conservative marker even when their bounded prefixes deduplicate.
   Only unattributed units deduplicate against original text; attributed units
   compare within the displayed header plus channel ID and timestamp when supplied;
   missing keys fall back to the displayed attribution, not full source identity.
   Yield between batches of backscroll rendering.
   Omission hints explain cursor pagination, including when no placeholder fits.
-  Accept decimal-digit SLACK_BACKSCROLL_LIMIT values in [1, 1000]; invalid or
-  out-of-range values fall back to 50 rather than accepting an integer prefix.
+  Classic link previews can appear in reads and match textContains; they are
+  skipped only when from_url exactly matches an extracted original URL. App
+  unfurls are skipped separately; shares retain their source bodies.

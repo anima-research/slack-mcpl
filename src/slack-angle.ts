@@ -1,4 +1,4 @@
-// One place to update if Slack widens its ID alphabet.
+// Shared ID alphabet for angle-token parsing; other API validators also constrain IDs.
 export const SLACK_ID = '[A-Z0-9]+';
 
 /** Single-pass Slack angle-token scan. Nested '<' starts a new
