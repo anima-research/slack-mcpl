@@ -174,11 +174,11 @@ export function backscrollLine(m: {
   return `[${m.timestamp.toISOString()}${thread} id=${m.id}] ${nameShown(m.authorName)}${att}: ${senderText(m.content)}`;
 }
 
-/** The `<backscroll>` block given with the first message from a conversation. */
+/** Context fetched for addressed delivery before any accepted delivery in this conversation. */
 export function backscrollBlock(
   messages: Parameters<typeof backscrollLine>[0][],
   where: { channelName?: string; isDM: boolean },
-  historyGranted = false,
+  historyGranted: boolean | 'tools' = false,
 ): string {
   const attrs: string[] = [];
   if (where.channelName && !where.isDM) attrs.push(`channel=${quotedLabel(`#${Array.from(where.channelName).slice(0, 100).join('')}`)}`);
@@ -187,9 +187,13 @@ export function backscrollBlock(
   // placeholder rather than a silent gap; if even that cannot fit, summarize
   // the older prefix. Both forms count against the same hard byte budget.
   const maxBytes = 32_768;
+  const historyAvailable = historyGranted === true;
+  const unavailable = historyGranted === 'tools'
+    ? '; history unavailable: missing host grant tools'
+    : '; history unavailable: missing host grant slack.history';
   const lines: string[] = [];
   const summary = (count: number, before?: string) =>
-    `[${count} older backscroll ${count === 1 ? 'message' : 'messages'} not shown${historyGranted ? '; try fetch_history' + (before ? ' latest=' + before : '; follow nextCursor until the omitted window is reached') : '; history unavailable until the host enables slack.history'}]`;
+    `[${count} older backscroll ${count === 1 ? 'message' : 'messages'} not shown${historyAvailable ? '; try fetch_history' + (before ? ' latest=' + before : '; follow nextCursor until the omitted window is reached') : unavailable}]`;
   const frame = (count: number) => `<backscroll ${[...attrs, `count="${count}"`].join(' ')}>\n\n</backscroll>`;
   const rendered = messages.map(backscrollLine);
   const complete = [`<backscroll ${[...attrs, `count="${messages.length}"`].join(' ')}>`,
@@ -205,7 +209,7 @@ export function backscrollBlock(
       (i ? Buffer.byteLength(summary(i, message.id)) + 1 : 0);
     let shown = line;
     if (bytes + size + 1 + reserved > maxBytes) {
-      shown = `[backscroll notice: message omitted (${size} bytes); timestamp=${message.timestamp.toISOString()}${message.threadTs ? ' thread=' + message.threadTs : ''} id=${message.id}; author=${quotedLabel(nameShown(message.authorName))}${historyGranted ? '; try fetch_history; follow nextCursor until this id is reached' : '; history unavailable until the host enables slack.history'}]`;
+      shown = `[backscroll notice: message omitted (${size} bytes); timestamp=${message.timestamp.toISOString()}${message.threadTs ? ' thread=' + message.threadTs : ''} id=${message.id}; author=${quotedLabel(message.authorName)}${historyAvailable ? '; try fetch_history; follow nextCursor until this id is reached' : unavailable}]`;
     }
     const shownBytes = Buffer.byteLength(shown) + 1;
     if (bytes + shownBytes + reserved > maxBytes) break;
@@ -243,8 +247,8 @@ export class SlackMcplServer {
   private subscriptionsLoaded = false;
 
   /** Per-conversation ts of the newest message this peer has taken. Its
-   *  presence marks the peer's first interaction with the conversation as
-   *  done, so a new peer gets its own first-interaction backscroll. */
+   *  presence suppresses initial backscroll, including after ambient delivery.
+   *  A new peer starts without these accepted-delivery watermarks. */
   private forwardedWatermark = new Map<string, string>();
 
   /** Conversations the agent has unsubscribed from with unsubscribe_channel
@@ -1726,11 +1730,10 @@ export class SlackMcplServer {
       return;
     }
 
-    // First-interaction handling: when the very first message from this
-    // conversation for this peer is addressed, pull backscroll for context.
-    // A mention may also auto-subscribe the conversation, with a system note
-    // (below). Both are committed in taken(), once the host has the message
-    // that carries them.
+    // Fetch context for addressed delivery before any accepted delivery in
+    // this conversation for this peer. A rejected delivery can fetch again;
+    // an accepted ambient delivery suppresses later initial backscroll.
+    // Auto-subscription and the watermark commit only in taken() below.
     this.ensureSubscriptionsLoaded();
     const isFirstInteraction = !this.forwardedWatermark.has(msg.channelId);
     // The conversation's metadata is looked up at most once per message: the
@@ -1789,7 +1792,7 @@ export class SlackMcplServer {
     }
     if (backscroll.length > 0) {
       blocks.push(backscrollBlock(backscroll, { channelName: meta?.name, isDM: msg.isDM },
-        this.grant.has('tools') && this.grant.isFeatureSetActive(HISTORY_FEATURE_SET)));
+        !this.grant.has('tools') ? 'tools' : this.grant.isFeatureSetActive(HISTORY_FEATURE_SET)));
     }
     // Told with the first message the agent gets from here, addressed or not.
     // Counted as told only once the host has taken that message.

@@ -105,14 +105,14 @@ test('omission markers do not promise history access or whole oversized messages
   const defaultBlock = backscrollBlock(rows, {isDM: false});
   assert.doesNotMatch(defaultBlock, /fetch_history/);
   assert.match(defaultBlock, /backscroll notice: message omitted/);
-  assert.match(defaultBlock, /history unavailable until the host enables slack\.history/);
+  assert.match(defaultBlock, /history unavailable: missing host grant slack\.history/);
 });
 
 test('ungranted history omission notices explicitly name the missing host grant', () => {
   const rows = Array.from({length: 1000}, (_, i) => message(i + 1, 'x'.repeat(33000)));
   const block = backscrollBlock(rows, {isDM: false}, false);
-  assert.match(block, /older backscroll messages not shown; history unavailable until the host enables slack\.history/);
-  assert.match(block, /backscroll notice: message omitted.*history unavailable until the host enables slack\.history/);
+  assert.match(block, /older backscroll messages not shown; history unavailable: missing host grant slack\.history/);
+  assert.match(block, /backscroll notice: message omitted.*history unavailable: missing host grant slack\.history/);
   assert.doesNotMatch(block, /Ann: message omitted|try fetch_history/);
   assert.ok(Buffer.byteLength(block) <= 32768);
 });
@@ -140,4 +140,22 @@ test('backscroll limit accepts only whole values in range', (t) => {
     process.env.SLACK_BACKSCROLL_LIMIT = raw;
     assert.equal(server.backscrollLimit, Number(raw), raw);
   }
+});
+
+
+test('omission author is quoted once, matching normal name framing', () => {
+  const row = {...message(1, 'x'.repeat(33000)), authorName: 'Alice 😀'};
+  assert.equal(backscrollBlock([row], {isDM: true}, true),
+    '<backscroll dm="true" count="1">\n' +
+    '[backscroll notice: message omitted (33053 bytes); timestamp=1970-01-01T00:00:01.000Z id=1.000001; author="Alice 😀"; try fetch_history; follow nextCursor until this id is reached]\n' +
+    '</backscroll>');
+});
+
+test('missing tools grant is named in both omission marker forms', () => {
+  const rows = Array.from({length: 1000}, (_, i) => message(i + 1, 'x'.repeat(33000)));
+  const block = backscrollBlock(rows, {isDM: false}, 'tools');
+  assert.match(block, /older backscroll messages not shown; history unavailable: missing host grant tools/);
+  assert.match(block, /backscroll notice: message omitted.*; history unavailable: missing host grant tools/);
+  assert.doesNotMatch(block, /slack\.history|fetch_history|enables/);
+  assert.ok(Buffer.byteLength(block) <= 32768);
 });

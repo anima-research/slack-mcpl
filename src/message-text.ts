@@ -27,10 +27,17 @@ function normalized(value: string): string {
   let fence = '';
   let openedAt = -1;
   const parts = value.split(/(`+)/);
+  // Only closed fences have cosmetic edge breaks. Match in one linear pass.
+  const closed = new Set<number>();
+  for (let i = 1; i < parts.length; i += 2) {
+    if (!fence) { fence = parts[i]; openedAt = i; }
+    else if (parts[i] === fence) { closed.add(openedAt); fence = ''; }
+  }
+  fence = '';
   return parts.map((part, i) => {
     if (i % 2) { if (!fence) { fence = part; openedAt = i; } else if (part === fence) fence = ''; return part; }
     if (fence) {
-      if (fence.length < 3) return part;
+      if (fence.length < 3 || !closed.has(openedAt)) return part;
       if (i === openedAt + 1) part = part.replace(FENCE_START_BREAK, '');
       if (parts[i + 1] === fence) part = part.replace(FENCE_END_BREAK, '');
       return part;
@@ -106,18 +113,21 @@ export function renderMessageText(
   function join(values: Iterable<string>, separator = '\n', reuseLineBreak = false): string {
     const pieces: string[] = [];
     let length = 0;
-    let endsInBreak = false;
+    let last = '';
     for (const value of values) {
       if (!value) continue;
       // Only rich containers reuse a section's existing break. Never collapse
       // blank rows in ordinary body text or table joins. Inspect only the last
       // appended code unit, never the growing concatenation.
-      const part = (length && !(reuseLineBreak && endsInBreak) ? separator : '') + value;
+      // CR + LF across sections are two breaks, not a newly formed CRLF.
+      const reuse = reuseLineBreak && /[\n\r\u000b\u000c\u0085\u2028\u2029]/.test(last) &&
+        !(last === '\r' && value.startsWith('\n'));
+      const part = (length && !reuse ? separator : '') + value;
       const remaining = renderLimit - length;
       const piece = prefix(part, remaining);
       pieces.push(piece);
       length += piece.length;
-      endsInBreak = /[\n\r\u000b\u000c\u0085\u2028\u2029]/.test(piece.slice(-1));
+      last = piece.slice(-1);
       if (part.length > remaining) { truncated = true; break; }
     }
     return pieces.join('');

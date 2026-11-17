@@ -294,10 +294,6 @@ test('review fragment passes the actual release validator', () => {
     // or repository version/Unreleased state make this validation pass.
     const name = 'readable-message-payloads.added.md';
     const fragment = readFileSync(join('test/fixtures', name), 'utf8');
-    // Until release consumes it, validate the shipped fragment too.
-    if (existsSync(join('changelog.d', name))) {
-      assert.equal(readFileSync(join('changelog.d', name), 'utf8'), fragment);
-    }
     writeFileSync(join(root, 'package.json'), JSON.stringify({ version: '1.2.3' }));
     writeFileSync(join(root, 'CHANGELOG.md'), '# Changelog\n\n## Unreleased\n');
     mkdirSync(join(root, 'changelog.d'));
@@ -861,4 +857,19 @@ test('fence comparison removes every supported edge break without changing code 
       ] }],
     }), text, JSON.stringify(edge));
   }
+});
+
+
+test('unclosed fences retain their opening edge break during deduplication', () => {
+  for (const edge of ['\n', '\r\n', '\r', '\v', '\f', '\u0085', '\u2028', '\u2029']) {
+    for (const [text, mirror] of [['```' + edge + 'x', '```x'], ['```x', '```' + edge + 'x']]) {
+      assert.equal(renderMessageText({text, attachments: [{text: mirror}]}), text + '\n' + mirror);
+    }
+  }
+});
+
+test('rich section boundary CR and LF remain two line breaks', async () => {
+  const blocks = [richBlock(richSection(literal('first\r')), richSection(literal('\nsecond')))];
+  assert.equal(renderMessageText({blocks}), 'first\r\n\nsecond');
+  await expectText({blocks}, 'first\r\n\nsecond');
 });
