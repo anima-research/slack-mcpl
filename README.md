@@ -19,7 +19,7 @@ that grant arrives; plain MCP tool calls are unaffected.
 - **Channels**: every conversation the bot can act in, of each kind its token has the read scope for, is registered as an MCPL channel (`slack:<conversationId>`) when the host grants `channels.register`, and `refresh_channels` registers ones joined since. `channels/publish` posts in the thread of the last message from that conversation the host took, which can change while the agent is answering. Use [`reply_message` for an explicit thread](#reply-to-a-specific-thread).
 - **Real-time events** via Socket Mode — no public webhook URL needed, so the
   server can be spawned over stdio like any other MCPL server.
-- **Addressing model**: mentions (`<@bot>`) and DMs are always delivered;
+- **Addressing model**: mentions (`<@bot>`) and DMs bypass ambient subscriptions, subject to admission controls;
   ambient channel chatter flows only from subscribed conversations
   (auto-subscribe on first mention, opt out with `unsubscribe_channel`).
   With `SLACK_SUBSCRIBE_MEMBER_CHANNELS`, every conversation the bot is in is
@@ -354,10 +354,13 @@ native search or interaction-token handling are included.
 
 ### Readable message payloads
 
-History, threads, backscroll and human live messages keep Slack's original
-`text` first. Posts that carry `bot_id` are **not delivered live**; their bodies
-are available through `fetch_history` and `fetch_thread`; backscroll also includes
-other bots, but excludes this server's own bot posts.
+History, threads, backscroll and eligible live messages keep Slack's original
+`text` first. Posts that carry `bot_id` are dropped live by default;
+see [Bot message delivery](#bot-message-delivery) for opt-in admission.
+Their bodies remain available through `fetch_history` and `fetch_thread`; backscroll also includes
+other bots. Backscroll always excludes this server's own user ID; it also excludes
+its own bot ID when bot delivery is opted in. With `SLACK_BOT_MESSAGES` unset,
+legacy backscroll is preserved, including user-less own bot posts.
 
 In order, append each classic attachment's readable body (pretext, title with
 link, text, fields as `title: value`, else fallback), then that attachment's nested blocks, then top-level blocks.
@@ -483,20 +486,106 @@ Switches take `true`/`false` (also `1`/`0`, `yes`/`no`); any other value stops t
 |----------|----------|-------------|
 | `SLACK_BOT_TOKEN` | yes | Bot token (`xoxb-…`) for Web API calls |
 | `SLACK_APP_TOKEN` | yes | App-level token (`xapp-…`, `connections:write`) for Socket Mode |
+| `SLACK_BOT_MESSAGES` | no | Opt in to live messages from other bots: `all`, or comma-separated bot IDs/user IDs (e.g. `B012ABC,U034DEF`). Unset keeps the legacy bot-event filter; empty or invalid values stop startup. Known own identities are dropped (opt-in requires a user identity at startup). See [Bot message delivery](#bot-message-delivery). |
 | `SLACK_DM_USERS` | no | Comma-separated user-ID whitelist for DMs; others' DMs are dropped. It filters incoming DMs only, not group DMs, history reads or the conversation list. Set but naming no user is refused at startup |
-| `SLACK_SEND_CHANNELS` | no | Comma-separated conversation-ID allow-list for writes (send, upload, DM, edit, delete, reaction, and the host's `channels/publish`); writes elsewhere are refused before the call reaches Slack. Other conversations are registered `inbound`, `list_channels` shows `writable: false`, and the first message the agent gets from one, addressed or not, carries a read-only note. A mention there still reaches the agent; whether it wakes is the host's policy. `send_dm` is refused before a DM is opened, and not offered, unless the list names a DM. Set but empty is refused at startup; the effective list is logged |
-| `SLACK_SUBSCRIBE_MEMBER_CHANNELS` | no | `true` delivers ambient messages from every channel the bot is a member of, so inviting the bot is the subscription. `unsubscribe_channel` then mutes a conversation (`subscribe_channel` unmutes it) and `list_subscriptions` lists the muted ones. Takes `true` or `false` (also `1`/`0`, `yes`/`no`); unset is off, and any other value, empty included, stops startup |
+| `SLACK_SEND_CHANNELS` | no | Comma-separated conversation-ID allow-list for writes (send, upload, DM, edit, delete, reaction, and the host's `channels/publish`); writes elsewhere are refused before the call reaches Slack. Other conversations are registered `inbound`, `list_channels` shows `writable: false`, and the first message the agent gets from one, addressed or not, carries a read-only note. A mention from an admitted sender there still reaches the agent; whether it wakes is the host's policy. `send_dm` is refused before a DM is opened, and not offered, unless the list names a DM. Set but empty is refused at startup; the effective list is logged |
+| `SLACK_SUBSCRIBE_MEMBER_CHANNELS` | no | `true` delivers admitted ambient messages (subject to sender admission and DM controls) from every channel the bot is a member of, so inviting the bot is the subscription. `unsubscribe_channel` then mutes a conversation (`subscribe_channel` unmutes it) and `list_subscriptions` lists the muted ones. Takes `true` or `false` (also `1`/`0`, `yes`/`no`); unset is off, and any other value, empty included, stops startup |
 | `SLACK_DISABLE_DMS` | no | `true` drops incoming DMs and group DMs, refuses every write to them and both history reads on them, and leaves them out of `conversations.list`, so they are neither listed nor registered; `send_dm` is not offered. Only a conversation Slack confirms as a channel passes: a group DM ID looks like a channel ID, and a user ID posts into that user's DM. An unknown ID is asked about until Slack confirms it. One Slack won't describe is refused; when the question can't be answered just now (a rate limit, a failure on the way or on Slack's side, or too little of the call's time), nothing is written, and the error says why and that the call can be made again. Incoming events pass only when Slack marks them `channel` or `group`. Takes `true` or `false` (also `1`/`0`, `yes`/`no`); unset is off, and any other value, empty included, stops startup |
 | `SLACK_ACK_REACTION` | no | Emoji name (e.g. `eyes`) put on a message that addresses the bot. It means "received": it is removed at the bot's next post in that conversation that Slack confirms, after 10 minutes, or at once if the host does not accept the message. A removal that fails in a way that can pass (a rate limit, an HTTP error, a network failure, or Slack's own failure such as `internal_error`) is tried again every minute, up to 5 tries in all; one Slack refuses is dropped. An add that fails isn't tried again. One that may have landed is removed as usual: `already_reacted` says it's there, and Slack's failure while handling it (`internal_error`, `fatal_error`, `service_unavailable`), an HTTP error, an answer not in Slack's form or one the client can't read, or a failure in transit after the request may have reached Slack leaves it unknown. One Slack refused, rate-limited or received only in part (`request_timeout`), one whose connection was never made, and one this server refused itself, such as outside `SLACK_SEND_CHANNELS`, isn't there. On SIGTERM, SIGINT or the host closing stdin, pending reactions are removed (5 s at most); a crash cannot, so removal is best-effort. For a typing signal see **Typing** above. |
 | `SLACK_SUBSCRIPTIONS_FILE` | no | JSON file persisting ambient subscriptions across restarts: an array of IDs, or `{subscribed, muted}` while anything is muted (older versions read the object form as empty) |
 | `SLACK_BACKSCROLL_LIMIT` | no | Messages fetched for an addressed interaction before host acceptance when no accepted interaction has recorded a watermark (rejection can therefore discard fetched backscroll; an accepted ambient message prevents later initial backscroll; default 50; only decimal-digit integers in [1, 1,000] are accepted, otherwise falls back to 50); shown in a newest contiguous window within 32 KiB including framing, in-position omission placeholders and a leading summary for older messages that cannot fit |
 | `SLACK_MCPL_DEBUG_LOG` | no | Absolute path for a diagnostic file log |
 
+## Bot message delivery
+
+With `SLACK_BOT_MESSAGES` unset, tool descriptions, subscription results and
+notices, the feature-set manifest, startup logs, refresh guidance and registration
+retry behavior remain unchanged from before bot delivery was introduced. Admission-qualified guidance and the
+`chat:from-bot` ontology addition apply only when bot delivery is enabled.
+
+`SLACK_BOT_MESSAGES=all` admits other bots' live messages. For narrower
+admission, use an allow-list such as `SLACK_BOT_MESSAGES=B012ABC,U034DEF`:
+either the event's bot ID or its author user ID must match (`U…` and `W…`
+user IDs are accepted). A bot event without a user ID uses its bot ID as
+author ID, and Slack's username as its display name when supplied.
+For legacy/incoming-webhook posts, list the **bot ID** (`B…`), exposed by
+`fetch_history` as `authorBotId`; the member ID (`U…`) shown in Slack's UI
+does not match user-less events. List both IDs for apps that post both ways.
+With an ID allow-list, explicitly listed user or bot IDs pass even when
+`users.info` fails; unknown listed senders are conservatively marked as bot,
+never human. In opt-in modes, Slackbot (`USLACKBOT`) is always classified as
+a bot despite Slack reporting `is_bot: false`; list its user ID to admit it.
+Unlisted senders pass only after Slack verifies they are human.
+Verification is in memory only: after every restart, every unlisted sender
+starts unverified. All messages from unlisted senders not verified since startup,
+including mentions and DMs, are dropped throughout a `users.info` outage and
+for 30 seconds after each failed or inconclusive lookup. Rate limits instead
+honor Slack's Retry-After while cached. The 256-entry failure cache can evict
+any cooldown early, permitting an earlier retry and renewed warning. Permanent refusals stay negative until restart or
+eviction. Addressed drops log the sender ID and reason on stderr once per
+sender per cooldown (once per cached permanent refusal).
+A lookup not sent because a host call ran out of time creates no negative entry.
+For unlisted, unverified authors in list mode, mention names are resolved only
+after author admission; other lookups stay batched.
+Allow-list startup requires `users:read` when Slack reports token scopes;
+unknown scopes defer verification to lookups.
+Failures are never cached as human: non-abortable live/host lookups coalesce per user, with at most
+256 negative entries (oldest evicted). Verified humans pass without being listed.
+Abortable backscroll lookups can join live/host work but are not shared as owners,
+so concurrent backscroll and live lookups may send separate requests.
+Unset and `all` modes retain best-effort delivery when a lookup fails.
+Opt-in bot-delivery startup requires both authenticated self IDs so messages from this
+connector are dropped by user ID **or** bot ID, even if explicitly allowed.
+
+Admitted bot messages carry `chat:from-bot` (not `chat:from-human`) and a
+`[Slack source: bot]` text marker. Both delivery lanes expose `isBot` and,
+when available, `authorBotId` in metadata/origin. In `all` mode, user-only
+senders whose lookup fails or is inconclusive remain unknown: they are not
+verified human, but receive no bot tag without evidence of a bot. Delivery
+continues via the normal non-bot lane (`chat:from-human`); this tag is not proof
+of verified humanity. Known bots and explicit bot events still receive bot tags.
+For reliable user-only bot classification, grant `users:read` and reinstall the
+app in the workspace. In `all` mode, known missing scopes at startup or a `missing_scope`
+lookup refusal produce one operator warning per adapter, naming `users:read`.
+In `all` mode, permanent refusals remain cached until restart; in list mode,
+they can also be evicted from the bounded failure cache.
+Existing subscriptions, mention/DM wake
+policy, and DM controls still apply. Enabling this option alone does not
+subscribe to channels or grant access, but an admitted bot mention can auto-subscribe
+a channel under the existing first-interaction rules and can receive the
+configured acknowledgement reaction. For other ambient channel delivery,
+subscribe to the channel or enable `SLACK_SUBSCRIBE_MEMBER_CHANNELS`.
+
+**Loop risk:** self-filtering prevents reacting to this connector's own
+messages, not cycles between different bots. A bot mentioning another bot,
+or sending it a DM, can trigger a reply loop under the host's wake policy.
+Prefer an allow-list and configure host-side bot wake restrictions/rate
+limits before enabling this option. Unset it to restore the legacy filter:
+`bot_id` and `bot_message` events are dropped, but user-only bot events can pass.
+No bot-message startup status is printed when the option is unset; this is not a
+guarantee that every bot identity is excluded. The current suggested rules wake immediately on `chat:addressed`;
+hosts should restrict/rate-limit the `chat:addressed` + `chat:from-bot` pair.
+That pair alone does not cover user-only bots in `all` mode whose identity lookup
+fails or is inconclusive: they use `chat:from-human`. Use an allow-list or
+rate-limit addressed messages regardless of the bot tag to cover that case.
+An admitted ambient bot message can also change the last-taken thread used by
+`channels/publish` while an answer is being composed; use `reply_message` with
+an explicit target to avoid this.
+
+Edits (`chat.update`) are never delivered live: only the initial post is seen,
+including placeholders or initial CI status. Use `fetch_history` for the
+current channel state, or `fetch_thread` for a thread reply. This option does not filter history reads. In list mode their name
+lookups share verification state: failed author lookups show cached names or raw IDs; inconclusive answers retain any returned display name without verifying identity;
+mentions can retain a Slack-provided fallback label. These failures start that user's cooldown, which also affects live admission. Live original-text mention lookups share this same cache: a failed lookup for someone mentioned can start that person's admission cooldown before they send a message. Live delivery, backscroll and explicit history/thread tools use cached names or raw IDs for supplemental-only mentions without starting lookups.
+
 ## Tests
 
 ```bash
 npm test
 ```
+
+Bot delivery tests cover admission/self-filtering, startup parsing, and both
+live MCPL lanes, including attachment/block-only payloads from integrations.
 
 ## Contributing
 

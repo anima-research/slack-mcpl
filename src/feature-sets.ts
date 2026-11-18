@@ -53,7 +53,7 @@ export const SLACK_TAG_ONTOLOGY: TagOntology = {
   open: true,
 };
 
-export function buildFeatureSets(): Record<string, FeatureSetDeclaration> {
+export function buildFeatureSets(botDelivery = false): Record<string, FeatureSetDeclaration> {
   const messagingUses: CapabilityPath[] = [
     'tools',
     'channels.register',
@@ -70,7 +70,8 @@ export function buildFeatureSets(): Record<string, FeatureSetDeclaration> {
       // §8.1: what this server sent since a checkpoint can be undone
       // (state/rollback deletes the bot's own messages and uploaded files).
       rollback: true,
-      tagOntology: SLACK_TAG_ONTOLOGY,
+      tagOntology: botDelivery ? { ...SLACK_TAG_ONTOLOGY, coreTags: SLACK_TAG_ONTOLOGY.coreTags!.flatMap(tag =>
+        tag === 'chat:from-human' ? [tag, 'chat:from-bot'] : [tag]) } : SLACK_TAG_ONTOLOGY,
     },
     [TYPING_FEATURE_SET]: {
       description: 'Show typing as a status on a pending addressed thread',
@@ -84,13 +85,14 @@ export function buildFeatureSets(): Record<string, FeatureSetDeclaration> {
       description:
         'Manage per-conversation ambient-message subscriptions (which conversations ' +
         'deliver non-mention messages for passive awareness). Mentions and DMs are ' +
-        'always delivered and are not affected by subscriptions.',
+        (botDelivery ? 'not affected by subscriptions; admission controls still apply.' :
+          'always delivered and are not affected by subscriptions.'),
       uses: ['tools'],
     },
   };
 }
 
-export function buildServerCapabilities(): McplManifest {
+export function buildServerCapabilities(botDelivery = false): McplManifest {
   return {
     version: '0.5',
     pushEvents: true,
@@ -101,7 +103,7 @@ export function buildServerCapabilities(): McplManifest {
       incoming: true,
       typing: true,
     },
-    featureSets: buildFeatureSets(),
+    featureSets: buildFeatureSets(botDelivery),
   };
 }
 

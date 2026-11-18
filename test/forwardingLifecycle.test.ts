@@ -470,8 +470,8 @@ test("an agent's unsubscribe holds across reconnects: a new peer's first mention
     f.emit('112.1');
     f.emit('112.2', 'C1', { mentionsBot: false, mentionIds: [] });
     await until(() => next.deliveries().length > 0, 'the new peer\'s mention');
-    await settle();
-    assert.equal(next.deliveries().length, 1, 'the ambient message is still dropped');
+    await (f.server as any).forwarding.get('C1');
+    assert.equal(next.deliveries().length, 1, 'the completed ambient message was dropped');
     const text = pushText(next.deliveries()[0]);
     assert.match(text, /<backscroll/, 'the new peer\'s own first interaction');
     assert.doesNotMatch(text, /Auto-subscribed/);
