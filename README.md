@@ -19,10 +19,10 @@ that grant arrives; plain MCP tool calls are unaffected.
 - **Channels**: every conversation the bot can act in, of each kind its token has the read scope for, is registered as an MCPL channel (`slack:<conversationId>`) when the host grants `channels.register`, and `refresh_channels` registers ones joined since. `channels/publish` posts in the thread of the last message from that conversation the host took, which can change while the agent is answering. Use [`reply_message` for an explicit thread](#reply-to-a-specific-thread).
 - **Real-time events** via Socket Mode — no public webhook URL needed, so the
   server can be spawned over stdio like any other MCPL server.
-- **Addressing model**: mentions (`<@bot>`) and DMs are always delivered;
+- **Addressing model**: mentions (`<@bot>`) and DMs bypass subscription filtering, but still require access admission and successful delivery;
   ambient channel chatter flows only from subscribed conversations
   (auto-subscribe on first mention, opt out with `unsubscribe_channel`).
-  With `SLACK_SUBSCRIBE_MEMBER_CHANNELS`, every conversation the bot is in is
+  With `SLACK_SUBSCRIBE_MEMBER_CHANNELS`, each admitted, discovered conversation the bot is in is
   subscribed and `unsubscribe_channel` mutes one instead.
   Events carry MCPL RFC-001 `chat:*` tags for host-side wake gating.
 - **Threads**: incoming thread replies carry `threadId`; `reply_message`
@@ -49,18 +49,19 @@ that grant arrives; plain MCP tool calls are unaffected.
   hosts sending only that shape clear via post, disconnect, shutdown or expiry.
   Successful statuses refresh at most once a minute; Slack expires them
   after 2 minutes. Lasting API refusals disable status in that conversation
-  until the peer changes, except `invalid_thread_ts`, which disables it in
+  until the peer changes (ordinary local policy exclusions do not latch; missing reported grants and lasting Slack metadata refusals latch starts/refreshes, not explicit clears, which still require fresh admission), except `invalid_thread_ts`, which disables it in
   that thread only; transient failures may retry on the next refresh,
   including a conversation check rate-limited without usable Retry-After.
   Policy-reduction clears run independently of the policy request's time
   budget, even when it queued behind another request.
-  A failed clear is not retried: that status stays until Slack expires it
+  An attempted clear is not retried (with policy, a failed admission retains
+  ownership for a later authorized clear): that status stays until Slack expires it
   or the bot replies in that thread, unless a later status there replaces
   it.
   This uses `assistant.threads.setStatus` with `chat:write`;
   Slack recommends migrating to
   [`agents.sessions.setStatus`](https://docs.slack.dev/reference/methods/agents.sessions.setStatus/).
-- **Attachments**: incoming files are forwarded as refs and fetched on demand
+- **Attachments**: without an access policy, incoming files are forwarded as refs and fetched on demand
   via `fetch_attachment`, which is auth-locked to `files.slack.com` (the bot
   token is never sent to any other host) and size-capped at 5MB. A download
   that takes longer than 10 seconds fails, and can be called again.
@@ -251,7 +252,7 @@ it a complete thread search. Use `fetch_thread(channelId, threadTs)` for one
 known root. No automatic thread expansion or workspace search occurs.
 
 Both tools return `messages`, each with `id`, `author`, `timestamp`, `content`,
-optional `threadTs` and attachment hints, as before, and add:
+optional `threadTs` and (without a policy) attachment hints, as before, and add:
 
 - `authorId` when Slack supplies a user ID, and `authorBotId` when supplied.
   Authors' and mentioned users' names are looked up as before, and an author
@@ -359,14 +360,26 @@ Switches take `true`/`false` (also `1`/`0`, `yes`/`no`); any other value stops t
 |----------|----------|-------------|
 | `SLACK_BOT_TOKEN` | yes | Bot token (`xoxb-…`) for Web API calls |
 | `SLACK_APP_TOKEN` | yes | App-level token (`xapp-…`, `connections:write`) for Socket Mode |
-| `SLACK_DM_USERS` | no | Comma-separated user-ID whitelist for DMs; others' DMs are dropped. It filters incoming DMs only, not group DMs, history reads or the conversation list. Set but naming no user is refused at startup |
-| `SLACK_SEND_CHANNELS` | no | Comma-separated conversation-ID allow-list for writes (send, upload, DM, edit, delete, reaction, and the host's `channels/publish`); writes elsewhere are refused before the call reaches Slack. Other conversations are registered `inbound`, `list_channels` shows `writable: false`, and the first message the agent gets from one, addressed or not, carries a read-only note. A mention there still reaches the agent; whether it wakes is the host's policy. `send_dm` is refused before a DM is opened, and not offered, unless the list names a DM. Set but empty is refused at startup; the effective list is logged |
+| `SLACK_DM_USERS` | no | Comma-separated user-ID whitelist for DMs; others' DMs are dropped. Without an access policy it filters incoming DMs only, not group DMs, history reads or the conversation list. Set but naming no user is refused at startup |
+| `SLACK_SEND_CHANNELS` | no | Comma-separated conversation-ID allow-list for writes (send, upload, DM, edit, delete, reaction, and the host's `channels/publish`); writes elsewhere are refused before the call reaches Slack. Other conversations are registered `inbound`, `list_channels` shows `writable: false`, and the first message the agent gets from one, addressed or not, carries a read-only note. A mention there still reaches the agent; whether it wakes is the host's policy. `send_dm` is refused before a DM is opened, and not offered, unless the list names a DM. In policy mode, Slack must first open the DM to return its exact ID; if that ID fails admission, the error reports the opened DM and that nothing was posted. Set but empty is refused at startup; the effective list is logged |
 | `SLACK_SUBSCRIBE_MEMBER_CHANNELS` | no | `true` delivers ambient messages from every channel the bot is a member of, so inviting the bot is the subscription. `unsubscribe_channel` then mutes a conversation (`subscribe_channel` unmutes it) and `list_subscriptions` lists the muted ones. Takes `true` or `false` (also `1`/`0`, `yes`/`no`); unset is off, and any other value, empty included, stops startup |
 | `SLACK_DISABLE_DMS` | no | `true` drops incoming DMs and group DMs, refuses every write to them and both history reads on them, and leaves them out of `conversations.list`, so they are neither listed nor registered; `send_dm` is not offered. Only a conversation Slack confirms as a channel passes: a group DM ID looks like a channel ID, and a user ID posts into that user's DM. An unknown ID is asked about until Slack confirms it. One Slack won't describe is refused; when the question can't be answered just now (a rate limit, a failure on the way or on Slack's side, or too little of the call's time), nothing is written, and the error says why and that the call can be made again. Incoming events pass only when Slack marks them `channel` or `group`. Takes `true` or `false` (also `1`/`0`, `yes`/`no`); unset is off, and any other value, empty included, stops startup |
-| `SLACK_ACK_REACTION` | no | Emoji name (e.g. `eyes`) put on a message that addresses the bot. It means "received": it is removed at the bot's next post in that conversation that Slack confirms, after 10 minutes, or at once if the host does not accept the message. A removal that fails in a way that can pass (a rate limit, an HTTP error, a network failure, or Slack's own failure such as `internal_error`) is tried again every minute, up to 5 tries in all; one Slack refuses is dropped. An add that fails isn't tried again. One that may have landed is removed as usual: `already_reacted` says it's there, and Slack's failure while handling it (`internal_error`, `fatal_error`, `service_unavailable`), an HTTP error, an answer not in Slack's form or one the client can't read, or a failure in transit after the request may have reached Slack leaves it unknown. One Slack refused, rate-limited or received only in part (`request_timeout`), one whose connection was never made, and one this server refused itself, such as outside `SLACK_SEND_CHANNELS`, isn't there. On SIGTERM, SIGINT or the host closing stdin, pending reactions are removed (5 s at most); a crash cannot, so removal is best-effort. For a typing signal see **Typing** above. |
+| `SLACK_ACK_REACTION` | no | Emoji name (e.g. `eyes`) put on a message that addresses the bot. It means "received": it is removed at the bot's next post in that conversation that Slack confirms, after 10 minutes, or cleanup is requested at once if the host does not accept the message. Under a policy, adding it needs fresh write admission and reactions:write; cleanup also needs admission and may leave the reaction visible if refused. A removal that fails in a way that can pass (a rate limit, an HTTP error, a network failure, or Slack's own failure such as `internal_error`) is tried again every minute, up to 5 tries in all; one Slack refuses is dropped. An add that fails isn't tried again. One that may have landed is removed as usual: `already_reacted` says it's there, and Slack's failure while handling it (`internal_error`, `fatal_error`, `service_unavailable`), an HTTP error, an answer not in Slack's form or one the client can't read, or a failure in transit after the request may have reached Slack leaves it unknown. One Slack refused, rate-limited or received only in part (`request_timeout`), one whose connection was never made, and one this server refused itself, such as outside `SLACK_SEND_CHANNELS`, isn't there. On SIGTERM, SIGINT or the host closing stdin, pending reactions are removed (5 s at most); a crash cannot, so removal is best-effort. For a typing signal see **Typing** above. |
 | `SLACK_SUBSCRIPTIONS_FILE` | no | JSON file persisting ambient subscriptions across restarts: an array of IDs, or `{subscribed, muted}` while anything is muted (older versions read the object form as empty) |
 | `SLACK_BACKSCROLL_LIMIT` | no | Messages fetched on first interaction with a conversation (default 50) |
 | `SLACK_MCPL_DEBUG_LOG` | no | Absolute path for a diagnostic file log |
+
+### Access-policy composition (internal; not yet configurable)
+
+When an access policy is installed, DM admission is an **intersection**, never
+an override: the peer must be in the policy's `dmUsers`, `SLACK_DISABLE_DMS`
+must be off, and, if set, `SLACK_DM_USERS` must include that peer. This applies
+to listing/registration, metadata, history, inbound delivery, `send_dm`, and
+all DM writes/effects. A peer allowed by only one list is refused; disjoint
+lists admit no DMs. Writes additionally intersect `SLACK_SEND_CHANNELS`.
+Group DMs remain unsupported under policy. Without a policy, the legacy
+switch behavior above is unchanged (including the incoming-only user filter).
+No environment setting installs an access policy in this release.
 
 ## Tests
 
@@ -392,3 +405,17 @@ The MCPL 0.5 policy handshake (`src/grant.ts`, `src/errors.ts`, and the
 `src/grant.ts`, which is itself protocol-generic — no Zulip-specific logic —
 built on `@animalabs/mcpl-core`'s `grantFromUpdate`/`capabilityGranted`/
 `deriveFeatureSets`.
+
+With an explicit policy, delivery runs one final fresh admission before committing
+headers, subscriptions or routing; preliminary subscription and first-interaction
+checks can occur earlier. The result supplies the label without awaiting DM names.
+Rate limits receive at most two retries with a combined two-second retry-wait
+budget. Delivery waits five seconds, not a cancellation deadline for the underlying
+request or its retries. A classified rate-limit, transport or Slack-service failure
+within that wait can retain initial admission only when no lasting refusal or grant
+withdrawal is known. Missing/unverified results, unclassified errors, lasting refusals,
+shutdown and expiry of the five-second wait drop the event and request ACK cleanup; fresh write admission may refuse cleanup and leave the reaction visible.
+Optional backscroll failure omits context; its lasting admission refusal vetoes
+transient fallback. A successful final admission may establish recovered access.
+Unset-policy delivery is unchanged at this layer.
+

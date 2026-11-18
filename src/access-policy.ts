@@ -54,7 +54,7 @@ const ALLOWED_KEYS = new Set(REQUIRED_KEYS);
  * Snapshot before validating to retain the values checked. This is not a sandbox
  * for hostile JavaScript objects, accessors, proxies or iterators. */
 export function parseAccessPolicy(value: unknown): SlackAccessPolicyConfig {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid Slack access policy: expected an object');
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid Slack access policy');
   const config = value as Record<string, unknown>;
   const keys = new Set(Reflect.ownKeys(config));
   if ([...REQUIRED_KEYS].some((key) => !keys.has(key))
@@ -68,8 +68,57 @@ export function parseAccessPolicy(value: unknown): SlackAccessPolicyConfig {
   return Object.freeze({ readJoinedChannels, writeChannels: Object.freeze(channels), dmUsers: Object.freeze(users) });
 }
 
-/** Pure decisions over trusted host-supplied metadata: no Slack calls or cached membership.
- * Snapshots provide consistency, not isolation from hostile JavaScript inputs. */
+export class SlackAccessDenied extends Error {
+  override name = 'SlackAccessDenied';
+  constructor(message: string, options?: ErrorOptions, readonly authoritative = true) { super(message, options); }
+}
+
+/** Invalid caller input, distinct from host-owned access restrictions. */
+export class SlackAccessInputError extends Error { override name = 'SlackAccessInputError'; }
+
+/** A missing reported grant is lasting until installation or scope evidence changes. */
+export class SlackAccessGrantDenied extends SlackAccessDenied {}
+
+const accessContexts = new WeakMap<object, string>();
+const accessContextOriginals = new WeakMap<object, string>();
+/** At a new client occurrence, discard even context on rethrown local wrappers. */
+export function accessContextOriginalMessage(err: object): string | undefined {
+  return accessContextOriginals.get(err);
+}
+/** Context also survives frozen client errors without replacing their identity. */
+export function accessContextMessage(err: unknown): string | undefined {
+  return err !== null && typeof err === 'object' ? accessContexts.get(err) : undefined;
+}
+/** Add operation context while preserving Slack's error code and original cause. */
+export async function withAccessContext<T>(notDone: string, run: () => Promise<T>): Promise<T> {
+  try { return await run(); }
+  catch (err) {
+    // Identity carries effect/request provenance; never clone an error here.
+    const failure = err !== null && typeof err === 'object' ? err : new Error('Slack request failed', { cause: err });
+    if (!accessContextOriginals.has(failure)) accessContextOriginals.set(failure, (failure as Error).message ?? 'Slack request failed');
+    const contextual = accessContexts.has(failure);
+    const text = accessContexts.get(failure) ?? (failure as Error).message ?? 'Slack request failed';
+    const alreadyPrefixed = text.startsWith(`${notDone}:`);
+    const remedy = contextual || alreadyPrefixed ? ''
+      : err instanceof SlackAccessDenied
+        ? err.authoritative
+          ? '. Retrying unchanged will not help; ask whoever runs this host to check access for this operation.'
+          : '. Retry once for fresh evidence; if it persists, ask whoever runs this host to investigate access.'
+        : '';
+    const message = `${alreadyPrefixed ? '' : `${notDone}: `}${text}${remedy}`;
+    accessContexts.set(failure, message);
+    try { Object.defineProperty(failure, 'message', { value: message, configurable: true, writable: true }); }
+    catch { /* Frozen errors still carry context out-of-band and keep identity. */ }
+    throw failure;
+  }
+}
+
+/** Pure decisions over trusted host metadata: no Slack calls or cached membership.
+ * Snapshots provide consistency, not isolation from hostile JavaScript inputs.
+ * The user directory is outside this policy's confinement: find_user is gated
+ * only on users:read and searches the whole workspace directory, not just
+ * admitted DM peers or conversation members. Directory filtering remains a
+ * decision for the later activation PR. */
 export class SlackAccessPolicy {
   private readonly writeChannels: ReadonlySet<string>;
   private readonly dmUsers: ReadonlySet<string>;
@@ -82,6 +131,11 @@ export class SlackAccessPolicy {
     this.readJoinedChannels = parsed.readJoinedChannels;
   }
 
+  /** Cheap veto only; fresh metadata still decides admission. */
+  mayRead(channelId: string): boolean {
+    return channelId.startsWith('D') ? this.dmsWritable : this.readJoinedChannels;
+  }
+
   get dmsWritable(): boolean { return this.dmUsers.size > 0; }
 
   /** A synchronous configuration hint, never an authorization decision. */
@@ -91,43 +145,52 @@ export class SlackAccessPolicy {
 
   requireScope(scopes: readonly string[] | undefined, needed: string): void {
     scopes = Array.isArray(scopes) ? Array.from(scopes) : scopes;
-    if (!Array.isArray(scopes) || !scopes.every((scope) => typeof scope === 'string')) throw new Error(`Slack scope metadata is unavailable or malformed; requires granted scope evidence for ${rejectedValue(needed)}; supply a string array of Slack-reported grants`);
-    if (!scopes.includes(needed)) throw new Error(`Slack access requires granted scope ${rejectedValue(needed)}`);
+    if (!Array.isArray(scopes) || !scopes.every(scope => typeof scope === 'string')) throw new Error(`Slack scope metadata is unavailable or malformed; requires granted scope evidence for ${rejectedValue(needed)}; ask whoever runs this host to refresh Slack-reported permission evidence with list_channels or restart`);
+    if (!scopes.includes(needed)) throw new SlackAccessGrantDenied(`Slack access requires granted scope ${rejectedValue(needed)}`);
   }
+
+  mayDmUser(userId: string): boolean { return this.dmUsers.has(userId); }
 
   requireDmUser(userId: string): void {
-    if (!this.dmUsers.has(userId)) throw new Error(`Direct messages with ${rejectedValue(userId)} are not allowed by the Slack access policy dmUsers`);
+    if (!USER_ID.test(userId)) throw new SlackAccessInputError(`Invalid Slack user ID ${rejectedValue(userId)}; use find_user to choose a user`);
+    if (!this.mayDmUser(userId)) throw new SlackAccessDenied(`Direct messages with ${rejectedValue(userId)} are not allowed by the Slack access policy for allowed DM peers`);
   }
 
-  /** The caller must supply fresh, exact metadata. Checks metadata read scope only;
-   * callers must separately require the history scope before reading messages. Group DMs are unsupported. */
-  requireReadable(channelId: string, conversation: AccessConversation | undefined, scopes: readonly string[] | undefined): 'channel' | 'private_channel' | 'dm' {
-    if (!conversation) throw new Error(`Conversation ${rejectedValue(channelId)} has missing metadata`);
+  /** Conversation evidence only: no mutable grant state or known-refusal inputs. */
+  requireReadableMetadata(channelId: string, conversation: AccessConversation | undefined): 'channel' | 'private_channel' | 'dm' {
+    if (!conversation) throw new SlackAccessDenied(`Conversation ${rejectedValue(channelId)} has missing metadata`, undefined, false);
     conversation = Object.assign(Object.create(null), conversation) as AccessConversation;
-    if (typeof channelId !== 'string' || typeof conversation.id !== 'string' || conversation.id !== channelId) throw new Error(`Conversation ${rejectedValue(channelId)} has mismatched identity metadata`);
-    if (conversation.is_mpim === true) throw new Error('Group direct messages are unsupported in this version');
+    if (typeof channelId !== 'string' || typeof conversation.id !== 'string' || conversation.id !== channelId) throw new SlackAccessDenied(`Conversation ${rejectedValue(channelId)} has mismatched identity metadata`, undefined, false);
+    if (conversation?.is_mpim === true) throw new SlackAccessDenied('Group direct messages are unsupported in this version');
     if (conversation.is_im === true) {
       if ((conversation.is_mpim !== undefined && conversation.is_mpim !== false)
-          || !DM_ID.test(channelId) || (typeof conversation.user !== 'string' || !USER_ID.test(conversation.user))) throw new Error(`Conversation ${rejectedValue(channelId)} has invalid DM metadata (expected D-prefixed id, U/W-prefixed user, is_im:true and is_mpim:false or absent)`);
-      this.requireScope(scopes, 'im:read');
-      this.requireDmUser(conversation.user);
+          || !DM_ID.test(channelId) || (typeof conversation.user !== 'string' || !USER_ID.test(conversation.user))) throw new SlackAccessDenied(`Conversation ${rejectedValue(channelId)} has invalid DM metadata (direct-message identity or kind could not be verified)`, undefined, false);
+      if (!this.mayDmUser(conversation.user)) throw new SlackAccessDenied(`Conversation ${rejectedValue(channelId)} is not an admitted direct message`);
       return 'dm';
     }
+    if (conversation.is_member === false) throw new SlackAccessDenied(`The bot is not in conversation ${rejectedValue(channelId)}; a member can invite it with /invite, then access must be checked again`);
     if (conversation.is_im !== false || conversation.is_mpim !== false || typeof conversation.is_private !== 'boolean'
         || !CHANNEL_ID.test(channelId)) {
-      throw new Error(`Conversation ${rejectedValue(channelId)} has invalid channel metadata (expected C/G-prefixed id, is_im:false, is_mpim:false and boolean is_private)`);
+      throw new SlackAccessDenied(`Conversation ${rejectedValue(channelId)} has invalid channel metadata (conversation identity or kind could not be verified)`, undefined, false);
     }
-    if (conversation.is_member !== true) throw new Error(`Conversation ${rejectedValue(channelId)} is not a confirmed joined channel`);
-    if (!this.readJoinedChannels) throw new Error('Joined-channel reads are disabled by the Slack access policy readJoinedChannels');
-    this.requireScope(scopes, conversation.is_private ? 'groups:read' : 'channels:read');
+    if (conversation.is_member !== true) throw new SlackAccessDenied(`Conversation ${rejectedValue(channelId)} is not a confirmed joined channel`, undefined, false);
+    if (!this.readJoinedChannels) throw new SlackAccessDenied('Joined-channel reads are disabled by the Slack access policy for joined-conversation reads');
     return conversation.is_private ? 'private_channel' : 'channel';
+  }
+
+  /** Fresh exact metadata and current grants are independent evidence. History
+   * scopes are checked separately by callers. Group DMs are unsupported. */
+  requireReadable(channelId: string, conversation: AccessConversation | undefined, scopes: readonly string[] | undefined): 'channel' | 'private_channel' | 'dm' {
+    const kind = this.requireReadableMetadata(channelId, conversation);
+    this.requireScope(scopes, kind === 'dm' ? 'im:read' : kind === 'private_channel' ? 'groups:read' : 'channels:read');
+    return kind;
   }
 
   requireWritable(channelId: string, conversation: AccessConversation | undefined, scopes: readonly string[] | undefined, writeScope: string): void {
     if (!['chat:write', 'files:write', 'reactions:write'].includes(writeScope)) throw new Error(`Unsupported Slack write scope ${rejectedValue(writeScope)}; expected chat:write, files:write or reactions:write`);
     scopes = Array.isArray(scopes) ? Array.from(scopes) : scopes;
     const kind = this.requireReadable(channelId, conversation, scopes);
-    if (kind !== 'dm' && !this.writeChannels.has(channelId)) throw new Error(`Writing to ${rejectedValue(channelId)} is not allowed by the Slack access policy writeChannels`);
+    if (kind !== 'dm' && !this.writeChannels.has(channelId)) throw new SlackAccessDenied(`Writing to ${rejectedValue(channelId)} is not allowed by the Slack access policy for write destinations`);
     this.requireScope(scopes, writeScope);
   }
 }

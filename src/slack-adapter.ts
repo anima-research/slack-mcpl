@@ -24,6 +24,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { WebClient, ErrorCode, LogLevel, type Logger, type WebAPICallResult, type WebClientOptions } from '@slack/web-api';
 import { SocketModeClient } from '@slack/socket-mode';
 import { clock } from './clock.js';
+import { SlackAccessDenied, SlackAccessGrantDenied, SlackAccessInputError, accessContextOriginalMessage, withAccessContext, type SlackAccessPolicy } from './access-policy.js';
 import { NOTHING_RETURNED, SLACK_TS, readBounded, readOptions, type HistoryReadResult, type ReadStop } from './history-read.js';
 import {
   formatSlackText,
@@ -58,6 +59,115 @@ const STATUS_THREAD_REFUSALS = new Set(['invalid_thread_ts']);
 /** This adapter confirmed a DM or a conversation it cannot treat as a channel. */
 class ChannelOnlyRefusal extends Error {}
 
+/** Failure before an effect's authorization boundary, including embedded clients. */
+const accessAdmissionFailures = new WeakSet<object>();
+export function failedAccessAdmission(err: unknown): boolean {
+  return errorChain(err).some(value => accessAdmissionFailures.has(value));
+}
+
+/** Bounded cause traversal; wrappers retain per-occurrence request provenance. */
+function errorChain(err: unknown): object[] {
+  const chain: object[] = [];
+  while (err !== null && typeof err === 'object' && chain.length < 16 && !chain.includes(err)) {
+    chain.push(err);
+    if (clientErrorSources.has(err)) break; // The cause belongs to an earlier/client occurrence.
+    err = (err as { cause?: unknown }).cause;
+  }
+  return chain;
+}
+
+/** Raw client errors are reusable, even when frozen or rethrown by an embedder.
+ * Only a fresh occurrence may acquire admission, context or effect marks. */
+// Only the client request boundary advances this clock. All observations,
+// positive or negative, retain the producing request's issue serial.
+let observationSerial = 0;
+const responseIssued = new WeakMap<object, number>();
+const clientErrorSources = new WeakMap<object, object>();
+function clientErrorOccurrence(err: object, method: string): object {
+  let source = err;
+  while (clientErrorSources.has(source)) source = clientErrorSources.get(source)!;
+  // Read source accessors with their branded receiver (DOMException/private
+  // fields), but keep all per-call annotations on a fresh carrier.
+  const target = Object.create(source instanceof OutOfCallTime && source.method !== method ? Error.prototype : Object.getPrototypeOf(source));
+  Object.defineProperties(target, {
+    message: { value: accessContextOriginalMessage(source) ?? (source as Error).message ?? 'Slack request failed', writable: true, configurable: true },
+    cause: { value: source, configurable: true },
+  });
+  const failure = new Proxy(target, {
+    get(target, key, receiver) {
+      return Object.hasOwn(target, key) ? Reflect.get(target, key, receiver) : Reflect.get(source, key, source);
+    },
+  });
+  clientErrorSources.set(failure, source);
+  failedRequests.set(failure, method);
+  return failure;
+}
+
+/** A lazy view keeps supported injected-client method replacements observable.
+ * No client object/error is mutated. Local policy errors keep their identity
+ * after this boundary, so nested contexts and rollback share one occurrence. */
+function isolateClientErrors(web: SlackWebLike, enabled: () => boolean, observe: (method: string, args: unknown[], answer: unknown, error: boolean, issued: number) => void): SlackWebLike {
+  const views = new WeakMap<object, Map<string, object>>();
+  const view = (source: object, path: string): object => {
+    let paths = views.get(source);
+    if (!paths) views.set(source, paths = new Map());
+    let proxy = paths.get(path);
+    if (proxy) return proxy;
+    // An empty target also permits frozen client namespaces: wrapping a frozen
+    // method directly on its source would violate Proxy get invariants.
+    proxy = new Proxy({}, {
+      get(_target, key) {
+        const value = Reflect.get(source, key, source);
+        const method = path ? `${path}.${String(key)}` : String(key);
+        if (typeof value === 'function') return async (...args: unknown[]) => {
+          const issued = ++observationSerial;
+          let result: unknown;
+          try { result = await Reflect.apply(value, source, args); }
+          catch (err) {
+            if (!enabled()) throw err;
+            const failure = clientErrorOccurrence(err !== null && typeof err === 'object' ? err : new Error('Slack client rejected without an error', { cause: err }), method);
+            observe(method, args, failure, true, issued);
+            throw failure;
+          }
+          if (!enabled()) return result;
+          // A fresh carrier also isolates reused/frozen response objects. Request
+          // provenance belongs to this occurrence, never to client-owned data.
+          if (result !== null && typeof result === 'object') {
+            result = new Proxy(result, {});
+            responseIssued.set(result as object, issued);
+          }
+          observe(method, args, result, false, issued);
+          return result;
+        };
+        return value !== null && typeof value === 'object' ? view(value, method) : value;
+      },
+      // Preserve test/embedding method replacement through the adapter view.
+      set(_target, key, value) { return Reflect.set(source, key, value); },
+      deleteProperty(_target, key) { return Reflect.deleteProperty(source, key); },
+      defineProperty(_target, key, descriptor) { return Reflect.defineProperty(source, key, descriptor); },
+      getOwnPropertyDescriptor(_target, key) {
+        const descriptor = Reflect.getOwnPropertyDescriptor(source, key);
+        return descriptor && { ...descriptor, configurable: true };
+      },
+      ownKeys() { return Reflect.ownKeys(source); },
+    });
+    paths.set(path, proxy);
+    return proxy;
+  };
+  return view(web, '') as SlackWebLike;
+}
+
+/** Content-free policy diagnostics: never log Slack payloads, text or stacks. */
+export function policyFailureSummary(err: unknown): string {
+  const code = slackRefusal(err);
+  if (code) return `Slack refusal ${code.slice(0, 64)}`;
+  if (err instanceof NoReadableConversations) return 'no readable conversation grants; ask the host to grant read scopes and reinstall';
+  if (err instanceof SlackAccessDenied) return err.authoritative ? 'access refused' : 'access evidence unavailable';
+  const kind = (err as { code?: unknown } | null)?.code;
+  return [ErrorCode.RateLimitedError, ErrorCode.RequestError, ErrorCode.HTTPError].includes(kind as ErrorCode)
+    ? String(kind) : 'Slack operation failed; outcome may be unknown';
+}
+
 /** Slack's code, when Slack refused the call; undefined for any other error,
  *  an answer with no code in Slack's form (SLACK_CODE) included. */
 export function slackRefusal(err: unknown): string | undefined {
@@ -70,6 +180,7 @@ export function slackRefusal(err: unknown): string | undefined {
  *  same way again: a refusal that isn't Slack's own failure (SLACK_FAILED), so
  *  one waitToAskAgain gives no wait. */
 export function refusedForGood(err: unknown): boolean {
+  if (err instanceof SlackAccessDenied) return err.authoritative;
   const code = slackRefusal(err);
   return code !== undefined && !SLACK_FAILED.has(code);
 }
@@ -126,11 +237,11 @@ const andList = (items: string[]): string =>
  *  every response, naming the token's scopes, and the client splits it on
  *  commas, so a blank header comes back as ['']. A blank or empty list is read
  *  as a header that didn't come through, not as a token without scopes. */
-function reportedScopes(metadata: unknown): string[] | undefined {
+function reportedScopes(metadata: unknown, policy = false): string[] | undefined {
   const scopes = (metadata as { scopes?: unknown } | null | undefined)?.scopes;
   if (!Array.isArray(scopes) || !scopes.every((scope) => typeof scope === 'string')) return undefined;
-  const named = scopes.filter((scope) => scope !== '');
-  return named.length > 0 ? named : undefined;
+  const named = policy ? scopes.map(scope => scope.trim()).filter(Boolean) : scopes.filter((scope) => scope !== '');
+  return policy || named.length > 0 ? named : undefined;
 }
 
 /** A listing's conversations, and the enabled types it left out because the
@@ -138,6 +249,8 @@ function reportedScopes(metadata: unknown): string[] | undefined {
 export interface SlackListing {
   conversations: SlackConversationInfo[];
   leftOut: string[];
+  /** Background candidates skipped because fresh admission failed. */
+  admissionFailures?: number;
 }
 
 /** What a listing's answer says of the types it left out, or '' when it left
@@ -443,7 +556,7 @@ const failedRequests = new WeakMap<object, string>();
  *  of SlackWebClient's threw. */
 export function failedRequest(err: unknown): string | undefined {
   if (err instanceof OutOfCallTime) return err.method;
-  return err !== null && typeof err === 'object' ? failedRequests.get(err) : undefined;
+  return errorChain(err).map(value => failedRequests.get(value)).find(method => method !== undefined);
 }
 
 /** The file an upload left when it failed after its first step, and whether
@@ -534,8 +647,11 @@ function cannotHaveLanded(err: unknown): boolean {
       return refused !== undefined && !MAY_HAVE_LANDED.has(refused);
     }
     default:
-      // A rate limit, this server's OutOfCallTime, or an error the client
-      // doesn't classify, but for a TypeError.
+      // The SDK's unclassified errors are pre-send, but an injected policy
+      // client has no such guarantee. An unclassified occurrence after the
+      // post starts must remain uncertain. Explicit deadlines/429s are safe.
+      if (err !== null && typeof err === 'object' && clientErrorSources.has(err)
+          && !(err instanceof OutOfCallTime) && e?.code !== ErrorCode.RateLimitedError) return false;
       return !(err instanceof TypeError);
   }
 }
@@ -544,6 +660,8 @@ function cannotHaveLanded(err: unknown): boolean {
  *  message's ts, or failed in a way that may have posted it. */
 export interface PostLeft {
   channelId: string;
+  /** Opt-in formatter provenance; legacy calls retain their exact responses. */
+  policy?: boolean;
   /** The thread it was posted into, for a reply. */
   threadTs?: string;
 }
@@ -763,7 +881,7 @@ export interface SlackUploadedFile {
 export interface SlackWebLike {
   conversations: {
     list(args: Record<string, unknown>): Promise<{ channels?: unknown[]; response_metadata?: { next_cursor?: string; scopes?: string[] } }>;
-    info(args: { channel: string }): Promise<{ channel?: unknown }>;
+    info(args: { channel: string }): Promise<{ channel?: unknown; response_metadata?: unknown }>;
     open(args: { users: string }): Promise<{ channel?: { id?: string } }>;
     history(args: Record<string, unknown>): Promise<{ messages?: unknown[]; has_more?: boolean; response_metadata?: { next_cursor?: string } }>;
     replies(args: Record<string, unknown>): Promise<{ messages?: unknown[]; has_more?: boolean; response_metadata?: { next_cursor?: string } }>;
@@ -805,27 +923,36 @@ export class SlackAdapter {
    *  waits for. */
   private inbound = new Map<string, Promise<void>>();
   private userNameCache = new Map<string, string>();
-  private messageHandlers: Array<(msg: SlackMessageData) => void> = [];
+  private messageHandlers: Array<(msg: SlackMessageData) => unknown> = [];
   private socketStarted = false;
+  /** Dormant until the complete policy chain lands. No supported installer yet;
+   * tests supply a SlackAccessPolicy built through parseAccessPolicy. */
+  private accessPolicy?: SlackAccessPolicy;
+
+  /** Internal discriminator only; no supported policy installer or setting. */
+  get hasAccessPolicy(): boolean { return this.accessPolicy !== undefined; }
   /** Conversations Slack reported as DMs or group DMs, and as channels. IDs
    *  alone don't tell them apart. */
   private dmIds = new Set<string>();
   private channelIds = new Set<string>();
 
   get dmsDisabled(): boolean {
+    if (this.accessPolicy) return this.disableDms || !this.accessPolicy.dmsWritable
+      || (this.dmUsers !== undefined && !this.dmUsers.some((user) => this.accessPolicy!.mayDmUser(user)));
     return this.disableDms;
   }
 
   /** Can send_dm succeed at all? A DM ID starts with D. */
   get dmsWritable(): boolean {
-    return !this.disableDms && (!this.sendChannels?.length || this.sendChannels.some((id) => id.startsWith('D')));
+    return !this.dmsDisabled && (!this.sendChannels?.length || this.sendChannels.some((id) => id.startsWith('D')));
   }
 
   private stopping = false;
+  get isStopping(): boolean { return this.stopping; }
 
   /** The bot token's scopes, as Slack has reported them with auth.test's
    *  answers and with the listings' answers and refusals, each added to those
-   *  before; undefined while Slack hasn't. */
+   *  before in legacy mode, replacing them in policy mode; undefined while Slack hasn't. */
   private scopes: string[] | undefined;
 
   constructor(
@@ -841,42 +968,66 @@ export class SlackAdapter {
      *  empty list, is unknown, so a listing asks for every type. */
     scopes?: string[],
   ) {
+    this.web = isolateClientErrors(web, () => this.hasAccessPolicy, (method, args, answer, error, issued) => {
+      const payload = error ? (answer as { data?: unknown } | null)?.data : answer;
+      this.observeScopes(reportedScopes((payload as { response_metadata?: unknown } | null)?.response_metadata, true), issued);
+      const channelId = (args[0] as { channel?: unknown } | undefined)?.channel;
+      if (error && ['conversations.info', 'conversations.history', 'conversations.replies'].includes(method) && typeof channelId === 'string'
+          && ['not_in_channel', 'channel_not_found', 'invalid_channel_id', 'missing_scope', 'not_authed', 'invalid_auth', 'token_revoked', 'token_expired', 'account_inactive', 'ekm_access_denied'].includes(slackRefusal(answer) ?? '')) {
+        this.observeDelivery(channelId, { issued, refusal: answer });
+      }
+    });
     this.scopes = reportedScopes({ scopes });
     const omitted = this.leftOutTypes();
     if (omitted.length) this.logLeftOut(omitted, '');
-    // Register the handler at construction so start() ordering can't race
-    // an early event past an unregistered listener. Each event is prepared as
-    // it arrives, its author's and mentions' names looked up, and delivered
-    // after the event before it in its conversation: the lookups take
-    // different times, and a later message must not reach the host before an
-    // earlier one. Preparing at arrival keeps one conversation's lookups side
-    // by side, so a run of slow or failing ones costs the slowest, not their
-    // sum, within the Web API client's 100 requests at once, which every
-    // conversation's lookups share. From delivery on, the server keeps the
-    // same order with its own chain per conversation (setupSlackForwarding).
+    // Preparation overlaps within a conversation; delivery alone stays FIFO.
+    // Ambient events await the last addressed delivery's subscription commit,
+    // not each earlier ambient event's admission retries or host delivery.
+    const addressedTurns = new Map<string, Promise<void>>();
     this.socket.on('message', ({ event, ack }) => {
       // Always ack first — Slack redelivers unacked envelopes.
       void Promise.resolve().then(() => ack()).catch(() => { /* ignore */ });
       // Settled into a value at once, so a preparation that fails before its
       // turn is never a rejection nothing handles.
-      const prepared = this.prepareMessageEvent(event).then(
+      const prepare = () => (this.accessPolicy && this.stopping ? Promise.resolve(undefined) : this.prepareMessageEvent(event)).then(
         (msg) => ({ ok: true as const, msg }),
         (error: unknown) => ({ ok: false as const, error }),
       );
       const key = typeof event?.channel === 'string' ? event.channel : '';
+      const addressed = key.startsWith('D') || (this.botUserId !== null
+        && typeof event?.text === 'string' && extractSlackUserIds(event.text).includes(this.botUserId));
+      const prepared = this.accessPolicy && this.ambientMessageFilter && !addressed
+        ? (addressedTurns.get(key) ?? Promise.resolve()).then(prepare)
+        : prepare();
       const turn = (this.inbound.get(key) ?? Promise.resolve())
         .then(() => prepared)
-        .then((done) => {
+        .then(async (done) => {
+          if (this.accessPolicy && this.stopping) return;
           if (!done.ok) throw done.error;
-          if (done.msg) for (const handler of this.messageHandlers) handler(done.msg);
+          if (done.msg) for (const handler of this.messageHandlers) {
+            if (this.accessPolicy && this.stopping) break;
+            const delivered = handler(done.msg);
+            if (this.accessPolicy) await delivered;
+          }
         })
-        .catch((error) => console.error('[slack-mcpl] Failed to handle Slack message event:', error));
+        .catch((error) => console.error('[slack-mcpl] Failed to handle Slack message event:', this.accessPolicy ? policyFailureSummary(error) : error));
+      if (addressed && this.accessPolicy) {
+        addressedTurns.set(key, turn);
+        void turn.then(() => { if (addressedTurns.get(key) === turn) addressedTurns.delete(key); });
+      }
       this.inbound.set(key, turn);
       void turn.then(() => { if (this.inbound.get(key) === turn) this.inbound.delete(key); });
     });
   }
 
-  onMessage(handler: (msg: SlackMessageData) => void): void {
+  private ambientMessageFilter?: (channelId: string) => boolean;
+
+  /** Cheap delivery veto only, never authorization. Addressed events bypass it. */
+  setAmbientMessageFilter(filter: (channelId: string) => boolean): void {
+    this.ambientMessageFilter = filter;
+  }
+
+  onMessage(handler: (msg: SlackMessageData) => unknown): void {
     this.messageHandlers.push(handler);
   }
 
@@ -905,14 +1056,16 @@ export class SlackAdapter {
 
   // ── Conversations ──
 
+  // TODO(activation): describe policy exclusions (group DMs and unjoined channels) in tool schemas.
   private conversationTypes(): string[] {
+    if (this.accessPolicy) return ['public_channel', 'private_channel', ...(!this.dmsDisabled ? ['im'] : [])]; // group DMs come later
     return this.disableDms ? ['public_channel', 'private_channel'] : Object.keys(TYPE_SCOPE);
   }
 
   /** The enabled types the token's scopes can read: every one while they're
-   *  unknown. */
+   *  unknown in legacy mode; policy mode requires reported grants. */
   private readableTypes(): string[] {
-    return this.conversationTypes().filter((type) => !this.scopes || this.scopes.includes(TYPE_SCOPE[type]));
+    return this.conversationTypes().filter((type) => this.scopes ? this.scopes.includes(TYPE_SCOPE[type]) : !this.accessPolicy);
   }
 
   /** The enabled types the token's scopes can't read: none while they're
@@ -927,21 +1080,30 @@ export class SlackAdapter {
       : '[slack-mcpl] Conversation listing now asks for every type it lists: the token has each one\'s read scope.');
   }
 
-  /** Adds the scopes a Slack answer reports, if it reports any, to those
-   *  known, and says on stderr which types listings leave out whenever that
-   *  changes. Slack never narrows a token's scopes, so an answer naming fewer,
-   *  such as one sent before a grant that lands after it, takes none away. */
+  /** One ordered full grant report, not independently re-stamped withdrawals. */
+  private scopesIssued = 0;
+  private observeScopes(reported: string[] | undefined, issued: number): void {
+    if (!reported || issued < this.scopesIssued) return;
+    this.scopesIssued = issued;
+    this.replaceScopes(reported);
+  }
+
+  /** Legacy ingestion only. Policy responses are observed once at the client boundary. */
   private takeScopes(reported: string[] | undefined): void {
-    if (!reported) return;
+    if (this.accessPolicy || !reported) return;
+    this.replaceScopes([...(this.scopes ?? []), ...reported]);
+  }
+
+  private replaceScopes(reported: string[]): void {
     const before = this.leftOutTypes().join(',');
-    this.scopes = [...new Set([...(this.scopes ?? []), ...reported])];
+    this.scopes = [...new Set(reported)];
     const omitted = this.leftOutTypes();
     if (omitted.join(',') !== before) this.logLeftOut(omitted, 'now ');
   }
 
   /** Enumerate conversations the bot can act in: member channels, DMs, and
    *  group DMs, of the types whose read scopes Slack has reported the token
-   *  has (every enabled type while it hasn't reported any). Slack reports the
+   *  has (legacy mode requests every enabled type while scopes are unknown; policy mode admits none). Slack reports the
    *  scopes with each answer, and the client hands them on with an answer or a
    *  refusal, though not with an HTTP error such as a 429. A listing whose
    *  types they change, by its own answer or another listing's, starts over
@@ -961,28 +1123,35 @@ export class SlackAdapter {
    *  user, is asked for again once `waitOut` resolves (waitToAskAgain says how
    *  long), even when the types changed meanwhile. A DM whose name is still
    *  missing carries `nameWait`. */
-  async listConversations(includeNonMember = false, waitOut?: SlackWaitOut): Promise<SlackListing> {
+  async listConversations(includeNonMember = false, waitOut?: SlackWaitOut, isCurrent: () => boolean = () => true): Promise<SlackListing> {
+    const checkCurrent = () => {
+      if (this.accessPolicy && this.stopping) throw new Error('Conversation listing stopped');
+      if (!isCurrent()) throw new Error('A newer registration superseded this one');
+    };
     const noneReadable = () => new NoReadableConversations(this.conversationTypes().map((type) => TYPE_SCOPE[type]));
     let types = this.readableTypes();
     let out: SlackConversationInfo[] = [];
     let cursor: string | undefined;
     let limited = 0;
+    let admissionFailures = 0;
     const names = { waitOut };
     // A listing keeps its types while it pages, so a cursor keeps its meaning,
     // and starts over whenever the types the token can read change. Once
-    // Slack has reported the scopes, they only grow, so a listing starts over
-    // at most once more than there are types.
+    // Slack has reported scopes, legacy observations only grow; policy mode
+    // instead uses the latest reported grant set, including withdrawals.
     const startOver = (): boolean => {
       const now = this.readableTypes();
       if (now.join(',') === types.join(',')) return false;
       if (now.length === 0) throw noneReadable();
       types = now;
       out = [];
+      admissionFailures = 0;
       cursor = undefined;
       limited = 0;
       return true;
     };
     for (;;) {
+      checkCurrent();
       let result: Awaited<ReturnType<SlackWebLike['conversations']['list']>>;
       try {
         // Slack refuses the whole call when one type lacks its read scope, and
@@ -994,6 +1163,7 @@ export class SlackAdapter {
           this.takeScopes(reportedScopes((await this.web.auth.test()).response_metadata));
           limited = 0;
           types = this.readableTypes();
+          if (this.accessPolicy && !Array.isArray(this.scopes)) throw new Error('Slack scope metadata is unavailable; ask whoever runs this host to refresh reported permissions or restart before retrying');
           if (types.length === 0) throw noneReadable();
           continue;
         }
@@ -1004,6 +1174,7 @@ export class SlackAdapter {
           cursor,
         });
       } catch (err) {
+        checkCurrent();
         const method = types.length > 0 ? 'conversations.list' : 'auth.test';
         this.takeScopes(reportedScopes((err as { data?: { response_metadata?: unknown } } | null)?.data?.response_metadata));
         const changed = startOver();
@@ -1020,11 +1191,49 @@ export class SlackAdapter {
         if (changed) continue;
         throw err;
       }
+      checkCurrent();
       limited = 0;
       this.takeScopes(reportedScopes(result.response_metadata));
       if (startOver()) continue;
-      for (const raw of (result.channels ?? []) as SlackApiConversation[]) {
+      for (let raw of (result.channels ?? []) as SlackApiConversation[]) {
+        checkCurrent();
+        if (this.accessPolicy) {
+          try {
+            if (!raw || typeof raw !== 'object' || typeof raw.id !== 'string' || !/^[CGD][A-Z0-9]+$/.test(raw.id)) throw new Error('No conversations were returned: malformed Slack listing candidate; retry once, then ask whoever runs this host to investigate');
+            if (!raw.id) continue;
+            // Listed peers are rejection-only hints: fresh metadata still authorizes.
+            if (raw.is_im === true && typeof raw.user === 'string'
+                && (!this.accessPolicy.mayDmUser(raw.user) || (this.dmUsers && !this.dmUsers.includes(raw.user)))) continue;
+            // Avoid a metadata request for every unjoined public workspace channel.
+            if (raw.is_im === false && raw.is_mpim === false && raw.is_member === false) continue;
+            let attempts = 0;
+            for (;;) {
+              try { checkCurrent(); raw = await this.readAccessConversation(raw.id!); checkCurrent(); break; }
+              catch (err) {
+                checkCurrent();
+                const wait = waitToAskAgain(err, 'conversations.info');
+                if (!wait || !waitOut) throw err;
+                await waitOut(wait, ++attempts);
+              }
+            }
+          } catch (err) {
+            checkCurrent();
+            if (err instanceof SlackAccessDenied && err.authoritative) continue;
+            if (NOT_SHOWN.has(slackRefusal(err) ?? '')) {
+              console.error(`[slack-mcpl] listing candidate ${raw.id} is no longer available: ${slackRefusal(err)}`);
+              continue;
+            }
+            if (waitOut) {
+              admissionFailures++;
+              console.error(`[slack-mcpl] Registration candidate ${typeof raw?.id === "string" && /^[CGD][A-Z0-9]{1,80}$/.test(raw.id) ? raw.id : "unknown"} skipped: admission failed; count is incomplete: ${policyFailureSummary(err)}`);
+              continue;
+            }
+            throw err;
+          }
+        }
+        checkCurrent();
         const info = await this.describeConversation(raw, names);
+        if (this.accessPolicy) checkCurrent();
         if (!info) continue;
         if (!includeNonMember && info.kind === 'channel' && !info.isMember) continue;
         out.push(info);
@@ -1033,14 +1242,118 @@ export class SlackAdapter {
       // Another listing's answer may have changed the scopes while this page's
       // DM names were looked up, so they're checked once more before it ends.
       if (!cursor && !startOver()) {
-        return { conversations: out, leftOut: this.conversationTypes().filter((type) => !types.includes(type)) };
+        return { conversations: out, leftOut: this.conversationTypes().filter((type) => !types.includes(type)),
+          ...(admissionFailures ? { admissionFailures } : {}) };
       }
     }
   }
 
-  async getConversationMeta(channelId: string): Promise<SlackConversationInfo | null> {
+  async getConversationMeta(channelId: string, forDelivery = false): Promise<SlackConversationInfo | null> {
+    if (this.accessPolicy) {
+      const conversation = forDelivery
+        ? await this.retryEventAdmission(channelId, true)
+        : await this.readAccessConversation(channelId);
+      // A delivery check must not await an optional DM display-name lookup.
+      if (forDelivery && (this.stopping || !conversation)) throw new Error('Delivery admission was stopped');
+      if (forDelivery && conversation?.is_im) return null;
+      return this.describeConversation(conversation!);
+    }
     const info = await this.web.conversations.info({ channel: channelId });
     return this.describeConversation((info.channel ?? {}) as SlackApiConversation);
+  }
+
+  private deliveryObservations = new Map<string, { issued: number } & (
+    { conversation: SlackApiConversation } | { refusal: unknown }
+  )>();
+
+  private observeDelivery(channelId: string, observation: { issued: number } & (
+    { conversation: SlackApiConversation } | { refusal: unknown }
+  )): void {
+    if ((this.deliveryObservations.get(channelId)?.issued ?? 0) <= observation.issued) {
+      this.deliveryObservations.set(channelId, observation);
+    }
+  }
+
+  /** Interpret only this response's metadata, never a denial derived from grants
+   * or another request's known veto. Neither propagation nor local checks observe. */
+  private observeDeliveryConversation(channelId: string, conversation: SlackApiConversation | undefined, issued: number): void {
+    try { this.accessPolicy!.requireReadableMetadata(channelId, conversation); }
+    catch (err) {
+      if (err instanceof SlackAccessDenied && err.authoritative) this.observeDelivery(channelId, { issued, refusal: err });
+      return;
+    }
+    this.observeDelivery(channelId, { issued, conversation: conversation! });
+  }
+
+  private assertNoKnownDeliveryRefusal(channelId: string): void {
+    const observation = this.deliveryObservations.get(channelId);
+    if (observation && 'refusal' in observation) throw observation.refusal;
+  }
+
+  /** Synchronous veto only: a transient failure cannot undo known refusal or grant withdrawal. */
+  assertKnownDeliveryAdmission(channelId: string): void {
+    if (!this.accessPolicy) return;
+    if (this.stopping) throw new Error('Delivery admission was stopped');
+    this.assertNoKnownDeliveryRefusal(channelId);
+    const observation = this.deliveryObservations.get(channelId);
+    const conversation = observation && 'conversation' in observation ? observation.conversation : undefined;
+    this.accessPolicy.requireReadable(channelId, conversation, this.scopes);
+    this.accessPolicy.requireScope(this.scopes, conversation!.is_im ? 'im:history'
+      : conversation!.is_private ? 'groups:history' : 'channels:history');
+  }
+
+  /** Only fresh exact metadata authorizes access; cached labels/kinds never do. */
+  private async readAccessConversation(channelId: string): Promise<SlackApiConversation> {
+    if (!this.accessPolicy) throw new Error('Slack access policy is not configured');
+    if (!/^[CGD][A-Z0-9]+$/.test(channelId)) throw new SlackAccessInputError(`Invalid Slack conversation ID ${JSON.stringify(channelId)}; use list_channels to choose a conversation`);
+    if (channelId.startsWith('D') && this.dmsDisabled) throw new SlackAccessDenied('Direct messages are not admitted on this host');
+    if (!this.accessPolicy.mayRead(channelId)) throw new SlackAccessDenied(`Conversation ${channelId} is excluded by the Slack access policy`);
+    if (!Array.isArray(this.scopes)) throw new Error('Slack scope metadata is unavailable; ask whoever runs this host to refresh reported permissions or restart before retrying');
+
+    const result = await this.web.conversations.info({ channel: channelId });
+    const conversation = result.channel as SlackApiConversation | undefined;
+    this.observeDeliveryConversation(channelId, conversation, responseIssued.get(result)!);
+    this.assertNoKnownDeliveryRefusal(channelId);
+    this.accessPolicy.requireReadable(channelId, conversation, this.scopes);
+    if (conversation!.is_im && this.dmUsers && !this.dmUsers.includes(conversation!.user!)) throw new SlackAccessDenied(`Conversation ${channelId} is not an admitted direct message`);
+    return conversation!;
+  }
+
+  /** Policy admission intersects both legacy DM guards on every read/effect. */
+  private requirePolicyDmUser(userId: string): void {
+    this.accessPolicy!.requireDmUser(userId);
+    if (this.disableDms) throw new SlackAccessDenied('Direct messages are turned off on this host');
+    if (this.dmUsers && !this.dmUsers.includes(userId)) {
+      throw new SlackAccessDenied(`Direct messages with ${userId} are not allowed by this host`);
+    }
+  }
+
+  /** One check per call, including cursor continuation, not per history page. */
+  private async requireHistoryConversation(channelId: string, notDone: string): Promise<SlackApiConversation | undefined> {
+    if (!this.accessPolicy) { await this.assertNotDm(channelId, notDone); return; }
+    return withAccessContext(notDone, async () => {
+      const conversation = await this.readAccessConversation(channelId);
+      this.accessPolicy!.requireScope(this.scopes, conversation.is_im ? 'im:history'
+        : conversation.is_private ? 'groups:history' : 'channels:history');
+      return conversation;
+    });
+  }
+
+  /** Cheap vetoes precede fresh admission; neither authorizes an effect alone. */
+  private async requireWritableConversation(channelId: string, scope: string, notDone: string): Promise<SlackApiConversation | undefined> {
+    if (!this.accessPolicy) { this.assertWritable(channelId, notDone); return; }
+    return withAccessContext(notDone, async () => {
+      if (!/^[CGD][A-Z0-9]+$/.test(channelId)) throw new SlackAccessInputError(`Invalid Slack conversation ID ${JSON.stringify(channelId)}; use list_channels to choose a conversation`);
+      if (!this.accessPolicy!.mayWrite(channelId)) throw new SlackAccessDenied(`Writing to ${channelId} is not allowed by the Slack access policy; use list_channels to find writable alternatives`);
+      this.assertWritable(channelId, notDone);
+      const conversation = await this.readAccessConversation(channelId);
+      this.accessPolicy!.requireWritable(channelId, conversation, this.scopes, scope);
+      return conversation;
+    }).catch(err => {
+      // Preserve identity-keyed request/effect provenance through admission too.
+      if (err !== null && typeof err === 'object') accessAdmissionFailures.add(err);
+      throw err;
+    });
   }
 
   /** `names.waitOut`, in a listing that runs in the background, waits out a
@@ -1100,13 +1413,15 @@ export class SlackAdapter {
   /** Slack scopes are workspace-wide, so "speak only here" is enforced here:
    *  the one place every write passes through. */
   canWrite(channelId: string): boolean {
+    if (this.accessPolicy && (!this.accessPolicy.mayWrite(channelId) || (channelId.startsWith('D') && this.dmsDisabled))) return false;
     return !this.sendChannels?.length || this.sendChannels.includes(channelId);
   }
 
   /** `notDone` opens the refusal: what the call would have done, as not done. */
   private assertWritable(channelId: string, notDone: string): void {
     if (!this.canWrite(channelId)) {
-      throw new Error(
+      if (this.accessPolicy) throw new SlackAccessDenied(`${notDone}: writing to ${channelId} is not allowed on this host. Use list_channels to find writable alternatives. Retrying unchanged will not help; ask whoever runs this host to check write access.`);
+      throw new (this.accessPolicy ? SlackAccessDenied : Error)(
         `${notDone}: this bot may write only to ${this.sendChannels?.join(', ')}, and ${channelId} isn't one of ` +
           'them. list_channels marks the conversations it may write to with writable: true. Calling again ' +
           "won't change that; whoever runs this host decides where it may write.",
@@ -1153,11 +1468,12 @@ export class SlackAdapter {
   setThreadStatus(channelId: string, threadTs: string | undefined): Promise<void> {
     const epoch = this.statusEpoch;
     const turn = (this.statusQueue.get(channelId) ?? Promise.resolve()).then(async () => {
-      if (threadTs && (this.stopping || epoch !== this.statusEpoch || this.statusRefused.has(channelId))) return;
+      if (threadTs && (this.stopping || epoch !== this.statusEpoch)) return;
       const cur = this.statusOn.get(channelId);
       if (threadTs && cur?.ts === threadTs && clock.now() - cur.at < STATUS_REFRESH_MS) return;
       if (cur && cur.ts !== threadTs) {
-        await this.callStatus(channelId, cur.ts, '');
+        const clear = await this.callStatus(channelId, cur.ts, '');
+        if (clear === 'not_attempted') return;
         this.statusOn.delete(channelId);
       }
       if (!threadTs || !this.canWrite(channelId) || !this.web.assistant || this.statusRefusedFor(channelId, threadTs)) return;
@@ -1170,19 +1486,25 @@ export class SlackAdapter {
         if (epoch === this.statusEpoch && lasting) {
           this.statusRefused.add(channelId);
         }
-        console.error(`[slack-mcpl] thread status on ${channelId} refused:`, err instanceof Error ? err.message : err);
+        console.error(`[slack-mcpl] thread status on ${channelId} refused:`, this.accessPolicy ? policyFailureSummary(err) : err instanceof Error ? err.message : err);
         return;
       }
       if (this.stopping || epoch !== this.statusEpoch) return;
       const entry = { ts: threadTs, at: clock.now() };
       this.statusOn.set(channelId, entry);
       const outcome = await this.callStatus(channelId, threadTs, STATUS_TEXT);
-      if (outcome !== 'ok') {
-        if (outcome === 'refused') this.statusOn.delete(channelId);
+      if (outcome === 'not_attempted') {
+        if (cur?.ts === threadTs) this.statusOn.set(channelId, cur); else this.statusOn.delete(channelId);
+      } else if (outcome !== 'ok') {
+        if (outcome === 'refused') {
+          if (this.hasAccessPolicy && cur?.ts === threadTs) this.statusOn.set(channelId, cur);
+          else this.statusOn.delete(channelId);
+        }
+        else if (this.hasAccessPolicy && cur?.ts === threadTs) this.statusOn.set(channelId, cur);
         else entry.at = -Infinity;
       }
     }).catch((err: unknown) => {
-      try { console.error(`[slack-mcpl] thread status on ${channelId} failed:`, err); } catch { /* best effort */ }
+      try { console.error(`[slack-mcpl] thread status on ${channelId} failed:`, this.accessPolicy ? policyFailureSummary(err) : err); } catch { /* best effort */ }
     });
     this.statusQueue.set(channelId, turn);
     void turn.then(() => { if (this.statusQueue.get(channelId) === turn) this.statusQueue.delete(channelId); });
@@ -1202,30 +1524,28 @@ export class SlackAdapter {
     await Promise.all([...channels].map((id) => this.setThreadStatus(id, undefined)));
   }
 
-  private async callStatus(channelId: string, threadTs: string, status: string): Promise<'ok' | 'refused' | 'uncertain'> {
+  private async callStatus(channelId: string, threadTs: string, status: string): Promise<'ok' | 'refused' | 'uncertain' | 'not_attempted'> {
     if (!this.web.assistant) return 'uncertain';
+    if (status && this.hasAccessPolicy && this.statusRefusedFor(channelId, threadTs)) return 'not_attempted';
     const epoch = this.statusEpoch;
+    let attempted = false;
     try {
-      // The policy stack is optional on this branch. When composed with it,
-      // authorize every effect (including clears) using its fresh write gate.
-      const policy = this as unknown as {
-        readonly hasAccessPolicy?: boolean;
-        requireWritableConversation(id: string, scope: string, notDone: string): Promise<unknown>;
-      };
-      if (policy.hasAccessPolicy) {
-        await policy.requireWritableConversation(channelId, 'chat:write', 'No thread status was set');
-        if (status && (this.stopping || epoch !== this.statusEpoch)) return 'uncertain';
+      if (this.hasAccessPolicy) {
+        await this.requireWritableConversation(channelId, 'chat:write', status ? 'No thread status was set' : 'Thread status was not cleared; the old status may remain');
+        if (status && (this.stopping || epoch !== this.statusEpoch)) return 'not_attempted';
       }
+      attempted = true;
       await this.web.assistant.threads.setStatus({ channel_id: channelId, thread_ts: threadTs, status });
       return 'ok';
     } catch (err) {
-      if (!this.statusRefusedFor(channelId, threadTs)) {
-        console.error(`[slack-mcpl] thread status on ${channelId} failed:`, err instanceof Error ? err.message : err);
+      if (!status || !this.statusRefusedFor(channelId, threadTs)) {
+        console.error(`[slack-mcpl] thread status on ${channelId} failed:`, this.accessPolicy ? policyFailureSummary(err) : err instanceof Error ? err.message : err);
       }
       const refused = refusedForGood(err);
-      if (status && epoch === this.statusEpoch && refused) {
+      if ((status || this.hasAccessPolicy) && epoch === this.statusEpoch && refused && (!(err instanceof SlackAccessDenied) || err instanceof SlackAccessGrantDenied)) {
         this.statusRefused.add(STATUS_THREAD_REFUSALS.has(slackRefusal(err) ?? '') ? `${channelId} ${threadTs}` : channelId);
       }
+      if (!attempted) return 'not_attempted';
       return refused ? 'refused' : 'uncertain';
     }
   }
@@ -1234,7 +1554,7 @@ export class SlackAdapter {
   async acknowledge(channelId: string, ts: string): Promise<void> {
     if (!this.ackReaction || this.stopping) return;
     if (this.ackPending.get(channelId)?.has(ts)) return; // Slack delivered the event twice
-    const added = this.addReaction(channelId, ts, this.ackReaction).then(
+    const added = this.addReaction(channelId, ts, this.ackReaction, true).then(
       () => true,
       // The add counts as there, and is removed like an added one, when it may
       // have landed, by the rule that reads a post's failure
@@ -1250,6 +1570,7 @@ export class SlackAdapter {
       // add, such as the DM check's conversations.info. Slack answers a
       // removal of one that isn't there with no_reaction.
       (err: unknown) => {
+        if (failedAccessAdmission(err)) return false;
         const failed = failedRequest(err);
         if (failed !== undefined && failed !== 'reactions.add') return false;
         return !cannotHaveLanded(err);
@@ -1288,13 +1609,17 @@ export class SlackAdapter {
     if (!(await entry.added)) return this.dropAck(channelId, ts, entry);
     entry.tries++;
     try {
+      if (this.accessPolicy) await this.requireWritableConversation(channelId, 'reactions:write', 'No reaction was removed');
       await this.web.reactions.remove({ channel: channelId, timestamp: ts, name: this.ackReaction! });
       this.dropAck(channelId, ts, entry);
     } catch (err) {
       // Slack's refusal will be the same next time. A rate limit, an HTTP
       // error, a failure in transit or Slack's own failure can pass. The fifth
       // failure drops the entry, so no sixth attempt can start.
-      if (refusedForGood(err) || this.stopping || entry.tries >= ACK_MAX_TRIES) this.dropAck(channelId, ts, entry);
+      if (refusedForGood(err) || this.stopping || entry.tries >= ACK_MAX_TRIES) {
+        if (this.accessPolicy) console.error(`[slack-mcpl] ACK cleanup retired for ${channelId} ${ts}; reaction may remain: ${policyFailureSummary(err)}`);
+        this.dropAck(channelId, ts, entry);
+      }
       else entry.timer = this.armAck(channelId, ts, ACK_RETRY_MS);
     }
   }
@@ -1310,14 +1635,19 @@ export class SlackAdapter {
     opts: { threadTs?: string } = {},
     notDone = 'Nothing was posted',
   ): Promise<{ messageId: string }> {
-    // The allow-list's refusal first, since calling again can't change it,
-    // then the text's, both before the DM check can ask Slack anything.
-    this.assertWritable(channelId, notDone);
+    // Policy admission precedes text validation. Without policy, preserve the
+    // legacy allow-list, text, then DM-check refusal order.
+    await this.requireWritableConversation(channelId, 'chat:write', notDone);
     assertSendable(text, notDone);
     await this.assertNotDm(channelId, notDone);
+    return this.postValidatedMessage(channelId, text, opts);
+  }
+
+  /** Called only after write admission, including sendDM's exact peer check. */
+  private async postValidatedMessage(channelId: string, text: string, opts: { threadTs?: string } = {}): Promise<{ messageId: string }> {
     const left = (err: unknown): unknown => {
       if (err !== null && typeof err === 'object') {
-        postsLeft.set(err, { channelId, ...(opts.threadTs ? { threadTs: opts.threadTs } : {}) });
+        postsLeft.set(err, { channelId, ...(this.accessPolicy ? { policy: true } : {}), ...(opts.threadTs ? { threadTs: opts.threadTs } : {}) });
       }
       return err;
     };
@@ -1335,6 +1665,7 @@ export class SlackAdapter {
     // names nothing the agent or a rollback could edit, reply to or delete,
     // and can't show the post went through, so it reads as an unknown
     // outcome, as a failure that may have posted does.
+    if (this.accessPolicy && !result) throw left(new PostNotConfirmed(channelId));
     if (typeof result.ts !== 'string' || !result.ts) throw left(new PostNotConfirmed(channelId));
     void outsideCallTime(() => this.clearAck(channelId));
     return { messageId: result.ts };
@@ -1360,7 +1691,7 @@ export class SlackAdapter {
     channelId: string,
     file: { filename: string; data: Buffer; title?: string; comment?: string; threadTs?: string },
   ): Promise<{ fileId: string; shareTs?: string }> {
-    this.assertWritable(channelId, 'Nothing was uploaded');
+    await this.requireWritableConversation(channelId, 'files:write', 'Nothing was uploaded');
     await this.assertNotDm(channelId, 'Nothing was uploaded');
     const target = await this.web.files.getUploadURLExternal({ filename: file.filename, length: file.data.byteLength });
     const url = target.upload_url;
@@ -1382,6 +1713,10 @@ export class SlackAdapter {
       await this.postFileBytes(url, file.data);
     } catch (err) {
       throw left(err, false);
+    }
+    if (this.accessPolicy) {
+      try { await this.requireWritableConversation(channelId, 'files:write', 'Nothing was shared'); }
+      catch (err) { throw left(err, false); }
     }
     let answer: Awaited<ReturnType<SlackWebLike['files']['completeUploadExternal']>>;
     try {
@@ -1441,6 +1776,8 @@ export class SlackAdapter {
    *  ID, and a user ID (U…) posts into that user's DM. An unknown ID is asked
    *  about until Slack confirms it; if Slack cannot say, it is refused. */
   private async assertNotDm(channelId: string, notDone: string): Promise<void> {
+    // Policy callers have already checked fresh admission, including both legacy DM guards.
+    if (this.accessPolicy) return;
     if (!this.disableDms || this.channelIds.has(channelId)) return;
     const refuse = (why: string) =>
       new ChannelOnlyRefusal(
@@ -1474,7 +1811,7 @@ export class SlackAdapter {
       'To reach people, post in a channel with send_message; list_channels marks where this bot may write with ' +
       'writable: true.';
     if (this.disableDms) {
-      throw new Error(
+      throw new (this.accessPolicy ? SlackAccessDenied : Error)(
         "Nothing was sent: direct messages are turned off on this host, so send_dm can't reach anyone. Calling " +
           `again won't change that; whoever runs this host decides whether this bot may send DMs. ${toChannels}`,
       );
@@ -1482,11 +1819,32 @@ export class SlackAdapter {
     // A DM ID starts with D. If the allow-list names none, no DM can be written,
     // so don't open one just to find that out.
     if (this.sendChannels?.length && !this.sendChannels.some((id) => id.startsWith('D'))) {
-      throw new Error(
+      if (this.accessPolicy) throw new SlackAccessDenied('Nothing was sent: direct-message writes are not allowed on this host. Use list_channels to find writable alternatives. Retrying unchanged will not help; ask whoever runs this host to check write access.');
+      throw new (this.accessPolicy ? SlackAccessDenied : Error)(
         `Nothing was sent: this bot may write only to ${this.sendChannels.join(', ')}, none of them a direct ` +
           "message, so send_dm can't reach anyone. Calling again won't change that; whoever runs this host decides " +
           `where it may write. ${toChannels}`,
       );
+    }
+    if (this.accessPolicy) {
+      const channelId = await withAccessContext('Nothing was sent', async () => {
+        this.requirePolicyDmUser(userId);
+        this.accessPolicy!.requireScope(this.scopes, 'im:write');
+        this.accessPolicy!.requireScope(this.scopes, 'im:read');
+        this.accessPolicy!.requireScope(this.scopes, 'chat:write');
+        assertSendable(text, 'Nothing was sent');
+        const open = await this.web.conversations.open({ users: userId });
+        if (!open.channel?.id) throw new Error(`Nothing was sent: Slack did not return a DM ID for user ${userId}; a DM may have been opened. Try again shortly`);
+        return open.channel.id;
+      });
+      const notPosted = `DM ${channelId} was opened, but nothing was posted`;
+      await withAccessContext(notPosted, async () => {
+        const conversation = await this.requireWritableConversation(channelId, 'chat:write', notPosted);
+        if (conversation?.is_im !== true || conversation.user !== userId) throw new SlackAccessDenied(`Opened DM ${channelId} does not match requested user ${userId}`);
+      });
+      // A post may have landed. Do not put it inside a pre-effect outcome wrapper.
+      const { messageId } = await withAccessContext(`DM ${channelId} was opened`, () => this.postValidatedMessage(channelId, text));
+      return { messageId, channelId };
     }
     // Before the DM is opened, as above.
     assertSendable(text, 'Nothing was sent');
@@ -1504,14 +1862,14 @@ export class SlackAdapter {
 
   async editMessage(channelId: string, ts: string, text: string): Promise<void> {
     // In the order sendMessage's checks run.
-    this.assertWritable(channelId, "The message wasn't changed");
+    await this.requireWritableConversation(channelId, 'chat:write', "The message wasn't changed");
     assertSendable(text, "The message wasn't changed");
     await this.assertNotDm(channelId, "The message wasn't changed");
     await this.web.chat.update({ channel: channelId, ts, text });
   }
 
   async deleteMessage(channelId: string, ts: string): Promise<void> {
-    this.assertWritable(channelId, 'Nothing was deleted');
+    await this.requireWritableConversation(channelId, 'chat:write', 'Nothing was deleted');
     await this.assertNotDm(channelId, 'Nothing was deleted');
     await this.web.chat.delete({ channel: channelId, ts });
   }
@@ -1519,14 +1877,21 @@ export class SlackAdapter {
   /** Deletes a file this bot uploaded, with the same write checks as a
    *  message's delete. */
   async deleteFile(channelId: string, fileId: string): Promise<void> {
-    this.assertWritable(channelId, 'Nothing was deleted');
+    // Relies on the caller's (channelId, fileId) pairing recorded from its own
+    // upload: files.delete uses only fileId. A future file tool must verify association.
+    await this.requireWritableConversation(channelId, 'files:write', 'Nothing was deleted');
     await this.assertNotDm(channelId, 'Nothing was deleted');
     await this.web.files.delete({ file: fileId });
   }
 
-  async addReaction(channelId: string, ts: string, emoji: string): Promise<void> {
-    this.assertWritable(channelId, 'No reaction was added');
+  async addReaction(channelId: string, ts: string, emoji: string, acknowledgement = false): Promise<void> {
+    await this.requireWritableConversation(channelId, 'reactions:write', 'No reaction was added');
     await this.assertNotDm(channelId, 'No reaction was added');
+    if (acknowledgement && this.hasAccessPolicy && this.stopping) {
+      const failure = new Error('Acknowledgement stopped before reaction add');
+      accessAdmissionFailures.add(failure);
+      throw failure;
+    }
     await this.web.reactions.add({ channel: channelId, timestamp: ts, name: reactionName(emoji) });
   }
 
@@ -1539,7 +1904,7 @@ export class SlackAdapter {
    *  with shapeHistory. */
   async readHistory(channelId: string, args: Record<string, unknown>): Promise<HistoryReadResult> {
     const opts = readOptions(args, 'history', channelId);
-    await this.assertNotDm(channelId, NOTHING_RETURNED);
+    await this.requireHistoryConversation(channelId, NOTHING_RETURNED);
     return readBounded(opts, {
       page: (at, limit) => this.web.conversations.history({
         channel: channelId, limit, inclusive: false,
@@ -1563,7 +1928,7 @@ export class SlackAdapter {
    *  thread from its parent. */
   async readThread(channelId: string, threadTs: string, args: Record<string, unknown>): Promise<HistoryReadResult> {
     const opts = readOptions(args, 'thread', channelId, threadTs);
-    await this.assertNotDm(channelId, NOTHING_RETURNED);
+    await this.requireHistoryConversation(channelId, NOTHING_RETURNED);
     return readBounded(opts, {
       page: (at, limit) => this.web.conversations.replies({
         channel: channelId, ts: threadTs, limit, inclusive: false,
@@ -1582,7 +1947,7 @@ export class SlackAdapter {
     channelId: string,
     opts: { limit?: number; oldest?: string; latest?: string } = {},
   ): Promise<{ messages: HistoryMessage[]; truncated: boolean }> {
-    await this.assertNotDm(channelId, 'Nothing was read');
+    await this.requireHistoryConversation(channelId, 'Nothing was read');
     const { messages, truncated } = await fetchSlackHistory(this.web, {
       channel: channelId,
       ...(opts.oldest !== undefined ? { oldest: opts.oldest } : {}),
@@ -1618,7 +1983,8 @@ export class SlackAdapter {
       // Missing means unknown, not none.
       ...(typeof count === 'number' && Number.isSafeInteger(count) && count >= 0 ? { replyCount: count } : {}),
       timestamp: new Date(parseFloat(msg.ts ?? '0') * 1000),
-      attachments: (msg.files ?? []).map((f) => ({
+      // Do not offer legacy URLs under policy; a later PR adds attachment enforcement.
+      attachments: this.accessPolicy ? [] : (msg.files ?? []).map((f) => ({
         name: f.name ?? 'attachment',
         mimeType: f.mimetype,
         url: f.url_private,
@@ -1630,6 +1996,7 @@ export class SlackAdapter {
   // ── Users ──
 
   async findUsers(query: string, max = 25): Promise<SlackUserMatch[]> {
+    await withAccessContext('No users were returned', async () => this.accessPolicy?.requireScope(this.scopes, 'users:read'));
     const q = query.toLowerCase();
     if (!q) throw new Error('query is required');
     const matches: SlackUserMatch[] = [];
@@ -1663,6 +2030,34 @@ export class SlackAdapter {
 
   // ── Incoming events ──
 
+  // Pending evidence is shared, never cached after settlement.
+  private eventAdmissions = new Map<string, Promise<SlackApiConversation | undefined>>();
+  private sharedEventAdmission(channel: string): Promise<SlackApiConversation | undefined> {
+    const pending = this.eventAdmissions.get(channel);
+    if (pending) return pending;
+    const request = this.retryEventAdmission(channel).finally(() => this.eventAdmissions.delete(channel));
+    this.eventAdmissions.set(channel, request);
+    return request;
+  }
+
+  private async retryEventAdmission(channel: string, forDelivery = false): Promise<SlackApiConversation | undefined> {
+    let waited = 0;
+    for (let attempt = 1; ; attempt++) {
+      if (this.stopping) throw new Error('Conversation admission stopped');
+      try { return await this.requireHistoryConversation(channel, 'Nothing was delivered'); }
+      catch (err) {
+        const wait = waitToAskAgain(err, 'conversations.info');
+        if (!this.stopping && attempt < 3 && wait && Number.isFinite(wait.seconds)
+            && wait.seconds >= 0 && waited + wait.seconds <= (forDelivery ? 2 : 60)) {
+          waited += wait.seconds;
+          await clock.sleep(wait.seconds * 1000, { unref: true });
+          if (!this.stopping) continue;
+        }
+        throw err;
+      }
+    }
+  }
+
   /** An event's checks and its author's and mentions' names, and the message
    *  they make, or undefined for an event that isn't delivered. */
   private async prepareMessageEvent(event: SlackMessageEvent): Promise<SlackMessageData | undefined> {
@@ -1677,19 +2072,42 @@ export class SlackAdapter {
     // (parseFloat(undefined) → NaN → toISOString() throws).
     if (!event.channel || !event.user || !event.ts) return;
 
-    const isDM = event.channel_type === 'im' || event.channel.startsWith('D');
+    let channelType = event.channel_type;
+    let isDM = event.channel_type === 'im' || event.channel.startsWith('D');
+    if (this.accessPolicy) {
+      // Skip undeliverable ambient traffic before spending the shared info quota.
+      // D IDs (not the untrusted channel_type hint) and exact bot mentions
+      // bypass this veto; neither bypasses fresh admission below.
+      const addressed = event.channel.startsWith('D') || (this.botUserId !== null
+        && typeof event.text === 'string' && extractSlackUserIds(event.text).includes(this.botUserId));
+      if (!addressed && this.ambientMessageFilter && !this.ambientMessageFilter(event.channel)) return;
+      if (event.channel.startsWith('D') && (this.dmsDisabled || !this.accessPolicy.mayDmUser(event.user)
+          || (this.dmUsers && !this.dmUsers.includes(event.user)))) return;
+      try {
+        const conversation = await this.sharedEventAdmission(event.channel);
+        if (this.stopping) return;
+        isDM = conversation?.is_im === true;
+        channelType = conversation?.is_im ? 'im' : conversation?.is_mpim ? 'mpim' : conversation?.is_private ? 'group' : 'channel';
+        if (isDM && conversation?.user !== event.user) return;
+      } catch (err) {
+        console.error(`[slack-mcpl] dropped message ${event.channel} ${event.ts}: admission failed: ${policyFailureSummary(err)}`);
+        return;
+      }
+    }
     // Only what Slack marks as a channel gets through, not merely what isn't marked a DM.
-    if (this.disableDms && event.channel_type !== 'channel' && event.channel_type !== 'group') return;
-    if (isDM && this.dmUsers && !this.dmUsers.includes(event.user)) {
+    if (!this.accessPolicy && this.disableDms && event.channel_type !== 'channel' && event.channel_type !== 'group') return;
+    if (!this.accessPolicy && isDM && this.dmUsers && !this.dmUsers.includes(event.user)) {
       return; // DM whitelist active and this sender isn't on it
     }
 
     // Resolve author + mentioned users before formatting.
     const mentionIds = extractSlackUserIds(event.text ?? '');
     await this.resolveUserNames([event.user, ...mentionIds]);
+    if (this.accessPolicy && this.stopping) return;
     const authorName = this.userNameCache.get(event.user) ?? event.user;
 
-    const attachments: AttachmentRef[] = (event.files ?? [])
+    // No unprotected attachment references; a later PR adds attachment enforcement.
+    const attachments: AttachmentRef[] = this.accessPolicy ? [] : (event.files ?? [])
       .filter((f): f is { url_private: string; name?: string; mimetype?: string } => !!f.url_private)
       .map((f) => {
         const name = f.name ?? 'attachment';
@@ -1715,7 +2133,7 @@ export class SlackAdapter {
       // @here/@channel broadcasts deliberately don't count.
       mentionsBot: this.botUserId !== null && mentionIds.includes(this.botUserId),
       isDM,
-      channelType: event.channel_type,
+      channelType,
       teamId: event.team,
       timestamp: new Date(parseFloat(event.ts) * 1000),
       attachments,
