@@ -20,3 +20,36 @@ test('a sleep waits out its time, and holds the process meanwhile unless it is u
   await unref;
   clearTimeout(holding);
 });
+
+test('abort wakes a real referenced sleep and removes its timer and listener', async () => {
+  const { default: EventEmitter } = await import('node:events');
+  const getEventListeners = EventEmitter.getEventListeners;
+  const controller = new AbortController();
+  const before = timers();
+  const pending = clock.sleep(60000, { signal: controller.signal });
+  assert.equal(timers(), before + 1);
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 1);
+  controller.abort(); await pending;
+  assert.equal(timers(), before);
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+  await clock.sleep(60000, { signal: controller.signal });
+  assert.equal(timers(), before, 'already-aborted sleep never arms a timer');
+});
+
+test('abortable sleeps resolve and remove listeners on every exit path', async () => {
+  const { EventEmitter } = await import('node:events');
+  const getEventListeners = EventEmitter.getEventListeners;
+  const already = new AbortController();
+  already.abort();
+  await clock.sleep(60_000, { signal: already.signal });
+  assert.equal(getEventListeners(already.signal, 'abort').length, 0);
+  const pending = new AbortController();
+  const sleep = clock.sleep(60_000, { signal: pending.signal });
+  assert.equal(getEventListeners(pending.signal, 'abort').length, 1);
+  pending.abort();
+  await sleep;
+  assert.equal(getEventListeners(pending.signal, 'abort').length, 0);
+  const completed = new AbortController();
+  await clock.sleep(1, { signal: completed.signal });
+  assert.equal(getEventListeners(completed.signal, 'abort').length, 0);
+});

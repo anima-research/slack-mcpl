@@ -1,0 +1,83 @@
+{
+  "timeout": {
+    "content": [
+      {
+        "type": "text",
+        "text": "client timeout\n\nSlack went 10 seconds without answering, or the connection to it failed, so whether the message was posted is unknown. Check the DM's history (list_channels shows its id, and fetch_history its messages) before posting again, so it isn't posted twice."
+      }
+    ],
+    "isError": true
+  },
+  "http": {
+    "content": [
+      {
+        "type": "text",
+        "text": "bad gateway\n\nSlack answered with HTTP 502, so whether the message was posted is unknown. Check the DM's history (list_channels shows its id, and fetch_history its messages) before posting again, so it isn't posted twice."
+      }
+    ],
+    "isError": true
+  },
+  "type": {
+    "content": [
+      {
+        "type": "text",
+        "text": "unreadable answer\n\nSlack's answer, if one came, couldn't be read, so whether the message was posted is unknown. Check the DM's history (list_channels shows its id, and fetch_history its messages) before posting again, so it isn't posted twice."
+      }
+    ],
+    "isError": true
+  },
+  "unclassified": {
+    "content": [
+      {
+        "type": "text",
+        "text": "embedded client lost the answer"
+      }
+    ],
+    "isError": true
+  },
+  "no timestamp": {
+    "content": [
+      {
+        "type": "text",
+        "text": "chat.postMessage: the answer named no message in D1\n\nSlack's answer to the post named no message, so whether the message was posted is unknown. Check the DM's history (list_channels shows its id, and fetch_history its messages) before posting again, so it isn't posted twice."
+      }
+    ],
+    "isError": true
+  },
+  "refusal": {
+    "content": [
+      {
+        "type": "text",
+        "text": "post refused\n\nNothing was sent: Slack doesn't know the conversation, or this bot can't see it. The id may be mistyped or remembered rather than copied, or it's a private conversation this bot isn't in. list_channels shows the conversations this bot can use, with their ids."
+      }
+    ],
+    "isError": true
+  },
+  "rate limit": {
+    "content": [
+      {
+        "type": "text",
+        "text": "post refused\n\nNothing was sent: Slack is rate-limiting this kind of call for the workspace, and asks to wait 20 seconds before trying again."
+      }
+    ],
+    "isError": true
+  },
+  "connection never made": {
+    "content": [
+      {
+        "type": "text",
+        "text": "client timeout\n\nNothing was sent: Slack couldn't be reached. Try again shortly. If it keeps failing, whoever runs this host has to check its connection to Slack."
+      }
+    ],
+    "isError": true
+  },
+  "open timeout": {
+    "content": [
+      {
+        "type": "text",
+        "text": "client timeout\n\nSlack went 10 seconds without answering, or the connection to it failed, so whether the message was posted is unknown. Check the DM's history (list_channels shows its id, and fetch_history its messages) before posting again, so it isn't posted twice."
+      }
+    ],
+    "isError": true
+  }
+}

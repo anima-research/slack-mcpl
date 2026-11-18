@@ -1,3 +1,6 @@
+import { paginationSettings, PAGE_SETTINGS, type PaginationLimits } from './pagination.js';
+import { parseAccessPolicy, type SlackAccessPolicyConfig } from './access-policy.js';
+
 /** Parse an operator switch. An absent value is off; a present value must
  *  say yes or no so a broken environment template cannot disable a guard. */
 export function booleanFlag(name: string, raw: string | undefined): boolean {
@@ -9,6 +12,8 @@ export function booleanFlag(name: string, raw: string | undefined): boolean {
 }
 
 export interface StartupSettings {
+  pagination?: Readonly<PaginationLimits>;
+  accessPolicy?: SlackAccessPolicyConfig;
   useStdio: boolean;
   tcpPort: number | undefined;
   botToken: string;
@@ -33,6 +38,22 @@ export function startupSettings(
   const appToken = env.SLACK_APP_TOKEN;
   if (!botToken || !appToken) return { refusal: 'SLACK_BOT_TOKEN and SLACK_APP_TOKEN environment variables are required' };
 
+  let pagination: Readonly<PaginationLimits>;
+  try { pagination = paginationSettings(env); }
+  catch (err) { return { refusal: (err as Error).message }; }
+  let accessPolicy: SlackAccessPolicyConfig | undefined;
+  if (env.SLACK_ACCESS_POLICY !== undefined) {
+    let value: unknown;
+    try { value = JSON.parse(env.SLACK_ACCESS_POLICY); }
+    catch { return { refusal: 'SLACK_ACCESS_POLICY must be valid JSON; value omitted' }; }
+    try { accessPolicy = parseAccessPolicy(value); }
+    catch (err) {
+      const message = err instanceof Error ? err.message : '';
+      const fields = ['readJoinedChannels', 'writeChannels', 'dmUsers', 'groupDms', 'historyMembershipFallbackChannels']
+        .filter(field => message.includes(field));
+      return { refusal: `SLACK_ACCESS_POLICY is invalid; check ${fields.join(', ') || 'structure and keys'}; value omitted` };
+    }
+  }
   const list = (raw: string | undefined) => raw?.split(',').map((s) => s.trim()).filter(Boolean);
   const dmUsers = list(env.SLACK_DM_USERS);
   if (env.SLACK_DM_USERS !== undefined && dmUsers!.length === 0) {
@@ -44,7 +65,7 @@ export function startupSettings(
   }
   const sendChannels = list(env.SLACK_SEND_CHANNELS);
   if (env.SLACK_SEND_CHANNELS !== undefined && sendChannels!.length === 0) {
-    return { refusal: 'SLACK_SEND_CHANNELS is set but names no conversation; unset it to allow writing anywhere' };
+    return { refusal: 'SLACK_SEND_CHANNELS is set but names no conversation; unset it to ' + (accessPolicy ? 'remove this additional write restriction' : 'allow writing anywhere') };
   }
   let disableDms: boolean;
   let subscribeMemberChannels: boolean;
@@ -56,6 +77,7 @@ export function startupSettings(
   }
   const ackReaction = env.SLACK_ACK_REACTION?.replace(/:/g, '').trim() || undefined;
   return {
-    settings: { useStdio, tcpPort, botToken, appToken, dmUsers, sendChannels, disableDms, subscribeMemberChannels, ackReaction },
+    settings: { ...(Object.values(PAGE_SETTINGS).some(name => env[name] !== undefined) ? { pagination } : {}), useStdio, tcpPort, botToken, appToken, dmUsers, sendChannels, disableDms, subscribeMemberChannels, ackReaction,
+      ...(accessPolicy ? { accessPolicy } : {}) },
   };
 }
