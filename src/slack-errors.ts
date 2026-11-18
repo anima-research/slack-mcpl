@@ -49,6 +49,7 @@ import {
   failedRequest,
   failedAccessAdmission,
   fileLeftByUpload,
+  failedHistoryAdmission,
   retryAfterSeconds,
   slackRefusal,
 } from './slack-adapter.js';
@@ -214,7 +215,7 @@ function explanation(err: unknown, call: SlackCall, policyUploadDetail = false):
   // to come before the write. An error no request of the client's threw keeps
   // the tool's reading, since then which request failed can't be told.
   const failed = failedRequest(err);
-  const mayHaveWritten = isWrite && !failedAccessAdmission(err) && (failed === undefined || !BEFORE_WRITE.has(failed));
+  const mayHaveWritten = isWrite && !failedAccessAdmission(err) && !failedHistoryAdmission(err) && (failed === undefined || !BEFORE_WRITE.has(failed));
   /** For a listing tool: a new call starts over, so a listing too large for
    *  `limit` stops near the same place each time. */
   const startsOver = (limit: string) => LISTINGS.has(call.tool)
@@ -401,8 +402,11 @@ function explanation(err: unknown, call: SlackCall, policyUploadDetail = false):
         'list_channels shows the conversations this bot can use, with their ids.'
       );
     case 'not_in_channel':
-      if (failedAccessAdmission(err)) {
+      if (failedAccessAdmission(err) && !failedHistoryAdmission(err)) {
         return `${lead}: Slack could not confirm this bot's membership in ${conversation}. Ask someone in that conversation to re-invite the bot; extra posting permissions do not satisfy policy admission.`;
+      }
+      if (failedHistoryAdmission(err)) {
+        return `${lead}: Slack could not confirm that this bot can read ${conversation}. Ask someone in that conversation to re-invite the bot; if the channel should no longer be available, whoever runs this host can remove it from the configured public channels. Extra posting permissions will not restore read access.`;
       }
       if (call.tool === 'upload_file') {
         return `${lead}: this bot isn't a member of ${conversation}, so Slack didn't let it share the file there. ${invite}`;

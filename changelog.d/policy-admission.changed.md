@@ -5,7 +5,7 @@
 - Final policy delivery checks run before rendering or delivery-visible state,
   reuse their metadata for labels, and do not await DM names. They retry rate
   limits at most twice within a two-second wait budget and a five-second delivery wait
-  bound (the lookup may finish later). Classified rate-limit, transport and Slack service failures retain the original event admission only without a known lasting refusal or withdrawn grant; other failures, including expired wait bounds, drop the message and request acknowledgement cleanup.
+  bound (the lookup may finish later). Classified rate-limit, transport and Slack service failures retain the original event admission only without a known lasting refusal, private-pin veto or withdrawn grant; other failures, including expired wait bounds, drop the message and request acknowledgement cleanup.
   Optional backscroll failures omit context; known lasting admission refusals veto transient fallback.
 - With an explicit policy, refused status starts are not owned; a refused refresh retains the prior visible status until reset can clear it; an attempted status clear forgets ownership
   even if Slack refuses or its outcome is uncertain. Failed clear admission retains
@@ -38,4 +38,4 @@
 - Foreground and background policy candidate admission share initial inbound pacing; foreground rate limits preserve collected rows with an explicit incomplete notice. Background admission and yields to addressed work; retired or exhausted candidates are skipped and counted as incomplete; healthy candidates continue.
 - The final delivery recheck, ACK and optional backscroll checks are separate
   from initial-event pacing. The final recheck has its own small retry and
-  five-second delivery wait budget, retaining original admission only on classified rate-limit, transport and Slack service failures without known lasting refusals or grant withdrawals. Other failures drop the event and request ACK cleanup, which can itself be refused.
+  five-second delivery wait budget, retaining original admission only on classified rate-limit, transport and Slack service failures without known lasting refusals, private-pin vetoes or grant withdrawals. Other failures drop the event and request ACK cleanup, which can itself be refused.

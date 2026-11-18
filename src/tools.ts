@@ -266,11 +266,11 @@ export const toolDefinitions: ToolDefinition[] = [
 
 /** Keep the legacy tools/list surface unchanged when policy is absent. */
 export function policyListingTool(tool: ToolDefinition, policy: boolean): ToolDefinition {
-  if (policy && tool.name === 'refresh_channels') return { ...tool, description: 'Re-scan conversations this bot can currently access and register newly discovered eligible ones. Access restrictions can leave conversations out. Each eligible candidate needs a serial fresh metadata request. This unpaced foreground scan can fail without results at the 25-second deadline or rate limit; background registration shares inbound pacing and announces only after its scan finishes.' };
+  if (policy && tool.name === 'refresh_channels') return { ...tool, description: 'Re-scan conversations this bot can currently access and register newly discovered eligible ones. Access restrictions can leave conversations out. Each eligible candidate needs fresh serial admission: a metadata request when its grant is available, or a history proof for an eligible attested fallback pin. This unpaced foreground scan can fail without results at the 25-second deadline or rate limit; background registration shares inbound pacing and announces only after its scan finishes.' };
   if (!policy || tool.name !== 'list_channels') return tool;
   return {
     ...tool,
-    description: 'List only freshly admitted policy conversations. includeNonMember has no effect in policy mode: unjoined public channels are never listed. Each eligible candidate needs a serial fresh metadata request; candidate checks share initial admission pacing. A rate limit returns collected rows with an explicit incomplete notice; the 25-second call deadline can still stop the scan.',
+    description: 'List only freshly admitted policy conversations. includeNonMember has no effect in policy mode: unjoined public channels are never listed. Each eligible candidate needs fresh serial admission: a metadata request when its grant is available, or a history proof for an eligible attested fallback pin; candidate checks share initial admission pacing. A rate limit returns collected rows with an explicit incomplete notice; the 25-second call deadline can still stop the scan.',
     inputSchema: { ...tool.inputSchema, properties: { ...tool.inputSchema.properties,
       includeNonMember: { type: 'boolean', description: 'Has no effect in policy mode; unjoined public channels are never listed.' },
     } },

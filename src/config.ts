@@ -49,7 +49,7 @@ export function startupSettings(
     try { accessPolicy = parseAccessPolicy(value); }
     catch (err) {
       const message = err instanceof Error ? err.message : '';
-      const fields = ['readJoinedChannels', 'writeChannels', 'dmUsers', 'groupDms']
+      const fields = ['readJoinedChannels', 'writeChannels', 'dmUsers', 'groupDms', 'historyMembershipFallbackChannels']
         .filter(field => message.includes(field));
       return { refusal: `SLACK_ACCESS_POLICY is invalid; check ${fields.join(', ') || 'structure and keys'}; value omitted` };
     }

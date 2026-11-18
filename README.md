@@ -362,7 +362,7 @@ Switches take `true`/`false` (also `1`/`0`, `yes`/`no`); any other value stops t
 | `SLACK_DM_USERS` | no | Comma-separated user-ID whitelist for DMs; others' DMs are dropped. Without an access policy it filters incoming DMs only, not group DMs, history reads or the conversation list. Set but naming no user is refused at startup |
 | `SLACK_SEND_CHANNELS` | no | Comma-separated conversation-ID allow-list for writes (send, upload, DM, edit, delete, reaction, and the host's `channels/publish`); write effects elsewhere are refused before reaching Slack (send_dm may open first to learn its exact destination). Other admitted conversations can be registered `inbound`, `list_channels` shows `writable: false`, and the first message the agent gets from one, addressed or not, carries a read-only note. A mention there is eligible only after access admission and successful delivery; whether it wakes is the host's policy. `send_dm` is refused before a DM is opened, and not offered, unless the list names a DM. In policy mode, Slack must first open the DM to return its exact ID; if that ID fails admission, the error reports the opened DM and that nothing was posted. Set but empty is refused at startup; the effective list is logged |
 | `SLACK_SUBSCRIBE_MEMBER_CHANNELS` | no | `true` makes ambient messages from member channels eligible, subject to access admission and successful delivery; membership alone does not bypass policy. `unsubscribe_channel` then mutes a conversation (`subscribe_channel` unmutes it) and `list_subscriptions` lists the muted ones. Takes `true` or `false` (also `1`/`0`, `yes`/`no`); unset is off, and any other value, empty included, stops startup |
-| `SLACK_DISABLE_DMS` | no | `true` drops incoming DMs and group DMs, refuses every write to them and both history reads on them, and leaves them out of `conversations.list`, so they are neither listed nor registered; `send_dm` is not offered. Only a conversation Slack confirms as a channel passes: a group DM ID looks like a channel ID, and a user ID posts into that user's DM. An unknown ID is asked about until Slack confirms it. One Slack won't describe is refused; when the question can't be answered just now (a rate limit, a failure on the way or on Slack's side, or too little of the call's time), nothing is written, and the error says why and that the call can be made again. Without an access policy, incoming events pass only when Slack marks them `channel` or `group`; policy mode instead uses fresh conversation metadata. Takes `true` or `false` (also `1`/`0`, `yes`/`no`); unset is off, and any other value, empty included, stops startup |
+| `SLACK_DISABLE_DMS` | no | `true` drops incoming DMs and group DMs, refuses every write to them and both history reads on them, and leaves them out of `conversations.list`, so they are neither listed nor registered; `send_dm` is not offered. Except for operator-attested public history fallback pins (see below), only a conversation Slack confirms as a channel passes: a group DM ID looks like a channel ID, and a user ID posts into that user's DM. An unknown ID is asked about until Slack confirms it. One Slack won't describe is refused; when the question can't be answered just now (a rate limit, a failure on the way or on Slack's side, or too little of the call's time), nothing is written, and the error says why and that the call can be made again. Without explicit policy, incoming events pass only when Slack marks them `channel` or `group`; explicit policy instead requires fresh admission. Takes `true` or `false` (also `1`/`0`, `yes`/`no`); unset is off, and any other value, empty included, stops startup |
 | `SLACK_ACK_REACTION` | no | Emoji name (e.g. `eyes`) put on a message that addresses the bot. It means "received": it is removed at the bot's next post in that conversation that Slack confirms, after 10 minutes, or cleanup is requested at once if the host does not accept the message. Under a policy, adding it needs fresh write admission and reactions:write; cleanup also needs admission and may leave the reaction visible if refused. A removal that fails in a way that can pass (a rate limit, an HTTP error, a network failure, or Slack's own failure such as `internal_error`) is tried again every minute, up to 5 tries in all; one Slack refuses is dropped. An add that fails isn't tried again. One that may have landed is removed as usual: `already_reacted` says it's there, and Slack's failure while handling it (`internal_error`, `fatal_error`, `service_unavailable`), an HTTP error, an answer not in Slack's form or one the client can't read, or a failure in transit after the request may have reached Slack leaves it unknown. One Slack refused, rate-limited or received only in part (`request_timeout`), one whose connection was never made, and one this server refused itself, such as outside `SLACK_SEND_CHANNELS`, isn't there. On SIGTERM, SIGINT or the host closing stdin, pending reactions are removed (5 s at most); a crash cannot, so removal is best-effort. For a typing signal see **Typing** above. |
 | `SLACK_SUBSCRIPTIONS_FILE` | no | JSON file persisting ambient subscriptions across restarts: an array of IDs, or `{subscribed, muted}` while anything is muted (older versions read the object form as empty) |
 | `SLACK_BACKSCROLL_LIMIT` | no | Messages fetched on first interaction with a conversation (default 50) |
@@ -403,12 +403,69 @@ export SLACK_ACCESS_POLICY='{"readJoinedChannels":true,"writeChannels":["CEXAMPL
 | `writeChannels` | yes | Exact uppercase C/G IDs; writable pins, not membership proof |
 | `dmUsers` | yes | Exact uppercase U/W peer IDs; deliberate read **and write** grant |
 | `groupDms` | no | Exact uppercase G IDs; omission/empty denies group DMs |
+| `historyMembershipFallbackChannels` | no | Operator-attested public C IDs, also in `writeChannels`; omission/empty keeps normal metadata checks |
 
 Empty lists deny; IDs are exact uppercase. Joined ordinary channels require
 fresh membership and enabled joined reads; writes also need a pin. DMs require
 an allowed peer for reads and writes, not a D-ID pin. Groups need explicit
 naming and current membership; writes also need a pin. With joined reads off,
 every write pin must also be named in groupDms. No auto-join.
+
+For a bot token without `channels:read`, an optional public-pin fallback is:
+
+```json
+{"readJoinedChannels":true,"writeChannels":["CEXAMPLE"],"dmUsers":[],"historyMembershipFallbackChannels":["CEXAMPLE"]}
+```
+
+**Trust boundary:** the operator attests that each exact pin is a public,
+ordinary channel, and remains public. A C prefix and successful history call
+cannot establish visibility (including after public-to-private conversion);
+inbound events can reveal contrary evidence.
+Never pin private channels or DMs here; remove a pin before changing visibility.
+Only public C write pins are accepted, with joined reads enabled; fallback and
+`groupDms` must not overlap. Legacy G private IDs, DMs and group DMs cannot use this path. Modern private
+channels also have C IDs and can pass proof with groups:history. Pins discovered
+as private by a listing (requiring `groups:read` and reaching their page), or
+by an inbound event with a non-public `channel_type`, are excluded from history
+fallback for the process lifetime. Events without that marker do not prove
+visibility. Once `channels:read` is known, normal metadata decides.
+It does not join channels or bypass Slack membership refusals.
+
+Only when `channels:read` is absent, each operation first requires
+`channels:history` and a fresh one-message `conversations.history` response with
+`ok: true`. Its content is discarded; no proof is cached. Slack response scope metadata is learned. The synthetic label is the channel ID. Metadata, history/thread reads,
+backscroll, writes, ACKs and status all recheck admission. A continuation checks
+again; proof requests are outside data-page budgets. From the first operation after the server learns `channels:read`, the
+normal metadata path wins, even after refusal. Other scope/file gates remain.
+
+**History budget:** compound operations (such as rollback or replacing a thread status) perform multiple admissions. each admission costs one extra `conversations.history`
+request, in addition to data pages, except `upload_file`, which costs two:
+one before uploading bytes and one before sharing the file. Inbound proof runs only after local policy vetoes and the ambient subscription check. Ambient preparation waits for earlier addressed deliveries to commit subscription changes, not every ambient delivery; its early subscription veto can therefore precede the ordered delivery turn. Surviving events require proof before content delivery and the server rechecks subscriptions at delivery. Initial event admission failures are retried up to
+three attempts within the existing **10-second retry-wait budget** (including
+jitter, not request duration). Each inbound retry costs another proof. On
+initial-admission exhaustion the event is dropped, with reason-grouped aggregate stderr diagnostics (policy denial, transient
+unverifiability, or other verification failure), not agent notification or replay. The separate final delivery check makes at most three attempts within two seconds of requested waits and a five-second delivery wait bound (the lookup may finish later). Only classified rate-limit, transport and Slack service failures retain the original admission, absent a known private-pin veto. Other failures, including an expired delivery wait, drop and log the message and conversation IDs and request ACK cleanup, which may itself be refused. It reuses the result for labels, without a separate metadata-name request.
+A short successful addressed-message/reply exchange can cost eight proofs
+(initial admission, optional backscroll, final delivery check, ACK add, status set/clear, reply, ACK removal);
+this is **not a ceiling**. Long turns add a status proof each minute while typing
+continues. Each ACK-removal retry adds a proof (up to five removal attempts).
+Each registration/refresh attempts one proof per eligible pin while channels:read is absent; latched-private pins and local vetoes skip proof, and a scope refresh can select normal metadata admission instead. Background pin
+admission retries add proofs (up to five attempts). Scope-refresh retries add
+auth.test calls (up to five attempts), not history proofs themselves.
+Proofs and channel/backscroll data pages use the conversations.history budget; thread data pages use the separate conversations.replies budget.
+**Do not use this fallback on installations limited to one history request per
+minute.** Even Tier 3 budgets can be exhausted by chatter and agent reads.
+Proofs remain fresh per operation; no TTL is used.
+
+Pinned channels precede ordinary listing results and survive scope restarts
+and page-limit truncation without duplicates only while `channels:read` is
+absent. Once it is available, pins require normal metadata readmission; an
+exhausted listing page budget can leave them omitted until a later listing.
+A terminal stale-pin refusal omits only that pin, with aggregate admission
+diagnostics; later operations
+still fail closed. Candidate rate limits return collected rows with an explicit incomplete notice; other transient/deadline failures propagate in foreground calls. Background
+registration retries each pin at most five times, then skips and counts that
+candidate without discarding other registrations. Unset fallback is behavior-identical to the normal policy path.
 
 Scope grants still apply. Unknown scope metadata refuses startup; known
 limited grants diagnose missing capabilities and deny affected operations.
@@ -425,7 +482,8 @@ broaden admission, nor does policy sandbox unrelated host filesystem access.
 Fresh admission, including bounded MPIM members fallback, adds API demand;
 throttling/outages can drop acknowledged events after bounded retries, with
 separate timed diagnostics for policy denials and unverifiable drops. Unsubscribed ambient messages are discarded before admission. Each remaining
-inbound message may require fresh metadata calls (local vetoes can avoid them and concurrent events can share in-flight admission); see the migration guide for budgets and call costs. With
+inbound message may require fresh admission calls (metadata or a fallback history proof) (local vetoes can avoid them and concurrent events can share in-flight admission); see the migration guide for budgets and call costs. With
+
 readJoinedChannels:true, anyone who can invite the bot can extend its readable
 set, including private channels; there is no channel-read allow-list.
 
@@ -491,16 +549,20 @@ backscroll after **5 seconds**; the first rate limit also rejects the fetch. In
 either case delivery continues without backscroll or an incomplete note, even
 if earlier pages succeeded. With an explicit policy the bounded final admission
 still applies: only classified rate-limit, transport and Slack service failures
-retain the original event admission only without a known lasting refusal or withdrawn grant; other failures and expired delivery waits drop
+retain the original event admission only without a known lasting refusal, private-pin veto or withdrawn grant; other failures and expired delivery waits drop
 and request ACK cleanup, which can itself fail. The page limit bounds requests from an abandoned
 fetch that continues after delivery gives up. The normal latest-N-message backscroll window is not labelled incomplete. History/thread tools retain
 `pagination.scanComplete`, their existing stop reasons and continuation cursors.
 
 Background registration announces the eligible subset and logs incomplete
 enumeration, separately from host acceptance. `refresh_channels` marks partial
-scans with `truncated: true` and reports unresolved **page-limit-only** background enumeration in
-`registration.enumerationIncomplete`; a subsequent complete scan clears that
-status. This flag does not describe give-up, cursor-cycle or other registration errors. `visible` counts only eligible conversations observed in that scan.
+scans with `truncated: true` and reports unresolved page-limited or failed-candidate background enumeration in
+`registration.enumerationIncomplete` (reason `page_limit` or `admission_failed`,
+with the relevant counts). Type/scope restarts retain unresolved failed pin-proof counts until the scan admits or definitively denies that pin,
+because they retry page candidates but not the pin loop; incompleteness is
+conservative until another scan retries those pins. A subsequent scan without page truncation or failed
+candidates clears that status even when some conversation types remain outside
+the token’s scopes. This flag does not describe arbitrary whole-scan errors. `visible` counts only eligible conversations observed in that scan.
 A repeated listing or refresh starts over, **not** at a continuation cursor, and
 may repeatedly return the same subset. Review the limits with the operator;
 increasing them cannot guarantee complete discovery or bypass rate limits. In explicit-policy mode at the page cap, scope withdrawals remove retained rows requiring the withdrawn grants; newly granted types are not scanned without another invocation.
@@ -555,7 +617,7 @@ checks can occur earlier. The result supplies the label without awaiting DM name
 Rate limits receive at most two retries with a combined two-second retry-wait
 budget. Delivery waits five seconds, not a cancellation deadline for the underlying
 request or its retries. A classified rate-limit, transport or Slack-service failure
-within that wait can retain initial admission only when no lasting refusal or grant
+within that wait can retain initial admission only when no lasting refusal, private-pin veto or grant
 withdrawal is known. Missing/unverified results, unclassified errors, lasting refusals,
 shutdown and expiry of the five-second wait drop the event and request ACK cleanup; fresh write admission may refuse cleanup and leave the reaction visible.
 Optional backscroll failure omits context; its lasting admission refusal vetoes
@@ -563,7 +625,7 @@ transient fallback. A successful final admission may establish recovered access.
 The unset-mode exception is #61’s explicit incomplete result at page/match ceilings, including bounded partial backscroll; directory validation otherwise retains main behavior. With a policy installed, attachment hints use conversation and file IDs; byte access requires fresh conversation and file-association checks.
 
 With explicit policy, conversation listings make one fresh serial metadata
-request per eligible candidate. Foreground list/refresh candidate checks share initial admission pacing and
+request per eligible candidate when its metadata grant is available; attested fallback pins use a fresh history proof when channels:read is absent. Foreground list/refresh candidate checks share initial admission pacing and
 can fail at their 25-second call deadline; a candidate rate limit preserves collected rows with an incomplete notice; page caps do not ensure completion. Background registration shares
 the 1.2-second inbound admission pacer and announces descriptors after the
 whole scan: 100 candidates need roughly 119 seconds plus Slack latency and

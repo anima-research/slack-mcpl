@@ -25,7 +25,18 @@ for (const [name, args] of deniedTools) {
     t.after(() => h.close());
     await initialize(h, true);
     await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
-    f.calls.length = 0; // Discard registration's safe auth.test scope probe.
+    // The capability receipt does not await registration. Wait for its public
+    // busy flag to clear; a settled refresh also joins its own scope probes.
+    const deadline = AbortSignal.timeout(1000);
+    for (;;) {
+      assert.equal(deadline.aborted, false, 'registration did not settle');
+      const ready = await h.host.sendRequest('tools/call', { name: 'refresh_channels', arguments: {} }) as any;
+      if (JSON.stringify(ready).includes('still registering')) continue;
+      assert.equal(ready.isError, true);
+      assert.match(JSON.stringify(ready), /scope metadata is unavailable/);
+      break;
+    }
+    f.calls.length = 0;
     const result = await h.host.sendRequest('tools/call', { name, arguments: args }) as { isError?: boolean; content?: unknown };
     assert.equal(result.isError, true);
     assert.match(JSON.stringify(result.content), /scope/i, 'not an unknown tool or argument-validation refusal');
@@ -181,6 +192,12 @@ for (const mode of ['auto-subscribe', 'subscribe', 'unmute']) test(`queued ambie
   await initialize(h, true);
   await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
   if (mode === 'unmute') await h.host.sendRequest('tools/call', { name: 'unsubscribe_channel', arguments: { channelId: 'C1' } });
+  if (mode === 'subscribe') {
+    const subscribed = await h.host.sendRequest('tools/call', { name: 'subscribe_channel', arguments: { channelId: 'C1' } }) as { isError?: boolean };
+    assert.notEqual(subscribed.isError, true);
+    await f.emit({ type: 'message', channel: 'C1', user: 'U2', ts: '0.5', text: 'ambient before mention' });
+    assert.equal(h.hostSaw.filter(r => r.method === method.PUSH_EVENT).length, 1, 'explicit subscription delivers without mention auto-subscription');
+  }
   let entered!: () => void, release!: () => void;
   const started = new Promise<void>(r => { entered = r; });
   const held = new Promise<void>(r => { release = r; });
@@ -188,9 +205,9 @@ for (const mode of ['auto-subscribe', 'subscribe', 'unmute']) test(`queued ambie
   const first = f.emit({ type: 'message', channel: 'C1', user: 'U1', ts: '1.0', text: '<@UBOT> hello' });
   await started;
   const ambient = f.emit({ type: 'message', channel: 'C1', user: 'U1', ts: '2.0', text: 'ambient' });
-  if (mode !== 'auto-subscribe') await h.host.sendRequest('tools/call', { name: 'subscribe_channel', arguments: { channelId: 'C1' } });
+  if (mode === 'unmute') await h.host.sendRequest('tools/call', { name: 'subscribe_channel', arguments: { channelId: 'C1' } });
   release(); await Promise.all([first, ambient]);
-  assert.equal(h.hostSaw.filter(r => r.method === method.PUSH_EVENT).length, 2);
+  assert.equal(h.hostSaw.filter(r => r.method === method.PUSH_EVENT).length, mode === 'subscribe' ? 3 : 2);
 });
 
 test('unset policy does not call a same-named legacy filter hook', async t => {

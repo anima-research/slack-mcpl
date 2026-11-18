@@ -6,11 +6,18 @@ export interface SlackAccessPolicyConfig {
   readonly readJoinedChannels: boolean;
   readonly writeChannels: readonly string[];
   readonly dmUsers: readonly string[];
+  /** Exact public write pins, verified as public by the operator. History
+   * success proves fresh bot access, NOT visibility; C IDs alone are not proof. */
+  readonly historyMembershipFallbackChannels?: readonly string[];
   /** Exact joined group-DM IDs. Writes also need a writeChannels pin. Omit the key when unused. */
   readonly groupDms?: readonly string[];
 }
 
+/** In-process evidence only; neither JSON nor Slack metadata can mint it. */
+export const HISTORY_MEMBERSHIP_PROOF: unique symbol = Symbol('Slack bot history membership');
+
 export interface AccessConversation {
+  [HISTORY_MEMBERSHIP_PROOF]?: true;
   id?: string;
   user?: string;
   is_im?: boolean;
@@ -51,7 +58,7 @@ function validateIds(value: unknown, pattern: RegExp, field: string): asserts va
 }
 
 const REQUIRED_KEYS = new Set<string | symbol>(['readJoinedChannels', 'writeChannels', 'dmUsers']);
-const ALLOWED_KEYS = new Set([...REQUIRED_KEYS, 'groupDms']);
+const ALLOWED_KEYS = new Set([...REQUIRED_KEYS, 'groupDms', 'historyMembershipFallbackChannels']);
 
 /** One strict, unversioned format for future embedded and JSON callers.
  * Snapshot before validating to retain the values checked. This is not a sandbox
@@ -65,17 +72,26 @@ export function parseAccessPolicy(value: unknown): SlackAccessPolicyConfig {
   const { readJoinedChannels, writeChannels, dmUsers } = config;
   if ('groupDms' in config && !keys.has('groupDms')) throw new Error('Invalid Slack access policy: groupDms must be an own property');
   const groupDms = keys.has('groupDms') ? config.groupDms : undefined;
+  if ('historyMembershipFallbackChannels' in config && !keys.has('historyMembershipFallbackChannels')) throw new Error('Invalid Slack access policy: historyMembershipFallbackChannels must be an own property');
+  const historyMembershipFallbackChannels = config.historyMembershipFallbackChannels;
   const channels = Array.isArray(writeChannels) ? Array.from(writeChannels) : writeChannels;
   const users = Array.isArray(dmUsers) ? Array.from(dmUsers) : dmUsers;
   const groups = Array.isArray(groupDms) ? Array.from(groupDms) : groupDms;
+  const fallback = Array.isArray(historyMembershipFallbackChannels) ? Array.from(historyMembershipFallbackChannels) : historyMembershipFallbackChannels;
   if (typeof readJoinedChannels !== 'boolean') throw new Error('Invalid Slack access policy: readJoinedChannels must be boolean');
   validateIds(channels, CHANNEL_ID, 'writeChannels');
   validateIds(users, USER_ID, 'dmUsers');
   if (keys.has('groupDms')) validateIds(groups, GROUP_DM_ID, 'groupDms');
 
   if (!readJoinedChannels && channels.some(id => !(groups as string[] | undefined)?.includes(id))) throw new Error('readJoinedChannels:false requires every writeChannels entry to also be in groupDms');
+  if (keys.has('historyMembershipFallbackChannels')) {
+    validateIds(fallback, /^C[A-Z0-9]+$/, 'historyMembershipFallbackChannels');
+    if (fallback.some(id => !channels.includes(id))) throw new Error('Invalid Slack access policy: historyMembershipFallbackChannels must name pinned public write channels');
+  }
+
   return Object.freeze({ readJoinedChannels, writeChannels: Object.freeze(channels), dmUsers: Object.freeze(users),
-    ...(keys.has('groupDms') ? { groupDms: Object.freeze(groups as string[]) } : {}) });
+    ...(keys.has('groupDms') ? { groupDms: Object.freeze(groups as string[]) } : {}),
+    ...(keys.has('historyMembershipFallbackChannels') ? { historyMembershipFallbackChannels: Object.freeze(fallback as string[]) } : {}) });
 }
 
 export class SlackAccessDenied extends Error {
@@ -150,6 +166,7 @@ export class SlackAccessPolicy {
   private readonly dmUsers: ReadonlySet<string>;
   private readonly groupDms: ReadonlySet<string>;
   private readonly readJoinedChannels: boolean;
+  private readonly historyFallbackChannels: ReadonlySet<string>;
 
   constructor(config: SlackAccessPolicyConfig) {
     const parsed = parseAccessPolicy(config);
@@ -157,6 +174,22 @@ export class SlackAccessPolicy {
     this.dmUsers = new Set(parsed.dmUsers);
     this.groupDms = new Set(parsed.groupDms);
     this.readJoinedChannels = parsed.readJoinedChannels;
+    this.historyFallbackChannels = new Set(parsed.historyMembershipFallbackChannels);
+  }
+
+  historyMembershipFallbacks(scopes: readonly string[] | undefined): string[] {
+    if (!Array.isArray(scopes) || scopes.includes('channels:read') || !this.readJoinedChannels) return [];
+    return [...this.historyFallbackChannels];
+  }
+
+  /** Configuration identity is independent of whether the fallback is active. */
+  namesHistoryMembershipFallback(channelId: string): boolean {
+    return this.historyFallbackChannels.has(channelId);
+  }
+
+  usesHistoryMembershipFallback(channelId: string, scopes: readonly string[] | undefined): boolean {
+    return this.readJoinedChannels && Array.isArray(scopes) && !scopes.includes('channels:read')
+      && this.historyFallbackChannels.has(channelId);
   }
 
   /** Cheap veto only; fresh metadata still decides admission. */
@@ -245,8 +278,14 @@ export class SlackAccessPolicy {
   /** Fresh exact metadata and current grants are independent evidence. History
    * scopes are checked separately by callers. */
   requireReadable(channelId: string, conversation: AccessConversation | undefined, scopes: readonly string[] | undefined): 'channel' | 'private_channel' | 'dm' | 'group_dm' {
+    conversation = conversation && Object.assign(Object.create(null), conversation) as AccessConversation;
     const kind = this.requireReadableMetadata(channelId, conversation);
-    this.requireScope(scopes, kind === 'group_dm' ? 'mpim:read' : kind === 'dm' ? 'im:read' : kind === 'private_channel' ? 'groups:read' : 'channels:read');
+    if (kind === 'channel' && conversation?.[HISTORY_MEMBERSHIP_PROOF] === true) {
+      this.requireScope(scopes, 'channels:history');
+      if (!this.usesHistoryMembershipFallback(channelId, scopes)) {
+        throw new SlackAccessDenied(`Conversation ${channelId} requires fresh Slack metadata`);
+      }
+    } else this.requireScope(scopes, kind === 'group_dm' ? 'mpim:read' : kind === 'dm' ? 'im:read' : kind === 'private_channel' ? 'groups:read' : 'channels:read');
     return kind;
   }
 

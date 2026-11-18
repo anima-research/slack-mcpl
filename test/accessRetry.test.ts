@@ -377,5 +377,5 @@ for (const retired of [false, true]) test(`real registration announces healthy c
   const announced = h.hostSaw.filter(r => r.method === method.CHANNELS_REGISTER).flatMap(r => (r.params as any).channels);
   assert.deepEqual(announced.map(c => c.id), ['slack:C0', 'slack:C1', 'slack:C2', 'slack:C3', 'slack:C4', 'slack:C6', 'slack:C7', 'slack:C8', 'slack:C9']);
   assert.equal(failures, retired ? 0 : 5);
-  assert.ok(log.mock.calls.some(c => /registration incomplete: 1 candidate\(s\) skipped/.test(c.arguments.join(' '))));
+  assert.ok(log.mock.calls.some(c => /registration incomplete: 1 candidate(?:\(s\) skipped| admissions did not complete)/.test(c.arguments.join(' '))));
 });

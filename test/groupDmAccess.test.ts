@@ -16,16 +16,16 @@ const fixture = (overrides = {}) => {
   return f;
 };
 
-test('group list is optional, strict, snapshotted once, frozen and cannot overlap unsupported fallback', () => {
+test('group list is optional, strict, snapshotted once, frozen and cannot overlap history fallback', () => {
   const old = { readJoinedChannels: true, writeChannels: [], dmUsers: [] };
   assert.deepEqual(parseAccessPolicy(old), old);
   for (const groupDms of [null, undefined, 'G1', {}, [null], new Array(1), ['C1'], ['D1'], ['G'], ['g1'], ['G1\n'], ['G1 ']]) {
     assert.throws(() => parseAccessPolicy(config({ groupDms })));
     assert.throws(() => new SlackAccessPolicy(config({ groupDms }) as SlackAccessPolicyConfig));
   }
-  for (const fallback of [['G1'], []]) {
-    assert.throws(() => parseAccessPolicy(config({ historyMembershipFallbackChannels: fallback })), /Invalid Slack access policy/);
-  }
+  assert.throws(() => parseAccessPolicy(config({ historyMembershipFallbackChannels: ['G1'] })), /historyMembershipFallbackChannels\[0\]/);
+  assert.deepEqual(parseAccessPolicy(config({ historyMembershipFallbackChannels: [] })),
+    config({ historyMembershipFallbackChannels: [] }));
   for (const key of ['extra', Symbol('extra')]) assert.throws(() => parseAccessPolicy({ ...config(), [key]: [] }));
   let reads = 0;
   const ids = ['G1'];
@@ -476,7 +476,7 @@ test('group proof A/B/C retains the producing membership request serial', async 
     if (call === 1) { enterA(); await heldA; }
     if (call === 3) { enterC(); await heldC; }
     return { members: call === 2 ? [] : ['UBOT'],
-      response_metadata: { scopes: scopes } };
+      response_metadata: { scopes } };
   };
   const a = f.adapter.getConversationMeta('G1').then(() => undefined, err => err);
   await startedA;
@@ -492,4 +492,10 @@ test('group proof A/B/C retains the producing membership request serial', async 
   assert.equal(result.value?.id, 'G1');
   assert.doesNotThrow(() => f.adapter.assertKnownDeliveryAdmission('G1'));
   assert.equal(calls, 3);
+});
+
+test('otherwise admissible named joined group rejects explicit public privacy', () => {
+  const p = new SlackAccessPolicy(config());
+  assert.equal(p.requireReadable('G1', group(), scopes), 'group_dm');
+  assert.throws(() => p.requireReadable('G1', { ...group(), is_private: false }, scopes));
 });

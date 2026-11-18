@@ -786,3 +786,20 @@ test('caller-controlled scope and ID wording in legacy refusals is not a policy 
     assert.equal(explainSlackError(failure, { tool: 'send_message', args: { channelId: value } }), failure.message);
   }
 });
+
+test('policy permission refusals preserve missing grants for file and history reads', async () => {
+  const { accessFixture, accessScopes } = await import('./adapterAccessFixture.js');
+  for (const grant of ['files:read', 'channels:history']) {
+    const f = accessFixture({ scopes: accessScopes.filter(scope => scope !== grant) });
+    const tool = grant === 'files:read' ? 'fetch_attachment' : 'fetch_history';
+    await assert.rejects(grant === 'files:read'
+      ? f.adapter.resolveFileDownload('C1', 'F1')
+      : f.adapter.readHistory('C1', {}), error => {
+      const text = explainSlackError(error, { tool, args: { channelId: 'C1', fileId: 'F1' } });
+      assert.ok(text.includes(grant), `name the permission to restore: ${text}`);
+      assert.match(text, /whoever runs this host/);
+      return true;
+    });
+    await f.adapter.stop();
+  }
+});

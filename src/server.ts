@@ -1,4 +1,4 @@
-import { SlackAccessDenied, SlackScopeEvidenceError } from './access-policy.js';
+import { HISTORY_MEMBERSHIP_PROOF, SlackAccessDenied, SlackScopeEvidenceError } from './access-policy.js';
 /**
  * SlackMcplServer — main MCPL server orchestrator.
  *
@@ -209,7 +209,7 @@ export class SlackMcplServer {
    *  ends; a registration it superseded may still be finishing after that. A
    *  refresh_channels answers at once while it's set. */
   private registering: number | undefined;
-  private registrationIncomplete?: PageTruncation;
+  private registrationIncomplete?: PageTruncation | { reason: 'admission_failed'; failed: number };
   private stateTracker = new StateTracker();
   /** Serial delivery within a conversation; different conversations stay independent. */
   private forwarding = new Map<string, Promise<void>>();
@@ -896,7 +896,7 @@ export class SlackMcplServer {
         // or noted, as the tool's description says.
         if (leftOut.length === 0 && !admissionFailures && !truncation) return listed;
         return { _content: [textContent(toolResultJson(listed)),
-          ...(leftOut.length ? [textContent(leftOutNote(leftOut))] : []),
+          ...(leftOut.length ? [textContent(leftOutNote(leftOut, this.slack.hasAccessPolicy && conversations.some(c => c.kind === 'channel'), this.slack.hasHistoryFallbackPins))] : []),
           ...(truncation ? [textContent(listingTruncationNote(truncation))] : []),
           ...(admissionFailures ? [textContent('Incomplete: candidate admission was rate-limited; rows above are usable but more may exist. Retry later; a new call starts over.')] : [])] };
       }
@@ -1198,8 +1198,8 @@ export class SlackMcplServer {
         : await this.slack.listConversations(false, waitOut);
       const { conversations: convs, admissionFailures, truncation } = listing;
       if (!isCurrent()) return;
-      if (admissionFailures) console.error(`[slack-mcpl] Conversation registration incomplete: ${admissionFailures} candidate(s) skipped after failed admission; enumerated ${convs.length} eligible conversations. refresh_channels can retry skipped candidates.`);
-      this.registrationIncomplete = truncation;
+      this.registrationIncomplete = admissionFailures ? { reason: 'admission_failed', failed: admissionFailures } : truncation;
+      if (admissionFailures) console.error(`[slack-mcpl] Conversation registration incomplete: ${admissionFailures} candidate admissions did not complete; refresh_channels can retry discovery after the backlog or Slack refusal clears.`);
       if (truncation) console.error(`[slack-mcpl] Conversation registration incomplete: enumeration reached ${truncation.pages} pages; ` +
         `additional conversations may be missing. Review the adapter pagination.conversations option (or SLACK_CONVERSATION_PAGE_LIMIT for the executable), restart after changing it, then refresh_channels where available; repeating the same limit may omit the same conversations. Enumerated ${convs.length} eligible conversations; host acceptance is separate.`);
       descriptors = convs.map((c) => toDescriptor(c, this.slack.teamName, this.slack.canWrite(c.id)));
@@ -1356,7 +1356,7 @@ export class SlackMcplServer {
       );
     }
     const gone = () => this.conn !== conn || !!conn?.isClosed;
-    const { conversations: convs, leftOut: typesLeftOut, truncation } = await (this.slack.hasAccessPolicy ? this.slack.listConversations(false, undefined, () => !gone()) : this.slack.listConversations());
+    const { conversations: convs, leftOut: typesLeftOut, truncation, admissionFailures } = await (this.slack.hasAccessPolicy ? this.slack.listConversations(false, undefined, () => !gone()) : this.slack.listConversations());
     const incomplete = truncation ? { truncated: true, stopReason: truncation.reason } : {};
     const incompleteNote = truncation ? ` ${listingTruncationNote(truncation)} The visible count includes only eligible conversations found in this scan.` : '';
     // The host keeps the label a conversation is first announced with, and a
@@ -1379,7 +1379,7 @@ export class SlackMcplServer {
       };
     }
     const added = this.registerAndNotifyNew(descriptors);
-    if (!truncation) this.registrationIncomplete = undefined;
+    if (!truncation && !admissionFailures) this.registrationIncomplete = undefined;
     const wait = Math.max(1, ...unnamed.map((c) => c.nameWait?.seconds ?? 0));
     const unnamedIds = unnamed.map((c) => `${mcplChannelId(c.id)} (user ${c.userId})`).join(', ');
     const leftOut = unnamed.length === 0 ? '' :
@@ -1399,7 +1399,7 @@ export class SlackMcplServer {
             ? 'No conversation was registered.'
             : truncation ? 'No additional conversations were registered from this incomplete scan.'
             : 'No new conversations: the host already has every one this listing found.') + leftOut +
-        (typesLeftOut.length > 0 ? ` ${leftOutNote(typesLeftOut)}` : '') + incompleteNote,
+        (typesLeftOut.length > 0 ? ` ${leftOutNote(typesLeftOut, this.slack.hasAccessPolicy && convs.some(c => c.kind === 'channel'), this.slack.hasHistoryFallbackPins)}` : '') + incompleteNote,
     };
   }
 
@@ -1820,10 +1820,12 @@ export class SlackMcplServer {
         meta = await this.deliveryLookup(this.slack.getConversationMeta(msg.channelId, true),
           `delivery admission for message ${msg.id} in ${msg.channelId}`,
           'retaining original admission only for classified transient Slack failures');
+        if (meta?.[HISTORY_MEMBERSHIP_PROOF]) this.slack.assertDeliveryFallbackAllowed(msg.channelId);
         if (meta === undefined || (meta === null && !msg.isDM)) throw new TypeError('Final admission returned no result');
       } catch (err) {
         try {
           if (backscrollRefused) throw new Error('Earlier backscroll admission refused delivery');
+          this.slack.assertDeliveryFallbackAllowed(msg.channelId);
           this.slack.assertKnownDeliveryAdmission(msg.channelId);
         } catch (veto) { err = veto; }
         if (!isTransientSlackFailure(err)) {

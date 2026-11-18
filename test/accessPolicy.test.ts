@@ -38,9 +38,9 @@ test('validation and construction reject missing, unknown and null fields identi
     delete missing[key];
     invalid.push(missing, { ...config(), [key]: null }, { ...config(), [key]: undefined });
   }
-  // These extensions are deliberately unsupported in A1, even empty or null.
+  // The optional fallback still rejects null, G-prefixed IDs and unpinned IDs; C IDs do not prove visibility.
   for (const key of ['historyMembershipFallbackChannels']) {
-    for (const value of [null, [], ['G1']]) invalid.push({ ...config(), [key]: value });
+    for (const value of [null, ['G1'], ['COTHER']]) invalid.push({ ...config(), [key]: value });
   }
   invalid.push({ ...config(), readJoinedChannels: 'true' });
   for (const value of invalid) {
@@ -473,5 +473,19 @@ test('admission errors distinguish authoritative denials from unverified evidenc
   ] as const) {
     assert.throws(() => policy.requireReadable('C1', metadata, granted), (err: unknown) =>
       err instanceof SlackAccessDenied && err.authoritative === authoritative);
+  }
+});
+
+
+test('access context preserves error identity and carries primitive rejections as causes', async () => {
+  const { withAccessContext } = await import('../src/access-policy.js');
+  for (const original of [new Error('rate limit'), 'primitive', null, 42]) {
+    await assert.rejects(withAccessContext('Nothing was done', async () => { throw original; }), err => {
+      assert.ok(err instanceof Error);
+      assert.match(err.message, /^Nothing was done:/);
+      if (original instanceof Error) assert.equal(err, original);
+      else { assert.equal(err.cause, original); assert.notEqual(err, original); }
+      return true;
+    });
   }
 });

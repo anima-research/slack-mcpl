@@ -19,4 +19,6 @@
   or blank scope metadata keeps the last known set, and while the scopes are
   unknown, every enabled type is asked for, as before.
 
-- With an explicit policy, reports can withdraw grants. Older in-flight responses cannot restore grants withdrawn after their requests began. Unknown scope evidence fails closed; a scope probe with no readable types can return an empty listing instead of a legacy no-readable-scopes error.
+  These accumulating-scope and unknown-scope rules describe legacy mode.
+
+- With an explicit policy, reports can withdraw grants. Older in-flight responses cannot restore grants withdrawn after their requests began. Unknown scope evidence fails closed; with no readable types, the initial refresh can return an empty listing with omission diagnostics unless fresh history-fallback pins can be admitted.
