@@ -779,6 +779,23 @@ test('legacy DM peer listing veto is independent of policy peers and disabled DM
   await f.adapter.stop();
 });
 
+
+test('policy stop fences subsequent handlers without joining an in-flight handler', async () => {
+  const f = accessFixture();
+  let entered!: () => void, release!: () => void;
+  const started = new Promise<void>(r => { entered = r; });
+  const held = new Promise<void>(r => { release = r; });
+  let later = 0;
+  f.adapter.onMessage(async () => { entered(); await held; });
+  f.adapter.onMessage(() => { later++; });
+  const event = f.emit({ type: 'message', channel: 'C1', user: 'U1', ts: '1.0', text: '<@UBOT> hi' });
+  await started;
+  await f.adapter.stop();
+  release();
+  await event;
+  assert.equal(later, 0);
+});
+
 test('delivery recheck requires history grants even when metadata stays readable', async () => {
   const f = accessFixture();
   await f.adapter.getConversationMeta('C1');

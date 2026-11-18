@@ -1,7 +1,7 @@
 - Activate explicit-policy adapter admission gates through the opt-in SLACK_ACCESS_POLICY setting. With a policy installed, status
   refreshes latch lasting Slack metadata refusals until reset and post-transfer
   admission failures identify the allocated unshared file. Completion failures
-  can leave sharing uncertain; check whether the file was shared before retrying. Unset-policy responses are unchanged; only policy-mode uncertain `send_dm` post errors name the opened DM and explicitly say the message may have been sent.
+  can leave sharing uncertain; check whether the file was shared before retrying. Legacy authorization and unset-policy `send_dm` responses are unchanged; bounded pagination is documented separately. Only policy-mode uncertain `send_dm` post errors name the opened DM and explicitly say the message may have been sent.
 - Final policy delivery checks run before rendering or delivery-visible state,
   reuse their metadata for labels, and do not await DM names. They retry rate
   limits at most twice within a two-second wait budget and a five-second delivery wait

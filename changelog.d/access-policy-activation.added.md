@@ -20,7 +20,9 @@
   a current writable share but deletes across all shares; restart or eviction
   from the 1000-entry provenance store requires manual cleanup. Concurrent
   unsharing cannot be made atomic. Legacy DM-name give-up behavior
-  is preserved. In policy conversation listings and directory lookups, a repeated pagination cursor fails instead of looping forever. Legacy cursor behavior is unchanged at this layer.
+  is preserved. In legacy and policy conversation listings, directory lookups
+  and backscroll, a repeated pagination cursor now fails instead of looping forever,
+  unless the requested message or match limit already ended the scan.
 - **Hosts and agents:** policy mode replaces the `fetch_attachment` URL argument
   with `channelId`/`fileId`, carries protected attachment ID hints, offers
   `send_dm` only when effective policy permits DM writes, and lists only freshly admitted conversations. `includeNonMember`

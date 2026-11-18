@@ -7,6 +7,7 @@
  * Salvaged from zulip-mcp PR #8 (multi-platform branch), Slack halves only.
  */
 
+import { DEFAULT_PAGINATION, pageLimit } from './pagination.js';
 import type { PolicyFileRef } from './file-access.js';
 import { channelShown, mimeShown, nameShown } from './framing.js';
 
@@ -429,11 +430,18 @@ export async function fetchSlackHistory(
     latest?: string;
     inclusive?: boolean;
     maxMessages: number;
+    maxPages?: number;
+    /** Policy callers refuse cycles; legacy callers stop via their page cap. */
+    rejectCursorCycles?: boolean;
   },
-): Promise<{ messages: SlackHistoryMessage[]; truncated: boolean }> {
+): Promise<{ messages: SlackHistoryMessage[]; truncated: boolean; stopReason?: 'message_limit' | 'page_limit' }> {
+  const maxPages = pageLimit(params.maxPages === undefined ? DEFAULT_PAGINATION.backscroll : params.maxPages, 'maxPages');
+  let pages = 0;
   const collected: SlackHistoryMessage[] = [];
   let cursor: string | undefined;
   let truncated = false;
+  let stopReason: 'message_limit' | 'page_limit' | undefined;
+  const cursors = new Set<string>();
   do {
     const result = await client.conversations.history({
       channel: params.channel,
@@ -443,12 +451,17 @@ export async function fetchSlackHistory(
       limit: Math.min(200, params.maxMessages - collected.length),
       cursor,
     });
+    pages++;
     collected.push(...((result.messages ?? []) as SlackHistoryMessage[]));
     cursor = result.response_metadata?.next_cursor || undefined;
     if (cursor && collected.length >= params.maxMessages) {
       truncated = true;
+      stopReason = 'message_limit';
       cursor = undefined;
     }
+    if (params.rejectCursorCycles && cursor && cursors.has(cursor)) throw new Error('No backscroll context was returned: Slack history cursor cycle (repeated pagination cursor). Retry once; if it repeats, ask whoever runs this host to investigate Slack pagination.');
+    if (cursor) cursors.add(cursor);
+    if (cursor && pages >= maxPages) { truncated = true; stopReason = 'page_limit'; break; }
   } while (cursor);
-  return { messages: collected.reverse(), truncated };
+  return { messages: collected.reverse(), truncated, ...(stopReason ? { stopReason } : {}) };
 }

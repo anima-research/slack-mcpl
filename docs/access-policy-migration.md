@@ -109,7 +109,19 @@ independent counter for each candidate. An ordinary candidate that exhausts admi
 is skipped and counted in an incomplete-registration diagnostic; healthy candidates continue;
 refresh_channels can retry later. DM-name lookup keeps the existing
 registration give-up behavior: after one name exhausts the waiter, later DMs
-still attempt name lookup and use their user IDs if it fails, without further waits. Policy conversation listings and directory lookups reject repeated pagination cursors. Legacy mode retains its existing cursor behavior at this layer. Backscroll does not detect cursor cycles at this layer.
+still attempt name lookup and use their user IDs if it fails, without further waits. Conversation listings, directory
+lookups and backscroll in policy mode fail on a repeated pagination
+cursor instead of looping forever, unless the message or match limit ends the scan first.
+
+Page-count limits apply equally in legacy and explicit-policy mode. A normal
+limit stop returns eligible partial results with an explicit incomplete signal;
+it is not a cursor-cycle, rate-limit or authorization error. Fresh admission,
+per-candidate retries and the five-page MPIM membership proof remain unchanged.
+Page-limit incompleteness is reported in logs and refresh status; candidate admission skips and enumeration failures are logged but are not retained as refresh registration status at this layer; a repeated
+refresh starts over and need not reach missing conversations. Truncated
+backscroll may omit older context and is not a complete archive. Complete
+valid responses below all limits retain their normal complete results. Without a policy, the only intended difference is the explicit bounded incomplete-result contract, including partial backscroll; main directory validation and cursor behavior are otherwise retained. See README's **Bounded pagination**
+section for the three validated operator settings and result fields.
 
 ## Troubleshooting and rollback
 
@@ -126,13 +138,11 @@ can broaden access; never automatically fall back after malformed policy.
 Shutdown wakes pending inbound admission pacing and retry sleeps (candidate retry sleeps are not cancelled) and prevents starting subsequent policy message handlers. It does not cancel or join an already-running embedded or server handler or its asynchronous lookups; such a handler may still deliver after stop begins.
 An already-running Slack request remains subject to its timeout and the CLI shutdown deadline; diagnostics for such unfinished requests are best effort.
 
-Initial event admission attempts are paced at least 1.2 seconds apart per adapter, including fast refusals; pacing adds queue latency without caching settled evidence. Final delivery checks, ACK and optional backscroll admission, foreground operations and SDK internal retries are not covered by this pacing bound. The single final check runs before rendering or delivery state, retries at most twice within two seconds of requested waits and a five-second delivery wait bound (the lookup may finish later), and retains original admission only on classified rate-limit, transport and Slack service failures when no lasting refusal or withdrawn grant is known. Other failures, including expired delivery waits, drop the event and request ACK cleanup; cleanup needs fresh write admission and may leave a visible reaction.
+Initial admission slots are released at least 1.2 seconds apart per adapter (event-loop stalls can bunch actual starts), including fast refusals; pacing adds queue latency without caching settled evidence. Final delivery checks, ACK and optional backscroll admission, foreground effects and SDK internal retries are not covered by this pacing bound. The single final check runs before rendering or delivery state, retries at most twice within two seconds of requested waits and a five-second delivery wait bound (the lookup may finish later), and retains original admission only on classified rate-limit, transport and Slack service failures when no lasting refusal or withdrawn grant is known. Other failures, including expired delivery waits, drop the event and request ACK cleanup; cleanup needs fresh write admission and may leave a visible reaction.
 
 Policy enumeration costs: each eligible listed candidate needs a fresh, serial
 `conversations.info` request. This layer does not implement pinned history fallback. Foreground
-`list_channels` and `refresh_channels` do not use the inbound pacer: they share
-the existing 25-second call deadline and can fail without results at the first
-rate limit or budget exhaustion. Repeating a large scan may reach the same
+`list_channels` and `refresh_channels` candidate checks use the initial inbound pacer and the existing 25-second call deadline. Candidate rate limits preserve collected rows with an explicit incomplete notice; budget exhaustion can still fail the call. Repeating a large scan may reach the same
 limit; page ceilings do not guarantee interactive completion. Background
 registration checks use the shared 1.2-second pacer, including retry attempts,
 and yield to addressed inbound work. Descriptors are announced only after the

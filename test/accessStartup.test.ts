@@ -179,3 +179,34 @@ for (const [pins, send, writes] of [
   const warning = h.stderr().split('\n').find(line => line.includes('Access policy: unavailable scopes:')) ?? '';
   for (const scope of ['chat:write', 'files:write', 'reactions:write']) assert.equal(warning.includes(scope), writes, h.stderr());
 });
+
+test('pagination real startup source wires caps and refuses without echo', async (t) => {
+  const h = await running(t, false, { SLACK_CONVERSATION_PAGE_LIMIT: '2', SLACK_USER_PAGE_LIMIT: '2', SLACK_BACKSCROLL_PAGE_LIMIT: '2' }, { pagination: true });
+  await initialize(h, false);
+  const listing = await h.host.sendRequest('tools/call', { name: 'list_channels', arguments: {} });
+  assert.match(JSON.stringify(listing), /Incomplete conversation listing/);
+  const directory = await h.host.sendRequest('tools/call', { name: 'find_user', arguments: { query: 'absent' } });
+  assert.match(JSON.stringify(directory), /directory search is incomplete/);
+  await until(() => (h.stderr().match(/"name":"conversations.list"/g) ?? []).length >= 2
+    && (h.stderr().match(/"name":"users.list"/g) ?? []).length >= 2, 'listing and directory call logs');
+  assert.equal((h.stderr().match(/"name":"conversations.list"/g) ?? []).length, 2);
+  assert.equal((h.stderr().match(/"name":"users.list"/g) ?? []).length, 2);
+  const call = invocation({ SLACK_USER_PAGE_LIMIT: 'do-not-echo' }, ['--stdio']);
+  const refused = spawnSync(process.execPath, call.args, { ...call.options, input: '', encoding: 'utf8', timeout: 15000 });
+  assert.equal(refused.status, 1); assert.equal(refused.stdout, '');
+  assert.equal(refused.stderr, 'SLACK_USER_PAGE_LIMIT must be a decimal integer from 1 to 10000\n');
+});
+
+test('real startup forwards the backscroll page ceiling through connectSlack', async t => {
+  const h = await running(t, false, { ...policyEnv(policy), SLACK_BACKSCROLL_PAGE_LIMIT: '2' }, { backscroll: true });
+  await initialize(h, true);
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await until(() => h.requests.some(r => r.method === method.CHANNELS_REGISTER), 'registration');
+  await h.host.sendRequest('tools/call', { name: 'find_user', arguments: { query: 'directory' } });
+  await until(() => h.requests.some(r => r.method === method.PUSH_EVENT), 'backscroll delivery');
+  const push = h.requests.find(r => r.method === method.PUSH_EVENT)!;
+  assert.match(JSON.stringify(push.params), /Backscroll is incomplete/);
+  await until(() => (h.stderr().match(/"name":"conversations.history"/g) ?? []).length >= 2, 'history call logs');
+  assert.equal((h.stderr().match(/"name":"conversations.history"/g) ?? []).length, 2);
+
+});
