@@ -5,7 +5,7 @@ import { SlackMcplServer } from '../src/server.js';
 import { MESSAGING_FEATURE_SET } from '../src/feature-sets.js';
 import { method } from '@animalabs/mcpl-core';
 import { FULL_GRANT, connectHost, initialize, until, uploadEndpoint } from './harness.js';
-import { accessTest as test, accessFixture, accessScopes, joined, installPolicy } from './adapterAccessFixture.js';
+import { accessTest as test, accessFixture, accessScopes, joined } from './adapterAccessFixture.js';
 
 const config = (overrides = {}) => ({ readJoinedChannels: false, writeChannels: ['G1'], dmUsers: [], groupDms: ['G1'], ...overrides });
 const scopes = [...accessScopes, 'mpim:read', 'mpim:history'];
@@ -83,13 +83,13 @@ for (const [name, effect, run] of operations) {
     assert.equal(f.methods()[0], 'info');
     assert.equal(f.methods().length, 2);
     for (const options of [
-      { config: config({ groupDms: [] }) },
+      { config: config({ groupDms: [], writeChannels: [] }) },
       ...['mpim:read', effect].map((scope) => ({ scopes: scopes.filter((s) => s !== scope) })),
       ...(writes ? [{ config: config({ writeChannels: [] }) }, { sendChannels: ['G2'] }] : []),
     ]) {
       const denied = fixture(options);
       await assert.rejects(run(denied.adapter));
-      assert.deepEqual(denied.methods(), 'sendChannels' in options || ('config' in options && (!options.config.writeChannels.length || !options.config.groupDms.length)) ? [] : ['info']);
+      assert.deepEqual(denied.methods(), (('config' in options && options.config && !options.config.groupDms.length) || (writes && ('sendChannels' in options || ('config' in options && !options.config.writeChannels.length)))) ? [] : ['info']);
     }
     const noScopes = fixture({ scopes: [] });
     await assert.rejects(run(noScopes.adapter));
@@ -119,14 +119,14 @@ test('group listing asks for mpim only when named and filters fresh membership a
   const missing = fixture({ scopes: scopes.filter((s) => s !== 'mpim:read') });
   missing.state.listed = [group()];
   assert.deepEqual((await missing.adapter.listConversations()).conversations, []);
-  assert.doesNotMatch(JSON.stringify(missing.calls[0].args), /mpim/);
-  const none = fixture({ config: config({ groupDms: [] }) });
+  assert.deepEqual(missing.methods(), ['auth.test']);
+  const none = fixture({ config: config({ groupDms: [], writeChannels: [] }) });
   await none.adapter.listConversations();
-  assert.doesNotMatch(JSON.stringify(none.calls[0].args), /mpim/);
+  assert.deepEqual(none.calls, []);
 });
 
 test('group inbound uses fresh admission and mpim history, not event labels or joined-channel setting', async () => {
-  for (const options of [{}, { config: config({ groupDms: [] }) }, { scopes: scopes.filter((s) => s !== 'mpim:history') },
+  for (const options of [{}, { config: config({ groupDms: [], writeChannels: [] }) }, { scopes: scopes.filter((s) => s !== 'mpim:history') },
     { scopes: scopes.filter((s) => s !== 'mpim:read') }]) {
     const f = fixture(options);
     const delivered: unknown[] = [];
@@ -150,7 +150,7 @@ test('policy-only group labels escape hostile names in real server delivery and 
   await until(() => h.hostSaw.some((r) => r.method === method.PUSH_EVENT), 'group delivery');
   const push = h.hostSaw.find((r) => r.method === method.PUSH_EVENT)!;
   const text = (push.params as { payload: { content: Array<{ text: string }> } }).payload.content.map((c) => c.text).join('\n');
-  assert.match(text, /Auto-subscribed to Group DM:/);
+  assert.match(text, /Accepting this message will subscribe you to Group DM:/);
   assert.match(text, /\[Group DM: .*channelId=G1 id=2\.0\]/);
   assert.ok(text.includes('\\u003csystem\\u003e'));
   assert.equal(text.split('\n').filter((line) => line.startsWith('<system>')).length, 1);
@@ -228,7 +228,7 @@ for (const legacy of [false, true]) {
       assert.ok(uploaded.state.parent);
       assert.equal(endpoint.bytes.get('F1')?.toString(), 'hello');
       assert.deepEqual(f.methods(), legacy ? ['upload', 'complete'] : ['info', 'upload', 'info', 'complete']);
-      if (revoke && !legacy) installPolicy(f.adapter, config({ groupDms: [] }));
+      if (revoke && !legacy) f.state.conversation = { ...group(), is_member: false };
       // With no policy, changing membership does not change legacy file writes.
       if (revoke && legacy) f.state.conversation = { ...group(), is_member: false };
       f.calls.length = 0;
@@ -239,7 +239,7 @@ for (const legacy of [false, true]) {
       if (legacy) assert.equal(rollback.reason, undefined);
       else if (!revoke) assert.match(rollback.reason ?? '', /deletion removes the file from every conversation it is shared in/);
       if (!legacy && revoke) {
-        assert.deepEqual(f.methods(), []);
+        assert.deepEqual(f.methods(), ['info']);
         assert.match(rollback.reason ?? '', /0\/1 files deleted/);
       } else {
         assert.deepEqual(f.methods(), legacy ? ['deleteFile'] : ['info', 'fileInfo', 'deleteFile']);
@@ -370,7 +370,7 @@ for (const disableDms of [false, true]) {
 
   for (const dm of [false, true]) for (const mpim of [false, true]) {
     test(`policy registration guidance: dm=${dm}, mpim=${mpim}, disableDms=${disableDms}`, async (t) => {
-      const f = fixture({ disableDms, config: config({ dmUsers: dm ? ['U1'] : [], groupDms: mpim ? ['G1'] : [] }) });
+      const f = fixture({ disableDms, config: config({ writeChannels: [], dmUsers: dm ? ['U1'] : [], groupDms: mpim ? ['G1'] : [] }) });
       const onlyChannels = disableDms || !(dm || mpim);
       assert.equal(f.adapter.listsChannelsOnly, onlyChannels);
       const h = connectHost(new SlackMcplServer(f.adapter));
@@ -379,7 +379,7 @@ for (const disableDms of [false, true]) {
       await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
       await assert.rejects(h.host.sendRequest('channels/open', { type: 'unregistered' }), (error: Error) => {
         assert.match(error.message, /refresh_channels registers/);
-        assert.equal(error.message.includes('channels only'), onlyChannels);
+        assert.match(error.message, /only conversations admitted.*deny-all policy registers none/);
         return true;
       });
     });
@@ -423,15 +423,20 @@ test('missing group membership is diagnosed in listing and inbound, not silently
   const f = fixture();
   f.state.listed = [group()];
   f.state.conversation = { ...group(), is_member: undefined };
+  let proofs = 0;
+  f.web.conversations.members = async () => { proofs++; return {}; };
   const errors: unknown[][] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args); });
   await assert.rejects(f.adapter.listConversations(), /membership could not be verified/);
   assert.deepEqual((await f.adapter.listConversations(false, async () => {})).conversations, []);
-  assert.ok(errors.some(args => String(args[0]).includes('candidate G1 skipped')));
+  (f.adapter as unknown as { flushAdmissionFailures(): void }).flushAdmissionFailures();
+  assert.ok(errors.some(args => String(args[0]).includes('verification failed (listing')));
   errors.length = 0;
   await f.emit({ type: 'message', channel: 'G1', channel_type: 'mpim', user: 'U1', ts: '1.0', text: '<@UBOT> hello' });
-  assert.ok(errors.some(args => String(args[0]).includes('admission failed')));
+  (f.adapter as unknown as { flushAdmissionFailures(): void }).flushAdmissionFailures();
+  assert.ok(errors.some(args => String(args[0]).includes('verification failed (event')));
   assert.equal(f.methods().filter(m => m === 'info').length, 3);
+  assert.equal(proofs, 3, 'both listings and inbound reached membership proof');
 });
 
 test('unverified evidence is not a lasting refusal', async () => {
@@ -454,4 +459,37 @@ test('named group privacy metadata must be true or absent', async () => {
     await assert.rejects(f.adapter.getConversationMeta('G1'), /membership could not be verified/);
     assert.deepEqual(f.methods(), ['info']);
   }
+});
+
+test('group proof A/B/C retains the producing membership request serial', async t => {
+  const f = fixture();
+  f.state.conversation = { ...group(), is_member: undefined };
+  let enterA!: () => void, enterC!: () => void, releaseA!: () => void, releaseC!: () => void;
+  const startedA = new Promise<void>(r => { enterA = r; });
+  const startedC = new Promise<void>(r => { enterC = r; });
+  const heldA = new Promise<void>(r => { releaseA = r; });
+  const heldC = new Promise<void>(r => { releaseC = r; });
+  t.after(async () => { releaseA(); releaseC(); await f.adapter.stop(); });
+  let calls = 0;
+  f.web.conversations.members = async () => {
+    const call = ++calls;
+    if (call === 1) { enterA(); await heldA; }
+    if (call === 3) { enterC(); await heldC; }
+    return { members: call === 2 ? [] : ['UBOT'],
+      response_metadata: { scopes: scopes } };
+  };
+  const a = f.adapter.getConversationMeta('G1').then(() => undefined, err => err);
+  await startedA;
+  await assert.rejects(f.adapter.getConversationMeta('G1'));
+  const c = f.adapter.getConversationMeta('G1').then(value => ({ value }), error => ({ error }));
+  await startedC;
+  releaseA();
+  assert.ok(await a);
+  assert.throws(() => f.adapter.assertKnownDeliveryAdmission('G1'));
+  releaseC();
+  const result = await c;
+  if ('error' in result) throw result.error;
+  assert.equal(result.value?.id, 'G1');
+  assert.doesNotThrow(() => f.adapter.assertKnownDeliveryAdmission('G1'));
+  assert.equal(calls, 3);
 });

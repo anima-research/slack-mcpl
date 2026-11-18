@@ -75,6 +75,10 @@ test('ordinary channel read/write matrix requires joined reads, membership and a
       for (const readJoinedChannels of [false, true]) {
         for (const isMember of [false, true]) {
           for (const pinned of [false, true]) {
+            if (!readJoinedChannels && pinned) {
+              assert.throws(() => new SlackAccessPolicy(config({ readJoinedChannels, writeChannels: [id] })), /readJoinedChannels/);
+              continue;
+            }
             const policy = new SlackAccessPolicy(config({ readJoinedChannels, writeChannels: pinned ? [id] : [] }));
             const metadata = { ...channel(id, isPrivate), is_member: isMember };
             const read = () => policy.requireReadable(id, metadata, scopes);
@@ -204,12 +208,12 @@ test('duplicate IDs are harmless and construction snapshots both lists and the r
 });
 
 test('synchronous write hints are not authorization decisions', () => {
-  const policy = new SlackAccessPolicy(config({ readJoinedChannels: false }));
+  const policy = new SlackAccessPolicy(config());
   assert.equal(policy.dmsWritable, true);
-  assert.equal(policy.mayWrite('C1'), false);
+  assert.equal(policy.mayWrite('C1'), true);
   assert.equal(policy.mayWrite('C2'), false);
   assert.equal(policy.mayWrite('D2'), true);
-  assert.throws(() => policy.requireWritable('C1', channel(), scopes, 'chat:write'));
+  assert.throws(() => policy.requireWritable('C1', { ...channel(), is_member: false }, scopes, 'chat:write'));
   assert.throws(() => policy.requireWritable('D2', { ...dm('U2'), id: 'D2' }, scopes, 'chat:write'));
 });
 
@@ -292,7 +296,19 @@ test('parser and denials identify the failing field or evidence', () => {
   assert.throws(() => policy.requireReadable('C1', undefined, scopes), /missing metadata/);
   assert.throws(() => policy.requireReadable('C1', channel('C2'), scopes), /mismatched/);
   assert.throws(() => policy.requireReadable('C1', { ...channel(), is_member: false }, scopes), /not in conversation/);
-  assert.throws(() => new SlackAccessPolicy(config({ readJoinedChannels: false })).requireReadable('C1', channel(), scopes), /reads are disabled/);
+  assert.throws(() => new SlackAccessPolicy(config({ readJoinedChannels: false, writeChannels: [] })).requireReadable('C1', channel(), scopes), /reads are disabled/);
+});
+
+test('R3-1 effective capabilities deduplicate and intersect all legacy controls', () => {
+  const p = new SlackAccessPolicy({ readJoinedChannels: true, writeChannels: ['C1', 'C2', 'C2'], dmUsers: ['W1', 'W1'], groupDms: ['G1', 'G1'] });
+  assert.deepEqual(p.capabilities(false, undefined, ['C2', 'C3', 'D9', 'D9']), { peers: ['W1'], groups: ['G1'], pins: ['C2'], dmTargets: ['D9'], dmWrites: true });
+  assert.deepEqual(p.capabilities(true, undefined, ['C3']), { peers: [], groups: [], pins: [], dmTargets: [], dmWrites: false });
+  assert.ok(!p.diagnosticScopes(true, undefined, ['C3']).some(s => s.startsWith('im:') || s.endsWith(':write')));
+});
+
+test('A17 inherited group-DM property is not validated then discarded', () => {
+  const config = Object.assign(Object.create({ groupDms: ['G1'] }), { readJoinedChannels: false, writeChannels: ['G1'], dmUsers: [] });
+  assert.throws(() => parseAccessPolicy(config), /groupDms must be an own property/);
 });
 
 test('list diagnostics identify the bad index, including sparse entries', () => {
@@ -317,6 +333,7 @@ test('access context preserves input, unverified and local-denial identity, clas
       assert.equal(err.cause, cause);
       assert.equal(err.message.split('Nothing was posted:').length, 2);
       assert.equal(err.message.includes('Retrying unchanged'), Ctor === SlackAccessDenied);
+      if (Ctor === SlackAccessUnverified) assert.equal(err.message, 'Nothing was posted: reason. Retry once for fresh evidence; if it persists, ask whoever runs this host to investigate access.');
       return true;
     });
   }
@@ -389,6 +406,29 @@ test('array elements and DM peer metadata are snapshotted before decisions', () 
   assert.equal(policy.mayWrite('G1'), false);
   assert.throws(() => policy.requireReadable('D1', { ...dm(), get user() { return ++peers === 1 ? 'U2' : 'U1'; } }, scopes), /not an admitted direct message|Direct messages.*U2.*not allowed/);
   assert.deepEqual([channels, users, peers], [1, 1, 1]);
+});
+
+test('capability DM targets require exact uppercase IDs', () => {
+  const p = new SlackAccessPolicy(config());
+  for (const id of ['D', 'D…', 'Dnot-an-id', 'd1', 'D1 ', 'D1\n']) {
+    assert.deepEqual(p.capabilities(false, undefined, [id]).dmTargets, []);
+    assert.equal(p.capabilities(false, undefined, [id]).dmWrites, false);
+  }
+  assert.deepEqual(p.capabilities(false, undefined, ['D1', 'D1']).dmTargets, ['D1']);
+  assert.ok(p.diagnosticScopes(false).includes('mpim:read') === false);
+  const groups = new SlackAccessPolicy({ ...config(), groupDms: ['G1'] }).diagnosticScopes(false);
+  assert.ok(groups.includes('mpim:read') && groups.includes('mpim:history'));
+});
+
+test('scope evidence context preserves class and cause', async () => {
+  const { withAccessContext, SlackScopeEvidenceError } = await import('../src/access-policy.js');
+  const original = new SlackScopeEvidenceError('unavailable');
+  await assert.rejects(withAccessContext('Nothing was posted', async () => { throw original; }), err => {
+    assert.ok(err instanceof SlackScopeEvidenceError);
+    assert.equal(err, original);
+    assert.match(err.message, /^Nothing was posted:/);
+    return true;
+  });
 });
 
 test('DM IDs must be primitive strings and peers must be well formed', () => {

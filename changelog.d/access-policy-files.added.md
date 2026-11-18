@@ -5,7 +5,6 @@
   deletion still removes the file from its other shares too. Unshared or unverifiable
   files are left for manual cleanup. Upload provenance is capped at 1000 entries;
   evicted entries also require manual cleanup. Checks cannot make concurrent unsharing atomic.
-  Embedded policy callers use these protections; legacy URL fetching and rollback stay unchanged.
 
   ID-only `check_file_info` stubs may offer a fetch hint without known mode or
   fresh association, unless explicit unavailable markers veto the hint;

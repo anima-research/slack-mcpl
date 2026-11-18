@@ -53,7 +53,7 @@ export const SLACK_TAG_ONTOLOGY: TagOntology = {
   open: true,
 };
 
-export function buildFeatureSets(): Record<string, FeatureSetDeclaration> {
+export function buildFeatureSets(policy = false): Record<string, FeatureSetDeclaration> {
   const messagingUses: CapabilityPath[] = [
     'tools',
     'channels.register',
@@ -84,13 +84,13 @@ export function buildFeatureSets(): Record<string, FeatureSetDeclaration> {
       description:
         'Manage per-conversation ambient-message subscriptions (which conversations ' +
         'deliver non-mention messages for passive awareness). Mentions and DMs are ' +
-        'always delivered and are not affected by subscriptions.',
+        (policy ? 'not affected by subscriptions; all delivery remains subject to access admission and successful forwarding.' : 'always delivered and are not affected by subscriptions.'),
       uses: ['tools'],
     },
   };
 }
 
-export function buildServerCapabilities(): McplManifest {
+export function buildServerCapabilities(policy = false): McplManifest {
   return {
     version: '0.5',
     pushEvents: true,
@@ -101,7 +101,7 @@ export function buildServerCapabilities(): McplManifest {
       incoming: true,
       typing: true,
     },
-    featureSets: buildFeatureSets(),
+    featureSets: buildFeatureSets(policy),
   };
 }
 

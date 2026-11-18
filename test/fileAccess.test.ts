@@ -8,7 +8,7 @@ import { fileLeftByUpload, SlackAdapter, SlackWebClient, SLACK_CLIENT_OPTIONS, w
 import { fakeSlackApi } from './slackApi.js';
 import { SlackMcplServer } from '../src/server.js';
 import { connectHost, initialize, FULL_GRANT } from './harness.js';
-import { accessTest as test, accessFixture, accessScopes, joined, installPolicy } from './adapterAccessFixture.js';
+import { accessTest as test, accessFixture, accessScopes, joined, fixturePolicy } from './adapterAccessFixture.js';
 
 const url = 'https://files.slack.com/files-pri/T1-F1/canonical.txt';
 async function fixture(t: Parameters<Parameters<typeof test>[1]>[0], options: Parameters<typeof accessFixture>[0] = {}) {
@@ -219,8 +219,7 @@ test('production server/client path uses canonical URL and real bounded bytes, n
   api.answerFor('files.info', { body: { ok: true, file: { mode: 'hosted', id: 'F1', channels: ['C1'], url_private: url } } });
   const client = new SlackWebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: api.url });
   const adapter = new SlackAdapter(client as unknown as SlackWebLike, { on() {}, async start() {}, async disconnect() {} }, 'UBOT', 'test',
-    undefined, undefined, false, undefined, accessScopes);
-  installPolicy(adapter);
+    undefined, undefined, false, undefined, accessScopes, fixturePolicy());
   const h = connectHost(new SlackMcplServer(adapter));
   t.after(() => h.close());
   await initialize(h, false);
@@ -269,8 +268,7 @@ test('policy fetch retains streaming cap and exhausted-call start rule', async (
   assert.equal((await f.call({ channelId: 'C1', fileId: 'F1' })).isError, true);
   const client = new SlackWebClient('xoxb-test', SLACK_CLIENT_OPTIONS);
   const adapter = new SlackAdapter(client as unknown as SlackWebLike, { on() {}, async start() {}, async disconnect() {} }, 'UBOT', 'test',
-    undefined, undefined, false, undefined, accessScopes);
-  installPolicy(adapter);
+    undefined, undefined, false, undefined, accessScopes, fixturePolicy());
   await assert.rejects(withCallTime(Date.now() - CALL_SECONDS * 1000, () => adapter.resolveFileDownload('C1', 'F1')), /out of this call/);
 });
 
@@ -437,7 +435,7 @@ test('policy tool description retains the inline return shapes', async (t) => {
 for (const scenario of ['admitted', 'unrelated', 'unnamed', 'missing mpim:read'] as const) {
   test(`real group file download inherits admission: ${scenario}`, async (t) => {
     const f = await fixture(t, {
-      config: { readJoinedChannels: false, writeChannels: ['G1'], dmUsers: [], groupDms: scenario === 'unnamed' ? [] : ['G1'] },
+      config: { readJoinedChannels: false, writeChannels: [], dmUsers: [], groupDms: scenario === 'unnamed' ? [] : ['G1'] },
       scopes: [...accessScopes, ...(scenario === 'missing mpim:read' ? [] : ['mpim:read'])],
     });
     f.state.conversation = { ...joined('G1'), is_mpim: true, is_private: true };
@@ -515,7 +513,7 @@ test('R1-5 file metadata rate limits preserve retry information', async t => {
   await assert.rejects(f.adapter.resolveFileDownload('C1', 'F1'), err => { assert.equal((err as { retryAfter?: number }).retryAfter, 12); return true; });
 });
 
-for (const failure of ['redirect', 'recheck', 'membership', 'unexpected', 'denied', 'bytes', 'timeout'] as const) {
+for (const failure of ['redirect', 'recheck', 'membership', 'unexpected', 'denied', 'bytes', 'timeout', 'scope'] as const) {
   test(`upload ${failure} retains issued ID without claiming nothing uploaded`, async t => {
     const f = accessFixture();
     f.state.uploadUrl = 'https://files.slack.com/upload';
@@ -523,6 +521,7 @@ for (const failure of ['redirect', 'recheck', 'membership', 'unexpected', 'denie
     t.mock.method(globalThis, 'fetch', async (_input: string | URL | Request, init?: RequestInit) => {
       requests.push(init!);
       if (failure === 'bytes' || failure === 'timeout') throw new Error('byte connection failed');
+      if (failure === 'scope') f.state.infoScopes = accessScopes.filter(scope => scope !== 'files:write');
       if (failure === 'unexpected') f.state.infoError = new Error('unexpected info failure: original cause');
       if (failure === 'denied') f.state.conversation = { ...joined(), is_member: false };
       if (failure === 'recheck') f.state.infoError = Object.assign(new Error('limited'), { code: 'slack_webapi_rate_limited_error', retryAfter: 12 });
@@ -542,6 +541,10 @@ for (const failure of ['redirect', 'recheck', 'membership', 'unexpected', 'denie
     if (failure === 'unexpected') assert.match(text, /unexpected info failure: original cause/i);
     if (failure === 'timeout') assert.match(text, /didn't finish within 10 seconds/);
     if (failure === 'bytes') assert.doesNotMatch(text, /didn't finish within 10 seconds/);
+    if (failure === 'scope') {
+      assert.match(text, /required Slack permission files:write is not granted/);
+      assert.doesNotMatch(text, /requires granted scope/);
+    }
     assert.equal(result.isError, true);
     assert.equal(requests.length, 1);
     assert.equal(requests[0].redirect, 'manual');

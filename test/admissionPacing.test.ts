@@ -324,6 +324,7 @@ async function until(check: () => boolean): Promise<void> {
 }
 
 for (const phase of ['pacing', 'retry'] as const) test(`stop wakes a pending ${phase} sleep and retires queued work`, { timeout: 5000 }, async t => {
+  t.mock.method(Math, 'random', () => 0);
   const time = controlledClock(t);
   t.mock.method(console, 'error', () => {});
   const f = accessFixture();
@@ -332,12 +333,12 @@ for (const phase of ['pacing', 'retry'] as const) test(`stop wakes a pending ${p
   f.adapter.onMessage(msg => { received.push(msg.id); });
   f.web.conversations.info = async ({ channel }) => {
     starts.push(channel);
-    if (phase === 'retry') throw Object.assign(new Error('limited'), { code: 'slack_webapi_rate_limited_error', retryAfter: 60 });
+    if (phase === 'retry') throw Object.assign(new Error('limited'), { code: 'slack_webapi_rate_limited_error', retryAfter: 6 });
     return { channel: joined(channel) };
   };
   if (phase === 'pacing') await f.emit(event('C0'));
   const pending = [f.emit(event('C1')), f.emit(event('C1', '<@UBOT> queued', '2.0'))];
-  await until(() => time.timers.some(timer => timer.due === (phase === 'retry' ? 60_000 : 1200)));
+  await until(() => time.timers.some(timer => timer.due === (phase === 'retry' ? 6000 : 1200)));
   assert.deepEqual(starts, phase === 'retry' ? ['C1'] : ['C0']);
   assert.ok((f.adapter as any).policyTurns.get('C1').length > 0, 'second event is queued');
   const before = starts.length;
@@ -387,4 +388,21 @@ test('foreground candidate rate limits retain usable progress with an incomplete
   assert.deepEqual(starts, [0, 1200]);
   assert.deepEqual(listing.conversations.map(row => row.id), ['C1']);
   assert.equal(listing.admissionFailures, 1);
+});
+
+test('activation local veto retires turns before preparation but preserves denial accounting', async t => {
+  t.mock.method(console, 'error', () => {});
+  const f = accessFixture({ config: { readJoinedChannels: false, writeChannels: [], dmUsers: [] } });
+  const internal = f.adapter as unknown as {
+    policyTurns: Map<string, unknown[]>;
+    admissionFailures: Map<string, { count: number }>;
+    settlePolicyEvent: (event: unknown) => Promise<unknown>;
+  };
+  const prepare = t.mock.method(internal, 'settlePolicyEvent');
+  await f.emit(event('C1'));
+  await f.emit(event('D1'));
+  assert.equal(internal.policyTurns.size, 0);
+  assert.equal(prepare.mock.callCount(), 0);
+  assert.equal([...internal.admissionFailures.values()].reduce((sum, row) => sum + row.count, 0), 2);
+  await f.adapter.stop();
 });

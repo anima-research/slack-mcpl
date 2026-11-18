@@ -13,15 +13,27 @@ async function fixture(options = {}) {
 
 for (const denial of ['revoked membership', 'missing chat scope', 'missing read scope', 'non-write channel', 'lookup failure']) {
   test(`policy composition: thread status denies ${denial} without an effect`, async t => {
-    t.mock.method(console, 'error', () => {});
+    const log = t.mock.method(console, 'error', () => {});
     const f = await fixture(denial === 'missing chat scope' ? { scopes: ['channels:read', 'reactions:write'] }
       : denial === 'missing read scope' ? { scopes: ['chat:write'] }
       : denial === 'non-write channel' ? { config: { readJoinedChannels: true, writeChannels: [], dmUsers: [] } } : {});
     t.after(() => f.adapter.stop());
     if (denial === 'revoked membership') f.state.conversation!.is_member = false;
     if (denial === 'lookup failure') f.state.infoError = new Error('offline');
+    const writable = t.mock.method(f.adapter, 'canWrite');
+    log.mock.resetCalls();
     await f.adapter.setThreadStatus('C1', '1.0');
     assert.deepEqual(f.effects, []);
+    assert.deepEqual(f.methods(), denial === 'non-write channel' ? [] : ['info']);
+    const reasons: Record<string, RegExp> = {
+      'revoked membership': /access refused/, 'missing chat scope': /access refused/,
+      'missing read scope': /access refused/, 'non-write channel': /not allowed/,
+      'lookup failure': /Slack operation failed; outcome may be unknown/,
+    };
+    if (denial === 'non-write channel') {
+      assert.equal(writable.mock.callCount(), 1);
+      assert.equal(writable.mock.calls[0].result, false);
+    } else assert.match(log.mock.calls.map(call => call.arguments.join(' ')).join('\n'), reasons[denial]);
   });
 }
 
@@ -111,6 +123,7 @@ for (const terminal of [false, true]) test(`status admission failure cannot beco
     ? { code: 'slack_webapi_platform_error', data: { error: 'channel_not_found' } }
     : { code: 'slack_webapi_http_error', statusCode: 503 });
   await f.adapter.setThreadStatus('C1', '1.0');
+  assert.deepEqual(f.methods(), ['info'], 'the failing admission really ran');
   const attempts = f.methods().length;
   await f.adapter.clearThreadStatuses();
   assert.equal(f.methods().length, attempts, 'no clear of a status never attempted');

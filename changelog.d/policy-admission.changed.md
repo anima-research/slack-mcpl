@@ -1,4 +1,4 @@
-- Internal preparation only: dormant explicit-policy adapter admission gates have no supported installer or setting at this layer. With a policy installed, status
+- Activate explicit-policy adapter admission gates through the opt-in SLACK_ACCESS_POLICY setting. With a policy installed, status
   refreshes latch lasting Slack metadata refusals until reset and post-transfer
   admission failures identify the allocated unshared file. Completion failures
   can leave sharing uncertain; check whether the file was shared before retrying. Unset-policy responses are unchanged; only policy-mode uncertain `send_dm` post errors name the opened DM and explicitly say the message may have been sent.
