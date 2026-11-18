@@ -1,32 +1,33 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { cliInvocation } from './cliHarness.js';
+import { toolDefinitions } from '../src/tools.js';
 import { startupSettings } from '../src/config.js';
 
-const root = fileURLToPath(new URL('..', import.meta.url));
-
-/** Start the CLI as an operator would, with tokens Slack would reject, so
- *  whatever it reports instead of an API error was checked before connecting.
- *  The test's own SLACK_* variables are left out. */
-function startWith(vars: Record<string, string>) {
-  const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (value !== undefined && !key.startsWith('SLACK_')) env[key] = value;
-  }
-  return spawnSync(process.execPath, ['--import', 'tsx', 'src/index.ts', '--stdio'], {
-    cwd: root,
-    env: { ...env, SLACK_BOT_TOKEN: 'xoxb-0-test', SLACK_APP_TOKEN: 'xapp-0-test', ...vars },
-    input: '',
-    encoding: 'utf8',
-    timeout: 30_000,
-  });
+/** Start the CLI with no inherited SLACK_* settings or real Slack traffic. */
+function startWith(vars: Record<string, string>, allowSlackStartup = false) {
+  const { args, options } = cliInvocation(vars, allowSlackStartup);
+  return spawnSync(process.execPath, args, { ...options, input: '', encoding: 'utf8' });
 }
 
 test('a bad switch stops startup with one line, before Slack is contacted', () => {
   const run = startWith({ SLACK_DISABLE_DMS: 'maybe' });
   assert.equal(run.status, 1);
   assert.equal(run.stderr, 'SLACK_DISABLE_DMS must be true or false, got "maybe"\n');
+});
+
+test('index refuses a bad disabled tool on one line before contacting Slack', () => {
+  const run = startWith({ SLACK_DISABLED_TOOLS: 'send_message,bad\nname' });
+  assert.equal(run.status, 1, run.stderr);
+  assert.equal(run.stdout, '');
+  assert.equal(run.stderr, `SLACK_DISABLED_TOOLS names an unknown tool: "bad\\nname"; tools are ${toolDefinitions.map(tool => tool.name).join(', ')}\n`);
+});
+
+test('startup logs that no tools are disabled by default', () => {
+  const run = startWith({}, true);
+  assert.equal(run.status, 0, run.stderr);
+  assert.match(run.stderr, /writes: anywhere; DMs: on; tools off: none\n/);
 });
 
 test('startup refuses a missing mode, missing tokens and an empty SLACK_SEND_CHANNELS, each with its own line', () => {
@@ -52,6 +53,7 @@ test('startup reads every setting from the command line and the environment', ()
     SLACK_DISABLE_DMS: 'yes',
     SLACK_SUBSCRIBE_MEMBER_CHANNELS: '1',
     SLACK_ACK_REACTION: ':eyes:',
+    SLACK_DISABLED_TOOLS: 'send_dm,upload_file',
   };
   assert.deepEqual(startupSettings(['--tcp', '4100'], env), {
     settings: {
@@ -61,6 +63,7 @@ test('startup reads every setting from the command line and the environment', ()
       appToken: 'xapp-1',
       dmUsers: ['U1', 'U2'],
       sendChannels: ['C1', 'C2'],
+      disabledTools: ['send_dm', 'upload_file'],
       disableDms: true,
       subscribeMemberChannels: true,
       ackReaction: 'eyes',
@@ -99,4 +102,13 @@ test('a SLACK_DM_USERS that names no user is refused with one line, DMs on or of
   const unset = startupSettings(['--stdio'], tokens);
   assert.ok('settings' in unset, JSON.stringify(unset));
   assert.equal(unset.settings.dmUsers, undefined);
+});
+
+test('empty disabled-tools restrictions fail before contacting Slack', () => {
+  for (const raw of ['', ' , \t, ']) {
+    const run = startWith({ SLACK_DISABLED_TOOLS: raw });
+    assert.equal(run.status, 1);
+    assert.equal(run.stdout, '');
+    assert.equal(run.stderr, `SLACK_DISABLED_TOOLS is set but names no tool: ${JSON.stringify(raw)}; unset it to keep every tool; tools are ${toolDefinitions.map(tool => tool.name).join(', ')}\n`);
+  }
 });

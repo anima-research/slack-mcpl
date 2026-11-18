@@ -31,6 +31,8 @@
 
 import type { CapabilityPath, FeatureSetDeclaration, McplManifest, TagOntology } from '@animalabs/mcpl-core';
 
+import { toolDefinitions } from './tools.js';
+
 export const MESSAGING_FEATURE_SET = 'slack.messaging';
 export const TYPING_FEATURE_SET = 'slack.typing';
 export const HISTORY_FEATURE_SET = 'slack.history';
@@ -53,9 +55,10 @@ export const SLACK_TAG_ONTOLOGY: TagOntology = {
   open: true,
 };
 
-export function buildFeatureSets(): Record<string, FeatureSetDeclaration> {
+export function buildFeatureSets(disabledTools: readonly string[] = []): Record<string, FeatureSetDeclaration> {
   const messagingUses: CapabilityPath[] = [
-    'tools',
+    ...(toolDefinitions.some(tool => featureSetForTool(tool.name) === MESSAGING_FEATURE_SET && !disabledTools.includes(tool.name))
+      ? ['tools' as const] : []),
     'channels.register',
     'channels.lifecycle',
     'channels.publish',
@@ -63,7 +66,7 @@ export function buildFeatureSets(): Record<string, FeatureSetDeclaration> {
     'pushEvents',
   ];
 
-  return {
+  const sets: Record<string, FeatureSetDeclaration> = {
     [MESSAGING_FEATURE_SET]: {
       description: 'Send, read, react to messages in Slack conversations',
       uses: messagingUses,
@@ -88,9 +91,16 @@ export function buildFeatureSets(): Record<string, FeatureSetDeclaration> {
       uses: ['tools'],
     },
   };
+  // Messaging also owns non-tool protocol paths, so it survives an empty tool surface.
+  for (const name of [HISTORY_FEATURE_SET, SUBSCRIPTIONS_FEATURE_SET]) {
+    if (!toolDefinitions.some(tool => featureSetForTool(tool.name) === name && !disabledTools.includes(tool.name))) {
+      delete sets[name];
+    }
+  }
+  return sets;
 }
 
-export function buildServerCapabilities(): McplManifest {
+export function buildServerCapabilities(disabledTools: readonly string[] = []): McplManifest {
   return {
     version: '0.5',
     pushEvents: true,
@@ -101,11 +111,11 @@ export function buildServerCapabilities(): McplManifest {
       incoming: true,
       typing: true,
     },
-    featureSets: buildFeatureSets(),
+    featureSets: buildFeatureSets(disabledTools),
   };
 }
 
-/** Get the feature set that owns a given tool. Returns undefined for always-available tools. */
+/** Get the feature set that owns a given tool. Returns undefined for tools not gated by a feature set. */
 export function featureSetForTool(toolName: string): string | undefined {
   switch (toolName) {
     case 'send_message':
@@ -127,7 +137,7 @@ export function featureSetForTool(toolName: string): string | undefined {
     case 'list_channels':
     case 'refresh_channels':
     case 'find_user':
-      return undefined; // Always available
+      return undefined; // Not gated by a feature set; operator policy still applies
     default:
       return undefined;
   }

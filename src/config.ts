@@ -1,3 +1,5 @@
+import { toolDefinitions, validateDisabledTools } from './tools.js';
+
 /** Parse an operator switch. An absent value is off; a present value must
  *  say yes or no so a broken environment template cannot disable a guard. */
 export function booleanFlag(name: string, raw: string | undefined): boolean {
@@ -15,6 +17,7 @@ export interface StartupSettings {
   appToken: string;
   dmUsers: string[] | undefined;
   sendChannels: string[] | undefined;
+  disabledTools: string[];
   disableDms: boolean;
   subscribeMemberChannels: boolean;
   ackReaction: string | undefined;
@@ -46,6 +49,15 @@ export function startupSettings(
   if (env.SLACK_SEND_CHANNELS !== undefined && sendChannels!.length === 0) {
     return { refusal: 'SLACK_SEND_CHANNELS is set but names no conversation; unset it to allow writing anywhere' };
   }
+  const disabledTools = [...new Set(list(env.SLACK_DISABLED_TOOLS) ?? [])];
+  if (env.SLACK_DISABLED_TOOLS !== undefined && disabledTools.length === 0) {
+    return { refusal: `SLACK_DISABLED_TOOLS is set but names no tool: ${JSON.stringify(env.SLACK_DISABLED_TOOLS)}; unset it to keep every tool; tools are ${toolDefinitions.map(tool => tool.name).join(', ')}` };
+  }
+  try {
+    validateDisabledTools(disabledTools);
+  } catch (err) {
+    return { refusal: (err as Error).message };
+  }
   let disableDms: boolean;
   let subscribeMemberChannels: boolean;
   try {
@@ -56,6 +68,6 @@ export function startupSettings(
   }
   const ackReaction = env.SLACK_ACK_REACTION?.replace(/:/g, '').trim() || undefined;
   return {
-    settings: { useStdio, tcpPort, botToken, appToken, dmUsers, sendChannels, disableDms, subscribeMemberChannels, ackReaction },
+    settings: { useStdio, tcpPort, botToken, appToken, dmUsers, sendChannels, disabledTools, disableDms, subscribeMemberChannels, ackReaction },
   };
 }

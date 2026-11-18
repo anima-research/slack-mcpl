@@ -52,7 +52,7 @@ test('DM sends and DM history reads are refused before reaching Slack', async ()
     message:
       "Nothing was sent: direct messages are turned off on this host, so send_dm can't reach anyone. Calling again " +
       "won't change that; whoever runs this host decides whether this bot may send DMs. To reach people, post in a " +
-      'channel with send_message; list_channels marks where this bot may write with writable: true.',
+      'writable channel with send_message. list_channels marks where this bot may write with writable: true.',
   });
   await assert.rejects(adapter.fetchHistory('D1'), { message: `Nothing was read: D1 is a direct message or group DM, ${offHere}` });
   await assert.rejects(adapter.readThread('D1', '1.0', { channelId: 'D1', threadTs: '1.0' }), {
@@ -251,4 +251,17 @@ test('conversations.list asks only for the types the token has a read scope for'
   await new SlackAdapter(web, socket, 'UBOT', 'acme', undefined, undefined, false, undefined, scopes).listConversations();
   await new SlackAdapter(web, socket, 'UBOT', 'acme', undefined, undefined, false).listConversations();
   assert.deepEqual(listTypes, ['public_channel,private_channel,im', 'public_channel,private_channel,im,mpim']);
+});
+
+test('scope values that resemble disabled tools retain operator remedies', async t => {
+  const api = await fakeSlackApi();
+  t.after(() => api.close());
+  api.answer({ body: { ok: false, error: 'missing_scope', needed: 'delete_message' } });
+  const adapter = strictOver(api.url);
+  adapter.toolEnabled = name => name !== 'delete_message';
+  await assert.rejects(adapter.fetchHistory('CUNKNOWN'), (err: Error) => {
+    assert.match(err.message, /adds the scope it needs \(Slack names delete_message\)/);
+    assert.match(err.message, /reinstalls the app/);
+    return true;
+  });
 });

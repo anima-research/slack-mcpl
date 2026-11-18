@@ -92,9 +92,8 @@ for (const [tool, args, text] of [
   [
     'add_reaction',
     { channelId: 'C1' },
-    'messageId must be a non-empty string, and this call left it out. Take it from the message: its id= ' +
-      "(reply_message takes its thread= when it shows one, or its rootTs in fetch_history and fetch_thread results), or " +
-      "from fetch_history's ids.",
+    "messageId must be a non-empty string, and this call left it out. Copy the message's own id= from where it arrived, " +
+      'or from fetch_history or fetch_thread results.',
   ],
   [
     'add_reaction',

@@ -2,7 +2,7 @@
  * A post this server can't name: Slack's answer named no message (no ts), or
  * the post failed in a way that may have posted it. Its call answers as an
  * unknown outcome, never as a success with an empty id, and a rollback past it
- * says it may remain, with where the agent can find its id, rather than send a
+ * says it may remain, with context for a manual check, not a deletion target, rather than send a
  * delete with an empty ts. A post that can't have gone out, such as one Slack
  * refused, leaves nothing to say. Driven through the real client against a
  * local endpoint that answers as Slack does.
@@ -89,7 +89,7 @@ test("a post whose answer names no message is an unknown outcome, joins the next
     checkpoint: one.state!.checkpoint,
     success: true,
     reason: "Rolled back (1/2 messages deleted). May remain: a message in C1 whose id this server doesn't know. No rollback " +
-      'tries these again: delete_message can delete one by its id, which fetch_history shows (fetch_thread, for one in a thread)',
+      'tries these again. Someone with access must manually check Slack for the possible post among top-level messages; this server cannot identify it, so do not delete messages based on this notice.',
   });
   assert.deepEqual(unnamedLines(logged), [
     "[slack-mcpl] Rollback couldn't delete a message in C1: Slack's answer to the post named none, or the post's outcome is unknown",
@@ -111,8 +111,7 @@ test("a reply this server can't name is placed under its thread, beside a messag
   assert.equal(
     (await rollback(one.state!.checkpoint)).reason,
     'Rolled back (0/2 messages deleted). May remain: message 1.2 in C1; a message in the thread under message 1.1 in C1 ' +
-      "whose id this server doesn't know. No rollback tries these again: delete_message can try a message among them " +
-      "again, by its id, and fetch_history shows the id of one this server doesn't know (fetch_thread, for one in a thread)",
+      "whose id this server doesn't know. No rollback tries these again. delete_message can retry only the known message IDs listed above. Someone with access must manually check Slack for the possible post in thread 1.1; this server cannot identify it, so do not delete messages based on this notice.",
   );
   assert.deepEqual(unnamedLines(logged), [
     "[slack-mcpl] Rollback couldn't delete a message in the thread under message 1.1 in C1: Slack's answer to the post " +
@@ -130,8 +129,8 @@ test("a post this server can't name stays under may remain beside a message Slac
   assert.equal(
     (await rollback(one.state!.checkpoint)).reason,
     "Rolled back (0/2 messages deleted). May remain: a message in C1 whose id this server doesn't know. No rollback tries " +
-      'these again: delete_message can delete one by its id, which fetch_history shows (fetch_thread, for one in a thread). ' +
-      "Slack refused to delete these, and calling again won't change that: message 1.2 in C1",
+      'these again. Someone with access must manually check Slack for the possible post among top-level messages; this server cannot identify it, so do not delete messages based on this notice. ' +
+      "Slack refused to delete these, and calling again won't change that: message 1.2 in C1.",
   );
 });
 
@@ -311,4 +310,47 @@ test('a publish whose answer names no message is answered as any publish whose o
     back.reason ?? '',
     /^Rolled back \(0\/2 messages deleted\)\. May remain: a message in C1 whose id this server doesn't know; a message in C1 whose id this server doesn't know\./,
   );
+});
+
+for (const disabled of ['fetch_history', 'fetch_thread', 'delete_message']) {
+  for (const thread of [false, true]) {
+    test(`unnamed rollback requires a location-specific manual check for thread=${thread}, disabled=${disabled}`, async t => {
+      api.answerFor('chat.postMessage', named, unnamed);
+      t.after(() => api.answerFor('chat.postMessage'));
+      const h = connectHost(new SlackMcplServer(
+        new SlackAdapter(client as unknown as SlackWebLike, socket, 'UBOT', 'acme'),
+        { disabledTools: [disabled] },
+      ));
+      t.after(() => h.close());
+      await initialize(h, true);
+      await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+      const first = await h.host.sendRequest('tools/call', {
+        name: 'send_message', arguments: { channelId: 'C1', content: 'before' },
+      }) as Result;
+      const post = await h.host.sendRequest('tools/call', {
+        name: thread ? 'reply_message' : 'send_message',
+        arguments: { channelId: 'C1', messageId: '1.1', content: 'unknown' },
+      }) as Result;
+      assert.equal(post.isError, true);
+      const result = await h.host.sendRequest(method.STATE_ROLLBACK, {
+        featureSet: MESSAGING_FEATURE_SET, checkpoint: first.state!.checkpoint,
+      }) as { reason: string };
+      assert.match(result.reason, thread
+        ? /manually check Slack for the possible post in thread 1\.1/
+        : /manually check Slack for the possible post among top-level messages/);
+      assert.match(result.reason, /cannot identify it, so do not delete messages based on this notice/);
+      assert.doesNotMatch(result.reason, /fetch_history|fetch_thread|delete_message|locate and delete/);
+      assert.doesNotMatch(result.reason, new RegExp(disabled));
+    });
+  }
+}
+
+test('mixed unnamed posts and replies get location-specific rollback remedies', async t => {
+  const { call, rollback } = await server(t, named, unnamed, unnamed);
+  const first = await call('send_message', { channelId: 'C1', content: 'before' });
+  await call('send_message', { channelId: 'C1', content: 'top-level' });
+  await call('reply_message', { channelId: 'C1', messageId: '1.1', content: 'reply' });
+  const result = await rollback(first.state!.checkpoint);
+  assert.match(result.reason!, /manually check Slack for the possible post among top-level messages/);
+  assert.match(result.reason!, /manually check Slack for the possible post in thread 1\.1/);
 });

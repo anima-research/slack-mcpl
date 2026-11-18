@@ -25,7 +25,7 @@ export interface SentMessage {
   messageId?: string;
   channelId: string;
   /** For a post this server can't name, the thread it went into, if any:
-   *  fetch_thread finds a reply there, where fetch_history doesn't. */
+   *  a manual check must not treat this context as a deletion target. */
   threadTs?: string;
   content: string;
   timestamp: string;
@@ -40,6 +40,8 @@ export interface UploadedFile {
   /** The message that shared the file, when Slack's answer named it: it holds
    *  the upload's comment. */
   shareTs?: string;
+  /** Parent thread for a sharing comment, if the upload was threaded. */
+  threadTs?: string;
   /** Whether a comment may have gone out with the file: the upload had one,
    *  and Slack may have shared the file. */
   comment: boolean;
@@ -85,7 +87,7 @@ export class StateTracker {
   }
 
   /** Record a post this server can't name (SentMessage's messageId), with its
-   *  conversation and thread, where a rollback says the agent can find it. */
+   *  conversation and thread, where rollback requests a manual check, not identification or deletion. */
   recordUnnamed(channelId: string, content: string, threadTs?: string): void {
     this.sentItems.push({
       kind: 'message',
@@ -98,12 +100,13 @@ export class StateTracker {
 
   /** Track the Slack file itself, which files.delete removes, and the message
    *  that shared it, when known, which chat.delete removes. */
-  recordUploaded(fileId: string, channelId: string, share: { shareTs?: string; comment: boolean }): void {
+  recordUploaded(fileId: string, channelId: string, share: { shareTs?: string; threadTs?: string; comment: boolean }): void {
     this.sentItems.push({
       kind: 'file',
       fileId,
       channelId,
       ...(share.shareTs ? { shareTs: share.shareTs } : {}),
+      threadTs: share.threadTs,
       comment: share.comment,
       timestamp: new Date().toISOString(),
     });

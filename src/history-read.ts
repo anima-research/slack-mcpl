@@ -8,6 +8,7 @@ import { createHash } from 'node:crypto';
 import { formatSlackText, type SlackHistoryMessage } from './content.js';
 import { mimeShown, nameShown, toolResultJson, urlShown } from './framing.js';
 import { isNearMiss } from './near-miss.js';
+import { toolHint } from './tool-guidance.js';
 import type { HistoryMessage } from './slack-adapter.js';
 
 type Kind = 'history' | 'thread';
@@ -121,15 +122,15 @@ export function refuseUnknownArguments(args: Record<string, unknown>, kind: Kind
 
 /** A read's arguments, checked before Slack is asked. */
 export type ReadOptions = ReturnType<typeof readOptions>;
-export function readOptions(args: Record<string, unknown>, kind: Kind, channelId: string, threadTs?: string) {
+export function readOptions(args: Record<string, unknown>, kind: Kind, channelId: string, threadTs?: string, toolEnabled: (name: string) => boolean = () => true) {
   refuseUnknownArguments(args, kind);
   if (!/^[CGD][A-Z0-9]+$/.test(channelId)) {
     throw refused(
       `channelId must be a Slack conversation id, such as C0123456789, and this call passed ${passed(channelId)}. ` +
-        `${CHANNEL_IDS}.`,
+        `${toolHint(CHANNEL_IDS, toolEnabled, "Copy channelId= from an incoming message")}.`,
     );
   }
-  if (kind === 'thread') timestamp(threadTs, 'threadTs', `${PARENT_IDS}.`);
+  if (kind === 'thread') timestamp(threadTs, 'threadTs', `${toolHint(PARENT_IDS, toolEnabled, 'Copy thread= from a reply, or id= from its parent')}.`);
   const limits = {} as Record<keyof typeof READ_LIMITS, number>;
   for (const [name, bounds] of Object.entries(READ_LIMITS)) {
     const value = args[name] === undefined
@@ -140,7 +141,8 @@ export function readOptions(args: Record<string, unknown>, kind: Kind, channelId
     }
     limits[name as keyof typeof READ_LIMITS] = value;
   }
-  const bound = "Take one from fetch_history's ids, or from a message's id=.";
+  const bound = toolHint("Take one from fetch_history's ids, or from a message's id=.", toolEnabled,
+    "Take one from a message's own id=.");
   const oldest = args.oldest === undefined ? undefined : timestamp(args.oldest, 'oldest', bound);
   const latest = args.latest === undefined ? undefined : timestamp(args.latest, 'latest', bound);
   if (oldest && latest && compareTs(oldest, latest) >= 0) throw refused('oldest must precede latest.');
@@ -154,8 +156,8 @@ export function readOptions(args: Record<string, unknown>, kind: Kind, channelId
     const ids = args.authorIds;
     if (!Array.isArray(ids) || ids.length < 1 || ids.length > 50) {
       throw refused(
-        "authorIds must contain 1 to 50 Slack user or bot IDs, as a message's authorId or authorBotId gives them, or find_user's " +
-          'userId.',
+        toolHint("authorIds must contain 1 to 50 Slack user or bot IDs, as a message's authorId or authorBotId gives them, or find_user's " +
+          'userId.', toolEnabled, "authorIds must contain 1 to 50 Slack user or bot IDs, from a message's authorId or authorBotId."),
       );
     }
     // The first malformed entry, by its place, so a call that passes many can
@@ -163,8 +165,9 @@ export function readOptions(args: Record<string, unknown>, kind: Kind, channelId
     const bad = ids.findIndex((id) => typeof id !== 'string' || !AUTHOR_ID.test(id));
     if (bad >= 0) {
       throw refused(
-        `authorIds[${bad}] must be a Slack user or bot ID, as a message's authorId or authorBotId gives it, or find_user's ` +
-          `userId, and this call passed ${passed(ids[bad])}.`,
+        toolHint(`authorIds[${bad}] must be a Slack user or bot ID, as a message's authorId or authorBotId gives it, or find_user's ` +
+          'userId', toolEnabled,
+          `authorIds[${bad}] must be a Slack user or bot ID, from a message's authorId or authorBotId`) + `, and this call passed ${passed(ids[bad])}.`,
       );
     }
   }
@@ -216,7 +219,7 @@ function cursorPosition(cursor: unknown, queryHash: string): string {
 }
 
 /** A message as the read tools return it. */
-export function historyRecord(m: HistoryMessage) {
+export function historyRecord(m: HistoryMessage, attachmentToolEnabled = true) {
   return {
     id: m.id,
     ...(m.authorId ? { authorId: m.authorId } : {}),
@@ -230,7 +233,7 @@ export function historyRecord(m: HistoryMessage) {
     ...(m.attachments.length > 0
       ? {
           attachments: m.attachments.map((a) =>
-            `${nameShown(a.name)}${a.mimeType ? ` (${mimeShown(a.mimeType)})` : ''}${a.url ? ` — fetchable via fetch_attachment: ${urlShown(a.url)}` : ''}`,
+            `${nameShown(a.name)}${a.mimeType ? ` (${mimeShown(a.mimeType)})` : ''}${a.url ? ` — ${attachmentToolEnabled ? 'fetchable via fetch_attachment' : 'attachment URL (content unavailable through this server)'}: ${urlShown(a.url)}` : ''}`,
           ),
         }
       : {}),
@@ -260,6 +263,7 @@ export interface ReadSource {
   page(at: string | undefined, limit: number): Promise<{ messages?: unknown; has_more?: unknown; response_metadata?: unknown }>;
   shape(messages: SlackHistoryMessage[]): Promise<HistoryMessage[]>;
   writable: boolean;
+  attachmentToolEnabled?: boolean;
   stopped(err: unknown): ReadStop | undefined;
 }
 
@@ -351,7 +355,7 @@ export async function readBounded(opts: ReadOptions, source: ReadSource): Promis
         if (scanned >= opts.maxScanned) { stopReason = 'scan_limit'; break pages; }
         const record = shaped.get(m);
         if (record) {
-          const returned = historyRecord(record);
+          const returned = historyRecord(record, source.attachmentToolEnabled);
           const bytes = Buffer.byteLength(toolResultJson(returned));
           if (skeleton + recordBytes + records.length + bytes > opts.maxBytes) {
             // Held back whole, and neither scanned nor matched here: the

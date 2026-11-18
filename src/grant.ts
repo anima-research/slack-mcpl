@@ -86,7 +86,7 @@ export class CapabilityGrant {
 
   /** Is a declared feature set currently active? */
   isFeatureSetActive(name: string): boolean {
-    if (!this.state.ready) return false;
+    if (!this.state.ready || !Object.hasOwn(this.declarations, name)) return false;
     if (!featureSetSelected(this.state, name)) return false;
     return this.missingFor(name).length === 0;
   }

@@ -24,6 +24,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { WebClient, ErrorCode, LogLevel, type Logger, type WebAPICallResult, type WebClientOptions } from '@slack/web-api';
 import { SocketModeClient } from '@slack/socket-mode';
 import { clock } from './clock.js';
+import { guidance, toolHint } from './tool-guidance.js';
 import { NOTHING_RETURNED, SLACK_TS, readBounded, readOptions, type HistoryReadResult, type ReadStop } from './history-read.js';
 import {
   formatSlackText,
@@ -85,13 +86,13 @@ const NOT_SHOWN = new Set(['channel_not_found', 'invalid_channel_id']);
  *  assertNotDm leaves its error to the explainer. A rate limit's answer
  *  without the Retry-After the client needs does come here, and is told to
  *  try again shortly. */
-function afterFailedCheck(err: unknown): string {
+function afterFailedCheck(err: unknown, enabled: (name: string) => boolean): string {
   const e = err as { data?: { needed?: unknown } } | null;
   const code = slackRefusal(err);
   // Not Slack's refusal, nor a failure waitToAskAgain names, such as a rate
   // limit's answer without the Retry-After the client needs.
   if (code === undefined) return 'Try again shortly.';
-  if (NOT_SHOWN.has(code)) return 'list_channels shows the ones it can use.';
+  if (NOT_SHOWN.has(code)) return toolHint('list_channels shows the ones it can use.', enabled, 'Copy channelId from an incoming channel message, or ask someone with Slack access for a channel ID this bot can use.');
   if (code === 'missing_scope') {
     const needed = typeof e?.data?.needed === 'string' && e.data.needed ? ` (Slack names ${e.data.needed})` : '';
     return (
@@ -801,6 +802,13 @@ export interface SlackSocketLike {
 }
 
 export class SlackAdapter {
+  /** Diagnostic guidance only: never gates server-initiated Slack operations. */
+  toolEnabled: (name: string) => boolean = () => true;
+
+  private hint(text: string, fallback = ''): string {
+    return toolHint(text, this.toolEnabled, fallback);
+  }
+
   /** Each conversation's last event's turn, which the next event's delivery
    *  waits for. */
   private inbound = new Map<string, Promise<void>>();
@@ -1108,7 +1116,7 @@ export class SlackAdapter {
     if (!this.canWrite(channelId)) {
       throw new Error(
         `${notDone}: this bot may write only to ${this.sendChannels?.join(', ')}, and ${channelId} isn't one of ` +
-          'them. list_channels marks the conversations it may write to with writable: true. Calling again ' +
+          'them. ' + this.hint('list_channels marks the conversations it may write to with writable: true. ') + 'Calling again ' +
           "won't change that; whoever runs this host decides where it may write.",
       );
     }
@@ -1444,8 +1452,8 @@ export class SlackAdapter {
     if (!this.disableDms || this.channelIds.has(channelId)) return;
     const refuse = (why: string) =>
       new ChannelOnlyRefusal(
-        `${notDone}: ${channelId} ${why}, and this bot works only in channels here, since direct messages are ` +
-          'turned off. list_channels shows the ones it can use.',
+        guidance(`${notDone}: ${channelId} ${why}, and this bot works only in channels here, since direct messages are ` +
+          'turned off.', this.hint('list_channels shows the ones it can use.', 'Copy channelId from an incoming channel message, or ask someone with Slack access for a channel ID this bot can use.')),
       );
     if (this.dmIds.has(channelId) || channelId.startsWith('D')) throw refuse('is a direct message or group DM');
     try {
@@ -1461,8 +1469,8 @@ export class SlackAdapter {
       const answer = slackRefusal(err);
       const why = answer !== undefined ? `Slack answered ${answer}` : (err as Error).message;
       throw new Error(
-        `${notDone}: Slack couldn't confirm ${channelId} is a channel (${why}), and with direct messages turned ` +
-          `off, this bot works only in conversations Slack confirms are channels. ${afterFailedCheck(err)}`,
+        guidance(`${notDone}: Slack couldn't confirm ${channelId} is a channel (${why}), and with direct messages turned ` +
+          `off, this bot works only in conversations Slack confirms are channels.`, afterFailedCheck(err, this.toolEnabled)),
         { cause: err },
       );
     }
@@ -1470,9 +1478,9 @@ export class SlackAdapter {
   }
 
   async sendDM(userId: string, text: string): Promise<{ messageId: string; channelId: string }> {
-    const toChannels =
-      'To reach people, post in a channel with send_message; list_channels marks where this bot may write with ' +
-      'writable: true.';
+    const toChannels = guidance(this.hint(
+      'To reach people, post in a writable channel with send_message.', 'Someone with Slack access can contact the recipient.'),
+      this.toolEnabled('send_message') ? this.hint('list_channels marks where this bot may write with writable: true.', 'Copy channelId from an incoming channel message, or ask someone with Slack access for a writable channel ID.') : '');
     if (this.disableDms) {
       throw new Error(
         "Nothing was sent: direct messages are turned off on this host, so send_dm can't reach anyone. Calling " +
@@ -1494,8 +1502,8 @@ export class SlackAdapter {
     const channelId = open.channel?.id;
     if (!channelId) {
       throw new Error(
-        `Nothing was sent: Slack opened no DM with user ${userId}. Check the id with find_user, which returns ` +
-          "each person's userId, and call again.",
+        `Nothing was sent: Slack opened no DM with user ${userId}. ` +
+          this.hint("Check the id with find_user, which returns each person's userId, and call again.", "Copy a uid: from a mention." + this.hint(" Or copy a message's authorId from fetch_history results.")),
       );
     }
     const { messageId } = await this.sendMessage(channelId, text, {}, 'Nothing was sent');
@@ -1538,7 +1546,7 @@ export class SlackAdapter {
    *  Backscroll keeps fetchHistory, its own pager, and both shape messages
    *  with shapeHistory. */
   async readHistory(channelId: string, args: Record<string, unknown>): Promise<HistoryReadResult> {
-    const opts = readOptions(args, 'history', channelId);
+    const opts = readOptions(args, 'history', channelId, undefined, this.toolEnabled);
     await this.assertNotDm(channelId, NOTHING_RETURNED);
     return readBounded(opts, {
       page: (at, limit) => this.web.conversations.history({
@@ -1556,13 +1564,14 @@ export class SlackAdapter {
       shape: (messages) => this.shapeHistory(messages),
       writable: this.canWrite(channelId),
       stopped: readStop,
+      attachmentToolEnabled: this.toolEnabled('fetch_attachment'),
     });
   }
 
   /** fetch_thread's read, as readHistory's, paging forward through one
    *  thread from its parent. */
   async readThread(channelId: string, threadTs: string, args: Record<string, unknown>): Promise<HistoryReadResult> {
-    const opts = readOptions(args, 'thread', channelId, threadTs);
+    const opts = readOptions(args, 'thread', channelId, threadTs, this.toolEnabled);
     await this.assertNotDm(channelId, NOTHING_RETURNED);
     return readBounded(opts, {
       page: (at, limit) => this.web.conversations.replies({
@@ -1572,6 +1581,7 @@ export class SlackAdapter {
       shape: (messages) => this.shapeHistory(messages),
       writable: this.canWrite(channelId),
       stopped: readStop,
+      attachmentToolEnabled: this.toolEnabled('fetch_attachment'),
     });
   }
 
