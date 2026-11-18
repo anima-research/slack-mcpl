@@ -155,7 +155,7 @@ test("a download its call's time has no room for isn't started, and says calling
     result.content[0].text,
     "The download from files.slack.com: out of this call's time\n\n" +
       `Nothing was fetched: this server gives each call ${CALL_SECONDS} seconds from when it reaches this server, and ` +
-      `this one had used ${used} of them, waiting behind earlier calls or on its own earlier requests, so too few were ` +
+      `this one had used ${used} of them, waiting behind earlier calls, on requests, or on background coordination, so too few were ` +
       "left to send this request to Slack. It wasn't sent, so calling again is safe.",
   );
   assert.equal(downloads, 0, 'nothing was downloaded');

@@ -57,6 +57,7 @@ import {
   type SlackMessageData,
   type SlackWait,
 } from './slack-adapter.js';
+import { reactionName } from './content.js';
 import { toolDefinitions } from './tools.js';
 import { withToolClasses } from './tool-classes.js';
 import { buildFeatureSets, buildServerCapabilities, featureSetForTool, MESSAGING_FEATURE_SET, TYPING_FEATURE_SET } from './feature-sets.js';
@@ -397,7 +398,10 @@ export class SlackMcplServer {
    *  during a connection, as a grant can. */
   private offeredTools() {
     return toolDefinitions.filter((t) =>
-      (t.name !== 'send_dm' || this.slack.dmsWritable) && (t.name !== 'refresh_channels' || this.mcplEnabled));
+      (t.name !== 'send_dm' || this.slack.dmsWritable) && (t.name !== 'refresh_channels' || this.mcplEnabled))
+      .map((t) => this.slack.ackReactionName && ['fetch_history', 'fetch_thread', 'add_reaction', 'remove_reaction'].includes(t.name)
+        ? { ...t, description: t.description + ` The configured ACK emoji, ${this.slack.ackReactionName}, is added best-effort to addressed messages while they are being handled; automatic removal is best-effort after the bot's next confirmed post in that conversation, or after 10 minutes, or when the host rejects the message, unless an explicit add confirms adoption (reported as Reaction added for a new reaction, or ACK adopted when already present). Confirmed adoption cancels unsent cleanup and retries, not a removal already sent. Failed adds do not adopt. Redelivery protection lasts 10 minutes in this process only.` }
+        : t);
   }
 
   private requireMcpl(): void {
@@ -824,11 +828,27 @@ export class SlackMcplServer {
         } catch (err) {
           // The reaction the call asks for is there, which is its intent.
           if (slackRefusal(err) === 'already_reacted') {
-            return `Nothing changed: message ${messageId} already has this bot's ${emoji} reaction.`;
+            return reactionName(emoji) === this.slack.ackReactionName
+              ? `Message ${messageId} already has this bot's ${emoji} reaction. ACK adopted; any pending unsent automatic cleanup and retries cancelled.`
+              : `Nothing changed: message ${messageId} already has this bot's ${emoji} reaction.`;
           }
           throw err;
         }
         return 'Reaction added';
+      }
+
+      case 'remove_reaction': {
+        const channelId = this.requireString(args, 'channelId');
+        const messageId = this.requireString(args, 'messageId');
+        const emoji = this.requireString(args, 'emoji');
+        let removed: boolean;
+        try {
+          removed = await this.slack.removeReaction(channelId, messageId, emoji);
+        } catch (err) {
+          if (slackRefusal(err) !== 'no_reaction') throw err;
+          removed = false;
+        }
+        return removed ? 'Reaction removed' : `Nothing changed: message ${messageId} has no ${emoji} reaction from this bot`;
       }
 
       case 'edit_message':

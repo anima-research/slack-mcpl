@@ -98,6 +98,7 @@ const CALLS: Array<[tool: string, lead: string, writes: boolean]> = [
   ['edit_message', "The message wasn't changed", true],
   ['delete_message', 'Nothing was deleted', true],
   ['add_reaction', 'No reaction was added', true],
+  ['remove_reaction', 'No reaction was removed', true],
   ['fetch_history', 'No messages were returned', false],
   ['fetch_thread', 'No messages were returned', false],
   ['list_channels', 'Nothing was listed', false],
@@ -370,7 +371,7 @@ test("Slack's own failure: a read is tried again, a write's outcome is unknown a
   );
   assert.match(
     await explain('internal_error', 'add_reaction', { channelId: 'C14', messageId: '1.2', emoji: 'eyes' }),
-    /whether the reaction was added is unknown .*Adding it again is safe: if it's there, add_reaction says so and changes nothing\./s,
+    /whether the reaction was added is unknown .*Adding it again will not duplicate the reaction: if it's there, add_reaction reports success\./s,
   );
   const unavailable = await explain('service_unavailable', 'send_message', { channelId: 'C14' });
   assert.match(unavailable, /whether the message was posted is unknown\. Check fetch_history/);
@@ -589,7 +590,7 @@ test("a request its call's deadline left no time for says it wasn't sent, and th
   assert.ok(
     text.endsWith(
       `\n\nNothing was posted: this server gives each call ${CALL_SECONDS} seconds from when it reaches this server, and ` +
-        'this one had used 16 of them, waiting behind earlier calls or on its own earlier requests, so too few were ' +
+        'this one had used 16 of them, waiting behind earlier calls, on requests, or on background coordination, so too few were ' +
         "left to send this request to Slack. It wasn't sent, so calling again is safe.",
     ),
     text,

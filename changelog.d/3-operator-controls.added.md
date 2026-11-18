@@ -8,7 +8,9 @@
     and history reads on them.
   - `SLACK_ACK_REACTION`: an emoji put on a message that addresses the bot,
     removed at the bot's next post in that conversation that Slack confirms,
-    or after 10 minutes.
+    or after 10 minutes, unless a successful explicit add (including
+    `already_reacted`) adopts it. Adoption cancels unsent cleanup and retries,
+    not a removal already sent.
   - `SLACK_SUBSCRIBE_MEMBER_CHANNELS`: delivers ambient messages from every
     channel the bot is a member of, so inviting the bot is the subscription;
     `unsubscribe_channel` then mutes a conversation.
