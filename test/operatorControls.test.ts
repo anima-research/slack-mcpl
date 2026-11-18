@@ -20,6 +20,49 @@ async function ready(h: Harness) {
   await until(() => h.hostSaw.some((r) => r.method === method.CHANNELS_REGISTER), 'channels/register');
 }
 
+for (const limit of [0, 7, undefined]) {
+  test(`backscroll limit ${limit} controls automatic history without disabling explicit reads`, async (t) => {
+    const h = harness({ backscrollLimit: limit, historyMessages: [{ ts: '100.1', user: 'U2', text: 'earlier context' }] });
+    t.after(() => h.close());
+    await ready(h);
+
+    await h.socket.emitMessage(MENTION_EVENT);
+    await until(() => pushes(h).length === 1, 'push/event');
+    assert.deepEqual(h.reads, limit === 0 ? [] : ['history:C1']);
+    assert.deepEqual(h.historyCalls, limit === 0 ? [] : [
+      { channel: 'C1', limit: limit ?? 50, latest: MENTION_EVENT.ts },
+    ]);
+    if (limit === 0) assert.doesNotMatch(pushText(h, 0), /<backscroll/);
+    else assert.match(pushText(h, 0), /earlier context/);
+
+    const result = await h.host.sendRequest('tools/call', {
+      name: 'fetch_history', arguments: { channelId: 'C1' },
+    }) as { isError?: boolean; content: { text: string }[] };
+    assert.notEqual(result.isError, true);
+    assert.match(result.content[0].text, /earlier context/);
+    assert.deepEqual(h.reads, limit === 0 ? ['history:C1'] : ['history:C1', 'history:C1']);
+  });
+}
+
+test('zero backscroll keeps the auto-subscribe conversation name after an outbound write', async (t) => {
+  const h = harness({ backscrollLimit: 0 });
+  t.after(() => h.close());
+  await ready(h);
+
+  // An outbound write sets the current conversation without taking its
+  // first inbound message, so the next delivery won't need a new header.
+  const sent = await h.host.sendRequest('tools/call', {
+    name: 'send_message', arguments: { channelId: 'C1', content: 'hello' },
+  }) as { isError?: boolean };
+  assert.notEqual(sent.isError, true);
+  assert.equal(h.posts.length, 1);
+
+  await h.socket.emitMessage(MENTION_EVENT);
+  await until(() => pushes(h).length === 1, 'push/event');
+  assert.deepEqual(h.reads, []);
+  assert.match(pushText(h, 0), /Auto-subscribed to #general because you were mentioned/);
+});
+
 test('a conversation outside the write allow-list is registered inbound, listed as not writable, and the agent is told', async () => {
   const h = harness({ sendChannels: ['C9'] });
   await ready(h);

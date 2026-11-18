@@ -100,7 +100,7 @@ export async function nonJsonSlackApiUrl(
 
 function fakeWeb(
   posts: unknown[], reactions: string[], uploads: unknown[], deletedMessages: unknown[], deletedFiles: string[], uploadsBegun: unknown[],
-  reads: string[], statuses: string[],
+  reads: string[], historyCalls: HistoryCall[], statuses: string[],
   dms: Array<{ id: string; user: string }> = [],
   displayNames: Record<string, string> = {},
   channelName = 'general',
@@ -132,7 +132,8 @@ function fakeWeb(
       async open() {
         return { channel: { id: 'D1' } };
       },
-      async history({ channel }) {
+      async history({ channel, limit, latest }) {
+        historyCalls.push({ channel, limit, latest });
         reads.push(`history:${channel}`);
         return { messages: historyMessages.filter((m) => !m.thread_ts || m.thread_ts === m.ts) };
       },
@@ -201,11 +202,18 @@ function fakeWeb(
   };
 }
 
+export interface HistoryCall {
+  channel: unknown;
+  limit: unknown;
+  latest: unknown;
+}
+
 export interface HarnessOptions {
   sendChannels?: string[];
   disableDms?: boolean;
   ackReaction?: string;
   subscribeMemberChannels?: boolean;
+  backscrollLimit?: number;
   /** What the host answers to push/event (default true). */
   pushAccepted?: boolean;
   /** DMs conversations.list returns besides C1. */
@@ -232,6 +240,8 @@ export interface Harness {
   /** conversations.history / conversations.replies calls, as
    *  `history:<channel>` and `replies:<channel>:<ts>`. */
   reads: string[];
+  /** Exact conversations.history arguments received by Slack. */
+  historyCalls: HistoryCall[];
   /** assistant.threads.setStatus calls: channel:thread:status. */
   statuses: string[];
   /** files.completeUploadExternal's calls, each a shared upload. */
@@ -250,16 +260,17 @@ export function fakeSlack(opts: HarnessOptions = {}) {
   const posts: unknown[] = [];
   const reactions: string[] = [];
   const reads: string[] = [];
+  const historyCalls: HistoryCall[] = [];
   const statuses: string[] = [];
   const uploads: unknown[] = [];
   const uploadsBegun: unknown[] = [];
   const deletedMessages: unknown[] = [];
   const deletedFiles: string[] = [];
   const slack = new SlackAdapter(
-    fakeWeb(posts, reactions, uploads, deletedMessages, deletedFiles, uploadsBegun, reads, statuses, opts.dms, opts.displayNames, opts.channelName, opts.historyMessages), socket, 'UBOT', 'acme',
+    fakeWeb(posts, reactions, uploads, deletedMessages, deletedFiles, uploadsBegun, reads, historyCalls, statuses, opts.dms, opts.displayNames, opts.channelName, opts.historyMessages), socket, 'UBOT', 'acme',
     undefined, opts.sendChannels, opts.disableDms, opts.ackReaction, opts.scopes,
   );
-  return { slack, socket, posts, reactions, reads, statuses, uploads, uploadsBegun, deletedMessages, deletedFiles };
+  return { slack, socket, posts, reactions, reads, historyCalls, statuses, uploads, uploadsBegun, deletedMessages, deletedFiles };
 }
 
 /** Answer the server's requests on `host` as an MCPL host would; returns the
@@ -313,10 +324,10 @@ export function connectHost(server: SlackMcplServer, opts: HarnessOptions = {}) 
 }
 
 export function harness(opts: HarnessOptions = {}): Harness {
-  const { slack, socket, posts, reactions, reads, statuses, uploads, uploadsBegun, deletedMessages, deletedFiles } = fakeSlack(opts);
-  const server = new SlackMcplServer(slack, { subscribeMemberChannels: opts.subscribeMemberChannels });
+  const { slack, socket, posts, reactions, reads, historyCalls, statuses, uploads, uploadsBegun, deletedMessages, deletedFiles } = fakeSlack(opts);
+  const server = new SlackMcplServer(slack, { subscribeMemberChannels: opts.subscribeMemberChannels, backscrollLimit: opts.backscrollLimit });
   const { host, hostSaw, served, close } = connectHost(server, opts);
-  return { server, socket, host, hostSaw, posts, reactions, reads, statuses, uploads, uploadsBegun, deletedMessages, deletedFiles, served, close };
+  return { server, socket, host, hostSaw, posts, reactions, reads, historyCalls, statuses, uploads, uploadsBegun, deletedMessages, deletedFiles, served, close };
 }
 
 export async function initialize(h: { host: McplConnection }, mcpl: boolean) {

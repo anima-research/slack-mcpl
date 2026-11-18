@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { startupSettings } from '../src/config.js';
+import { parseBackscrollLimit, startupSettings } from '../src/config.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 
@@ -52,6 +52,7 @@ test('startup reads every setting from the command line and the environment', ()
     SLACK_DISABLE_DMS: 'yes',
     SLACK_SUBSCRIBE_MEMBER_CHANNELS: '1',
     SLACK_ACK_REACTION: ':eyes:',
+    SLACK_BACKSCROLL_LIMIT: ' 7 ',
   };
   assert.deepEqual(startupSettings(['--tcp', '4100'], env), {
     settings: {
@@ -64,6 +65,7 @@ test('startup reads every setting from the command line and the environment', ()
       disableDms: true,
       subscribeMemberChannels: true,
       ackReaction: 'eyes',
+      backscrollLimit: 7,
     },
   });
 });
@@ -77,6 +79,44 @@ test('each bad switch is refused with one line naming it and its value', () => {
   ]) {
     const started = startupSettings(['--stdio'], { SLACK_BOT_TOKEN: 'xoxb-0-test', SLACK_APP_TOKEN: 'xapp-0-test', [name]: raw });
     assert.deepEqual(started, { refusal: `${name} must be true or false, got ${JSON.stringify(raw)}` }, `${name}=${JSON.stringify(raw)}`);
+  }
+});
+
+test('backscroll accepts only decimal digits in range, with whitespace trimmed', () => {
+  for (const [raw, expected] of [
+    [undefined, 50], ['0', 0], ['7', 7], ['50', 50], ['1000', 1000],
+    [' 7 ', 7], ['\t0\n', 0], ['0007', 7],
+  ] as const) {
+    assert.equal(parseBackscrollLimit(raw), expected);
+    const started = startupSettings(['--stdio'], {
+      SLACK_BOT_TOKEN: 'xoxb-test', SLACK_APP_TOKEN: 'xapp-test', SLACK_BACKSCROLL_LIMIT: raw,
+    });
+    assert.ok('settings' in started);
+    assert.equal(started.settings.backscrollLimit, expected);
+  }
+});
+
+test('invalid backscroll values refuse startup rather than guessing', () => {
+  for (const raw of [
+    '', ' ', '\t\n', '-1', '-0', '+7', '1001', '2000', '9'.repeat(400),
+    'off', 'false', 'no', 'none', 'abc', '0junk', '7junk', '0.5', '1.5',
+    '0x32', '1e3', 'NaN', 'Infinity', '1 0', '1\n0', '７',
+  ]) {
+    const message = `SLACK_BACKSCROLL_LIMIT must be an integer from 0 to 1000 (0 turns automatic backscroll off), got ${JSON.stringify(raw)}`;
+    assert.throws(() => parseBackscrollLimit(raw), { message });
+    assert.deepEqual(startupSettings(['--stdio'], {
+      SLACK_BOT_TOKEN: 'xoxb-test', SLACK_APP_TOKEN: 'xapp-test', SLACK_BACKSCROLL_LIMIT: raw,
+    }), { refusal: message });
+    assert.equal(message.split('\n').length, 1);
+  }
+});
+
+test('bad backscroll stops the CLI with one line before connecting to Slack', () => {
+  for (const raw of ['off', '', '\t\n']) {
+    const run = startWith({ SLACK_BACKSCROLL_LIMIT: raw });
+    assert.equal(run.status, 1);
+    assert.equal(run.stdout, '');
+    assert.equal(run.stderr, `SLACK_BACKSCROLL_LIMIT must be an integer from 0 to 1000 (0 turns automatic backscroll off), got ${JSON.stringify(raw)}\n`);
   }
 });
 
