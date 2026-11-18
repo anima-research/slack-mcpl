@@ -20,6 +20,8 @@
  * Event handling salvaged from zulip-mcp PR #8's SlackAdapter.
  */
 
+import { StartupRefusal, type BotMessagePolicy } from './config.js';
+import { MAX_MESSAGE_TEXT_APPEND, renderMessageText } from './message-text.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { WebClient, ErrorCode, LogLevel, type Logger, type WebAPICallResult, type WebClientOptions } from '@slack/web-api';
 import { SocketModeClient } from '@slack/socket-mode';
@@ -185,11 +187,25 @@ export interface SlackWait {
   why: 'limited' | 'failed';
 }
 
+/** A sanitized verification failure: no Slack refusal data can become a name. */
+class VerificationFailure extends Error {
+  addressedLogged = false;
+  readonly retryAt: number;
+  constructor(message: string, readonly wait: SlackWait | undefined) {
+    super(message);
+    this.retryAt = wait ? clock.now() + wait.seconds * 1000 : Infinity;
+  }
+  diagnostic(): string {
+    return this.message.replace(/retry after \d+ seconds/, `retry after ${Math.max(0, Math.ceil((this.retryAt - clock.now()) / 1000))} seconds`);
+  }
+}
+
 /** The wait before asking Slack again after `err` from a request to `method`,
  *  for work no call waits on; undefined when Slack's answer will be the same
  *  next time, or `err` isn't the client's. A request the host is waiting on
  *  waits out only a `limited` one, within its budget (SlackWebClient). */
 export function waitToAskAgain(err: unknown, method: string): SlackWait | undefined {
+  if (err instanceof VerificationFailure) return err.wait && { ...err.wait, method, seconds: Math.max(0, (err.retryAt - clock.now()) / 1000) };
   const e = err as { code?: unknown; retryAfter?: unknown } | null;
   if (e?.code === ErrorCode.RateLimitedError && typeof e.retryAfter === 'number') {
     return { method, seconds: e.retryAfter, why: 'limited' };
@@ -248,18 +264,22 @@ export class GaveUp extends Error {
 }
 
 /** Message subtypes that represent real user content. Everything else
- * (message_changed, message_deleted, channel_join, bot_message, …) is noise
- * for the inference loop. */
+ * (message_changed, message_deleted, channel_join, …) is noise
+ * for the inference loop. bot_message is separately admitted by the opt-in. */
 const CONTENT_SUBTYPES = new Set([undefined, 'file_share', 'thread_broadcast', 'me_message']);
 
 /** The fields of a Socket Mode message event this adapter dereferences.
  * Payloads come off the wire — everything is optional until checked. */
 interface SlackMessageEvent {
+  client_msg_id?: string;
+  username?: string;
   type?: string;
   subtype?: string;
   channel?: string;
   user?: string;
   text?: string;
+  attachments?: unknown;
+  blocks?: unknown;
   ts?: string;
   thread_ts?: string;
   /** On a thread_broadcast the parent may be named only here. */
@@ -311,7 +331,13 @@ export interface SlackMessageData {
   threadTs?: string;
   authorId: string;
   authorName: string;
-  /** Raw mrkdwn text as received. */
+  /** Set only for opted-in live bot messages. */
+  isBot?: boolean;
+  senderKind?: 'bot';
+  authorBotId?: string;
+  /** Original Slack text (before supplemental payload rendering). */
+  rawContent?: string;
+  /** Rendered mrkdwn content. */
   content: string;
   /** Mentions resolved to @name (uid:U…), links/broadcasts unescaped. */
   cleanContent: string;
@@ -362,6 +388,8 @@ export interface SlackAdapterConfig {
   disableDms?: boolean;
   /** Emoji name put on an addressed message while the agent works on it. */
   ackReaction?: string;
+  /** Opt in to live messages from other bots. */
+  botMessages?: BotMessagePolicy;
 }
 
 /**
@@ -749,6 +777,8 @@ export async function connectSlack(config: SlackAdapterConfig, slackApiUrl?: str
     config.ackReaction,
     // Granted scopes, from the x-oauth-scopes header of auth.test.
     reportedScopes(auth.response_metadata),
+    config.botMessages,
+    auth.bot_id,
   );
 }
 
@@ -789,7 +819,7 @@ export interface SlackWebLike {
     delete(args: { file: string }): Promise<unknown>;
   };
   users: {
-    info(args: { user: string }): Promise<{ user?: { profile?: { display_name?: string }; real_name?: string; name?: string } }>;
+    info(args: { user: string }): Promise<{ user?: { profile?: { display_name?: string }; real_name?: string; name?: string; is_bot?: boolean } }>;
     list(args: { limit?: number; cursor?: string }): Promise<{ members?: unknown[]; response_metadata?: { next_cursor?: string } }>;
   };
 }
@@ -805,6 +835,16 @@ export class SlackAdapter {
    *  waits for. */
   private inbound = new Map<string, Promise<void>>();
   private userNameCache = new Map<string, string>();
+  private botUsers = new Set<string>();
+  private verifiedUsers = new Set<string>();
+  private inconclusiveNames = new Set<string>();
+  private warnedMissingUsersRead = false;
+  // LIST-only negative verification state: never a name or proof of humanity.
+  // FIFO eviction bounds retained failures; transient retries honor Slack or 30 seconds.
+  private verificationFailures = new Map<string, {
+    retryAt: number; reason: string; error: VerificationFailure;
+  }>();
+  private verificationInFlight = new Map<string, Promise<Awaited<ReturnType<SlackWebLike['users']['info']>>>>();
   private messageHandlers: Array<(msg: SlackMessageData) => void> = [];
   private socketStarted = false;
   /** Conversations Slack reported as DMs or group DMs, and as channels. IDs
@@ -840,8 +880,21 @@ export class SlackAdapter {
     /** The bot token's scopes, as auth.test reported them; undefined, or an
      *  empty list, is unknown, so a listing asks for every type. */
     scopes?: string[],
+    readonly botMessages?: BotMessagePolicy,
+    readonly botId?: string,
   ) {
+    if (botMessages && (!botUserId || !botId)) {
+      throw new StartupRefusal('Bot message delivery requires authenticated bot and user IDs for self-filtering: ' +
+        'auth.test must return both bot_id and user_id; use a token whose authentication response contains both, ' +
+        'or unset SLACK_BOT_MESSAGES to restore the legacy bot-event filter');
+    }
     this.scopes = reportedScopes({ scopes });
+    if (Array.isArray(botMessages) && this.scopes && !this.scopes.includes('users:read')) {
+      throw new StartupRefusal('SLACK_BOT_MESSAGES allow-list requires users:read to verify human senders; add the scope and reinstall the app to the workspace, or unset SLACK_BOT_MESSAGES');
+    }
+    if (botMessages === 'all' && this.scopes && !this.scopes.includes('users:read')) {
+      this.warnMissingUsersRead();
+    }
     const omitted = this.leftOutTypes();
     if (omitted.length) this.logLeftOut(omitted, '');
     // Register the handler at construction so start() ordering can't race
@@ -851,8 +904,8 @@ export class SlackAdapter {
     // different times, and a later message must not reach the host before an
     // earlier one. Preparing at arrival keeps one conversation's lookups side
     // by side, so a run of slow or failing ones costs the slowest, not their
-    // sum, within the Web API client's 100 requests at once, which every
-    // conversation's lookups share. From delivery on, the server keeps the
+    // sum. List admission may need a separate author round. The Web API
+    // client's 100 requests at once are shared by every conversation. From delivery on, the server keeps the
     // same order with its own chain per conversation (setupSlackForwarding).
     this.socket.on('message', ({ event, ack }) => {
       // Always ack first — Slack redelivers unacked envelopes.
@@ -965,6 +1018,7 @@ export class SlackAdapter {
     const noneReadable = () => new NoReadableConversations(this.conversationTypes().map((type) => TYPE_SCOPE[type]));
     let types = this.readableTypes();
     let out: SlackConversationInfo[] = [];
+    const nameWaitCapturedAt = new WeakMap<SlackConversationInfo, number>();
     let cursor: string | undefined;
     let limited = 0;
     const names = { waitOut };
@@ -1027,12 +1081,22 @@ export class SlackAdapter {
         const info = await this.describeConversation(raw, names);
         if (!info) continue;
         if (!includeNonMember && info.kind === 'channel' && !info.isMember) continue;
+        if (this.botMessages && info.nameWait) nameWaitCapturedAt.set(info, clock.now());
         out.push(info);
       }
       cursor = result.response_metadata?.next_cursor || undefined;
       // Another listing's answer may have changed the scopes while this page's
       // DM names were looked up, so they're checked once more before it ends.
       if (!cursor && !startOver()) {
+        // Only opt-in verification has an aging cooldown. Unset retains
+        // main's full retry interval, measured when the caller retries.
+        if (this.botMessages) {
+          const now = clock.now();
+          for (const info of out) {
+            if (info.nameWait) info.nameWait = {...info.nameWait,
+              seconds: Math.max(0, info.nameWait.seconds - (now - nameWaitCapturedAt.get(info)!) / 1000)};
+          }
+        }
         return { conversations: out, leftOut: this.conversationTypes().filter((type) => !types.includes(type)) };
       }
     }
@@ -1059,9 +1123,14 @@ export class SlackAdapter {
       // lookup's is, and the listing goes on; later DMs in it are looked up
       // once, without waiting, so a lookup that keeps failing holds it once.
       let nameWait: SlackWait | undefined;
+      const resolvedNames = new Map<string, string>();
       for (let inARow = 0; conv.user;) {
-        const failed = (await this.resolveUserNames([conv.user])).get(conv.user);
-        nameWait = waitToAskAgain(failed, 'users.info');
+        const failed = (await this.resolveUserNames([conv.user], resolvedNames)).get(conv.user);
+        nameWait = this.botMessages && resolvedNames.has(conv.user) ? undefined : waitToAskAgain(failed, 'users.info');
+        if (this.botMessages && !resolvedNames.has(conv.user) &&
+            (!failed || (this.botMessages === 'all' && !nameWait))) {
+          nameWait = { method: 'users.info', seconds: FAILED_WAIT_SECONDS, why: 'failed' };
+        }
         if (!nameWait || !names?.waitOut) break;
         try {
           await names.waitOut(nameWait, ++inARow);
@@ -1075,7 +1144,7 @@ export class SlackAdapter {
           break;
         }
       }
-      const userName = (conv.user ? this.userNameCache.get(conv.user) : undefined) ?? conv.user ?? conv.id;
+      const userName = (conv.user ? (this.botMessages ? resolvedNames.get(conv.user) : undefined) ?? this.userNameCache.get(conv.user) : undefined) ?? conv.user ?? conv.id;
       this.dmIds.add(conv.id);
       return { id: conv.id, kind: 'dm', name: userName, userId: conv.user, isMember: true, ...(nameWait ? { nameWait } : {}) };
     }
@@ -1490,6 +1559,9 @@ export class SlackAdapter {
     }
     // Before the DM is opened, as above.
     assertSendable(text, 'Nothing was sent');
+    if (this.botMessages && /^B[A-Z0-9]+$/.test(userId)) {
+      throw new Error('Nothing was sent: this is a Slack bot ID, not a user ID for send_dm. If the source conversation is writable, use reply_message for a thread reply or send_message for a top-level post. If the host grant offers fetch_history, it can filter by this bot author ID.');
+    }
     const open = await this.web.conversations.open({ users: userId });
     const channelId = open.channel?.id;
     if (!channelId) {
@@ -1580,28 +1652,43 @@ export class SlackAdapter {
    *  readThread asks). */
   async fetchHistory(
     channelId: string,
-    opts: { limit?: number; oldest?: string; latest?: string } = {},
+    opts: { limit?: number; oldest?: string; latest?: string; signal?: AbortSignal } = {},
   ): Promise<{ messages: HistoryMessage[]; truncated: boolean }> {
+    opts.signal?.throwIfAborted();
     await this.assertNotDm(channelId, 'Nothing was read');
     const { messages, truncated } = await fetchSlackHistory(this.web, {
       channel: channelId,
       ...(opts.oldest !== undefined ? { oldest: opts.oldest } : {}),
       ...(opts.latest !== undefined ? { latest: opts.latest } : {}),
       maxMessages: opts.limit ?? 50,
+      signal: opts.signal,
     });
-    return { messages: await this.shapeHistory(messages), truncated };
+    return { messages: await this.shapeHistory(messages, 2000, opts.signal), truncated };
   }
 
-  private async shapeHistory(messages: SlackHistoryMessage[]): Promise<HistoryMessage[]> {
-    // Pre-resolve author + mentioned user names in one pass.
+  private async shapeHistory(messages: SlackHistoryMessage[], maxAppend = MAX_MESSAGE_TEXT_APPEND, signal?: AbortSignal): Promise<HistoryMessage[]> {
+    // Supplemental-only mentions never spend the read's call budget or grow
+    // the name cache. All delivery paths use an existing name or the raw ID.
+    signal?.throwIfAborted();
     const ids = new Set<string>();
+    const texts: string[] = [];
+    for (let index = 0; index < messages.length; index++) {
+      // Large backscroll windows must not monopolize Socket Mode's loop.
+      if (index > 0 && index % 10 === 0) {
+        await new Promise<void>(resolve => setImmediate(resolve));
+        signal?.throwIfAborted();
+      }
+      texts.push(renderMessageText(messages[index], maxAppend));
+    }
     for (const msg of messages) {
       if (msg.user) ids.add(msg.user);
       for (const id of extractSlackUserIds(msg.text ?? '')) ids.add(id);
     }
-    await this.resolveUserNames(Array.from(ids));
+    const names = new Map<string, string>();
+    await this.resolveUserNames(Array.from(ids), names, signal);
+    signal?.throwIfAborted();
 
-    return messages.map((msg) => {
+    return messages.map((msg, index) => {
       const id = String(msg.ts ?? '');
       // The thread a message belongs to: the one its parent's ts names, as
       // Slack reports it, or the message's own.
@@ -1611,8 +1698,8 @@ export class SlackAdapter {
       id,
       authorId: msg.user,
       ...(msg.bot_id ? { authorBotId: msg.bot_id } : {}),
-      authorName: msg.user ? (this.userNameCache.get(msg.user) ?? msg.user) : (msg.username ?? 'bot'),
-      content: formatSlackText(msg.text ?? '', this.userNameCache),
+      authorName: msg.user ? (names.get(msg.user) ?? this.userNameCache.get(msg.user) ?? msg.user) : (msg.username ?? 'bot'),
+      content: formatMessageText(msg.text ?? '', texts[index], this.userNameCache, this.botMessages ? names : undefined),
       threadTs: msg.thread_ts && msg.thread_ts !== msg.ts ? msg.thread_ts : undefined,
       rootTs: reported ?? id,
       // Missing means unknown, not none.
@@ -1667,28 +1754,63 @@ export class SlackAdapter {
    *  they make, or undefined for an event that isn't delivered. */
   private async prepareMessageEvent(event: SlackMessageEvent): Promise<SlackMessageData | undefined> {
     if (!event || event.type !== 'message') return;
-    if (!CONTENT_SUBTYPES.has(event.subtype)) return;
-    // Self-filter: skip our own messages and other bots' (bot_id covers
-    // bot_message-without-subtype edge cases like app-posted file shares).
-    if (event.bot_id) return;
+    if (!CONTENT_SUBTYPES.has(event.subtype) && !(this.botMessages && event.subtype === 'bot_message')) return;
+    // Check both authenticated identities, including bot events without a user.
     if (this.botUserId !== null && event.user === this.botUserId) return;
-    // A real user content message always carries channel, user, and ts;
+    if (this.botId && event.bot_id === this.botId) return;
+    const fromBot = !!event.bot_id || event.subtype === 'bot_message' ||
+      (!!this.botMessages && event.user === 'USLACKBOT');
+    const botAllowed = this.botMessages === 'all' ||
+      Array.isArray(this.botMessages) && this.botMessages.some((id) => id === event.bot_id || id === event.user);
+    if (fromBot && !botAllowed) return;
+    // Legacy bot messages can lack a user; use their bot ID as author instead.
+    const authorId = event.user || (fromBot && this.botMessages ? event.bot_id : undefined);
+    // A content message always carries channel, author, and ts;
     // a malformed payload missing any of them is dropped, not crashed on
     // (parseFloat(undefined) → NaN → toISOString() throws).
-    if (!event.channel || !event.user || !event.ts) return;
+    if (!event.channel || !authorId || !event.ts) return;
 
     const isDM = event.channel_type === 'im' || event.channel.startsWith('D');
     // Only what Slack marks as a channel gets through, not merely what isn't marked a DM.
     if (this.disableDms && event.channel_type !== 'channel' && event.channel_type !== 'group') return;
-    if (isDM && this.dmUsers && !this.dmUsers.includes(event.user)) {
+    if (isDM && this.dmUsers && !this.dmUsers.includes(authorId)) {
       return; // DM whitelist active and this sender isn't on it
     }
 
-    // Resolve author + mentioned users before formatting.
-    const mentionIds = extractSlackUserIds(event.text ?? '');
-    await this.resolveUserNames([event.user, ...mentionIds]);
-    const authorName = this.userNameCache.get(event.user) ?? event.user;
+    // Verify the author before spending lookups on mentions of a dropped message.
+    // Supplemental names are display-only: use the cache, never wait for a lookup.
+    await Promise.resolve(); // Socket Mode queues ack first; yield before rendering.
+    if (Array.isArray(this.botMessages) && !botAllowed && this.botUsers.has(authorId)) return;
+    const legacyText = this.botMessages ? undefined : renderMessageText(event);
+    const originalText = this.botMessages && typeof event.text !== 'string' ? '' : event.text ?? '';
+    const mentionIds = extractSlackUserIds(originalText);
+    const splitLookups = Array.isArray(this.botMessages) && !botAllowed &&
+      !this.verifiedUsers.has(authorId);
+    const names = new Map<string, string>();
+    const lookupErrors = await this.resolveUserNames(splitLookups ? [event.user] : [event.user, ...mentionIds], names);
+    const authorName = event.user ? (names.get(authorId) ?? this.userNameCache.get(authorId) ?? authorId) : (event.username ?? authorId);
+    // In list mode an unknown user-only sender could be an unlisted bot.
+    // An explicitly listed identity needs no classification to be admitted.
+    // Listed unknown senders remain conservative. In all mode a failed or
+    // inconclusive lookup is not evidence of a bot; explicit bot signals still win.
+    const unverified = !!this.botMessages && !this.verifiedUsers.has(authorId);
+    const isBot = fromBot || this.botUsers.has(authorId) ||
+      (Array.isArray(this.botMessages) && unverified);
+    if (this.botMessages && isBot && !botAllowed) {
+      const authorError = lookupErrors.get(authorId);
+      const failure = unverified && ((authorError instanceof VerificationFailure ? authorError : undefined) ??
+        this.verificationFailures.get(authorId)?.error);
+      if (failure && (isDM || (this.botUserId !== null && mentionIds.includes(this.botUserId))) &&
+          !failure.addressedLogged) {
+        failure.addressedLogged = true;
+        console.error(`[slack-mcpl] Dropped addressed message from ${authorId} in ${event.channel} at ${event.ts} before delivery (not replayed): ${failure.diagnostic()}`);
+      }
+      return;
+    }
 
+    if (splitLookups) await this.resolveUserNames(mentionIds, names);
+
+    const text = legacyText ?? renderMessageText(event);
     const attachments: AttachmentRef[] = (event.files ?? [])
       .filter((f): f is { url_private: string; name?: string; mimetype?: string } => !!f.url_private)
       .map((f) => {
@@ -1706,10 +1828,13 @@ export class SlackAdapter {
       channelId: event.channel,
       id: String(event.ts),
       threadTs: event.thread_ts || event.root?.thread_ts || undefined,
-      authorId: String(event.user),
+      authorId,
       authorName,
-      content: event.text ?? '',
-      cleanContent: formatSlackText(event.text ?? '', this.userNameCache),
+      ...(this.botMessages && isBot ? { isBot: true, senderKind: 'bot' as const,
+        ...(event.bot_id ? { authorBotId: event.bot_id } : {}) } : {}),
+      ...(text !== originalText ? { rawContent: originalText } : {}),
+      content: text,
+      cleanContent: formatMessageText(originalText, text, this.userNameCache, this.botMessages ? names : undefined),
       mentionIds,
       // Personal mention of the bot — hosts use this to gate wake policy.
       // @here/@channel broadcasts deliberately don't count.
@@ -1723,13 +1848,236 @@ export class SlackAdapter {
     return msg;
   }
 
+  /** LIST lookups share in-flight work across authors and mentions. A failure
+   *  stays separate from verified identity/name caches and cools down retries. */
+  private async verifyListUser(args: { user: string }, retryJoined = true, signal?: AbortSignal): Promise<Awaited<ReturnType<SlackWebLike['users']['info']>>> {
+    signal?.throwIfAborted();
+    // A queued later chunk may have been verified by another batch meanwhile.
+    if (this.verifiedUsers.has(args.user) && this.userNameCache.has(args.user)) {
+      return { user: { name: this.userNameCache.get(args.user), is_bot: this.botUsers.has(args.user) } };
+    }
+    const failure = this.verificationFailures.get(args.user);
+    if (failure && clock.now() < failure.retryAt) {
+      // Preserve Slack's remaining wait without exposing refusal data to the
+      // shared name resolver (a refusal must never become a cached identity).
+      throw failure.error;
+    }
+    const pending = this.verificationInFlight.get(args.user);
+    if (pending) {
+      // A live lookup has no host deadline; joining it must obey the same
+      // start rule as sending a fresh request for this call.
+      assertRequestFits('users.info', SLACK_CLIENT_OPTIONS.timeout);
+      try {
+        const info = await pending;
+        signal?.throwIfAborted();
+        return info;
+      } catch (err) {
+        signal?.throwIfAborted();
+        if (!(err instanceof OutOfCallTime) || callTime.getStore()) throw err;
+        if (!retryJoined) {
+          // Host calls may have sent requests before running out of retry time.
+          // Diagnose without a cached cooldown so the next event can retry.
+          throw new VerificationFailure('users.info verification did not complete: joined host calls ran out of time; retry on the next message', {
+            method: 'users.info', seconds: 0, why: 'failed',
+          });
+        }
+        // The host's budget is not the live event's budget. The owner's
+        // finally has removed the failed lookup before this continuation.
+        return this.verifyListUser(args, false, signal);
+      }
+    }
+    const lookup = (async () => {
+      try {
+        const info = await this.lookupAllUser(args, signal);
+        signal?.throwIfAborted();
+        if (typeof info.user?.is_bot !== 'boolean') {
+          // Abortable history may finish after an independent live lookup.
+          // Do not replace that verified identity with an older partial answer.
+          if (this.verifiedUsers.has(args.user) && this.userNameCache.has(args.user)) {
+            return { user: { name: this.userNameCache.get(args.user), is_bot: this.botUsers.has(args.user) } };
+          }
+          const name = info.user?.profile?.display_name || info.user?.real_name || info.user?.name;
+          if (name) this.userNameCache.set(args.user, name);
+          throw new Error('users.info did not establish the sender kind');
+        }
+        const name = info.user.profile?.display_name || info.user.real_name || info.user.name;
+        if (name) this.userNameCache.set(args.user, name);
+        this.verifiedUsers.add(args.user);
+        if (info.user.is_bot) this.botUsers.add(args.user);
+        this.verificationFailures.delete(args.user);
+        return info;
+      } catch (err) {
+        signal?.throwIfAborted();
+        if (err instanceof OutOfCallTime) throw err;
+        const seconds = retryAfterSeconds(err);
+        const wait: SlackWait | undefined = slackRefusal(err) === 'ratelimited' && seconds !== undefined
+          ? { method: 'users.info', seconds, why: 'limited' }
+          : (err as { code?: unknown })?.code === ErrorCode.RateLimitedError
+            ? (seconds === undefined ? undefined : { method: 'users.info', seconds, why: 'limited' as const })
+            : waitToAskAgain(err, 'users.info');
+        const permanent = refusedForGood(err);
+        const reason = permanent ? `users.info refused verification (${slackRefusal(err)}); ${slackRefusal(err) === 'missing_scope' ? 'add users:read and reinstall the app in the workspace' : 'check the sender ID and Slack access'}, then restart to retry; alternatively explicitly allow-list the sender (cached refusals can also be evicted)` :
+          wait?.why === 'limited' ? `users.info rate-limited verification; retry after ${Math.ceil(wait.seconds)} seconds` :
+          slackRefusal(err) === 'ratelimited' || (err as { code?: unknown })?.code === ErrorCode.RateLimitedError ||
+            (err instanceof Error && err.message.startsWith('Retry header did not contain a valid timeout (url: '))
+            ? 'users.info rate-limited verification without usable Retry-After; retry after 30 seconds' :
+            'users.info failed or did not establish the sender kind; retry after 30 seconds';
+        const retry = permanent ? undefined : wait ?? {
+          method: 'users.info', seconds: FAILED_WAIT_SECONDS, why: 'failed' as const,
+        };
+        const error = new VerificationFailure(reason, retry);
+        this.verificationFailures.delete(args.user);
+        this.verificationFailures.set(args.user, {
+          retryAt: error.retryAt,
+          reason, error,
+        });
+        if (this.verificationFailures.size > 256) {
+          const oldest = this.verificationFailures.keys().next().value!;
+          this.verificationFailures.delete(oldest);
+          if (!this.verifiedUsers.has(oldest)) this.userNameCache.delete(oldest);
+        }
+        // Do not let the shared name resolver cache a permanent refusal as
+        // a raw-ID name: that would prevent verification after the cooldown.
+        throw error;
+      }
+    })();
+    // Abortable history owns its continuation; live callers must not join work
+    // whose owner can abandon it. It can still join non-abortable work.
+    if (!signal) this.verificationInFlight.set(args.user, lookup);
+    try {
+      return await lookup;
+    } finally {
+      if (this.verificationInFlight.get(args.user) === lookup) this.verificationInFlight.delete(args.user);
+    }
+  }
+
+  /** Opt-in all-mode callers share one answer, including failures. */
+  private async lookupAllUser(args: { user: string }, signal?: AbortSignal): Promise<Awaited<ReturnType<SlackWebLike['users']['info']>>> {
+    signal?.throwIfAborted();
+    const pending = this.verificationInFlight.get(args.user);
+    if (pending) {
+      assertRequestFits('users.info', SLACK_CLIENT_OPTIONS.timeout);
+      return pending;
+    }
+    const lookup = this.web.users.info(args);
+    if (!signal) this.verificationInFlight.set(args.user, lookup);
+    try { return await lookup; }
+    finally {
+      if (this.verificationInFlight.get(args.user) === lookup) this.verificationInFlight.delete(args.user);
+    }
+  }
+
+  private warnMissingUsersRead(): void {
+    if (this.warnedMissingUsersRead) return;
+    this.warnedMissingUsersRead = true;
+    console.error('[slack-mcpl] SLACK_BOT_MESSAGES=all: users:read is missing; add the scope and reinstall the app in the workspace, then restart. User-only senders remain unknown and use chat:from-human, not proof of humanity; restrict human-only wake rules to avoid bot loops. bot_id and bot_message events are still tagged bot.');
+  }
+
   /** Resolve user IDs into this adapter's cache (shared logic in content.ts).
    *  Returns the error of each lookup left uncached. */
-  private async resolveUserNames(userIds: Array<string | undefined>): Promise<Map<string, unknown>> {
-    return resolveSlackUserNames(
-      this.web,
-      this.userNameCache,
-      userIds.filter((id): id is string => !!id),
+  private async resolveUserNames(userIds: Array<string | undefined>, names?: Map<string, string>, signal?: AbortSignal): Promise<Map<string, unknown>> {
+    // Preserve the legacy cache and continuation path when delivery is unset.
+    if (!this.botMessages) return resolveSlackUserNames(
+      this.web, this.userNameCache, userIds.filter((id): id is string => !!id), signal,
     );
+    signal?.throwIfAborted();
+    // Keep this call's resolved names even if a later chunk evicts an incomplete
+    // profile from the bounded shared cache before the caller renders its batch.
+    for (const id of userIds) {
+      if (id && this.userNameCache.has(id)) names?.set(id, this.userNameCache.get(id)!);
+    }
+    const lookupIds = userIds.filter((id): id is string => !!id);
+    const cache = new Map<string, string>();
+    for (const id of lookupIds) {
+      if (this.userNameCache.has(id)) cache.set(id, this.userNameCache.get(id)!);
+    }
+    for (const id of lookupIds) {
+      if (!cache.has(id) || (Array.isArray(this.botMessages) && !this.verifiedUsers.has(id)) || this.inconclusiveNames.has(id)) cache.delete(id);
+    }
+    const failed = await resolveSlackUserNames(
+      { users: { info: async (args) => {
+        try {
+          if (Array.isArray(this.botMessages)) return await this.verifyListUser(args, true, signal);
+          let info: Awaited<ReturnType<SlackWebLike['users']['info']>>;
+          try {
+            info = await this.lookupAllUser(args, signal);
+            signal?.throwIfAborted();
+          } catch (err) {
+            signal?.throwIfAborted();
+            if (slackRefusal(err) === 'missing_scope') this.warnMissingUsersRead();
+            if (refusedForGood(err)) {
+              // Settle refusals here, retaining any earlier display name rather
+              // than downgrading it to a raw ID in a later continuation.
+              this.inconclusiveNames.delete(args.user);
+              if (!this.userNameCache.has(args.user) || !this.verifiedUsers.has(args.user)) {
+                this.userNameCache.set(args.user, this.userNameCache.get(args.user) ?? args.user);
+              }
+              throw new Error('users.info permanently refused name lookup');
+            }
+            throw err;
+          }
+          // Names and classification have independent completeness.
+          if (typeof info.user?.is_bot !== 'boolean') {
+            // A late inconclusive answer cannot undo verification or a settled
+            // permanent refusal (an unverified, non-inconclusive cached ID).
+            if ((this.verifiedUsers.has(args.user) && this.userNameCache.has(args.user)) ||
+                (this.userNameCache.has(args.user) && !this.inconclusiveNames.has(args.user))) {
+              return { user: { name: this.userNameCache.get(args.user) } };
+            }
+            // Publish here, not in a shared-resolver continuation after eviction.
+            const name = info.user?.profile?.display_name || info.user?.real_name || info.user?.name;
+            // A nameless incomplete answer must not make a later failed DM
+            // lookup appear named and skip its background retry wait.
+            if (name) this.userNameCache.set(args.user, name);
+            this.inconclusiveNames.add(args.user);
+            if (this.inconclusiveNames.size > 256) {
+              const oldest = this.inconclusiveNames.values().next().value!;
+              this.inconclusiveNames.delete(oldest);
+              // Evict the incomplete name too, so a future encounter still retries.
+              this.userNameCache.delete(oldest);
+            }
+            if (!name && !this.userNameCache.has(args.user)) {
+              throw new VerificationFailure('users.info did not return a display name', {
+                method: 'users.info', seconds: FAILED_WAIT_SECONDS, why: 'failed',
+              });
+            }
+            return info;
+          }
+          // Publish the name before verification, without an await between them.
+          // Another lookup can resume before the shared resolver caches this reply.
+          const name = info.user.profile?.display_name || info.user.real_name || info.user.name;
+          if (name) this.userNameCache.set(args.user, name);
+          this.inconclusiveNames.delete(args.user);
+          this.verifiedUsers.add(args.user);
+          if (info.user?.is_bot === true) this.botUsers.add(args.user);
+          return info;
+        } catch (err) {
+          // The base resolver treats any data.error as a settled refusal.
+          // Opt-in identity checks require a genuine classified Slack error.
+          if (!slackRefusal(err) && (err as { data?: { error?: unknown } } | null)?.data?.error) {
+            throw new Error('users.info returned an unclassified error', { cause: err });
+          }
+          throw err;
+        } finally {
+          if (!signal?.aborted && this.userNameCache.has(args.user)) names?.set(args.user, this.userNameCache.get(args.user)!);
+        }
+      } } },
+      cache,
+      lookupIds,
+      signal,
+    );
+    signal?.throwIfAborted();
+    return failed;
   }
+}
+
+// Preserve original fallback labels independently of supplemental mentions.
+function formatMessageText(original: string, rendered: string, cache: Map<string, string>, resolved?: Map<string, string>): string {
+  // Only original mentions need an overlay; never enumerate the lifetime cache.
+  const allNames = resolved
+    ? new Map(extractSlackUserIds(original).map(id => [id, resolved.get(id) ?? cache.get(id)!]))
+    : cache;
+  const supplemental = rendered.slice(original.length);
+  const names = new Map(extractSlackUserIds(supplemental).map(id => [id, resolved?.get(id) ?? cache.get(id) ?? id]));
+  return formatSlackText(original, allNames) + formatSlackText(supplemental, names);
 }

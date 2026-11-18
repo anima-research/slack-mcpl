@@ -4,7 +4,9 @@
  * request through the adapter's client, so it keeps the call's time and wait
  * budget like every other request. Backscroll keeps the adapter's own pager.
  */
+import { setImmediate } from 'node:timers/promises';
 import { createHash } from 'node:crypto';
+import { renderMessageText } from './message-text.js';
 import { formatSlackText, type SlackHistoryMessage } from './content.js';
 import { mimeShown, nameShown, toolResultJson, urlShown } from './framing.js';
 import { isNearMiss } from './near-miss.js';
@@ -340,12 +342,17 @@ export async function readBounded(opts: ReadOptions, source: ReadSource): Promis
         : -1;
       if (end >= 0) rows.splice(end);
       const isMatch = (m: SlackHistoryMessage) =>
-        (needle === undefined || fold(formatSlackText(m.text ?? '', BY_ID)).includes(needle)) &&
-        (!opts.authorIds.length || [m.user, m.bot_id].some((id) => id !== undefined && opts.authorIds.includes(id)));
-      // Only the matches the limit can still take are shaped, so names are
-      // looked up for them, not for every message scanned. Some may then not
-      // fit maxBytes; their names stay cached for the call that continues.
-      const matches = rows.filter(({ m }) => isMatch(m)).slice(0, opts.limit - records.length).map(({ m }) => m);
+        (!opts.authorIds.length || [m.user, m.bot_id].some((id) => id !== undefined && opts.authorIds.includes(id))) &&
+        (needle === undefined || fold(formatSlackText(renderMessageText(m), BY_ID)).includes(needle));
+      // Stop before rendering rows excluded by the author, scan or match limit.
+      const matches: SlackHistoryMessage[] = [];
+      let candidates = 0;
+      for (const { m } of rows.slice(0, opts.maxScanned - scanned)) {
+        if (matches.length >= opts.limit - records.length) break;
+        if (isMatch(m)) matches.push(m);
+        // Yield between bounded candidates, including when no text matches.
+        if (needle !== undefined && ++candidates % 8 === 0) await setImmediate();
+      }
       const shaped = new Map((await source.shape(matches)).map((m, i) => [matches[i]!, m]));
       for (const [i, { m, ts }] of rows.entries()) {
         if (scanned >= opts.maxScanned) { stopReason = 'scan_limit'; break pages; }

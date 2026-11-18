@@ -774,7 +774,9 @@ test('a listing in the background asks again 30 s after a failure that can pass,
   await assert.rejects(slack.listConversations(false, async () => {}), (err) => err === errors.missing_scope);
 });
 
-test("a listing in the background waits out a DM's name lookup that can pass, and keeps a refused one's id", { timeout: 5000 }, async () => {
+test("a listing in the background waits out a DM's name lookup that can pass, and keeps a refused one's id", { timeout: 5000 }, async (t) => {
+  // Elapsed-time subtraction must not depend on the test runner's speed.
+  virtualClock(t);
   api.answer({ status: 429, headers: { 'retry-after': '7' }, body: { ok: false, error: 'ratelimited' } });
   const { err: limitedLookup } = await failure(() => client.users.info({ user: 'U1' }));
   api.answer({ body: { ok: false, error: 'user_not_found' } });

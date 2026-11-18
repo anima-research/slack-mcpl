@@ -191,6 +191,13 @@ test('through the server, the host sees a conversation in arrival order, so a pu
   // White-box: the server's adapter and the adapter's client are private.
   const slack = (h.server as unknown as { slack: SlackAdapter }).slack;
   const web = (slack as unknown as { web: { users: { info(args: { user: string }): Promise<unknown> } } }).web;
+  let secondPreparedDone!: () => void;
+  const secondPrepared = new Promise<void>(resolve => { secondPreparedDone = resolve; });
+  const prepare = (slack as any).prepareMessageEvent.bind(slack);
+  (slack as any).prepareMessageEvent = async (event: { ts: string }) => {
+    try { return await prepare(event); }
+    finally { if (event.ts === '300.2') secondPreparedDone(); }
+  };
   const info = web.users.info.bind(web.users);
   web.users.info = async (args) => {
     if (args.user === 'U1') {
@@ -201,21 +208,26 @@ test('through the server, the host sees a conversation in arrival order, so a pu
   };
   const deliveredHere: string[] = [];
   slack.onMessage((m) => deliveredHere.push(m.id));
-  await initialize(h, true);
-  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
-  await until(() => h.hostSaw.some((r) => r.method === method.CHANNELS_REGISTER), 'channels/register');
-  // The earlier message is a reply in thread 50.0; the later one is top-level.
-  await h.socket.emitMessage({ type: 'message', channel: 'C1', channel_type: 'channel', user: 'U1', text: '<@UBOT> first', ts: '300.1', thread_ts: '50.0' });
-  await h.socket.emitMessage({ type: 'message', channel: 'C1', channel_type: 'channel', user: 'U2', text: '<@UBOT> second', ts: '300.2' });
-  await u1.entered;
-  await settled();
-  assert.deepEqual(deliveredHere, [], "the later message waits for the earlier one's lookup");
-  u1.release();
-  const pushed = () => h.hostSaw.filter((r) => r.method === method.PUSH_EVENT);
-  await until(() => pushed().length === 2, 'both messages at the host');
-  assert.deepEqual(pushed().map((r) => JSON.stringify(r.params).match(/300\.[12]/)?.[0]), ['300.1', '300.2']);
-  await h.host.sendRequest(method.CHANNELS_PUBLISH, { channelId: 'slack:C1', content: [{ type: 'text', text: 'reply' }] });
-  assert.equal((h.posts.at(-1) as { thread_ts?: string }).thread_ts, undefined,
-    'the last message the host took is the top-level one, so the publish goes top-level');
-  await h.close();
+  try {
+    await initialize(h, true);
+    await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+    await until(() => h.hostSaw.some((r) => r.method === method.CHANNELS_REGISTER), 'channels/register');
+    // The earlier message is a reply in thread 50.0; the later one is top-level.
+    void h.socket.emitMessage({ type: 'message', channel: 'C1', channel_type: 'channel', user: 'U1', text: '<@UBOT> first', ts: '300.1', thread_ts: '50.0' });
+    void h.socket.emitMessage({ type: 'message', channel: 'C1', channel_type: 'channel', user: 'U2', text: '<@UBOT> second', ts: '300.2' });
+    await u1.entered;
+    await secondPrepared;
+    await settled();
+    assert.deepEqual(deliveredHere, [], "the later message waits for the earlier one's lookup");
+    u1.release();
+    const pushed = () => h.hostSaw.filter((r) => r.method === method.PUSH_EVENT);
+    await until(() => pushed().length === 2, 'both messages at the host');
+    assert.deepEqual(pushed().map((r) => JSON.stringify(r.params).match(/300\.[12]/)?.[0]), ['300.1', '300.2']);
+    await h.host.sendRequest(method.CHANNELS_PUBLISH, { channelId: 'slack:C1', content: [{ type: 'text', text: 'reply' }] });
+    assert.equal((h.posts.at(-1) as { thread_ts?: string }).thread_ts, undefined,
+      'the last message the host took is the top-level one, so the publish goes top-level');
+  } finally {
+    u1.release();
+    await h.close();
+  }
 });

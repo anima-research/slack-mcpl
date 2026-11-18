@@ -139,6 +139,9 @@ test('a mention does not undo a mute', async () => {
   await h.socket.emitMessage(MENTION_EVENT); // first message from C1: the auto-subscribe path
   await until(() => pushes(h).length === 1, 'the mention');
   await h.socket.emitMessage({ type: 'message', channel: 'C1', user: 'U2', text: 'chatter', ts: '2.1' });
+  // Drain preparation and then forwarding: elapsed time cannot prove absence.
+  await (h.server as any).slack.inbound.get('C1');
+  await (h.server as any).forwarding.get('C1');
   assert.equal(pushes(h).length, 1, 'still muted');
   await h.close();
 });

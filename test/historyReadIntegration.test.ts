@@ -87,3 +87,31 @@ test("a slip for a read's required argument is named as a slip, not as the argum
   });
   assert.deepEqual(h.reads, []);
 });
+
+test('fake history honors exclusive and inclusive time windows before paging', async () => {
+  const {fakeSlack} = await import('./harness.js');
+  const {slack} = fakeSlack({historyMessages: [1, 4, 2, 3].map(n => ({
+    ts: n + '.000001', user: 'U1', text: String(n),
+  }))});
+  const exclusive = await slack.readHistory('C1', {oldest: '1.000001', latest: '4.000001', limit: 10});
+  assert.deepEqual(exclusive.messages.map(m => m.id), ['2.000001', '3.000001']);
+  const fakeExclusive = await (slack as any).web.conversations.history({
+    channel: 'C1', oldest: '1.000001', latest: '4.000001', inclusive: false, limit: 10,
+  });
+  assert.deepEqual(fakeExclusive.messages.map((m: any) => m.ts), ['3.000001', '2.000001']);
+  const inclusive = await (slack as any).web.conversations.history({
+    channel: 'C1', oldest: '1.000001', latest: '4.000001', inclusive: true, limit: 2,
+  });
+  assert.deepEqual(inclusive.messages.map((m: any) => m.ts), ['4.000001', '3.000001']);
+  const page = await (slack as any).web.conversations.history({
+    channel: 'C1', oldest: '1.000001', latest: '4.000001', inclusive: true, limit: 2,
+    cursor: inclusive.response_metadata.next_cursor,
+  });
+  assert.deepEqual(page.messages.map((m: any) => m.ts), ['2.000001', '1.000001']);
+  const many = fakeSlack({historyMessages: Array.from({length: 250}, (_, i) => ({
+    ts: (i + 1) + '.000001', user: 'U1', text: String(i),
+  }))});
+  const result = await many.slack.readHistory('C1', {limit: 250});
+  assert.equal(result.messages.length, 250);
+  assert.equal(new Set(result.messages.map(m => m.id)).size, 250);
+});
