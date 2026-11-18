@@ -60,7 +60,7 @@ import {
   type SlackMessageData,
   type SlackWait,
 } from './slack-adapter.js';
-import { toolDefinitions } from './tools.js';
+import { policyListingTool, toolDefinitions } from './tools.js';
 import { withToolClasses } from './tool-classes.js';
 import { buildFeatureSets, buildServerCapabilities, featureSetForTool, MESSAGING_FEATURE_SET, TYPING_FEATURE_SET } from './feature-sets.js';
 import { ChannelManager, mcplChannelId, parseMcplChannelId, toDescriptor } from './channels.js';
@@ -180,11 +180,12 @@ export function backscrollLine(m: {
 /** The `<backscroll>` block given with the first message from a conversation. */
 export function backscrollBlock(
   messages: Parameters<typeof backscrollLine>[0][],
-  where: { channelName?: string; isDM: boolean },
+  where: { channelName?: string; isDM: boolean; isGroupDM?: boolean },
 ): string {
   const attrs: string[] = [];
-  if (where.channelName && !where.isDM) attrs.push(`channel=${quotedLabel(`#${where.channelName}`)}`);
+  if (where.channelName && !where.isDM) attrs.push(`channel=${quotedLabel(where.isGroupDM ? where.channelName : `#${where.channelName}`)}`);
   if (where.isDM) attrs.push('dm="true"');
+  if (where.isGroupDM) attrs.push('group_dm="true"');
   attrs.push(`count="${messages.length}"`);
   return [`<backscroll ${attrs.join(' ')}>`, ...messages.map(backscrollLine), '</backscroll>'].join('\n');
 }
@@ -399,7 +400,7 @@ export class SlackMcplServer {
    *  connection has no host to register conversations with. Neither changes
    *  during a connection, as a grant can. */
   private offeredTools() {
-    return toolDefinitions.filter((t) =>
+    return toolDefinitions.map(t => policyListingTool(t, this.slack.hasAccessPolicy)).filter((t) =>
       (t.name !== 'fetch_attachment' || !this.slack.hasAccessPolicy) &&
       (t.name !== 'send_dm' || this.slack.dmsWritable) && (t.name !== 'refresh_channels' || this.mcplEnabled));
   }
@@ -860,11 +861,11 @@ export class SlackMcplServer {
       }
 
       case 'list_channels': {
-        const { conversations, leftOut } = await this.slack.listConversations(args.includeNonMember === true);
+        const { conversations, leftOut, admissionFailures } = await this.slack.listConversations(args.includeNonMember === true);
         const listed = conversations.map((c) => ({
           id: c.id,
           kind: c.kind,
-          name: c.kind === 'dm' ? `DM: @${c.name}` : c.name,
+          name: c.kind === 'dm' ? `DM: @${c.name}` : this.slack.hasAccessPolicy && c.policyGroupDm ? `Group DM: ${nameShown(c.name)}` : c.name,
           ...(c.topic ? { topic: c.topic } : {}),
           ...(c.kind === 'channel' || c.kind === 'private_channel' ? { isMember: c.isMember } : {}),
           writable: this.slack.canWrite(c.id),
@@ -874,8 +875,10 @@ export class SlackMcplServer {
         // from "the token can't read them"; one that left none out answers
         // with the list alone. Types the host has turned off aren't listed
         // or noted, as the tool's description says.
-        if (leftOut.length === 0) return listed;
-        return { _content: [textContent(toolResultJson(listed)), textContent(leftOutNote(leftOut))] };
+        if (leftOut.length === 0 && !admissionFailures) return listed;
+        return { _content: [textContent(toolResultJson(listed)),
+          ...(leftOut.length ? [textContent(leftOutNote(leftOut))] : []),
+          ...(admissionFailures ? [textContent('Incomplete: candidate admission was rate-limited; rows above are usable but more may exist. Retry later; a new call starts over.')] : [])] };
       }
 
       case 'refresh_channels':
@@ -1395,7 +1398,7 @@ export class SlackMcplServer {
    *  conversations come to be registered with the host, or that they can't. */
   private howChannelsRegister(): string {
     return this.grant.has('channels.register')
-      ? `refresh_channels registers the conversations this bot is in${this.slack.dmsDisabled ? ', channels only while direct messages are turned off' : ''}; open one by the id it announces.`
+      ? `refresh_channels registers the conversations this bot is in${(this.slack.hasAccessPolicy ? this.slack.listsChannelsOnly : this.slack.dmsDisabled) ? ', channels only while direct messages are turned off' : ''}; open one by the id it announces.`
       : "This host hasn't granted this server channels.register, so this server can't register conversations with it.";
   }
 
@@ -1794,7 +1797,9 @@ export class SlackMcplServer {
       !this.unsubscribedByAgent.has(msg.channelId) && !this.isChannelSubscribed(msg.channelId);
     const blocks: string[] = [];
     if (autoSubscribe) {
-      const where = meta?.name ? channelShown(meta.name) : `conversation ${msg.channelId}`;
+      const where = meta?.name
+        ? (this.slack.hasAccessPolicy && meta.policyGroupDm ? `Group DM: ${nameShown(meta.name)}` : channelShown(meta.name))
+        : `conversation ${msg.channelId}`;
       blocks.push(
         `<system>Auto-subscribed to ${where} because you were mentioned. ` +
           `Ambient (non-mention) messages from this conversation will now arrive in your context. ` +
@@ -1803,7 +1808,7 @@ export class SlackMcplServer {
       );
     }
     if (backscroll.length > 0) {
-      blocks.push(backscrollBlock(backscroll, { channelName: meta?.name, isDM: msg.isDM }));
+      blocks.push(backscrollBlock(backscroll, { channelName: meta?.name, isDM: msg.isDM, isGroupDM: this.slack.hasAccessPolicy && meta?.policyGroupDm }));
     }
     // Told with the first message the agent gets from here, addressed or not.
     // Counted as told only once the host has taken that message.
@@ -1819,7 +1824,9 @@ export class SlackMcplServer {
     const channelMcplId = mcplChannelId(msg.channelId);
     const channelIsOpen = this.channelManager.isOpen(channelMcplId);
     // A conversation whose name Slack didn't give is named by its ID.
-    const conversation = !contextChanged ? undefined : msg.isDM ? 'DM' : meta?.name ? channelShown(meta.name) : msg.channelId;
+    const conversation = !contextChanged ? undefined : msg.isDM ? 'DM'
+      : this.slack.hasAccessPolicy && meta?.policyGroupDm ? `Group DM: ${nameShown(meta.name || msg.channelId)}`
+      : meta?.name ? channelShown(meta.name) : msg.channelId;
     const location = locationHeader({
       conversation,
       teamName: contextChanged ? this.slack.teamName : undefined,

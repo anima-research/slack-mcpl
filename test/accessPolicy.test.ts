@@ -39,7 +39,7 @@ test('validation and construction reject missing, unknown and null fields identi
     invalid.push(missing, { ...config(), [key]: null }, { ...config(), [key]: undefined });
   }
   // These extensions are deliberately unsupported in A1, even empty or null.
-  for (const key of ['groupDms', 'historyMembershipFallbackChannels']) {
+  for (const key of ['historyMembershipFallbackChannels']) {
     for (const value of [null, [], ['G1']]) invalid.push({ ...config(), [key]: value });
   }
   invalid.push({ ...config(), readJoinedChannels: 'true' });
@@ -141,7 +141,7 @@ test('DM identity and kind cannot be inferred from a prefix or mismatched metada
   }
 });
 
-test('group DMs are unsupported even with membership, a write pin and mpim scopes', () => {
+test('unnamed group DMs are unsupported even with membership, a write pin and mpim scopes', () => {
   const policy = new SlackAccessPolicy(config());
   for (const id of ['C1', 'G1']) {
     for (const isIm of [undefined, false, true]) {
@@ -302,7 +302,24 @@ test('list diagnostics identify the bad index, including sparse entries', () => 
 });
 
 test('group DM guard has a specific diagnostic even for otherwise valid channel metadata', () => {
-  assert.throws(() => new SlackAccessPolicy(config()).requireReadable('C1', { ...channel(), is_mpim: true }, scopes), /Group direct messages are unsupported/);
+  assert.throws(() => new SlackAccessPolicy(config()).requireReadable('C1', { ...channel(), is_mpim: true }, scopes), /group direct message is not admitted/);
+});
+
+
+test('access context preserves input, unverified and local-denial identity, classes and cause', async () => {
+  const { withAccessContext, SlackAccessInputError, SlackAccessUnverified, SlackAccessDenied } = await import('../src/access-policy.js');
+  for (const Ctor of [SlackAccessInputError, SlackAccessUnverified, SlackAccessDenied]) {
+    const cause = new Error('original cause');
+    const original = new Ctor('reason', { cause });
+    await assert.rejects(withAccessContext('Nothing was posted', () => withAccessContext('Nothing was posted', async () => { throw original; })), err => {
+      assert.ok(err instanceof Ctor);
+      assert.equal(err, original);
+      assert.equal(err.cause, cause);
+      assert.equal(err.message.split('Nothing was posted:').length, 2);
+      assert.equal(err.message.includes('Retrying unchanged'), Ctor === SlackAccessDenied);
+      return true;
+    });
+  }
 });
 
 test('scope snapshots and remaining parser boundary cases', () => {
@@ -331,8 +348,8 @@ test('scope snapshots and remaining parser boundary cases', () => {
   assert.throws(() => policy.requireReadable('C1', channel(), grants));
   for (const id of ['C1', 'G1']) {
     const group = { ...channel(id), is_mpim: true };
-    assert.throws(() => policy.requireReadable(id, group, scopes), /Group direct messages/);
-    assert.throws(() => policy.requireWritable(id, group, scopes, 'chat:write'), /Group direct messages/);
+    assert.throws(() => policy.requireReadable(id, group, scopes), /group direct message/);
+    assert.throws(() => policy.requireWritable(id, group, scopes, 'chat:write'), /group direct message/);
   }
   assert.throws(() => parseAccessPolicy(config({ writeChannels: ['general'] })), /general.*uppercase C- or G-/);
 });

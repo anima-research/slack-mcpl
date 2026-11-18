@@ -20,11 +20,12 @@
  * Event handling salvaged from zulip-mcp PR #8's SlackAdapter.
  */
 
+import { setMaxListeners } from 'node:events';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { WebClient, ErrorCode, LogLevel, type Logger, type WebAPICallResult, type WebClientOptions } from '@slack/web-api';
 import { SocketModeClient } from '@slack/socket-mode';
 import { clock } from './clock.js';
-import { SlackAccessDenied, SlackAccessGrantDenied, SlackAccessInputError, accessContextOriginalMessage, withAccessContext, type SlackAccessPolicy } from './access-policy.js';
+import { SlackAccessDenied, SlackAccessUnverified, SlackAccessGrantDenied, SlackAccessInputError, accessContextOriginalMessage, withAccessContext, type SlackAccessPolicy } from './access-policy.js';
 import { NOTHING_RETURNED, SLACK_TS, readBounded, readOptions, type HistoryReadResult, type ReadStop } from './history-read.js';
 import {
   formatSlackText,
@@ -302,7 +303,11 @@ export interface SlackWait {
  *  for work no call waits on; undefined when Slack's answer will be the same
  *  next time, or `err` isn't the client's. A request the host is waiting on
  *  waits out only a `limited` one, within its budget (SlackWebClient). */
-export function waitToAskAgain(err: unknown, method: string): SlackWait | undefined {
+export function waitToAskAgain(err: unknown, method: string, policy = false): SlackWait | undefined {
+  if (policy && slackRefusal(err) === 'ratelimited') {
+    const seconds = retryAfterSeconds(err);
+    if (seconds !== undefined) return { method, seconds, why: 'limited' };
+  }
   const e = err as { code?: unknown; retryAfter?: unknown } | null;
   if (e?.code === ErrorCode.RateLimitedError && typeof e.retryAfter === 'number') {
     return { method, seconds: e.retryAfter, why: 'limited' };
@@ -403,6 +408,8 @@ export type ConversationKind = 'channel' | 'private_channel' | 'dm' | 'group_dm'
 export interface SlackConversationInfo {
   id: string;
   kind: ConversationKind;
+  /** Label group DMs distinctly only on the dormant explicit-policy path. */
+  policyGroupDm?: true;
   /** Channel name, group-DM name, or the DM counterpart's display name. */
   name: string;
   /** DM counterpart user ID (dm only). */
@@ -942,11 +949,17 @@ export class SlackAdapter {
     return this.disableDms;
   }
 
+  /** Whether registration guidance may describe the listing as channels only. */
+  get listsChannelsOnly(): boolean {
+    return !this.conversationTypes().some((type) => type === 'im' || type === 'mpim');
+  }
+
   /** Can send_dm succeed at all? A DM ID starts with D. */
   get dmsWritable(): boolean {
     return !this.dmsDisabled && (!this.sendChannels?.length || this.sendChannels.some((id) => id.startsWith('D')));
   }
 
+  private admissionStop = new AbortController();
   private stopping = false;
   get isStopping(): boolean { return this.stopping; }
 
@@ -965,7 +978,7 @@ export class SlackAdapter {
     private disableDms = false,
     private ackReaction?: string,
     /** The bot token's scopes, as auth.test reported them; undefined, or an
-     *  empty list, is unknown, so a listing asks for every type. */
+     *  empty list, is unknown; only legacy listings ask for every type. */
     scopes?: string[],
   ) {
     this.web = isolateClientErrors(web, () => this.hasAccessPolicy, (method, args, answer, error, issued) => {
@@ -977,16 +990,17 @@ export class SlackAdapter {
         this.observeDelivery(channelId, { issued, refusal: answer });
       }
     });
+    setMaxListeners(0, this.admissionStop.signal);
     this.scopes = reportedScopes({ scopes });
     const omitted = this.leftOutTypes();
     if (omitted.length) this.logLeftOut(omitted, '');
     // Preparation overlaps within a conversation; delivery alone stays FIFO.
-    // Ambient events await the last addressed delivery's subscription commit,
-    // not each earlier ambient event's admission retries or host delivery.
+    // This path is legacy-only; policy envelopes use enqueuePolicyEvent below.
     const addressedTurns = new Map<string, Promise<void>>();
     this.socket.on('message', ({ event, ack }) => {
       // Always ack first — Slack redelivers unacked envelopes.
       void Promise.resolve().then(() => ack()).catch(() => { /* ignore */ });
+      if (this.accessPolicy) { this.enqueuePolicyEvent(event); return; }
       // Settled into a value at once, so a preparation that fails before its
       // turn is never a rejection nothing handles.
       const prepare = () => (this.accessPolicy && this.stopping ? Promise.resolve(undefined) : this.prepareMessageEvent(event)).then(
@@ -1020,6 +1034,87 @@ export class SlackAdapter {
     });
   }
 
+  // Bound waiting ambient envelopes, including those behind a stalled host.
+  // Active handlers cannot be cancelled. Addressed work is FIFO but admission failures and shutdown can drop events.
+  private policyTurns = new Map<string, Array<{
+    event: SlackMessageEvent;
+    addressed: boolean;
+    prepared?: ReturnType<SlackAdapter['settlePolicyEvent']>;
+  }>>();
+  private policyAddressedPending = new Map<string, number>();
+  private ambientTurns: Array<{ event: SlackMessageEvent; addressed: boolean }> = [];
+  private settlePolicyEvent(event: SlackMessageEvent) {
+    return this.prepareMessageEvent(event).then(
+      msg => ({ ok: true as const, msg }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
+  }
+
+  private enqueuePolicyEvent(event: SlackMessageEvent): void {
+    if (this.stopping || !event || event.type !== 'message' || !CONTENT_SUBTYPES.has(event.subtype)
+        || event.bot_id || event.user === this.botUserId || !event.channel || !event.user || !event.ts) return;
+    const key = typeof event?.channel === 'string' ? event.channel : '';
+    const addressed = key.startsWith('D') || (this.botUserId !== null
+      && typeof event?.text === 'string' && extractSlackUserIds(event.text).includes(this.botUserId));
+    if (!addressed && !this.policyAddressedPending.has(key) && this.ambientMessageFilter && !this.ambientMessageFilter(key)) return;
+    if ((event.channel_type === 'mpim' && (this.disableDms || !this.accessPolicy!.namesGroupDm(key)))
+        || (key.startsWith('D') && (this.dmsDisabled || !this.accessPolicy!.mayDmUser(event.user)
+          || (this.dmUsers && !this.dmUsers.includes(event.user))))) return;
+    // Waiting ambient envelopes own no preparation. Only the bounded batch
+    // selected by the delivery loop may start lookups.
+    const item = { event, addressed, prepared: addressed ? this.settlePolicyEvent(event) : undefined };
+    if (addressed) this.policyAddressedPending.set(key, (this.policyAddressedPending.get(key) ?? 0) + 1);
+    const queue = this.policyTurns.get(key) ?? [];
+    queue.push(item);
+    this.policyTurns.set(key, queue);
+    if (!addressed) {
+      this.ambientTurns.push(item);
+      if (this.ambientTurns.length > 32) {
+        const oldest = this.ambientTurns.shift()!;
+        const waiting = this.policyTurns.get(oldest.event?.channel ?? '');
+        const index = waiting?.indexOf(oldest) ?? -1;
+        if (index >= 0) waiting!.splice(index, 1);
+        console.error(`[slack-mcpl] Dropped ambient event ${oldest.event.channel} ${oldest.event.ts}: delivery backlog limit 32; recover with fetch_history or fetch_thread for replies`);
+      }
+    }
+    if (this.inbound.has(key)) return;
+    const turn = Promise.resolve().then(async () => {
+      try {
+      while (queue.length) {
+        // Overlap the next ambient run, but never prepare past an addressed
+        // delivery whose handler may commit a subscription.
+        for (const pending of queue) {
+          if (pending.addressed) break;
+          pending.prepared ??= this.settlePolicyEvent(pending.event);
+        }
+        const next = queue.shift()!;
+        const index = this.ambientTurns.indexOf(next);
+        if (index >= 0) this.ambientTurns.splice(index, 1);
+        // Lazy ambient preparation observes the last addressed handler's commit.
+        try {
+        const droppedAtStop = () => console.error(`[slack-mcpl] Dropped active event ${next.event.channel} ${next.event.ts}: shutdown; recover with fetch_history or fetch_thread with its original thread root for replies`);
+        if (this.stopping) { droppedAtStop(); continue; }
+        const done = await (next.prepared ?? this.settlePolicyEvent(next.event));
+        if (!done.ok) { console.error(`[slack-mcpl] Failed event ${next.event.channel} ${next.event.ts}: ${policyFailureSummary(done.error)}; recover with fetch_history or fetch_thread for replies`); continue; }
+        if (this.stopping) continue;
+        if (done.msg) for (const handler of this.messageHandlers) {
+          if (this.stopping) break;
+          try { await handler(done.msg); }
+          catch (error) { console.error(`[slack-mcpl] Failed event ${next.event.channel} ${next.event.ts}: ${policyFailureSummary(error)}; recover with fetch_history or fetch_thread for replies`); break; }
+        }
+        } finally {
+          if (next.addressed) {
+            const count = Math.max(0, (this.policyAddressedPending.get(key) ?? 1) - 1);
+            if (count) this.policyAddressedPending.set(key, count);
+            else this.policyAddressedPending.delete(key);
+          }
+        }
+      }
+      } finally { this.policyTurns.delete(key); this.inbound.delete(key); }
+    });
+    this.inbound.set(key, turn);
+  }
+
   private ambientMessageFilter?: (channelId: string) => boolean;
 
   /** Cheap delivery veto only, never authorization. Addressed events bypass it. */
@@ -1042,6 +1137,15 @@ export class SlackAdapter {
     // Best effort: clear reactions and statuses together before going away.
     // index.ts gives shutdown five seconds; no new starts while that runs.
     this.stopping = true;
+    if (this.accessPolicy) {
+      this.admissionStop.abort();
+      for (const item of this.eventAdmissionQueue.splice(0)) item.resolve(false);
+      for (const queue of this.policyTurns.values()) {
+        for (const item of queue.splice(0)) console.error(`[slack-mcpl] Dropped queued event ${item.event.channel} ${item.event.ts}: shutdown; recover with fetch_history or fetch_thread for replies`);
+      }
+      this.ambientTurns.length = 0;
+      this.policyAddressedPending.clear();
+    }
     await Promise.all([this.resetThreadStatuses(), ...[...this.ackPending.keys()].map((c) => this.clearAck(c))]);
     // A removal that failed just before stop() began has armed its retry, and
     // the clear above only joined it. Nothing is tried again after a stop.
@@ -1056,9 +1160,10 @@ export class SlackAdapter {
 
   // ── Conversations ──
 
-  // TODO(activation): describe policy exclusions (group DMs and unjoined channels) in tool schemas.
+  // TODO(activation): describe policy exclusions (unnamed group DMs and unjoined channels) in tool schemas.
   private conversationTypes(): string[] {
-    if (this.accessPolicy) return ['public_channel', 'private_channel', ...(!this.dmsDisabled ? ['im'] : [])]; // group DMs come later
+    if (this.accessPolicy) return ['public_channel', 'private_channel', ...(!this.dmsDisabled ? ['im'] : []),
+      ...(!this.disableDms && this.accessPolicy.groupDmsReadable ? ['mpim'] : [])];
     return this.disableDms ? ['public_channel', 'private_channel'] : Object.keys(TYPE_SCOPE);
   }
 
@@ -1101,8 +1206,9 @@ export class SlackAdapter {
     if (omitted.join(',') !== before) this.logLeftOut(omitted, 'now ');
   }
 
-  /** Enumerate conversations the bot can act in: member channels, DMs, and
-   *  group DMs, of the types whose read scopes Slack has reported the token
+  /** Policy includeNonMember never broadens membership admission.
+   * Enumerate conversations the bot can act in: member channels, DMs, and
+   *  group DMs. includeNonMember broadens legacy results only; policy requires membership. Of the types whose read scopes Slack has reported the token
    *  has (legacy mode requests every enabled type while scopes are unknown; policy mode admits none). Slack reports the
    *  scopes with each answer, and the client hands them on with an answer or a
    *  refusal, though not with an HTTP error such as a 429. A listing whose
@@ -1182,7 +1288,7 @@ export class SlackAdapter {
         // anything is asked again, even when the types changed meanwhile, or
         // ends a listing nothing waits out. A refusal whose scopes changed the
         // types starts over at once.
-        const wait = waitToAskAgain(err, method);
+        const wait = waitToAskAgain(err, method, this.hasAccessPolicy);
         if (wait) {
           if (!waitOut) throw err;
           await waitOut(wait, ++limited);
@@ -1204,14 +1310,25 @@ export class SlackAdapter {
             // Listed peers are rejection-only hints: fresh metadata still authorizes.
             if (raw.is_im === true && typeof raw.user === 'string'
                 && (!this.accessPolicy.mayDmUser(raw.user) || (this.dmUsers && !this.dmUsers.includes(raw.user)))) continue;
+            if (raw.is_mpim && !this.accessPolicy.namesGroupDm(raw.id)) continue;
             // Avoid a metadata request for every unjoined public workspace channel.
-            if (raw.is_im === false && raw.is_mpim === false && raw.is_member === false) continue;
+            if (raw.is_im === false && raw.is_mpim === false && raw.is_member === false && !this.accessPolicy.namesGroupDm(raw.id)) continue;
             let attempts = 0;
             for (;;) {
-              try { checkCurrent(); raw = await this.readAccessConversation(raw.id!); checkCurrent(); break; }
+              try {
+                checkCurrent();
+                if (!await this.paceEventAdmission(raw.id!, { addressed: false })) throw new Error('Conversation listing admission slot was retired');
+                checkCurrent();
+                raw = await this.readAccessConversation(raw.id!);
+                checkCurrent();
+                break;
+              }
               catch (err) {
                 checkCurrent();
-                const wait = waitToAskAgain(err, 'conversations.info');
+                const wait = waitToAskAgain(err, 'conversations.info', this.hasAccessPolicy);
+                if (wait?.why === 'limited' && Number.isFinite(wait.seconds) && wait.seconds >= 0) {
+                  this.nextEventAdmissionAt = Math.max(this.nextEventAdmissionAt, clock.monotonic() + wait.seconds * 1000);
+                }
                 if (!wait || !waitOut) throw err;
                 await waitOut(wait, ++attempts);
               }
@@ -1222,6 +1339,9 @@ export class SlackAdapter {
             if (NOT_SHOWN.has(slackRefusal(err) ?? '')) {
               console.error(`[slack-mcpl] listing candidate ${raw.id} is no longer available: ${slackRefusal(err)}`);
               continue;
+            }
+            if (!waitOut && waitToAskAgain(err, 'conversations.info', this.hasAccessPolicy)?.why === 'limited') {
+              return { conversations: out, leftOut: this.leftOutTypes(), admissionFailures: admissionFailures + 1 };
             }
             if (waitOut) {
               admissionFailures++;
@@ -1251,7 +1371,7 @@ export class SlackAdapter {
   async getConversationMeta(channelId: string, forDelivery = false): Promise<SlackConversationInfo | null> {
     if (this.accessPolicy) {
       const conversation = forDelivery
-        ? await this.retryEventAdmission(channelId, true)
+        ? await this.retryEventAdmission(channelId, { addressed: true }, true)
         : await this.readAccessConversation(channelId);
       // A delivery check must not await an optional DM display-name lookup.
       if (forDelivery && (this.stopping || !conversation)) throw new Error('Delivery admission was stopped');
@@ -1298,7 +1418,7 @@ export class SlackAdapter {
     const observation = this.deliveryObservations.get(channelId);
     const conversation = observation && 'conversation' in observation ? observation.conversation : undefined;
     this.accessPolicy.requireReadable(channelId, conversation, this.scopes);
-    this.accessPolicy.requireScope(this.scopes, conversation!.is_im ? 'im:history'
+    this.accessPolicy.requireScope(this.scopes, conversation!.is_mpim ? 'mpim:history' : conversation!.is_im ? 'im:history'
       : conversation!.is_private ? 'groups:history' : 'channels:history');
   }
 
@@ -1315,6 +1435,9 @@ export class SlackAdapter {
     this.observeDeliveryConversation(channelId, conversation, responseIssued.get(result)!);
     this.assertNoKnownDeliveryRefusal(channelId);
     this.accessPolicy.requireReadable(channelId, conversation, this.scopes);
+    if (conversation!.is_mpim && this.disableDms) {
+      throw new SlackAccessDenied('Group direct messages are turned off on this host');
+    }
     if (conversation!.is_im && this.dmUsers && !this.dmUsers.includes(conversation!.user!)) throw new SlackAccessDenied(`Conversation ${channelId} is not an admitted direct message`);
     return conversation!;
   }
@@ -1333,7 +1456,7 @@ export class SlackAdapter {
     if (!this.accessPolicy) { await this.assertNotDm(channelId, notDone); return; }
     return withAccessContext(notDone, async () => {
       const conversation = await this.readAccessConversation(channelId);
-      this.accessPolicy!.requireScope(this.scopes, conversation.is_im ? 'im:history'
+      this.accessPolicy!.requireScope(this.scopes, conversation.is_mpim ? 'mpim:history' : conversation.is_im ? 'im:history'
         : conversation.is_private ? 'groups:history' : 'channels:history');
       return conversation;
     });
@@ -1394,7 +1517,8 @@ export class SlackAdapter {
     }
     if (conv.is_mpim) {
       this.dmIds.add(conv.id);
-      return { id: conv.id, kind: 'group_dm', name: conv.name ?? conv.id, isMember: true };
+      return { id: conv.id, kind: 'group_dm', name: conv.name ?? conv.id, isMember: true,
+        ...(this.accessPolicy ? { policyGroupDm: true as const } : {}) };
     }
     // Cached as a channel only when Slack says outright it is neither kind of DM.
     if (conv.is_im === false && conv.is_mpim === false) this.channelIds.add(conv.id);
@@ -1794,7 +1918,7 @@ export class SlackAdapter {
       // before the write: nothing was written, and calling again can confirm
       // the conversation. Anything else, Slack's refusal included, leaves it
       // unconfirmed, and the write is refused.
-      if (waitToAskAgain(err, 'conversations.info')) throw err;
+      if (waitToAskAgain(err, 'conversations.info', this.hasAccessPolicy)) throw err;
       const answer = slackRefusal(err);
       const why = answer !== undefined ? `Slack answered ${answer}` : (err as Error).message;
       throw new Error(
@@ -1948,6 +2072,7 @@ export class SlackAdapter {
     opts: { limit?: number; oldest?: string; latest?: string } = {},
   ): Promise<{ messages: HistoryMessage[]; truncated: boolean }> {
     await this.requireHistoryConversation(channelId, 'Nothing was read');
+    if (this.accessPolicy && this.stopping) throw new Error('History stopped before requesting a page');
     const { messages, truncated } = await fetchSlackHistory(this.web, {
       channel: channelId,
       ...(opts.oldest !== undefined ? { oldest: opts.oldest } : {}),
@@ -2031,26 +2156,82 @@ export class SlackAdapter {
   // ── Incoming events ──
 
   // Pending evidence is shared, never cached after settlement.
-  private eventAdmissions = new Map<string, Promise<SlackApiConversation | undefined>>();
-  private sharedEventAdmission(channel: string): Promise<SlackApiConversation | undefined> {
+  private eventAdmissions = new Map<string, { priority: { addressed: boolean }; request: Promise<SlackApiConversation | undefined> }>();
+  private sharedEventAdmission(channel: string, addressed: boolean): Promise<SlackApiConversation | undefined> {
     const pending = this.eventAdmissions.get(channel);
-    if (pending) return pending;
-    const request = this.retryEventAdmission(channel).finally(() => this.eventAdmissions.delete(channel));
-    this.eventAdmissions.set(channel, request);
+    if (pending) {
+      if (addressed) pending.priority.addressed = true;
+      return pending.request;
+    }
+    // Keep promotion through in-flight checks and backoff, not just queued slots.
+    const priority = { addressed };
+    const request = this.retryEventAdmission(channel, priority).finally(() => {
+      if (this.eventAdmissions.get(channel)?.priority === priority) this.eventAdmissions.delete(channel);
+    });
+    this.eventAdmissions.set(channel, { priority, request });
     return request;
   }
 
-  private async retryEventAdmission(channel: string, forDelivery = false): Promise<SlackApiConversation | undefined> {
+  // Pace initial admission slot releases across channels, including fast
+  // refusals. Never cache a settled authorization or weaken fresh checks.
+  private eventAdmissionQueue: Array<{ channel: string; priority: { addressed: boolean }; resolve: (admit: boolean) => void; reject: (error: unknown) => void }> = [];
+  private admissionPacing = false;
+  private nextEventAdmissionAt = 0;
+  private paceEventAdmission(channel: string, priority: { addressed: boolean }): Promise<boolean> {
+    const slot = new Promise<boolean>((resolve, reject) => {
+      this.eventAdmissionQueue.push({ channel, priority, resolve, reject });
+      const ambient = this.eventAdmissionQueue.filter(item => !item.priority.addressed);
+      if (ambient.length > 32) {
+        const oldest = ambient[0]!;
+        this.eventAdmissionQueue.splice(this.eventAdmissionQueue.indexOf(oldest), 1);
+        if (this.eventAdmissions.get(oldest.channel)?.priority === oldest.priority) this.eventAdmissions.delete(oldest.channel);
+        oldest.resolve(false);
+        console.error(`[slack-mcpl] dropped oldest ambient admission for ${oldest.channel}: backlog limit 32; automatic replay is unavailable; use refresh_channels for registration, fetch_history for channel messages or fetch_thread for replies.`);
+      }
+    });
+    void this.drainEventAdmissions();
+    return slot;
+  }
+
+  private async drainEventAdmissions(): Promise<void> {
+    if (this.admissionPacing) return;
+    this.admissionPacing = true;
+    try {
+      while (this.eventAdmissionQueue.length) {
+        const delay = Math.max(0, this.nextEventAdmissionAt - clock.monotonic());
+        if (this.stopping) {
+          for (const item of this.eventAdmissionQueue.splice(0)) item.resolve(false);
+          break;
+        }
+        if (delay) { await clock.sleep(Math.min(delay, 2_147_483_647), { signal: this.admissionStop.signal }); continue; }
+        // Select AFTER the wait so a newly arrived mention/DM overtakes ambient.
+        const priority = this.eventAdmissionQueue.findIndex(item => item.priority.addressed);
+        const item = this.eventAdmissionQueue.splice(priority < 0 ? 0 : priority, 1)[0]!;
+        this.nextEventAdmissionAt = clock.monotonic() + 1200;
+        item.resolve(true);
+        await Promise.resolve(); // let the released attempt start before reserving another slot
+      }
+    } catch (error) {
+      for (const item of this.eventAdmissionQueue.splice(0)) item.reject(error);
+    } finally { this.admissionPacing = false; }
+  }
+
+  private async retryEventAdmission(channel: string, priority: { addressed: boolean }, forDelivery = false): Promise<SlackApiConversation | undefined> {
     let waited = 0;
     for (let attempt = 1; ; attempt++) {
       if (this.stopping) throw new Error('Conversation admission stopped');
+      if (!forDelivery && !await this.paceEventAdmission(channel, priority)) return undefined;
+      if (this.stopping) throw new Error('Conversation admission stopped');
       try { return await this.requireHistoryConversation(channel, 'Nothing was delivered'); }
       catch (err) {
-        const wait = waitToAskAgain(err, 'conversations.info');
+        const wait = waitToAskAgain(err, 'conversations.info', this.hasAccessPolicy);
+                if (wait?.why === 'limited' && Number.isFinite(wait.seconds) && wait.seconds >= 0) {
+                  this.nextEventAdmissionAt = Math.max(this.nextEventAdmissionAt, clock.monotonic() + wait.seconds * 1000);
+                }
         if (!this.stopping && attempt < 3 && wait && Number.isFinite(wait.seconds)
             && wait.seconds >= 0 && waited + wait.seconds <= (forDelivery ? 2 : 60)) {
           waited += wait.seconds;
-          await clock.sleep(wait.seconds * 1000, { unref: true });
+          await clock.sleep(wait.seconds * 1000, { unref: true, signal: this.admissionStop.signal });
           if (!this.stopping) continue;
         }
         throw err;
@@ -2081,16 +2262,18 @@ export class SlackAdapter {
       const addressed = event.channel.startsWith('D') || (this.botUserId !== null
         && typeof event.text === 'string' && extractSlackUserIds(event.text).includes(this.botUserId));
       if (!addressed && this.ambientMessageFilter && !this.ambientMessageFilter(event.channel)) return;
+      if (event.channel_type === 'mpim' && (this.disableDms || !this.accessPolicy.namesGroupDm(event.channel))) return;
       if (event.channel.startsWith('D') && (this.dmsDisabled || !this.accessPolicy.mayDmUser(event.user)
           || (this.dmUsers && !this.dmUsers.includes(event.user)))) return;
       try {
-        const conversation = await this.sharedEventAdmission(event.channel);
+        const conversation = await this.sharedEventAdmission(event.channel, addressed);
+        if (!conversation) return;
         if (this.stopping) return;
         isDM = conversation?.is_im === true;
         channelType = conversation?.is_im ? 'im' : conversation?.is_mpim ? 'mpim' : conversation?.is_private ? 'group' : 'channel';
         if (isDM && conversation?.user !== event.user) return;
       } catch (err) {
-        console.error(`[slack-mcpl] dropped message ${event.channel} ${event.ts}: admission failed: ${policyFailureSummary(err)}`);
+        console.error(`[slack-mcpl] dropped message ${event.channel} ${event.ts}: admission failed: ${policyFailureSummary(err)}; no automatic replay; recover with fetch_history, or fetch_thread with the original thread root for replies`);
         return;
       }
     }

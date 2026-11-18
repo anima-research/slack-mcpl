@@ -20,3 +20,22 @@
 - Status refusal latches suppress starts and refreshes, not explicit clears; clears still require fresh write admission.
 - Policy client failures receive a fresh occurrence for request, admission, context and effect provenance. Reused, frozen or rethrown client errors cannot inherit marks from earlier calls; the reusable source error stays unchanged.
 - Policy access observations retain their Slack request issue order, for positive metadata, refusals and full grant reports. Reconstructing or propagating a known denial is not new evidence; a later-issued successful check can recover without a fourth request.
+
+- Initial policy event admission slots, including fast refusals, are released at
+  least 1.2 seconds apart per adapter; event-loop stalls can bunch actual request starts. Final-delivery checks are not paced. Concurrent events share pending evidence;
+  settled evidence is never reused. DMs and mentions take priority over waiting ambient admissions. Waiting
+  ambient admissions and ambient delivery envelopes each have a 32-entry drop-oldest
+  backlog, with a diagnostic on each drop. Addressed delivery stays FIFO; active
+  Slack requests and host handlers have no deadline, so this is not a hard
+  end-to-end latency bound. Pacing uses a monotonic clock. This does
+  not rate-limit foreground effects, other processes, or the Slack SDK's
+  internal retries. No production quota measurements were available offline.
+- Policy delivery awaits promises returned by embedded message handlers before
+  delivering the next event in that conversation. Shutdown prevents starting
+  subsequent handlers but cannot cancel an already-running handler.
+
+
+- Foreground and background policy candidate admission share initial inbound pacing; foreground rate limits preserve collected rows with an explicit incomplete notice. Background admission and yields to addressed work; retired or exhausted candidates are skipped and counted as incomplete; healthy candidates continue.
+- The final delivery recheck, ACK and optional backscroll checks are separate
+  from initial-event pacing. The final recheck has its own small retry and
+  five-second delivery wait budget, retaining original admission only on classified rate-limit, transport and Slack service failures without known lasting refusals or grant withdrawals. Other failures drop the event and request ACK cleanup, which can itself be refused.

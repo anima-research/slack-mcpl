@@ -18,6 +18,7 @@ export function accessFixture(options: { legacy?: boolean; scopes?: string[]; co
   const calls: Array<{ method: string; args: unknown }> = [];
   const state = {
     conversation: joined() as AccessConversation | undefined,
+    conversations: undefined as Record<string, AccessConversation | undefined> | undefined,
     listed: [] as AccessConversation[],
     messages: [] as Array<Record<string, unknown>>,
     more: false,
@@ -26,14 +27,14 @@ export function accessFixture(options: { legacy?: boolean; scopes?: string[]; co
     openId: 'D1',
     uploadUrl: 'https://example.invalid',
   };
-  const record = <T>(method: string, result: () => T) => async (args?: unknown): Promise<T> => {
+  const record = <T>(method: string, result: (args?: unknown) => T) => async (args?: unknown): Promise<T> => {
     calls.push({ method, args });
-    return result();
+    return result(args);
   };
   const web: SlackWebLike = {
     auth: { test: record('auth.test', () => ({})) },
     conversations: {
-      info: record('info', () => { if (state.infoError) throw state.infoError; return { channel: state.conversation, response_metadata: { scopes: state.infoScopes } }; }),
+      info: record('info', (args) => { if (state.infoError) throw state.infoError; return { response_metadata: { scopes: state.infoScopes }, channel: state.conversations ? state.conversations[(args as { channel: string }).channel] : state.conversation }; }),
       list: record('list', () => ({ channels: state.listed })),
       open: record('open', () => ({ channel: { id: state.openId } })),
       history: record('history', () => ({ messages: state.messages, has_more: state.more })),

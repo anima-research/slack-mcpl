@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
+import { virtualClock } from './virtualClock.js';
 import { method } from '@animalabs/mcpl-core';
 import { SlackMcplServer } from '../src/server.js';
 import { SlackAccessDenied, withAccessContext } from '../src/access-policy.js';
 import type { SlackMessageData } from '../src/slack-adapter.js';
-import { virtualClock } from './virtualClock.js';
 import { FULL_GRANT, connectHost, initialize } from './harness.js';
 import { accessTest as test, accessFixture } from './adapterAccessFixture.js';
 
@@ -89,6 +89,7 @@ test('ambient unsubscribe during final check withholds the message', async t => 
 });
 
 test('final rate limits retry only within the small wait budget', async t => {
+  virtualClock(t);
   const f = accessFixture(); t.after(() => f.adapter.stop());
   let calls = 0;
   f.web.conversations.info = async () => {
@@ -119,6 +120,7 @@ test('policy delivery does not read header state before final admission settles'
   t.mock.method(f.adapter, 'acknowledge', async () => {});
   t.mock.method(f.adapter, 'fetchHistory', async () => ({ messages: [] }));
   let settled = false;
+  let finalChecks = 0;
   let readsBeforeAdmission = 0;
   let lastChannel: string | null = null;
   Object.defineProperty(f.server, 'lastChannelId', {
@@ -128,11 +130,13 @@ test('policy delivery does not read header state before final admission settles'
   });
   t.mock.method(f.adapter, 'getConversationMeta', async () => {
     await Promise.resolve();
+    finalChecks++;
     settled = true;
     return { id: 'C1', name: 'alpha', kind: 'channel', isMember: true, writable: true } as any;
   });
   await f.deliver(message());
   assert.equal(readsBeforeAdmission, 0);
+  assert.equal(finalChecks, 1);
   assert.equal(lastChannel, 'C1');
 });
 

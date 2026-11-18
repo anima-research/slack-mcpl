@@ -108,7 +108,7 @@ test('history continuation rechecks admission, not just the first page', async (
   assert.deepEqual(f.methods(), ['info']);
 });
 
-test('listing ignores nonmembers before info, then uses only freshly admitted metadata, even with includeNonMember', async () => {
+test('listing vetoes unjoined public channels and unnamed group DMs, even with includeNonMember', async () => {
   const f = accessFixture();
   f.state.listed = [{ ...joined('C2'), is_member: false }, joined('C1'), { id: 'G2', is_mpim: true }];
   const info = f.web.conversations.info;
@@ -116,7 +116,9 @@ test('listing ignores nonmembers before info, then uses only freshly admitted me
     ? (f.calls.push({ method: 'info', args }), { channel: { id: 'G2', is_mpim: true } }) : info(args);
   const listed = await f.adapter.listConversations(true);
   assert.deepEqual(listed.conversations.map((c) => c.id), ['C1']);
-  assert.deepEqual(f.methods(), ['list', 'info', 'info']);
+  // Unnamed MPIMs cannot be admitted, so only C1 needs fresh metadata (R1-2).
+  assert.deepEqual(f.methods(), ['list', 'info']);
+  assert.deepEqual(f.calls[1].args, { channel: 'C1' });
   assert.deepEqual(f.calls[0].args, { types: 'public_channel,private_channel,im', exclude_archived: true, limit: 200, cursor: undefined });
   f.state.conversation = { ...joined(), is_member: false };
   assert.deepEqual((await f.adapter.listConversations(true)).conversations, []);
@@ -219,7 +221,7 @@ test('inbound admission precedes all user lookups and delivery, while socket env
   assert.deepEqual(f.methods(), ['info', 'info', 'user', 'user']);
 });
 
-test('inbound unknown scopes and group DMs are no-ops before sender lookup', async () => {
+test('inbound unknown scopes and unnamed group DMs are no-ops before sender lookup', async () => {
   for (const scopes of [[], accessScopes]) {
     const f = accessFixture({ scopes });
     f.state.conversation = { id: 'G1', is_mpim: true, is_member: true };
@@ -281,7 +283,7 @@ for (const [name, run] of operations.filter(([name]) => !['send_dm/open', 'find_
   test(`group DM refusal: ${name} has no data or write effect`, async () => {
     const f = accessFixture();
     f.state.conversation = { ...joined(), is_mpim: true };
-    await assert.rejects(run(f.adapter), /Group direct messages are unsupported/);
+    await assert.rejects(run(f.adapter), /group direct message is not admitted/);
     assert.deepEqual(f.methods(), ['info']);
   });
 }
@@ -354,12 +356,15 @@ test('dmsDisabled intersects policy peers and legacy disable, but not the write-
 });
 
 
-test('foreground candidate failures propagate; background retries can recover', async () => {
+test('foreground rate limits retain partial rows; background retries can recover', async (t) => {
+  virtualClock(t);
   const f = accessFixture();
   f.state.listed = [joined()];
   const error = Object.assign(new Error('limited'), { code: ErrorCode.RateLimitedError, retryAfter: 2 });
   f.state.infoError = error;
-  await assert.rejects(f.adapter.listConversations(), (err) => err instanceof Error && err.cause === error);
+  const partial = await f.adapter.listConversations();
+  assert.deepEqual(partial.conversations, []);
+  assert.equal(partial.admissionFailures, 1);
   const waits: unknown[] = [];
   const result = await f.adapter.listConversations(false, async (wait, attempt) => {
     waits.push([wait, attempt]);
@@ -388,7 +393,7 @@ test('inbound rate limit retries in order, and exhausted retries log the dropped
   const logs: unknown[][] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => logs.push(args));
   assert.equal(await f.emit({ ...event, ts: '3.0' }), true);
-  assert.deepEqual(slept, [2000, 2000, 2000]);
+  assert.deepEqual(slept, [2000, 1200, 2000, 2000]);
   assert.equal(logs.length, 1);
   assert.match(String(logs[0][0]), /dropped message C1 3.0/);
   assert.equal(delivered.length, 2);
@@ -411,7 +416,7 @@ test('policy refusals preserve operation lead and permanent refusal advice', asy
   await assert.rejects(f.adapter.sendMessage('C2', 'hi'), /^SlackAccessDenied: Nothing was posted:.*Retrying unchanged/);
   await assert.rejects(f.adapter.sendDM('UOTHER', 'hi'), /^SlackAccessDenied: Nothing was sent:.*Retrying unchanged/);
   f.state.conversation = { ...joined(), is_member: false };
-  await assert.rejects(f.adapter.readHistory('C1', {}), /^SlackAccessDenied: No messages were returned:.*Retrying unchanged/);
+  await assert.rejects(f.adapter.readHistory('C1', {}), /^SlackAccessUnverified: No messages were returned:.*Retrying unchanged/);
 });
 
 test('policy listing refreshes scopes via auth.test before listing', async () => {
@@ -686,6 +691,48 @@ test('listing vetoes excluded listed DM peers before metadata, but verifies allo
   g.state.conversation = { id: 'D2', is_im: true, user: 'UOTHER' };
   assert.deepEqual((await g.adapter.listConversations()).conversations, []);
   assert.deepEqual(g.methods(), ['list', 'info']);
+});
+
+test('second upload admission explains the existing unshared file', async () => {
+  const { explainSlackError } = await import('../src/slack-errors.js');
+  const endpoint = await uploadEndpoint();
+  for (const code of ['not_in_channel', 'http']) {
+    const f = accessFixture();
+    f.state.uploadUrl = `${endpoint.url}/phase-${code}`;
+    let count = 0;
+    f.web.conversations.info = async () => {
+      if (++count === 2) throw code === 'http'
+        ? Object.assign(new Error('http'), { code: ErrorCode.HTTPError, statusCode: 503 })
+        : Object.assign(new Error(code), { code: ErrorCode.PlatformError, data: { error: code } });
+      return { channel: joined() };
+    };
+    await assert.rejects(f.adapter.uploadFile('C1', { filename: 'x', data: Buffer.from(code) }), err => {
+      const explanation = explainSlackError(err, { tool: 'upload_file', args: { channelId: 'C1' } });
+      assert.match(explanation ?? '', /Nothing was shared; unshared file F1 may remain/);
+      assert.doesNotMatch(explanation ?? '', /Nothing was uploaded/);
+      return true;
+    });
+    assert.equal(count, 2);
+    assert.equal(f.methods().includes('complete'), false);
+  }
+});
+
+
+test('sequential inbound admission attempts are paced without caching evidence', async t => {
+  const { virtualClock } = await import('./virtualClock.js');
+  const time = virtualClock(t);
+  const f = accessFixture();
+  for (const ts of ['1.0', '2.0', '3.0']) {
+    await f.emit({ type: 'message', channel: 'C1', user: 'U1', ts, text: '<@UBOT> hello' });
+  }
+  assert.equal(f.methods().filter(m => m === 'info').length, 3, 'every settled event rechecks');
+  assert.deepEqual(time.slept, [1200, 1200]);
+  f.state.infoError = new Error('fast refusal');
+  await f.emit({ type: 'message', channel: 'C1', user: 'U1', ts: '4.0', text: '<@UBOT> hello' });
+  await f.emit({ type: 'message', channel: 'C1', user: 'U1', ts: '5.0', text: '<@UBOT> hello' });
+  assert.deepEqual(time.slept, [1200, 1200, 1200, 1200]);
+  assert.equal(f.methods().filter(m => m === 'info').length, 5);
+  await f.adapter.stop();
 });
 
 test('delivery recheck requires history grants even when metadata stays readable', async () => {
