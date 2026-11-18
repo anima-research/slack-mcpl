@@ -24,8 +24,9 @@ import { setMaxListeners } from 'node:events';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { WebClient, ErrorCode, LogLevel, type Logger, type WebAPICallResult, type WebClientOptions } from '@slack/web-api';
 import { SocketModeClient } from '@slack/socket-mode';
+import { associatedFile, FILE_ID, policyFileRefs, privateFileUrl, type PolicyFileRef } from './file-access.js';
 import { clock } from './clock.js';
-import { SlackAccessDenied, SlackAccessUnverified, SlackAccessGrantDenied, SlackAccessInputError, accessContextOriginalMessage, withAccessContext, type SlackAccessPolicy } from './access-policy.js';
+import { SlackAccessDenied, SlackAccessUnverified, SlackAccessGrantDenied, SlackFileAccessUnverified, SlackAccessInputError, accessContextOriginalMessage, withAccessContext, type SlackAccessPolicy } from './access-policy.js';
 import { NOTHING_RETURNED, SLACK_TS, readBounded, readOptions, type HistoryReadResult, type ReadStop } from './history-read.js';
 import {
   formatSlackText,
@@ -385,7 +386,7 @@ interface SlackMessageEvent {
   bot_id?: string;
   channel_type?: string;
   team?: string;
-  files?: Array<{ url_private?: string; name?: string; mimetype?: string }>;
+  files?: Array<{ id?: unknown; url_private?: string; name?: string; mimetype?: string }>;
 }
 
 /** The fields of a conversations.list/info entry this adapter dereferences —
@@ -460,7 +461,7 @@ export interface HistoryMessage {
   /** Its replies, when Slack gives a count; missing means unknown. */
   replyCount?: number;
   timestamp: Date;
-  attachments: Array<{ name: string; mimeType?: string; url?: string }>;
+  attachments: Array<PolicyFileRef | { name: string; mimeType?: string; url?: string; channelId?: never }>;
 }
 
 export interface SlackUserMatch {
@@ -571,11 +572,12 @@ export function failedRequest(err: unknown): string | undefined {
 export interface FileLeft {
   fileId: string;
   mayHaveShared: boolean;
+  policy?: true;
 }
 const filesLeft = new WeakMap<object, FileLeft>();
 
 /** The file an upload left when it failed after its first step, which a
- *  rollback deletes too, and whether Slack may have shared it; undefined for
+ *  rollback attempts to clean up, and whether Slack may have shared it; undefined for
  *  any other error. */
 export function fileLeftByUpload(err: unknown): FileLeft | undefined {
   return err !== null && typeof err === 'object' ? filesLeft.get(err) : undefined;
@@ -909,6 +911,7 @@ export interface SlackWebLike {
     threads: { setStatus(args: { channel_id: string; thread_ts: string; status: string }): Promise<unknown> };
   };
   files: {
+    info?(args: { file: string }): Promise<{ file?: unknown }>;
     getUploadURLExternal(args: { filename: string; length: number }): Promise<{ upload_url?: string; file_id?: string }>;
     completeUploadExternal(args: Record<string, unknown>): Promise<{ files?: SlackUploadedFile[] }>;
     delete(args: { file: string }): Promise<unknown>;
@@ -1167,8 +1170,8 @@ export class SlackAdapter {
     return this.disableDms ? ['public_channel', 'private_channel'] : Object.keys(TYPE_SCOPE);
   }
 
-  /** The enabled types the token's scopes can read: every one while they're
-   *  unknown in legacy mode; policy mode requires reported grants. */
+  /** Legacy mode requests every enabled type while scopes are unknown;
+   *  policy mode fails closed until grants are reported. */
   private readableTypes(): string[] {
     return this.conversationTypes().filter((type) => this.scopes ? this.scopes.includes(TYPE_SCOPE[type]) : !this.accessPolicy);
   }
@@ -1795,6 +1798,42 @@ export class SlackAdapter {
     return { messageId: result.ts };
   }
 
+  /** Provenance originates only in this adapter's upload ticket response, never caller pairs. */
+  private policyUploads = new Map<string, string>();
+
+  private async readAssociatedFile(channelId: string, fileId: string): Promise<Record<string, unknown>> {
+    this.accessPolicy!.requireScope(this.scopes, 'files:read');
+    if (!FILE_ID.test(fileId) || !this.web.files.info) throw new SlackFileAccessUnverified('File access could not be verified: file metadata support is unavailable; ask whoever runs this host to enable files.info support');
+    // A metadata refusal is not a successful deletion: in particular, do not let
+    // files.info's file_not_found be counted as files.delete's already-gone answer.
+    let result: { file?: unknown };
+    try { result = await this.web.files.info({ file: fileId }); }
+    catch (err) {
+      const failure = err !== null && typeof err === 'object' ? err
+        : new Error('Slack file metadata request failed', { cause: err });
+      accessAdmissionFailures.add(failure);
+      throw failure;
+    }
+    return associatedFile(result?.file, fileId, channelId);
+  }
+
+  /** Fresh admission and file evidence on every call; no raw metadata leaves the adapter. */
+  async resolveFileDownload(channelId: string, fileId: string): Promise<URL> {
+    if (!this.accessPolicy) throw new Error('Slack access policy is not configured');
+    return withAccessContext('Nothing was fetched', async () => {
+      if (!FILE_ID.test(fileId)) throw new SlackAccessInputError(`Invalid Slack file ID ${JSON.stringify(fileId)}; use a fileId shown by fetch_history or fetch_thread`);
+      this.accessPolicy!.requireScope(this.scopes, 'files:read');
+      await this.readAccessConversation(channelId);
+      return privateFileUrl(await this.readAssociatedFile(channelId, fileId));
+    });
+  }
+
+  private messageFileRefs(files: unknown, channelId: string): PolicyFileRef[] {
+    try { this.accessPolicy!.requireScope(this.scopes, 'files:read'); }
+    catch { return policyFileRefs(files, channelId).map(ref => ({ channelId, name: 'attachment (download unavailable)', isImage: ref.isImage, downloadUnavailable: 'files:read' as const })); }
+    return policyFileRefs(files, channelId);
+  }
+
   /** Upload a file into a conversation, in the three steps of Slack's
    *  working-with-files page: files.getUploadURLExternal gives an upload URL
    *  and the file's ID, the file's bytes go to that URL, and
@@ -1824,23 +1863,42 @@ export class SlackAdapter {
       throw new Error("files.getUploadURLExternal: Slack's answer gave no file ID, so nothing was uploaded");
     }
     // Slack gave the file its ID at the first step, so whatever fails from
-    // here leaves that file for a rollback to delete. Only the last step's
+    // here leaves that file for rollback to attempt cleanup (policy still requires association). Only the last step's
     // own request can have shared it.
     const left = (err: unknown, mayHaveShared: boolean): unknown => {
-      if (err !== null && typeof err === 'object') filesLeft.set(err, { fileId, mayHaveShared });
+      if (err === null || typeof err !== 'object') {
+        if (!this.accessPolicy) return err; // Preserve legacy thrown value and tracking.
+        err = new Error(String(err), { cause: err });
+      }
+      filesLeft.set(err as object, { fileId, mayHaveShared, ...(this.accessPolicy ? { policy: true as const } : {}) });
       return err;
     };
+    if (this.accessPolicy) {
+      if (!FILE_ID.test(fileId)) throw left(new Error('Slack upload returned an invalid file ID'), false);
+      this.policyUploads.set(fileId, channelId);
+      // Fixed insertion-order cap: evicted uploads fail closed at rollback and
+      // may need manual cleanup. Checking an entry does not refresh its age.
+      if (this.policyUploads.size > 1000) {
+        this.policyUploads.delete(this.policyUploads.keys().next().value!);
+      }
+    }
     if (typeof url !== 'string' || !url) {
       throw left(new Error("files.getUploadURLExternal: Slack's answer gave no upload URL, so nothing was uploaded"), false);
     }
     try {
+      if (this.accessPolicy) {
+        const targetUrl = new URL(url);
+        if (targetUrl.protocol !== 'https:' || targetUrl.username || targetUrl.password) throw new Error('Invalid Slack upload URL');
+      }
       await this.postFileBytes(url, file.data);
     } catch (err) {
       throw left(err, false);
     }
     if (this.accessPolicy) {
       try { await this.requireWritableConversation(channelId, 'files:write', 'Nothing was shared'); }
-      catch (err) { throw left(err, false); }
+      catch (err) {
+        throw left(err, false);
+      }
     }
     let answer: Awaited<ReturnType<SlackWebLike['files']['completeUploadExternal']>>;
     try {
@@ -1854,7 +1912,7 @@ export class SlackAdapter {
       throw left(err, !cannotHaveLanded(err));
     }
     // An answer whose files aren't a list of files names none.
-    const files: unknown = answer.files;
+    const files: unknown = this.accessPolicy ? answer?.files : answer.files;
     const shared = Array.isArray(files)
       ? (files as Array<SlackUploadedFile | null>).find((f) => f !== null && typeof f === 'object' && f.id === fileId)
       : undefined;
@@ -1877,14 +1935,19 @@ export class SlackAdapter {
     try {
       const answer = await fetch(url, {
         method: 'POST',
+        ...(this.accessPolicy ? { redirect: 'manual' as const } : {}),
         body: data,
         headers: { 'content-type': 'application/octet-stream' },
         signal: timeout,
       });
+      if (this.accessPolicy && answer.status >= 300 && answer.status < 400) {
+        try { void answer.body?.cancel().catch(() => {}); } catch { /* disposal must not replace the redirect refusal */ }
+        throw new SlackAccessDenied('Nothing was shared: this server refuses upload redirects. Ask whoever runs this host to investigate the upload endpoint.');
+      }
       await answer.arrayBuffer();
       if (!answer.ok) throw new UploadBytesFailed(answer.status);
     } catch (err) {
-      if (err instanceof UploadBytesFailed) throw err;
+      if (err instanceof UploadBytesFailed || err instanceof SlackAccessDenied) throw err;
       // Only the timeout aborts this post, and the error an abort gives
       // depends on the runtime and on when it lands: Node 22's fetch (22.12.0
       // and 22.23.3 alike) gives an AbortError for a body not yet being read,
@@ -1998,14 +2061,19 @@ export class SlackAdapter {
     await this.web.chat.delete({ channel: channelId, ts });
   }
 
-  /** Deletes a file this bot uploaded, with the same write checks as a
-   *  message's delete. */
+  /** Forget local upload provenance without deleting the Slack file. */
+  forgetUpload(fileId: string): void { this.policyUploads.delete(fileId); }
+
   async deleteFile(channelId: string, fileId: string): Promise<void> {
-    // Relies on the caller's (channelId, fileId) pairing recorded from its own
-    // upload: files.delete uses only fileId. A future file tool must verify association.
     await this.requireWritableConversation(channelId, 'files:write', 'Nothing was deleted');
     await this.assertNotDm(channelId, 'Nothing was deleted');
+    if (this.accessPolicy) {
+      if (this.policyUploads.get(fileId) !== channelId) throw new SlackAccessDenied('File deletion requires a recorded upload to this conversation');
+      await this.readAssociatedFile(channelId, fileId);
+    }
+    // Global deletion: other shares are affected too, even when this target is authorized.
     await this.web.files.delete({ file: fileId });
+    this.policyUploads.delete(fileId);
   }
 
   async addReaction(channelId: string, ts: string, emoji: string, acknowledgement = false): Promise<void> {
@@ -2042,7 +2110,7 @@ export class SlackAdapter {
         // to differ from Slack's reference.
         ...(at ? { latest: at } : {}),
       }),
-      shape: (messages) => this.shapeHistory(messages),
+      shape: (messages) => this.shapeHistory(messages, channelId),
       writable: this.canWrite(channelId),
       stopped: readStop,
     });
@@ -2058,7 +2126,7 @@ export class SlackAdapter {
         channel: channelId, ts: threadTs, limit, inclusive: false,
         ...(at ? { oldest: at } : {}), ...(opts.latest ? { latest: opts.latest } : {}),
       }),
-      shape: (messages) => this.shapeHistory(messages),
+      shape: (messages) => this.shapeHistory(messages, channelId),
       writable: this.canWrite(channelId),
       stopped: readStop,
     });
@@ -2079,10 +2147,10 @@ export class SlackAdapter {
       ...(opts.latest !== undefined ? { latest: opts.latest } : {}),
       maxMessages: opts.limit ?? 50,
     });
-    return { messages: await this.shapeHistory(messages), truncated };
+    return { messages: await this.shapeHistory(messages, channelId), truncated };
   }
 
-  private async shapeHistory(messages: SlackHistoryMessage[]): Promise<HistoryMessage[]> {
+  private async shapeHistory(messages: SlackHistoryMessage[], channelId: string): Promise<HistoryMessage[]> {
     // Pre-resolve author + mentioned user names in one pass.
     const ids = new Set<string>();
     for (const msg of messages) {
@@ -2108,8 +2176,8 @@ export class SlackAdapter {
       // Missing means unknown, not none.
       ...(typeof count === 'number' && Number.isSafeInteger(count) && count >= 0 ? { replyCount: count } : {}),
       timestamp: new Date(parseFloat(msg.ts ?? '0') * 1000),
-      // Do not offer legacy URLs under policy; a later PR adds attachment enforcement.
-      attachments: this.accessPolicy ? [] : (msg.files ?? []).map((f) => ({
+      // References carry message provenance, not download authority.
+      attachments: this.accessPolicy ? this.messageFileRefs(msg.files, channelId) : (msg.files ?? []).map((f) => ({
         name: f.name ?? 'attachment',
         mimeType: f.mimetype,
         url: f.url_private,
@@ -2289,8 +2357,8 @@ export class SlackAdapter {
     if (this.accessPolicy && this.stopping) return;
     const authorName = this.userNameCache.get(event.user) ?? event.user;
 
-    // No unprotected attachment references; a later PR adds attachment enforcement.
-    const attachments: AttachmentRef[] = this.accessPolicy ? [] : (event.files ?? [])
+    // No private URLs in policy references, including ID-only Slack Connect stubs.
+    const attachments: AttachmentRef[] = this.accessPolicy ? this.messageFileRefs(event.files, event.channel) : (event.files ?? [])
       .filter((f): f is { url_private: string; name?: string; mimetype?: string } => !!f.url_private)
       .map((f) => {
         const name = f.name ?? 'attachment';

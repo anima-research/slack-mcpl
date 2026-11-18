@@ -139,7 +139,10 @@ delete them along with later messages: the file, through Slack's file
 deletion API, and the message that shared it, which holds the comment, when
 Slack's answer named that message. When it didn't, the rollback's answer says
 the comment may remain, and that `delete_message` may delete it. An upload
-that failed after Slack gave the file its ID is rolled back the same way.
+that failed after Slack gave the file its ID is rolled back the same way in legacy mode.
+With an explicit policy, file cleanup also requires current admitted writable
+conversation association; allocated but unshared or unverifiable files remain
+for separate inspection and manual cleanup.
 Rollback is best-effort and reports partial failures by kind, naming each
 message and file it couldn't delete, with its conversation, and apart from
 the rest those Slack refused to delete for good. The items it couldn't delete
@@ -421,5 +424,5 @@ withdrawal is known. Missing/unverified results, unclassified errors, lasting re
 shutdown and expiry of the five-second wait drop the event and request ACK cleanup; fresh write admission may refuse cleanup and leave the reaction visible.
 Optional backscroll failure omits context; its lasting admission refusal vetoes
 transient fallback. A successful final admission may establish recovered access.
-Unset-policy delivery is unchanged at this layer. Policy-mode file references and downloads are not active yet.
+Unset-policy delivery is unchanged at this layer. With a policy installed, attachment hints use conversation and file IDs; byte access requires fresh conversation and file-association checks.
 

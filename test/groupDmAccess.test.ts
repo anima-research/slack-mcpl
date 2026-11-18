@@ -204,7 +204,18 @@ for (const legacy of [false, true]) {
     test(`real upload tool and rollback file delete: legacy=${legacy}, revoke group=${revoke}`, async (t) => {
       const f = fixture({ legacy });
       const endpoint = await uploadEndpoint();
-      f.state.uploadUrl = `${endpoint.url}/F1`;
+      f.state.uploadUrl = legacy ? `${endpoint.url}/F1` : 'https://files.slack.com/upload/F1';
+      if (!legacy) {
+        const realFetch = globalThis.fetch;
+        t.mock.method(globalThis, 'fetch', async (url: string | URL | Request, init?: RequestInit) => {
+          assert.equal(url, f.state.uploadUrl);
+          return realFetch(`${endpoint.url}/F1`, init);
+        });
+        f.web.files.info = async () => {
+          f.calls.push({ method: 'fileInfo', args: { file: 'F1' } });
+          return { file: { mode: 'hosted', id: 'F1', groups: ['G1'] } };
+        };
+      }
       const h = connectHost(new SlackMcplServer(f.adapter));
       t.after(() => h.close());
       await initialize(h, true);
@@ -225,11 +236,13 @@ for (const legacy of [false, true]) {
         featureSet: MESSAGING_FEATURE_SET, checkpoint: uploaded.state.parent,
       }) as { success: boolean; reason?: string };
       assert.equal(rollback.success, true);
+      if (legacy) assert.equal(rollback.reason, undefined);
+      else if (!revoke) assert.match(rollback.reason ?? '', /deletion removes the file from every conversation it is shared in/);
       if (!legacy && revoke) {
         assert.deepEqual(f.methods(), []);
         assert.match(rollback.reason ?? '', /0\/1 files deleted/);
       } else {
-        assert.deepEqual(f.methods(), legacy ? ['deleteFile'] : ['info', 'deleteFile']);
+        assert.deepEqual(f.methods(), legacy ? ['deleteFile'] : ['info', 'fileInfo', 'deleteFile']);
         assert.equal(JSON.stringify(f.calls.at(-1)), '{"method":"deleteFile","args":{"file":"F1"}}');
       }
     });
@@ -326,23 +339,23 @@ test('list_channels labels named groups and reports write pins; registration gui
 });
 
 for (const disableDms of [false, true]) {
-  test(`group DM legacy-switch intersection: disableDms=${disableDms}`, async () => {
+  test(`group DM legacy-switch intersection: disableDms=${disableDms}`, async (t) => {
     // A disjoint legacy peer list must not filter a multi-peer conversation.
     const options = { disableDms, dmUsers: ['UOTHER'] };
-    const endpoint = await uploadEndpoint();
+    t.mock.method(globalThis, 'fetch', async () => new Response('OK'));
     const listing = fixture(options);
     listing.state.listed = [group()];
     const result = await listing.adapter.listConversations();
     assert.deepEqual(result.conversations.map((c) => c.id), disableDms ? [] : ['G1']);
-    assert.equal(JSON.stringify(listing.calls[0].args).includes('mpim'), !disableDms);
+    assert.equal(JSON.stringify(listing.calls[0]?.args ?? {}).includes('mpim'), !disableDms);
     for (const run of [
       ...operations.map(([, , run]) => run),
       (a: SlackAdapter) => a.getConversationMeta('G1'),
-      (a: SlackAdapter) => a.deleteFile('G1', 'F1'),
+      async (a: SlackAdapter) => { if (!disableDms) await a.uploadFile('G1', { filename: 'x', data: Buffer.from('x') }); await a.deleteFile('G1', 'F1'); },
       (a: SlackAdapter) => a.uploadFile('G1', { filename: 'note.txt', data: Buffer.from('hello') }),
     ]) {
       const f = fixture(options);
-      f.state.uploadUrl = `${endpoint.url}/F1`;
+      f.state.uploadUrl = 'https://files.slack.com/upload';
       if (disableDms) {
         await assert.rejects(run(f.adapter), /turned off on this host/);
         assert.deepEqual(f.methods(), ['info']);

@@ -87,6 +87,12 @@ export class SlackAccessUnverified extends SlackAccessDenied {
   constructor(message: string, options?: ErrorOptions, authoritative = false) { super(message, options, authoritative); }
 }
 
+// File evidence has a different repair path from conversation membership.
+export class SlackFileAccessUnverified extends SlackAccessUnverified { override name = 'SlackFileAccessUnverified'; }
+
+// Confirmed file state needs replacement, not operator permission changes.
+export class SlackFileUnavailable extends SlackAccessDenied { override name = 'SlackFileUnavailable'; }
+
 /** Invalid caller input, distinct from host-owned access restrictions. */
 export class SlackAccessInputError extends Error { override name = 'SlackAccessInputError'; }
 
@@ -114,6 +120,8 @@ export async function withAccessContext<T>(notDone: string, run: () => Promise<T
     const text = accessContexts.get(failure) ?? (failure as Error).message ?? 'Slack request failed';
     const alreadyPrefixed = text.startsWith(`${notDone}:`);
     const remedy = contextual || alreadyPrefixed ? ''
+      : err instanceof SlackFileUnavailable ? '. Retrying this file unchanged will not help.'
+      : err instanceof SlackFileAccessUnverified ? '. Check the file reference; ask its sender to share a supported file in this conversation, then re-read the message for a current reference.'
       : err instanceof SlackAccessDenied
         ? err.authoritative
           ? '. Retrying unchanged will not help; ask whoever runs this host to check access for this operation.'

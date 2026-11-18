@@ -7,6 +7,7 @@
  * Salvaged from zulip-mcp PR #8 (multi-platform branch), Slack halves only.
  */
 
+import type { PolicyFileRef } from './file-access.js';
 import { channelShown, mimeShown, nameShown } from './framing.js';
 
 // Anthropic refuses images larger than this; mirror their cap server-side
@@ -64,18 +65,38 @@ function inTransit(err: unknown, signal?: AbortSignal): Error {
 export async function fetchAttachmentBytes(
   url: string,
   fallbackName: string,
-  opts: { headers?: Record<string, string>; signal?: AbortSignal } = {},
+  opts: { headers?: Record<string, string>; signal?: AbortSignal; redirect?: RequestInit['redirect'] } = {},
 ): Promise<FetchedAttachment> {
-  const resp = await fetch(url, { headers: opts.headers ?? {}, redirect: 'follow', signal: opts.signal }).catch((err: unknown) => {
+  const resp = await fetch(url, { headers: opts.headers ?? {}, redirect: opts.redirect === 'error' ? 'manual' : opts.redirect ?? 'follow', signal: opts.signal }).catch((err: unknown) => {
     throw inTransit(err, opts.signal);
   });
+  if ((opts.redirect === 'error' || opts.redirect === 'manual') && resp.status >= 300 && resp.status < 400) {
+    try { void Promise.resolve(resp.body?.cancel()).catch(() => {}); } catch { /* Best-effort disposal must not replace the refusal. */ }
+    throw new Error('Nothing was fetched: this server refuses file redirects. Ask whoever runs this host to investigate the file endpoint; retrying the same redirect will not help.');
+  }
   if (!resp.ok) {
+    if (opts.redirect === 'error') try { void Promise.resolve(resp.body?.cancel()).catch(() => {}); } catch { /* Best-effort disposal must not replace the refusal. */ }
+    if (opts.redirect === 'error' && resp.status === 429) {
+      const header = resp.headers.get('retry-after')?.trim();
+      const seconds = header && /^\d+(?:\.\d+)?$/.test(header) ? Math.ceil(Number(header))
+        : header && /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun), /.test(header) ? Math.max(0, Math.ceil((Date.parse(header) - Date.now()) / 1000)) : NaN;
+      const advice = Number.isFinite(seconds) ? `Wait ${seconds} seconds before trying again.` : 'Try again shortly.';
+      try { void Promise.resolve(resp.body?.cancel()).catch(() => {}); } catch { /* Best-effort disposal must not replace the refusal. */ }
+      throw new Error(`Nothing was fetched: the verified file endpoint is rate-limiting downloads (HTTP 429). ${advice}`);
+    }
     const answered = `HTTP ${resp.status} ${resp.statusText}`.trim();
+    if (opts.redirect === 'error' && resp.status !== 408 && resp.status !== 429 && resp.status < 500) {
+      throw new Error(`Nothing was fetched: the verified file endpoint answered ${answered}. Access may have changed; ask the sender to check the file or whoever runs this host to investigate.`);
+    }
+    // Policy callers cannot fix a denial by supplying a different URL.
+    const source = opts.redirect === 'error'
+      ? 'Use channelId and fileId from an attachment reference; this server verifies access again.'
+      : ATTACHMENT_URL_SOURCE;
     // A timeout, a rate limit or a failing server says nothing about the url.
     throw new Error(
       resp.status === 408 || resp.status === 429 || resp.status >= 500
         ? `Nothing was fetched: the file's url answered ${answered}, so the server was busy or failing. Try again shortly.`
-        : `Nothing was fetched: the file's url answered ${answered}. ${ATTACHMENT_URL_SOURCE} If it was exact, the ` +
+        : `Nothing was fetched: the file's url answered ${answered}. ${source} ${opts.redirect === 'error' ? 'The' : 'If it was exact, the'} ` +
             'file may have been deleted, or this bot may not be allowed to read it; calling again gets the same ' +
             'answer unless someone shares the file where this bot can read it, or, if the Slack app lacks ' +
             "files:read (Slack's file links need it), whoever runs this host adds that scope to the app's bot " +
@@ -88,6 +109,7 @@ export async function fetchAttachmentBytes(
   if (declared !== null) {
     const n = Number(declared);
     if (Number.isFinite(n) && n > MAX_ATTACHMENT_BYTES) {
+      if (opts.redirect === 'error') try { void Promise.resolve(resp.body?.cancel()).catch(() => {}); } catch { /* Best-effort disposal must not replace the refusal. */ }
       throw tooLarge(n);
     }
   }
@@ -192,7 +214,11 @@ export function attachmentName(url: URL): string {
   }
 }
 
-export interface AttachmentRef {
+export type AttachmentRef = PolicyFileRef | LegacyAttachmentRef;
+
+export interface LegacyAttachmentRef {
+  channelId?: never;
+  fileId?: never;
   path: string;       // url_private — needs Bearer bot-token auth to fetch
   name: string;       // basename for human display
   mimeType: string;   // best-effort from extension or the API
@@ -364,7 +390,8 @@ export interface SlackHistoryMessage {
   root?: { thread_ts?: string; ts?: string };
   reply_count?: number;
   bot_id?: string;
-  files?: Array<{ name?: string; mimetype?: string; url_private?: string }>;
+  // Raw Slack metadata stays permissive for legacy embedders; policyFileRefs validates IDs.
+  files?: Array<{ id?: unknown; name?: string; mimetype?: string; url_private?: string }>;
 }
 
 /** The minimal conversations.history surface fetchSlackHistory needs —

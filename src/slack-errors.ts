@@ -5,8 +5,8 @@ import { accessContextMessage } from './access-policy.js';
  * @slack/web-api reports a refusal from Slack's Web API as "An API error
  * occurred: <code>", which names Slack's code and nothing more: not whether
  * anything happened, which value the code is about, or what to do instead.
- * The explanation is appended after the error's own text, so its words stay
- * as they were. It says what didn't happen, names the value the call was
+ * Legacy explanations are appended after the error's own text. Policy upload
+ * errors instead compose a single outcome, residue, cause and remedy. It says what didn't happen, names the value the call was
  * given, and points to the tool that shows real values, or says that only
  * whoever runs this host, or the workspace's admins, can change the answer.
  *
@@ -28,10 +28,11 @@ import { accessContextMessage } from './access-policy.js';
  * isn't in Slack's form, as the client reads a body such as an HTML page, is
  * read as an answer that shows nothing about what Slack did, and so is a
  * TypeError from a write, which the client throws after a 200 it can't read
- * (cannotHaveLanded). Other errors, and codes not listed, pass through
- * unchanged, except that a read's failure still says that no messages were
- * returned.
+ * (cannotHaveLanded). Other legacy errors and unlisted codes pass through unchanged, except that
+ * a read's failure still says that no messages were returned. Explicit-policy
+ * errors may be rewritten into operation-specific guidance.
  */
+import { SlackAccessDenied } from './access-policy.js';
 import { ErrorCode } from '@slack/web-api';
 import { connectionNeverMade, reactionName, SLACK_FAILED } from './content.js';
 import { NOTHING_RETURNED, PARENT_IDS, TS_FORM } from './history-read.js';
@@ -45,8 +46,8 @@ import {
   UploadNotConfirmed,
   postLeftBy,
   failedRequest,
-  fileLeftByUpload,
   failedAccessAdmission,
+  fileLeftByUpload,
   retryAfterSeconds,
   slackRefusal,
 } from './slack-adapter.js';
@@ -67,6 +68,7 @@ const NOT_DONE: Record<string, string> = {
   upload_file: 'Nothing was uploaded',
   edit_message: "The message wasn't changed",
   delete_message: 'Nothing was deleted',
+  delete_file: 'Nothing was deleted',
   add_reaction: 'No reaction was added',
   // A read can fail after its first pages, so its lead is what the caller
   // didn't get.
@@ -135,8 +137,19 @@ export function explainSlackError(err: unknown, call: SlackCall): string {
     // branch covers every unknown post outcome, including malformed answers.
     return `DM ${post.channelId} was opened: the message may have been sent. No check available with send_dm's scopes can confirm whether it arrived. Before retrying, ask the recipient or whoever runs this host to inspect Slack for this message; do not resend until they confirm it is absent.`;
   }
-  const unshared = call.tool === 'upload_file' && failedAccessAdmission(err) ? fileLeftByUpload(err) : undefined;
-  if (unshared) return `Nothing was shared; unshared file ${unshared.fileId} may remain. Ask whoever runs this host to inspect and remove the unshared file by ID before retrying.`;
+  const left = call.tool === 'upload_file' ? fileLeftByUpload(err) : undefined;
+  if (left?.policy) {
+    // Compose the outcome/residue once; detail contains only cause and remedy.
+    const raw = err instanceof Error ? err.message : String(err);
+    const detail = (err instanceof SlackAccessDenied ? raw : explanation(err, call, true) ?? raw)
+      .replace(/Try again shortly\./g, 'Inspect residue before retrying this upload.')
+      .replace(/^(?:Nothing was (?:uploaded|shared)|Upload did not complete)[:.]?\s*/, '')
+      .replace(/^:\s*/, '')
+      .replace(/^[a-z]/, initial => initial.toUpperCase());
+    const outcome = left.mayHaveShared ? 'Upload outcome is unknown' : 'Upload did not complete';
+    return `${outcome}. File ${JSON.stringify(left.fileId)} may remain${left.mayHaveShared ? ' and may have been shared' : ' but was not shared'}. ${detail} ${left.mayHaveShared ? `Check ${typeof call.args.messageId === 'string' && call.args.messageId.trim() ? 'fetch_thread for the parent message ' + JSON.stringify(call.args.messageId) : 'fetch_history'} in conversation ${JSON.stringify(call.args.channelId)} before retrying to avoid duplicate uploads. If history permissions are unavailable, ask whoever runs this host to inspect Slack instead. ` : ''}${left.mayHaveShared ? 'If inspection confirms the upload succeeded, keep it; do not remove it or upload a duplicate. If it did not succeed, ask whoever runs this host to inspect and remove unwanted residue by ID.' : 'Ask whoever runs this host to inspect and remove that file by ID.'} File deletion removes all its shares. Rollback cleanup still requires current conversation association.`;
+  }
+
   const carried = accessContextMessage(err) ?? (err as { message?: unknown } | null)?.message;
   const text = typeof carried === 'string' ? carried : String(err);
   // A read that fails returns nothing, so a failure of one that nothing below
@@ -144,12 +157,10 @@ export function explainSlackError(err: unknown, call: SlackCall): string {
   // own refusals do. A write's may have written, so it passes through.
   const unexplained = READS.has(call.tool) && !text.startsWith(NOTHING_RETURNED) ? `${NOTHING_RETURNED}.` : undefined;
   const why = explanation(err, call) ?? unexplained;
-  const explained = why && !(accessContextMessage(err) && text.includes(why)) ? `${text}\n\n${why}` : text;
-  return call.tool === 'upload_file' && fileLeftByUpload(err) && failedAccessAdmission(err) && !explained.includes('inspect and remove the unshared file')
-    ? `${explained} Ask whoever runs this host to inspect and remove the unshared file by ID before retrying.` : explained;
+  return why && !(accessContextMessage(err) && text.includes(why)) ? `${text}\n\n${why}` : text;
 }
 
-function explanation(err: unknown, call: SlackCall): string | undefined {
+function explanation(err: unknown, call: SlackCall, policyUploadDetail = false): string | undefined {
   const e = err as {
     code?: unknown;
     retryAfter?: number;
@@ -169,8 +180,9 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
   // leads with what is true of the file by then.
   const unshared = call.tool === 'upload_file' && failedAccessAdmission(err) ? fileLeftByUpload(err) : undefined;
   const sharing = call.tool === 'upload_file' &&
-    (!!unshared || failedRequest(err) === 'files.completeUploadExternal' || err instanceof UploadBytesFailed);
-  const lead = unshared ? `Nothing was shared; unshared file ${unshared.fileId} may remain` : sharing ? 'Nothing was shared' : NOT_DONE[call.tool] ?? 'Nothing was done';
+    (failedRequest(err) === 'files.completeUploadExternal' || err instanceof UploadBytesFailed);
+  const lead = policyUploadDetail ? '' : unshared ? `Nothing was shared; unshared file ${unshared.fileId} may remain` : fileLeftByUpload(err)?.policy ? 'Upload did not complete' : sharing ? 'Nothing was shared' : NOT_DONE[call.tool] ?? 'Nothing was done';
+
   const channel = given('channelId');
   const conversation = channel ? `conversation ${channel}` : 'the conversation';
   // The message a call names: messageId, or fetch_thread's threadTs.
@@ -214,6 +226,7 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
           ? `fetch_thread for the thread under message ${thread} in ${conversation}`
           : `fetch_history for ${conversation}`;
       if (call.tool === 'upload_file') {
+        if (policyUploadDetail) return `${cause}${note}.`;
         return (
           `${cause}, so whether the file was shared is unknown${note}. Check ${where} before uploading again, so ` +
           "it isn't shared twice."
@@ -243,7 +256,8 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
   };
 
   if (err instanceof UploadNotConfirmed) {
-    // Its ID came from the first step, so a rollback deletes it either way.
+    // Its ID came from the first step; policy rollback still needs provenance
+    // and a current admitted association.
     return unknown("Slack's answer to the upload's last step named no file");
   }
   if (err instanceof PostNotConfirmed) {
@@ -252,25 +266,25 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
   }
   if (err instanceof UploadBytesFailed) {
     const seconds = SLACK_CLIENT_OPTIONS.timeout / 1000;
-    const unshared = "Slack shares a file only at the upload's last step, which wasn't sent";
+    const unshared = policyUploadDetail ? '' : "Slack shares a file only at the upload's last step, which wasn't sent";
     if (err.why === 'TimeoutError') {
       // The timeout covers the whole post: the bytes, the answer and its body.
       // The bytes may have reached the server, so this says only that the
       // post didn't finish.
       return (
         `${lead}: the post of the file's bytes to Slack's upload server didn't finish within ${seconds} seconds. ` +
-        `${unshared}, so calling again is safe. If it keeps timing out, Slack's upload server or this server's ` +
+        `${policyUploadDetail ? 'A new call starts a new upload' : `${unshared}, so calling again is safe`}. If it keeps timing out, Slack's upload server or this server's ` +
         `connection to it is too slow for this file within ${seconds} seconds: a smaller file may go through, ` +
         'and whoever runs this host can look into the connection.'
       );
     }
     if (err.why === 'transit') {
       return (
-        `${lead}: the connection to Slack's upload server failed. ${unshared}. Try again shortly. If it keeps ` +
+        `${lead}: the connection to Slack's upload server failed. ${unshared ? `${unshared}. ` : ''}Try again shortly. If it keeps ` +
         "failing, whoever runs this host has to check its connection to Slack's upload server."
       );
     }
-    return `${lead}: Slack's upload server answered the file's bytes with HTTP ${err.why}. ${unshared}. Try again shortly.`;
+    return `${lead}: Slack's upload server answered the file's bytes with HTTP ${err.why}. ${unshared ? `${unshared}. ` : ''}Try again shortly.`;
   }
   if (err instanceof OutOfCallTime) {
     // Not sent: a call's request goes out only if its timeout fits
@@ -334,7 +348,7 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
       : `${lead}: ${cause}. Try again shortly. If it keeps failing, whoever runs this host has to check its ` +
           'connection to Slack.';
   }
-  if (code === undefined) return unshared ? `${lead}. Ask whoever runs this host to inspect and remove the unshared file by ID before retrying.` : undefined;
+  if (code === undefined) return unshared && !policyUploadDetail ? `${lead}. Ask whoever runs this host to inspect and remove the unshared file by ID before retrying.` : undefined;
   const messageIds = call.tool === 'reply_message' || call.tool === 'fetch_thread' || call.tool === 'upload_file' ? PARENT_IDS : MESSAGE_IDS;
 
   // channels/publish names no message or thread itself: this server replies in
@@ -512,7 +526,9 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
       // upload ticket."
       return call.tool === 'upload_file'
         ? `${lead}: Slack couldn't find the file this upload's first step set up. Calling again starts a new upload.`
-        : undefined;
+        : ['fetch_attachment', 'delete_file'].includes(call.tool)
+          ? `${lead}: Slack could not find file ${given('fileId') ?? 'given'}, or this bot cannot access it. Check a current file reference before retrying.`
+          : undefined;
     // A workspace's refusals of an upload, which last until its admins change
     // them (R1-2). files.getUploadURLExternal documents all five, and
     // files.completeUploadExternal the two about file types.
@@ -540,5 +556,5 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
         "won't change that."
       );
   }
-  return unshared ? `${lead}. Ask whoever runs this host to inspect the unshared file before retrying.` : undefined;
+  return !policyUploadDetail && unshared ? `${lead}. Ask whoever runs this host to inspect the unshared file before retrying.` : undefined;
 }

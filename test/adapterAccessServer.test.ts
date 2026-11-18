@@ -84,19 +84,19 @@ test('server list/refresh report unavailable scopes and only probe auth.test', a
 });
 
 
-test('policy hides fetch_attachment and refuses direct invocation before fetch', async (t) => {
+test('policy exposes conversation-bound fetch_attachment and refuses URL-only invocation', async (t) => {
   const f = accessFixture();
   const h = connectHost(new SlackMcplServer(f.adapter));
   t.after(() => h.close());
   await initialize(h, false);
   const listed = await h.host.sendRequest('tools/list', {}) as { tools: Array<{ name: string }> };
-  assert.equal(listed.tools.some(tool => tool.name === 'fetch_attachment'), false);
+  assert.equal(listed.tools.some(tool => tool.name === 'fetch_attachment'), true);
   const fetch = t.mock.method(globalThis, 'fetch', async () => { throw new Error('must not fetch'); });
   const result = await h.host.sendRequest('tools/call', {
     name: 'fetch_attachment', arguments: { url: 'https://files.slack.com/secret' },
   }) as { isError?: boolean; content: unknown };
   assert.equal(result.isError, true);
-  assert.match(JSON.stringify(result.content), /attachments are disabled/);
+  assert.match(JSON.stringify(result.content), /channelId|fileId|url/);
   assert.equal(fetch.mock.callCount(), 0);
 });
 
