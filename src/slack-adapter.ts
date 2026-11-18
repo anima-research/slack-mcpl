@@ -20,6 +20,7 @@
  * Event handling salvaged from zulip-mcp PR #8's SlackAdapter.
  */
 
+import { MAX_MESSAGE_TEXT_APPEND, renderMessageText } from './message-text.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { WebClient, ErrorCode, LogLevel, type Logger, type WebAPICallResult, type WebClientOptions } from '@slack/web-api';
 import { SocketModeClient } from '@slack/socket-mode';
@@ -255,11 +256,14 @@ const CONTENT_SUBTYPES = new Set([undefined, 'file_share', 'thread_broadcast', '
 /** The fields of a Socket Mode message event this adapter dereferences.
  * Payloads come off the wire — everything is optional until checked. */
 interface SlackMessageEvent {
+  client_msg_id?: string;
   type?: string;
   subtype?: string;
   channel?: string;
   user?: string;
   text?: string;
+  attachments?: unknown;
+  blocks?: unknown;
   ts?: string;
   thread_ts?: string;
   /** On a thread_broadcast the parent may be named only here. */
@@ -311,7 +315,9 @@ export interface SlackMessageData {
   threadTs?: string;
   authorId: string;
   authorName: string;
-  /** Raw mrkdwn text as received. */
+  /** Original Slack text (before supplemental payload rendering). */
+  rawContent?: string;
+  /** Rendered mrkdwn content. */
   content: string;
   /** Mentions resolved to @name (uid:U…), links/broadcasts unescaped. */
   cleanContent: string;
@@ -1580,28 +1586,42 @@ export class SlackAdapter {
    *  readThread asks). */
   async fetchHistory(
     channelId: string,
-    opts: { limit?: number; oldest?: string; latest?: string } = {},
+    opts: { limit?: number; oldest?: string; latest?: string; signal?: AbortSignal } = {},
   ): Promise<{ messages: HistoryMessage[]; truncated: boolean }> {
+    opts.signal?.throwIfAborted();
     await this.assertNotDm(channelId, 'Nothing was read');
     const { messages, truncated } = await fetchSlackHistory(this.web, {
       channel: channelId,
       ...(opts.oldest !== undefined ? { oldest: opts.oldest } : {}),
       ...(opts.latest !== undefined ? { latest: opts.latest } : {}),
       maxMessages: opts.limit ?? 50,
+      signal: opts.signal,
     });
-    return { messages: await this.shapeHistory(messages), truncated };
+    return { messages: await this.shapeHistory(messages, 2000, opts.signal), truncated };
   }
 
-  private async shapeHistory(messages: SlackHistoryMessage[]): Promise<HistoryMessage[]> {
-    // Pre-resolve author + mentioned user names in one pass.
+  private async shapeHistory(messages: SlackHistoryMessage[], maxAppend = MAX_MESSAGE_TEXT_APPEND, signal?: AbortSignal): Promise<HistoryMessage[]> {
+    // Supplemental-only mentions never spend the read's call budget or grow
+    // the name cache. All delivery paths use an existing name or the raw ID.
+    signal?.throwIfAborted();
     const ids = new Set<string>();
+    const texts: string[] = [];
+    for (let index = 0; index < messages.length; index++) {
+      // Large backscroll windows must not monopolize Socket Mode's loop.
+      if (index > 0 && index % 10 === 0) {
+        await new Promise<void>(resolve => setImmediate(resolve));
+        signal?.throwIfAborted();
+      }
+      texts.push(renderMessageText(messages[index], maxAppend));
+    }
     for (const msg of messages) {
       if (msg.user) ids.add(msg.user);
       for (const id of extractSlackUserIds(msg.text ?? '')) ids.add(id);
     }
-    await this.resolveUserNames(Array.from(ids));
+    await this.resolveUserNames(Array.from(ids), signal);
+    signal?.throwIfAborted();
 
-    return messages.map((msg) => {
+    return messages.map((msg, index) => {
       const id = String(msg.ts ?? '');
       // The thread a message belongs to: the one its parent's ts names, as
       // Slack reports it, or the message's own.
@@ -1612,7 +1632,7 @@ export class SlackAdapter {
       authorId: msg.user,
       ...(msg.bot_id ? { authorBotId: msg.bot_id } : {}),
       authorName: msg.user ? (this.userNameCache.get(msg.user) ?? msg.user) : (msg.username ?? 'bot'),
-      content: formatSlackText(msg.text ?? '', this.userNameCache),
+      content: formatMessageText(msg.text ?? '', texts[index], this.userNameCache),
       threadTs: msg.thread_ts && msg.thread_ts !== msg.ts ? msg.thread_ts : undefined,
       rootTs: reported ?? id,
       // Missing means unknown, not none.
@@ -1684,7 +1704,10 @@ export class SlackAdapter {
       return; // DM whitelist active and this sender isn't on it
     }
 
-    // Resolve author + mentioned users before formatting.
+    // Resolve the author and original-text mentions only. Supplemental names
+    // are display-only: use the cache, never delay delivery for a lookup.
+    await Promise.resolve(); // Socket Mode queues ack first; yield before rendering.
+    const text = renderMessageText(event);
     const mentionIds = extractSlackUserIds(event.text ?? '');
     await this.resolveUserNames([event.user, ...mentionIds]);
     const authorName = this.userNameCache.get(event.user) ?? event.user;
@@ -1708,8 +1731,9 @@ export class SlackAdapter {
       threadTs: event.thread_ts || event.root?.thread_ts || undefined,
       authorId: String(event.user),
       authorName,
-      content: event.text ?? '',
-      cleanContent: formatSlackText(event.text ?? '', this.userNameCache),
+      ...(text !== (event.text ?? '') ? { rawContent: event.text ?? '' } : {}),
+      content: text,
+      cleanContent: formatMessageText(event.text ?? '', text, this.userNameCache),
       mentionIds,
       // Personal mention of the bot — hosts use this to gate wake policy.
       // @here/@channel broadcasts deliberately don't count.
@@ -1725,11 +1749,20 @@ export class SlackAdapter {
 
   /** Resolve user IDs into this adapter's cache (shared logic in content.ts).
    *  Returns the error of each lookup left uncached. */
-  private async resolveUserNames(userIds: Array<string | undefined>): Promise<Map<string, unknown>> {
+  private async resolveUserNames(userIds: Array<string | undefined>, signal?: AbortSignal): Promise<Map<string, unknown>> {
     return resolveSlackUserNames(
       this.web,
       this.userNameCache,
       userIds.filter((id): id is string => !!id),
+      signal,
     );
   }
+}
+
+/** The renderer preserves original text as a prefix. Format that prefix
+ * separately so only original occurrences retain Slack's fallback labels. */
+function formatMessageText(original: string, rendered: string, cache: Map<string, string>): string {
+  const supplemental = rendered.slice(original.length);
+  const names = new Map(extractSlackUserIds(supplemental).map(id => [id, cache.get(id) ?? id]));
+  return formatSlackText(original, cache) + formatSlackText(supplemental, names);
 }

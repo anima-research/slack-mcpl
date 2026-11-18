@@ -1,4 +1,4 @@
-const LINE_BREAK = /\r\n|[\n\r\u000b\u000c\u0085\u2028\u2029]/g;
+export const LINE_BREAK = /\r\n|[\n\r\u000b\u000c\u0085\u2028\u2029]/g;
 const INVISIBLE = '\\p{Cf}\\p{Default_Ignorable_Code_Point}';
 const GAP = `[\\s\\p{Cc}\\p{M}\\u2800${INVISIBLE}]`;
 // A tag's name ends at a gap, `>`, `/`, `=`, a quote or the end of the text.

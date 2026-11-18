@@ -25,8 +25,8 @@
  *                       minutes.
  *   SLACK_SUBSCRIPTIONS_FILE - Optional: JSON file persisting ambient-channel
  *                       subscriptions across restarts
- *   SLACK_BACKSCROLL_LIMIT   - Optional: messages fetched on first interaction
- *                       with a conversation (default 50)
+ *   SLACK_BACKSCROLL_LIMIT   - Optional: messages fetched for addressed delivery
+ *                       before any accepted delivery in that conversation (default 50)
  */
 
 import * as net from 'node:net';

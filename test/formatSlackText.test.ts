@@ -66,3 +66,8 @@ test('extractSlackUserIds dedupes and handles fallback syntax', () => {
 test('extractSlackUserIds returns empty for no mentions', () => {
   assert.deepEqual(extractSlackUserIds('no mentions here'), []);
 });
+
+test('formats a two-kilobyte labelled dashboard link', () => {
+  const url = 'https://example.com/path?q=' + 'x'.repeat(2048);
+  assert.equal(formatSlackText(`see <${url}|the report>`, new Map()), `see the report (${url})`);
+});
