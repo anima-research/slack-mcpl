@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  SlackAccessPolicy, SlackAccessDenied,
+  SlackAccessPolicy, SlackAccessDenied, SlackAccessUnverified,
   parseAccessPolicy,
   type AccessConversation,
   type SlackAccessPolicyConfig,
@@ -39,7 +39,7 @@ test('validation and construction reject missing, unknown and null fields identi
     invalid.push(missing, { ...config(), [key]: null }, { ...config(), [key]: undefined });
   }
   // These extensions are deliberately unsupported in A1, even empty or null.
-  for (const key of ['groupDms', 'historyMembershipFallbackChannels']) {
+  for (const key of ['historyMembershipFallbackChannels']) {
     for (const value of [null, [], ['G1']]) invalid.push({ ...config(), [key]: value });
   }
   invalid.push({ ...config(), readJoinedChannels: 'true' });
@@ -141,14 +141,17 @@ test('DM identity and kind cannot be inferred from a prefix or mismatched metada
   }
 });
 
-test('group DMs are unsupported even with membership, a write pin and mpim scopes', () => {
+test('unnamed group DMs are unsupported even with membership, a write pin and mpim scopes', () => {
   const policy = new SlackAccessPolicy(config());
   for (const id of ['C1', 'G1']) {
     for (const isIm of [undefined, false, true]) {
       const metadata = { ...channel(id, true), is_mpim: true, is_im: isIm };
       const allScopes = [...scopes, 'mpim:read', 'mpim:history'];
-      assert.throws(() => policy.requireReadable(id, metadata, allScopes), /Group direct messages are unsupported/);
-      assert.throws(() => policy.requireWritable(id, metadata, allScopes, 'chat:write'), /Group direct messages are unsupported/);
+      // Contradictory kind flags are unverified evidence, not an authoritative exclusion.
+      const expected = isIm === true ? /contradictory group DM kind/ : /group direct message is not admitted/;
+      assert.throws(() => policy.requireReadable(id, metadata, allScopes), (err: unknown) =>
+        expected.test((err as Error).message) && (err as { authoritative?: boolean }).authoritative === (isIm !== true));
+      assert.throws(() => policy.requireWritable(id, metadata, allScopes, 'chat:write'), expected);
     }
   }
 });
@@ -302,7 +305,29 @@ test('list diagnostics identify the bad index, including sparse entries', () => 
 });
 
 test('group DM guard has a specific diagnostic even for otherwise valid channel metadata', () => {
-  assert.throws(() => new SlackAccessPolicy(config()).requireReadable('C1', { ...channel(), is_mpim: true }, scopes), /Group direct messages are unsupported/);
+  assert.throws(() => new SlackAccessPolicy(config()).requireReadable('C1', { ...channel('C1', true), is_mpim: true }, scopes), /group direct message is not admitted/);
+  // A public flag contradicts a group DM: unverified, not an authoritative exclusion, pinned or not.
+  for (const id of ['C1', 'G1']) {
+    assert.throws(() => new SlackAccessPolicy(config()).requireReadable(id, { ...channel(id), is_mpim: true }, scopes), (err: unknown) =>
+      err instanceof SlackAccessUnverified && !err.authoritative && /contradictory group DM kind/.test(err.message));
+  }
+});
+
+
+test('access context preserves input, unverified and local-denial identity, classes and cause', async () => {
+  const { withAccessContext, SlackAccessInputError, SlackAccessUnverified, SlackAccessDenied } = await import('../src/access-policy.js');
+  for (const Ctor of [SlackAccessInputError, SlackAccessUnverified, SlackAccessDenied]) {
+    const cause = new Error('original cause');
+    const original = new Ctor('reason', { cause });
+    await assert.rejects(withAccessContext('Nothing was posted', () => withAccessContext('Nothing was posted', async () => { throw original; })), err => {
+      assert.ok(err instanceof Ctor);
+      assert.equal(err, original);
+      assert.equal(err.cause, cause);
+      assert.equal(err.message.split('Nothing was posted:').length, 2);
+      assert.equal(err.message.includes('Retrying unchanged'), Ctor === SlackAccessDenied);
+      return true;
+    });
+  }
 });
 
 test('scope snapshots and remaining parser boundary cases', () => {
@@ -330,9 +355,9 @@ test('scope snapshots and remaining parser boundary cases', () => {
   assert.throws(() => policy.requireScope(grants, 'channels:read'));
   assert.throws(() => policy.requireReadable('C1', channel(), grants));
   for (const id of ['C1', 'G1']) {
-    const group = { ...channel(id), is_mpim: true };
-    assert.throws(() => policy.requireReadable(id, group, scopes), /Group direct messages/);
-    assert.throws(() => policy.requireWritable(id, group, scopes, 'chat:write'), /Group direct messages/);
+    const group = { ...channel(id, true), is_mpim: true };
+    assert.throws(() => policy.requireReadable(id, group, scopes), /group direct message/);
+    assert.throws(() => policy.requireWritable(id, group, scopes, 'chat:write'), /group direct message/);
   }
   assert.throws(() => parseAccessPolicy(config({ writeChannels: ['general'] })), /general.*uppercase C- or G-/);
 });

@@ -8,6 +8,7 @@ export function virtualClock(t: TestContext): { slept: number[] } {
   let offset = 0;
   const slept: number[] = [];
   t.mock.method(clock, 'now', () => base + offset);
+  t.mock.method(clock, 'monotonic', () => offset);
   t.mock.method(clock, 'sleep', async (ms: number) => {
     slept.push(ms);
     offset += ms;

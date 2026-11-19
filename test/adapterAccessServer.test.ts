@@ -80,6 +80,8 @@ test('server list/refresh report unavailable scopes and only probe auth.test', a
   await assert.rejects(h.host.sendRequest(method.CHANNELS_PUBLISH, {
     channelId: 'slack:C1', content: [{ type: 'text', text: 'hi' }],
   }), /scope/i);
+  // Both tools reached the scope probe; nothing else was asked.
+  assert.ok(f.calls.length >= 2, 'list and refresh each probed auth.test');
   assert.ok(f.calls.every(c => c.method === 'auth.test'));
 });
 
@@ -265,3 +267,49 @@ for (const destination of ['allowed', 'blocked', 'wrong peer', 'blocked user'] a
     }
   });
 }
+
+test('list_channels and refresh_channels return admitted rows with an explicit incomplete notice when a candidate is rate-limited', async t => {
+  const f = accessFixture(); t.after(() => f.adapter.stop());
+  f.web.conversations.info = async (args: any) => {
+    if (args.channel === 'C1') throw Object.assign(new Error('limited'), { code: 'slack_webapi_rate_limited_error', retryAfter: 60 });
+    return { channel: joined(args.channel) };
+  };
+  const h = connectHost(new SlackMcplServer(f.adapter)); t.after(() => h.close());
+  await initialize(h, true);
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  const call = (name: string) => h.host.sendRequest('tools/call', { name, arguments: {} }) as Promise<any>;
+  await call('refresh_channels'); // background registration has ended
+  f.state.listed = [joined('C0'), joined('C1')];
+  const listed = await call('list_channels');
+  assert.notEqual(listed.isError, true);
+  assert.match(listed.content[0].text, /"C0"/);
+  assert.match(listed.content.at(-1).text, /^Incomplete: candidate admission was rate-limited; .*Retry after 60 seconds/);
+  const refreshed = await call('refresh_channels');
+  assert.notEqual(refreshed.isError, true);
+  // Slack's 60-second Retry-After now holds the shared pacer past this call's
+  // request deadline: the scan stops at once and reports that wait, not its deadline.
+  assert.match(refreshed.content[0].text, /Incomplete: candidate admission was rate-limited; .*Retry after 60 seconds/);
+  assert.doesNotMatch(refreshed.content[0].text, /deadline left no room/);
+  assert.doesNotMatch(refreshed.content[0].text, /already has every one/);
+});
+
+test('an uncertain policy post without the history grant does not point at fetch_history', async () => {
+  const { explainSlackError } = await import('../src/slack-errors.js');
+  const { accessScopes } = await import('./adapterAccessFixture.js');
+  const f = accessFixture({ scopes: accessScopes.filter(s => s !== 'channels:history') });
+  f.web.chat.postMessage = async () => { throw Object.assign(new Error('bad gateway'), { code: 'slack_webapi_http_error', statusCode: 502 }); };
+  await assert.rejects(f.adapter.sendMessage('C1', 'maybe'), err => {
+    const text = explainSlackError(err, { tool: 'send_message', args: { channelId: 'C1' } });
+    assert.match(text, /whether the message was posted is unknown/);
+    assert.match(text, /lacks the history grant fetch_history needs/);
+    return true;
+  });
+});
+
+test('the deadline notice states that a new call cannot continue past its stop', async () => {
+  const { admissionIncompleteNote } = await import('../src/server.js');
+  const note = admissionIncompleteNote({ reason: 'call_deadline' });
+  assert.match(note, /conversations found so far are usable/);
+  assert.match(note, /may never be listed or registered by calling again; if one you need is missing, ask whoever runs this host for its ID/);
+  assert.doesNotMatch(note, /rows above/);
+});

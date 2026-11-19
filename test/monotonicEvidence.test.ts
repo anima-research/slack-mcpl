@@ -245,3 +245,36 @@ test('definitive local exclusion precedes missing scope evidence', async t => {
   await assert.rejects(f.adapter.getConversationMeta('C1'), /excluded by the Slack access policy/);
   assert.deepEqual(f.calls, []);
 });
+
+test('a token-wide refusal on one conversation vetoes fallback for every conversation until a newer success', async t => {
+  const f = accessFixture(); t.after(() => f.adapter.stop());
+  f.state.conversation = joined('C2');
+  await f.adapter.getConversationMeta('C2');
+  f.state.infoError = Object.assign(new Error('revoked'), { code: 'slack_webapi_platform_error', data: { error: 'token_revoked' } });
+  await assert.rejects(f.adapter.getConversationMeta('C1'));
+  assert.throws(() => f.adapter.assertKnownDeliveryAdmission('C2'), /revoked/);
+  f.state.infoError = undefined;
+  await f.adapter.getConversationMeta('C2');
+  assert.doesNotThrow(() => f.adapter.assertKnownDeliveryAdmission('C2'));
+});
+
+test('an older token refusal answered after a newer success does not latch', async t => {
+  const f = accessFixture(); t.after(() => f.adapter.stop());
+  let entered!: () => void, release!: () => void;
+  const started = new Promise<void>(r => { entered = r; });
+  const held = new Promise<void>(r => { release = r; });
+  let calls = 0;
+  f.web.conversations.info = async () => {
+    if (++calls === 1) {
+      entered(); await held;
+      throw Object.assign(new Error('revoked'), { code: 'slack_webapi_platform_error', data: { error: 'invalid_auth' } });
+    }
+    return { channel: joined(), response_metadata: { scopes: accessScopes } };
+  };
+  const older = f.adapter.getConversationMeta('C1').then(() => undefined, error => error);
+  await started;
+  await f.adapter.getConversationMeta('C1');
+  release();
+  assert.ok(await older, 'the older request was refused');
+  assert.doesNotThrow(() => f.adapter.assertKnownDeliveryAdmission('C1'), 'the newer success already proved the token works');
+});

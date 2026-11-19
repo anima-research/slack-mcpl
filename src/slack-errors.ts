@@ -67,6 +67,8 @@ const NOT_DONE: Record<string, string> = {
   upload_file: 'Nothing was uploaded',
   edit_message: "The message wasn't changed",
   delete_message: 'Nothing was deleted',
+  // Rollback's file cleanup, explained like a tool's.
+  delete_file: 'Nothing was deleted',
   add_reaction: 'No reaction was added',
   // A read can fail after its first pages, so its lead is what the caller
   // didn't get.
@@ -219,7 +221,11 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
     if (POSTS.has(call.tool)) {
       // fetch_history leaves out a reply that wasn't also sent to the
       // channel, so a reply is looked for in its thread.
-      const where = !channel
+      // Policy mode knows whether this token could read the history at all.
+      const left = postLeftBy(err);
+      const where = left?.policy && left.historyReadable === false
+        ? `Slack directly, or ask someone in ${conversation} or whoever runs this host to (this bot lacks the history grant fetch_history needs)`
+        : !channel
         ? "the DM's history (list_channels shows its id, and fetch_history its messages)"
         : thread
           ? `fetch_thread for the thread under message ${thread} in ${conversation}`
@@ -230,9 +236,12 @@ function explanation(err: unknown, call: SlackCall): string | undefined {
           "it isn't shared twice."
         );
       }
+      // A host can withhold the history tools whatever the grants (policy wording only; unset text is main's).
+      const noTools = left?.policy && left.historyReadable !== false
+        ? ' If this host does not offer that tool, ask someone in the conversation or whoever runs this host to check instead.' : '';
       return (
         `${cause}, so whether the message was posted is unknown${note}. Check ${where} before posting again, so ` +
-        "it isn't posted twice."
+        `it isn't posted twice.${noTools}`
       );
     }
     // fetch_history leaves out a reply that wasn't also sent to the channel,
