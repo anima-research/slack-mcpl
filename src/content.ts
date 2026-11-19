@@ -7,6 +7,8 @@
  * Salvaged from zulip-mcp PR #8 (multi-platform branch), Slack halves only.
  */
 
+import { DEFAULT_PAGINATION, isHistoryRow, pageLimit, pageProblem } from './pagination.js';
+import type { PolicyFileRef } from './file-access.js';
 import { channelShown, mimeShown, nameShown } from './framing.js';
 
 // Anthropic refuses images larger than this; mirror their cap server-side
@@ -54,6 +56,32 @@ function inTransit(err: unknown, signal?: AbortSignal): Error {
   return new Error(`Nothing was fetched: the download failed on the way (${why}). Try again shortly.`);
 }
 
+/** The longest download rate-limit wait this server repeats as a number of seconds. */
+export const MAX_ADVISED_WAIT_SECONDS = 3600;
+const IMF_FIXDATE = /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun), (\d{2}) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (\d{4}) (\d{2}):(\d{2}):(\d{2}) GMT$/;
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+/**
+ * A Retry-After header as whole seconds from now: decimal seconds, or an
+ * IMF-fixdate (RFC 9110, e.g. "Sun, 06 Nov 1994 08:49:37 GMT") whose fields
+ * and weekday name a real date. Anything else, including the obsolete
+ * RFC 850 and asctime forms, is unknown (undefined), never a guessed deadline.
+ */
+export function retryAfterSeconds(raw: string | null | undefined, now = Date.now()): number | undefined {
+  const header = raw?.trim();
+  if (!header) return undefined;
+  if (/^\d+(?:\.\d+)?$/.test(header)) return Math.ceil(Number(header));
+  const m = IMF_FIXDATE.exec(header);
+  if (!m) return undefined;
+  const [, weekday, day, month, year, hour, minute, second] = m;
+  const at = Date.UTC(Number(year), MONTHS.indexOf(month), Number(day), Number(hour), Number(minute), Number(second));
+  const date = new Date(at);
+  if (date.getUTCFullYear() !== Number(year) || date.getUTCDate() !== Number(day) || date.getUTCMonth() !== MONTHS.indexOf(month) || date.getUTCHours() !== Number(hour)
+    || date.getUTCMinutes() !== Number(minute) || date.getUTCSeconds() !== Number(second) || WEEKDAYS[date.getUTCDay()] !== weekday) return undefined;
+  return Math.max(0, Math.ceil((at - now) / 1000));
+}
+
 /**
  * Authenticated GET with an enforced size cap. Checks Content-Length when the
  * server provides one, and streams with a running byte budget as defense in
@@ -64,18 +92,38 @@ function inTransit(err: unknown, signal?: AbortSignal): Error {
 export async function fetchAttachmentBytes(
   url: string,
   fallbackName: string,
-  opts: { headers?: Record<string, string>; signal?: AbortSignal } = {},
+  opts: { headers?: Record<string, string>; signal?: AbortSignal; redirect?: RequestInit['redirect'] } = {},
 ): Promise<FetchedAttachment> {
-  const resp = await fetch(url, { headers: opts.headers ?? {}, redirect: 'follow', signal: opts.signal }).catch((err: unknown) => {
+  const resp = await fetch(url, { headers: opts.headers ?? {}, redirect: opts.redirect === 'error' ? 'manual' : opts.redirect ?? 'follow', signal: opts.signal }).catch((err: unknown) => {
     throw inTransit(err, opts.signal);
   });
+  if ((opts.redirect === 'error' || opts.redirect === 'manual') && resp.status >= 300 && resp.status < 400) {
+    try { void Promise.resolve(resp.body?.cancel()).catch(() => {}); } catch { /* Best-effort disposal must not replace the refusal. */ }
+    throw new Error('Nothing was fetched: this server refuses file redirects. Ask whoever runs this host to investigate the file endpoint; retrying the same redirect will not help.');
+  }
   if (!resp.ok) {
+    if (opts.redirect === 'error') try { void Promise.resolve(resp.body?.cancel()).catch(() => {}); } catch { /* Best-effort disposal must not replace the refusal. */ }
+    if (opts.redirect === 'error' && resp.status === 429) {
+      const seconds = retryAfterSeconds(resp.headers.get('retry-after'));
+      const advice = seconds === undefined ? 'Try again shortly.'
+        : seconds > MAX_ADVISED_WAIT_SECONDS ? 'The endpoint asked for a wait of more than an hour; try again later.'
+          : `Wait ${seconds} seconds before trying again.`;
+      try { void Promise.resolve(resp.body?.cancel()).catch(() => {}); } catch { /* Best-effort disposal must not replace the refusal. */ }
+      throw new Error(`Nothing was fetched: the verified file endpoint is rate-limiting downloads (HTTP 429). ${advice}`);
+    }
     const answered = `HTTP ${resp.status} ${resp.statusText}`.trim();
+    if (opts.redirect === 'error' && resp.status !== 408 && resp.status !== 429 && resp.status < 500) {
+      throw new Error(`Nothing was fetched: the verified file endpoint answered ${answered}. Access may have changed; ask the sender to check the file or whoever runs this host to investigate.`);
+    }
+    // Policy callers cannot fix a denial by supplying a different URL.
+    const source = opts.redirect === 'error'
+      ? 'Use channelId and fileId from an attachment reference; this server verifies access again.'
+      : ATTACHMENT_URL_SOURCE;
     // A timeout, a rate limit or a failing server says nothing about the url.
     throw new Error(
       resp.status === 408 || resp.status === 429 || resp.status >= 500
         ? `Nothing was fetched: the file's url answered ${answered}, so the server was busy or failing. Try again shortly.`
-        : `Nothing was fetched: the file's url answered ${answered}. ${ATTACHMENT_URL_SOURCE} If it was exact, the ` +
+        : `Nothing was fetched: the file's url answered ${answered}. ${source} ${opts.redirect === 'error' ? 'The' : 'If it was exact, the'} ` +
             'file may have been deleted, or this bot may not be allowed to read it; calling again gets the same ' +
             'answer unless someone shares the file where this bot can read it, or, if the Slack app lacks ' +
             "files:read (Slack's file links need it), whoever runs this host adds that scope to the app's bot " +
@@ -88,6 +136,7 @@ export async function fetchAttachmentBytes(
   if (declared !== null) {
     const n = Number(declared);
     if (Number.isFinite(n) && n > MAX_ATTACHMENT_BYTES) {
+      if (opts.redirect === 'error') try { void Promise.resolve(resp.body?.cancel()).catch(() => {}); } catch { /* Best-effort disposal must not replace the refusal. */ }
       throw tooLarge(n);
     }
   }
@@ -192,7 +241,11 @@ export function attachmentName(url: URL): string {
   }
 }
 
-export interface AttachmentRef {
+export type AttachmentRef = PolicyFileRef | LegacyAttachmentRef;
+
+export interface LegacyAttachmentRef {
+  channelId?: never;
+  fileId?: never;
   path: string;       // url_private — needs Bearer bot-token auth to fetch
   name: string;       // basename for human display
   mimeType: string;   // best-effort from extension or the API
@@ -364,7 +417,8 @@ export interface SlackHistoryMessage {
   root?: { thread_ts?: string; ts?: string };
   reply_count?: number;
   bot_id?: string;
-  files?: Array<{ name?: string; mimetype?: string; url_private?: string }>;
+  // Raw Slack metadata stays permissive for legacy embedders; policyFileRefs validates IDs.
+  files?: Array<{ id?: unknown; name?: string; mimetype?: string; url_private?: string }>;
 }
 
 /** The minimal conversations.history surface fetchSlackHistory needs —
@@ -385,6 +439,14 @@ export interface SlackHistoryClient {
   };
 }
 
+/** Why fetchSlackHistory refused a policy page (pageProblem). */
+const HISTORY_PAGE_REFUSALS = {
+  container: 'Slack returned a malformed history page. Retry once; if it repeats, ask whoever runs this host to investigate Slack pagination.',
+  row: 'Slack returned a malformed history row (not a message with a placeable timestamp). Retry once; if it repeats, ask whoever runs this host to investigate the Slack response.',
+  cursor: 'Slack returned a malformed history pagination cursor. Retry once; if it repeats, ask whoever runs this host to investigate Slack pagination.',
+  cycle: 'Slack history cursor cycle (repeated pagination cursor). Retry once; if it repeats, ask whoever runs this host to investigate Slack pagination.',
+} as const;
+
 /**
  * Fetch conversations.history with cursor pagination. The API returns
  * newest-first pages and next_cursor walks toward older messages, so draining
@@ -402,11 +464,18 @@ export async function fetchSlackHistory(
     latest?: string;
     inclusive?: boolean;
     maxMessages: number;
+    maxPages?: number;
+    /** Policy callers refuse cycles and malformed pages; legacy callers stop via their page cap. */
+    rejectCursorCycles?: boolean;
   },
-): Promise<{ messages: SlackHistoryMessage[]; truncated: boolean }> {
+): Promise<{ messages: SlackHistoryMessage[]; truncated: boolean; stopReason?: 'message_limit' | 'page_limit' }> {
+  const maxPages = pageLimit(params.maxPages === undefined ? DEFAULT_PAGINATION.backscroll : params.maxPages, 'maxPages');
+  let pages = 0;
   const collected: SlackHistoryMessage[] = [];
   let cursor: string | undefined;
   let truncated = false;
+  let stopReason: 'message_limit' | 'page_limit' | undefined;
+  const cursors = new Set<string>();
   do {
     const result = await client.conversations.history({
       channel: params.channel,
@@ -416,12 +485,23 @@ export async function fetchSlackHistory(
       limit: Math.min(200, params.maxMessages - collected.length),
       cursor,
     });
+    pages++;
+    // Policy callers validate the whole page (pageProblem) before using any
+    // of it or stopping at the message limit: a missing container, a row that
+    // isn't a message with a placeable timestamp, a non-string or repeated
+    // cursor is refused, never shaped or treated as the end.
+    if (params.rejectCursorCycles) {
+      const problem = pageProblem(result.messages, result.response_metadata?.next_cursor as unknown, cursors, isHistoryRow);
+      if (problem) throw new Error(`No backscroll context was returned: ${HISTORY_PAGE_REFUSALS[problem]}`);
+    }
     collected.push(...((result.messages ?? []) as SlackHistoryMessage[]));
     cursor = result.response_metadata?.next_cursor || undefined;
     if (cursor && collected.length >= params.maxMessages) {
       truncated = true;
+      stopReason = 'message_limit';
       cursor = undefined;
     }
+    if (cursor && pages >= maxPages) { truncated = true; stopReason = 'page_limit'; break; }
   } while (cursor);
-  return { messages: collected.reverse(), truncated };
+  return { messages: collected.reverse(), truncated, ...(stopReason ? { stopReason } : {}) };
 }

@@ -4,7 +4,9 @@
  * request through the adapter's client, so it keeps the call's time and wait
  * budget like every other request. Backscroll keeps the adapter's own pager.
  */
+import { isPolicyFileRef, policyFileNote } from './file-access.js';
 import { createHash } from 'node:crypto';
+import { SLACK_TS, isSlackTimestamp } from './pagination.js';
 import { formatSlackText, type SlackHistoryMessage } from './content.js';
 import { mimeShown, nameShown, toolResultJson, urlShown } from './framing.js';
 import { isNearMiss } from './near-miss.js';
@@ -50,10 +52,9 @@ export const PARENT_IDS =
 /** What an answer this server can't read means for calling again. */
 const UNREADABLE = "Calling again may work; if it fails the same way, this server can't read Slack's answer for this range.";
 
-/** A Slack timestamp, a message's ts. */
-export const SLACK_TS = /^\d{1,16}(?:\.\d{1,6})?$/;
-const isTimestamp = (value: unknown): value is string =>
-  typeof value === 'string' && SLACK_TS.test(value) && Number.isFinite(new Date(Number(value) * 1000).getTime());
+/** A Slack timestamp, a message's ts (shared with the page validator). */
+export { SLACK_TS };
+const isTimestamp = isSlackTimestamp;
 /** The value a refusal names: a string as JSON quotes it, so a stray space
  *  shows, or what else it is. */
 function passed(value: unknown): string {
@@ -216,7 +217,11 @@ function cursorPosition(cursor: unknown, queryHash: string): string {
 }
 
 /** A message as the read tools return it. */
-export function historyRecord(m: HistoryMessage) {
+/** `policyAttachments`: only an explicit-policy read renders policy file
+ *  references. Without it, an attachment with extra channelId metadata stays
+ *  legacy; with it, a URL-less attachment that has a channelId renders as a
+ *  policy reference (a "not downloadable" note when it has no file ID). */
+export function historyRecord(m: HistoryMessage, policyAttachments = false) {
   return {
     id: m.id,
     ...(m.authorId ? { authorId: m.authorId } : {}),
@@ -230,7 +235,7 @@ export function historyRecord(m: HistoryMessage) {
     ...(m.attachments.length > 0
       ? {
           attachments: m.attachments.map((a) =>
-            `${nameShown(a.name)}${a.mimeType ? ` (${mimeShown(a.mimeType)})` : ''}${a.url ? ` — fetchable via fetch_attachment: ${urlShown(a.url)}` : ''}`,
+            policyAttachments && isPolicyFileRef(a) ? policyFileNote(a) : `${nameShown(a.name)}${a.mimeType ? ` (${mimeShown(a.mimeType)})` : ''}${a.url ? ` — fetchable via fetch_attachment: ${urlShown(a.url)}` : ''}`,
           ),
         }
       : {}),
@@ -261,6 +266,12 @@ export interface ReadSource {
   shape(messages: SlackHistoryMessage[]): Promise<HistoryMessage[]>;
   writable: boolean;
   stopped(err: unknown): ReadStop | undefined;
+  /** Explicit-policy reads render policy file references. */
+  policyAttachments?: boolean;
+  /** Explicit-policy reads refuse a page whose sign of more (has_more, or
+   *  response_metadata's next_cursor) is malformed, before any of its rows is
+   *  taken, rather than read it as the end of the range. */
+  strictPages?: boolean;
 }
 
 /**
@@ -321,6 +332,15 @@ export async function readBounded(opts: ReadOptions, source: ReadSource): Promis
       const page = await source.page(at, size);
       pages++;
       if (!Array.isArray(page.messages)) throw refused(`Slack's answer for a page of messages held no list of them. ${UNREADABLE}`);
+      // An explicit-policy page's sign of more is checked before any of its
+      // rows is taken: has_more absent or true/false, response_metadata
+      // absent or an object, its next_cursor absent or a string. Anything
+      // else (next_cursor 0, has_more "true") is refused, never read as the
+      // end that would make the read complete. Positions still follow
+      // timestamps; the cursor isn't followed.
+      if (source.strictPages && !completionSignalReadable(page)) {
+        throw refused(`Slack's answer for a page of messages held a malformed has_more or next_cursor, so whether more remain is unknown. ${UNREADABLE}`);
+      }
       // The page's messages in reading order, each strictly past the one
       // before it, starting from the position: one Slack gives again, such as
       // a thread's parent, or twice in one page, is taken once and never
@@ -351,7 +371,7 @@ export async function readBounded(opts: ReadOptions, source: ReadSource): Promis
         if (scanned >= opts.maxScanned) { stopReason = 'scan_limit'; break pages; }
         const record = shaped.get(m);
         if (record) {
-          const returned = historyRecord(record);
+          const returned = historyRecord(record, source.policyAttachments);
           const bytes = Buffer.byteLength(toolResultJson(returned));
           if (skeleton + recordBytes + records.length + bytes > opts.maxBytes) {
             // Held back whole, and neither scanned nor matched here: the
@@ -384,6 +404,16 @@ export async function readBounded(opts: ReadOptions, source: ReadSource): Promis
   if (complete) return result();
   if (scanned === 0 || at === undefined) throw new Error(stoppedAtStart(opts, stopReason, held, skeleton));
   return result(encodeCursor(opts.queryHash, at));
+}
+
+/** Whether a page's sign of more is of Slack's documented types. */
+function completionSignalReadable(page: { has_more?: unknown; response_metadata?: unknown }): boolean {
+  if (page.has_more !== undefined && typeof page.has_more !== 'boolean') return false;
+  const metadata = page.response_metadata;
+  if (metadata === undefined) return true;
+  if (metadata === null || typeof metadata !== 'object' || Array.isArray(metadata)) return false;
+  const next = (metadata as { next_cursor?: unknown }).next_cursor;
+  return next === undefined || typeof next === 'string';
 }
 
 /** Why a read that didn't move past its start returns nothing, and how to go

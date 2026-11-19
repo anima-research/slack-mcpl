@@ -1,0 +1,1 @@
+- Add strict access-policy parsing and immutable snapshots; the opt-in runtime activation is described in the access-policy activation entry.
