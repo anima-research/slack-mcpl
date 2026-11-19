@@ -449,7 +449,7 @@ test('missing DM peer is an unverified metadata refusal, not a peer exclusion', 
   const policy = new SlackAccessPolicy(config());
   for (const run of [() => policy.requireReadable('D1', { ...dm(), user: undefined }, scopes),
     () => policy.requireWritable('D1', { ...dm(), user: undefined }, scopes, 'chat:write')]) {
-    assert.throws(run, /invalid DM metadata/);
+    assert.throws(run, (err: unknown) => err instanceof SlackAccessUnverified && !err.authoritative && /invalid DM metadata/.test(err.message));
   }
 });
 

@@ -10,6 +10,7 @@ import { SlackAccessDenied } from './access-policy.js';
  * salvaged from zulip-mcp PR #8.
  */
 
+import { isPolicyFileRef, policyFileNote, type PolicyFileRef } from './file-access.js';
 import {
   McplConnection,
   textContent,
@@ -136,6 +137,7 @@ const ARGUMENT_SOURCES = {
   userId: "find_user returns each person's userId.",
   emoji: 'Pass an emoji name, such as thumbsup.',
   url: ATTACHMENT_URL_SOURCE,
+  fileId: 'Take the Slack file ID from an attachment reference.',
   query: "Pass part of a person's name.",
   content: "Pass the message's text.",
   filename: 'Pass the name the file is shown with in Slack, with its extension, such as positions.csv.',
@@ -171,9 +173,11 @@ export function backscrollLine(m: {
   timestamp: Date;
   authorName: string;
   content: string;
-  attachments: Array<{ name: string }>;
+  attachments: Array<PolicyFileRef | { name: string; channelId?: never }>;
+  /** Explicit policy rendering; unrelated legacy metadata never selects it. */
+  policyAttachments?: boolean;
 }): string {
-  const att = m.attachments.length > 0 ? ` [attachments: ${m.attachments.map((a) => nameShown(a.name)).join(', ')}]` : '';
+  const att = m.attachments.length > 0 ? ` [attachments: ${m.attachments.map((a) => m.policyAttachments && isPolicyFileRef(a) ? policyFileNote(a) : nameShown(a.name)).join(', ')}]` : '';
   const thread = m.threadTs ? ` thread=${m.threadTs}` : '';
   return `[${m.timestamp.toISOString()}${thread} id=${m.id}] ${nameShown(m.authorName)}${att}: ${senderText(m.content)}`;
 }
@@ -181,21 +185,23 @@ export function backscrollLine(m: {
 /** The `<backscroll>` block given with the first message from a conversation. */
 export function backscrollBlock(
   messages: Parameters<typeof backscrollLine>[0][],
-  where: { channelName?: string; isDM: boolean; isGroupDM?: boolean },
+  where: { channelName?: string; isDM: boolean; isGroupDM?: boolean; policyAttachments?: boolean },
 ): string {
   const attrs: string[] = [];
   if (where.channelName && !where.isDM) attrs.push(`channel=${quotedLabel(where.isGroupDM ? where.channelName : `#${where.channelName}`)}`);
   if (where.isDM) attrs.push('dm="true"');
   if (where.isGroupDM) attrs.push('group_dm="true"');
   attrs.push(`count="${messages.length}"`);
-  return [`<backscroll ${attrs.join(' ')}>`, ...messages.map(backscrollLine), '</backscroll>'].join('\n');
+  return [`<backscroll ${attrs.join(' ')}>`, ...messages.map(m => where.policyAttachments ? backscrollLine({ ...m, policyAttachments: true }) : backscrollLine(m)), '</backscroll>'].join('\n');
 }
 
 /** Content-free policy summary of a host request's failure: the host, not
  *  Slack, refused or failed it. */
-function hostFailureSummary(err: unknown): string {
+export function hostFailureSummary(err: unknown): string {
   const code = (err as { code?: unknown } | null)?.code;
-  return `host request failed${typeof code === 'number' ? ` (code ${code})` : ''}`;
+  // The host's own message may echo delivered content, so only its code is kept.
+  return `host request failed${typeof code === 'number' ? ` (code ${code})` : ''}; the host's reason is withheld from policy logs, ` +
+    'and Slack will not replay the message: check the host\'s logs, then recover it with fetch_history or fetch_thread';
 }
 
 /** The note a foreground policy listing carries when it stopped before
@@ -423,8 +429,15 @@ export class SlackMcplServer {
    *  during a connection, as a grant can. */
   private offeredTools() {
     return toolDefinitions.map(t => policyListingTool(t, this.slack.hasAccessPolicy)).filter((t) =>
-      (t.name !== 'fetch_attachment' || !this.slack.hasAccessPolicy) &&
-      (t.name !== 'send_dm' || this.slack.dmsWritable) && (t.name !== 'refresh_channels' || this.mcplEnabled));
+      (t.name !== 'send_dm' || this.slack.dmsWritable) && (t.name !== 'refresh_channels' || this.mcplEnabled)).map((t) =>
+        t.name === 'fetch_attachment' && this.slack.hasAccessPolicy ? {
+          ...t,
+          description: 'Fetch a Slack-hosted file through a freshly verified admitted conversation. Pass channelId and fileId from an attachment reference, not a URL. Returns bytes inline: images as image blocks, text-ish files decoded, other binary as base64. Max 5 MiB.',
+          inputSchema: { type: 'object' as const, properties: {
+            channelId: { type: 'string', description: 'Conversation ID from the attachment reference' },
+            fileId: { type: 'string', description: 'Slack file ID from the attachment reference' },
+          }, required: ['channelId', 'fileId'] },
+        } : t);
   }
 
   private requireMcpl(): void {
@@ -945,11 +958,22 @@ export class SlackMcplServer {
       }
 
       case 'fetch_attachment': {
-        if (this.slack.hasAccessPolicy) throw new Error('Nothing was fetched: attachments are disabled under the Slack access policy on this version of the host. Retrying will not help; ask whoever runs this host about support for conversation-bound attachments.');
         // The bot token goes only to files.slack.com, never to workspace hosts:
-        // parseSlackAttachmentUrl checks the url given, and fetch() drops
-        // Authorization on a redirect to another origin (fetchAttachment.test.ts).
-        const url = parseSlackAttachmentUrl(this.requireString(args, 'url'));
+        // legacy parsing checks the supplied URL; policy resolves it from fresh
+        // file evidence and refuses redirects. Legacy fetch strips cross-origin auth.
+        const policy = this.slack.hasAccessPolicy;
+        let url: URL;
+        if (policy) {
+          if ('url' in args) throw new Error('Nothing was fetched: use channelId and fileId from the attachment reference, not a URL');
+          for (const key of ['channelId', 'fileId']) {
+            if (typeof args[key] !== 'string' || !args[key]) throw new Error(`Nothing was fetched: ${key} must be a nonempty string from the attachment reference (received ${args[key] === null ? 'null' : args[key] === '' ? 'an empty string' : typeof args[key]})`);
+          }
+          const channelId = args.channelId as string;
+          const fileId = args.fileId as string;
+          url = await this.slack.resolveFileDownload(channelId, fileId);
+        } else {
+          url = parseSlackAttachmentUrl(this.requireString(args, 'url'));
+        }
         const botToken = process.env.SLACK_BOT_TOKEN || '';
         const headers: Record<string, string> = botToken
           ? { Authorization: `Bearer ${botToken}` }
@@ -972,6 +996,7 @@ export class SlackMcplServer {
         // call.
         assertRequestFits('The download from files.slack.com', SLACK_CLIENT_OPTIONS.timeout);
         return toFetchResult(await fetchAttachmentBytes(url.toString(), fileName, {
+          ...(policy ? { redirect: 'error' as const } : {}),
           headers,
           signal: AbortSignal.timeout(SLACK_CLIENT_OPTIONS.timeout),
         }));
@@ -1421,7 +1446,7 @@ export class SlackMcplServer {
    *  conversations come to be registered with the host, or that they can't. */
   private howChannelsRegister(): string {
     return this.grant.has('channels.register')
-      ? `refresh_channels registers the conversations this bot is in${(this.slack.hasAccessPolicy ? this.slack.listsChannelsOnly : this.slack.dmsDisabled) ? ', channels only while direct messages are turned off' : ''}; open one by the id it announces.`
+      ? `refresh_channels registers the conversations this bot is in${this.slack.hasAccessPolicy ? ' that the access policy admits, within its listing bounds' : ''}${(this.slack.hasAccessPolicy ? this.slack.listsChannelsOnly : this.slack.dmsDisabled) ? ', channels only while direct messages are turned off' : ''}; open one by the id it announces.`
       : "This host hasn't granted this server channels.register, so this server can't register conversations with it.";
   }
 
@@ -1507,6 +1532,7 @@ export class SlackMcplServer {
     // this server can't name counts as a message no delete can reach.
     const sent = { message: 0, file: 0 };
     const deleted = { message: 0, file: 0 };
+    let confirmedFileDeletes = 0;
     const admissionCauses: string[] = [];
     /** Each item a delete didn't confirm gone, or that no delete could name,
      *  by kind, id (where known) and conversation, and whether Slack refused
@@ -1518,9 +1544,15 @@ export class SlackMcplServer {
       sent[kind]++;
       try {
         await remove();
+        if (kind === 'file') confirmedFileDeletes++;
         deleted[kind]++;
       } catch (err) {
-        if (err instanceof SlackAccessDenied || failedAccessAdmission(err)) admissionCauses.push(`${kind} ${id} in ${channelId}: ` + explainSlackError(err, { tool: kind === 'file' ? 'delete_file' : 'delete_message', args: { channelId, ...(kind === 'file' ? { fileId: id } : { messageId: id }) } }));
+        if (err instanceof SlackAccessDenied || failedAccessAdmission(err)) {
+          // "Cleanup was not attempted" is the outcome; the explanation keeps only cause and remedy.
+          const why = (explainSlackError(err, { tool: kind === 'file' ? 'delete_file' : 'delete_message', args: { channelId, messageId: id, fileId: id } }) ?? (err instanceof Error ? err.message : String(err)))
+            .replace(/^Nothing was deleted:\s*/, '');
+          admissionCauses.push(`Cleanup was not attempted for ${kind} ${id} in ${channelId}: ${why.charAt(0).toUpperCase()}${why.slice(1)}`);
+        }
         const refusal = slackRefusal(err);
         if (!failedAccessAdmission(err) && !(err instanceof SlackAccessDenied) && refusal !== undefined && gone.includes(refusal)) {
           deleted[kind]++;
@@ -1543,6 +1575,7 @@ export class SlackMcplServer {
     for (const item of toDelete) {
       if (item.kind === 'file') {
         await attempt('file', item.fileId, item.channelId, FILE_GONE, () => this.slack.deleteFile(item.channelId, item.fileId));
+        this.slack.forgetUpload?.(item.fileId);
         const { shareTs } = item;
         if (shareTs) {
           await attempt('message', shareTs, item.channelId, ['message_not_found'],
@@ -1600,7 +1633,10 @@ export class SlackMcplServer {
         : []),
     ].join(', and ');
     const notes = [
-      ...admissionCauses.map(cause => `Cleanup was not attempted: ${cause}`),
+      ...admissionCauses,
+      ...(this.slack.hasAccessPolicy && confirmedFileDeletes > 0
+        ? ['A file deletion removes the file from every conversation it is shared in']
+        : []),
       ...(left.length > 0
         ? [[
             `Rolled back (${counts} deleted)`,
@@ -1621,7 +1657,7 @@ export class SlackMcplServer {
     return {
       checkpoint: params.checkpoint,
       success: true,
-      reason: notes.length > 0 ? notes.join('. ') : undefined,
+      reason: notes.length > 0 ? notes.map(note => this.slack.hasAccessPolicy ? note.replace(/\.+$/, '') : note).join('. ') : undefined,
     };
   }
 
@@ -1660,7 +1696,7 @@ export class SlackMcplServer {
    *  fetch_attachment rather than inlined here. */
   private attachmentNote(attachments: AttachmentRef[]): string {
     const lines = attachments.map((a) =>
-      `- ${nameShown(a.name)} (${mimeShown(a.mimeType)})${a.isImage ? ' — image' : ''}, fetchable via fetch_attachment: ${urlShown(a.path)}`,
+      this.slack.hasAccessPolicy && isPolicyFileRef(a) ? `- ${policyFileNote(a)}` : `- ${nameShown(a.name)} (${mimeShown(a.mimeType ?? '')})${a.isImage ? ' — image' : ''}, fetchable via fetch_attachment: ${urlShown(a.path ?? '')}`,
     );
     return `[attachments: ${attachments.length}]\n${lines.join('\n')}`;
   }
@@ -1831,7 +1867,7 @@ export class SlackMcplServer {
       );
     }
     if (backscroll.length > 0) {
-      blocks.push(backscrollBlock(backscroll, { channelName: meta?.name, isDM: msg.isDM, isGroupDM: this.slack.hasAccessPolicy && meta?.policyGroupDm }));
+      blocks.push(backscrollBlock(backscroll, { channelName: meta?.name, isDM: msg.isDM, isGroupDM: this.slack.hasAccessPolicy && meta?.policyGroupDm, policyAttachments: this.slack.hasAccessPolicy }));
     }
     // Told with the first message the agent gets from here, addressed or not.
     // Counted as told only once the host has taken that message.
@@ -1965,7 +2001,9 @@ export class SlackMcplServer {
           team: msg.teamId,
         } as Record<string, unknown>,
         tags: eventTags, // MCPL RFC-001 — the host routes/gates on these
-        payload: { content: contentBlocks },
+        payload: {
+          content: contentBlocks,
+        },
       };
 
       let res: { accepted?: boolean } | undefined;

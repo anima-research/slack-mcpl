@@ -204,16 +204,18 @@ test('a pending final lookup drops at the five-second delivery wait bound', asyn
   assert.equal(f.h.hostSaw.filter(r => r.method === method.PUSH_EVENT).length, 0);
 });
 
-for (const earlier of ['membership refusal', 'history grant withdrawal'] as const) test(`transient final admission cannot override ${earlier}`, async t => {
+for (const earlier of ['membership refusal', 'history grant withdrawal', 'history page refusal'] as const) test(`transient final admission cannot override ${earlier}`, async t => {
   const f = await fixture(t);
   const clears: string[] = [];
   t.mock.method(f.adapter, 'clearAck', async (_c: string, id: string) => { clears.push(id); });
   // The membership refusal reaches the ordered evidence through the real
   // backscroll admission, not through a server-side flag.
   if (earlier === 'membership refusal') f.state.conversation = { ...f.state.conversation, is_member: false };
+  // A real history page refusal, observed at the client boundary.
+  if (earlier === 'history page refusal') f.web.conversations.history = async () => { throw Object.assign(new Error('not in channel'), { code: 'slack_webapi_platform_error', data: { error: 'not_in_channel' } }); };
   const real = f.adapter.fetchHistory.bind(f.adapter);
   const backscroll = t.mock.method(f.adapter, 'fetchHistory', async (...args: Parameters<typeof real>) => {
-    if (earlier === 'membership refusal') return real(...args);
+    if (earlier !== 'history grant withdrawal') return real(...args);
     (f.adapter as any).scopes = ['channels:read'];
     throw Object.assign(new Error('limited after withdrawal'), { code: 'slack_webapi_rate_limited_error', retryAfter: 20 });
   });

@@ -44,3 +44,4 @@
   from initial-event pacing. The final recheck has its own small retry and
   five-second delivery wait budget, retaining original admission only on classified rate-limit, transport and Slack service failures without known lasting refusals or grant withdrawals. Other failures drop the event and request ACK cleanup, which can itself be refused.
 - Uncertain policy posts choose the history check from the freshly admitted conversation kind (a G ID can be a private channel or a group DM), and say whom to ask when the host does not offer that history tool. A final-admission drop names the thread root and the read that recovers it.
+- With `readJoinedChannels: false`, a policy listing requests only the DM and group-DM types, so excluded ordinary channels are neither enumerated nor paced; with no admitted kind enabled it lists nothing without asking Slack.

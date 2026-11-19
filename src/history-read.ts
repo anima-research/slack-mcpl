@@ -4,6 +4,7 @@
  * request through the adapter's client, so it keeps the call's time and wait
  * budget like every other request. Backscroll keeps the adapter's own pager.
  */
+import { isPolicyFileRef, policyFileNote } from './file-access.js';
 import { createHash } from 'node:crypto';
 import { formatSlackText, type SlackHistoryMessage } from './content.js';
 import { mimeShown, nameShown, toolResultJson, urlShown } from './framing.js';
@@ -216,7 +217,11 @@ function cursorPosition(cursor: unknown, queryHash: string): string {
 }
 
 /** A message as the read tools return it. */
-export function historyRecord(m: HistoryMessage) {
+/** `policyAttachments`: only an explicit-policy read renders policy file
+ *  references. Without it, an attachment with extra channelId metadata stays
+ *  legacy; with it, a URL-less attachment that has a channelId renders as a
+ *  policy reference (a "not downloadable" note when it has no file ID). */
+export function historyRecord(m: HistoryMessage, policyAttachments = false) {
   return {
     id: m.id,
     ...(m.authorId ? { authorId: m.authorId } : {}),
@@ -230,7 +235,7 @@ export function historyRecord(m: HistoryMessage) {
     ...(m.attachments.length > 0
       ? {
           attachments: m.attachments.map((a) =>
-            `${nameShown(a.name)}${a.mimeType ? ` (${mimeShown(a.mimeType)})` : ''}${a.url ? ` — fetchable via fetch_attachment: ${urlShown(a.url)}` : ''}`,
+            policyAttachments && isPolicyFileRef(a) ? policyFileNote(a) : `${nameShown(a.name)}${a.mimeType ? ` (${mimeShown(a.mimeType)})` : ''}${a.url ? ` — fetchable via fetch_attachment: ${urlShown(a.url)}` : ''}`,
           ),
         }
       : {}),
@@ -261,6 +266,8 @@ export interface ReadSource {
   shape(messages: SlackHistoryMessage[]): Promise<HistoryMessage[]>;
   writable: boolean;
   stopped(err: unknown): ReadStop | undefined;
+  /** Explicit-policy reads render policy file references. */
+  policyAttachments?: boolean;
 }
 
 /**
@@ -351,7 +358,7 @@ export async function readBounded(opts: ReadOptions, source: ReadSource): Promis
         if (scanned >= opts.maxScanned) { stopReason = 'scan_limit'; break pages; }
         const record = shaped.get(m);
         if (record) {
-          const returned = historyRecord(record);
+          const returned = historyRecord(record, source.policyAttachments);
           const bytes = Buffer.byteLength(toolResultJson(returned));
           if (skeleton + recordBytes + records.length + bytes > opts.maxBytes) {
             // Held back whole, and neither scanned nor matched here: the

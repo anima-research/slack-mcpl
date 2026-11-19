@@ -163,7 +163,8 @@ for (const user of ['U1', 'W1']) {
   for (const policyAllows of [false, true]) {
     for (const disableDms of [false, true]) {
       for (const dmUsers of [undefined, [], [user], ['UOTHER']]) {
-        test(`DM intersection: ${JSON.stringify({ user, policyAllows, disableDms, dmUsers })}`, async () => {
+        test(`DM intersection: ${JSON.stringify({ user, policyAllows, disableDms, dmUsers })}`, async (t) => {
+          t.mock.method(globalThis, 'fetch', async () => new Response('OK'));
           const f = accessFixture({ disableDms, dmUsers,
             config: { readJoinedChannels: true, writeChannels: ['C1'], dmUsers: policyAllows ? [user] : [] } });
           const allowed = policyAllows && !disableDms && (dmUsers === undefined || dmUsers.includes(user));
@@ -178,7 +179,7 @@ for (const user of ['U1', 'W1']) {
             () => f.adapter.sendMessage('D1', 'hi'),
             () => f.adapter.editMessage('D1', '1.0', 'hi'),
             () => f.adapter.deleteMessage('D1', '1.0'),
-            () => f.adapter.deleteFile('D1', 'F1'),
+            async () => { if (allowed) await f.adapter.uploadFile('D1', { filename: 'x', data: Buffer.from('x') }); await f.adapter.deleteFile('D1', 'F1'); },
             () => f.adapter.addReaction('D1', '1.0', 'eyes'),
           ];
           for (const operation of operations) {
@@ -268,17 +269,18 @@ test('legacy mode preserves calls, payloads, outputs and exact refusal text', as
   assert.deepEqual(h.calls, []);
 });
 
-test('policy attachment references are dormant no-ops until attachment enforcement, but legacy URLs remain unchanged', async () => {
-  const file = { name: 'note', mimetype: 'text/plain', url_private: 'https://files.slack.com/note' };
+test('policy attachment references carry conversation and file identifiers, but legacy URLs remain unchanged', async () => {
+  const file = { id: 'F1', mode: 'hosted', name: 'note', mimetype: 'text/plain', url_private: 'https://files.slack.com/note' };
   for (const legacy of [false, true]) {
     const f = accessFixture({ legacy });
     f.state.messages = [{ ts: '1.0', text: 'file', files: [file] }];
     const history = await f.adapter.fetchHistory('C1');
-    assert.deepEqual(history.messages[0].attachments, legacy ? [{ name: 'note', mimeType: 'text/plain', url: file.url_private }] : []);
+    assert.deepEqual(history.messages[0].attachments, legacy ? [{ name: 'note', mimeType: 'text/plain', url: file.url_private }] : [{ channelId: 'C1', fileId: 'F1', name: 'note', mimeType: 'text/plain', isImage: false }]);
     const delivered: Array<{ attachments: unknown[] }> = [];
     f.adapter.onMessage((m) => delivered.push(m));
     await f.emit({ type: 'message', channel: 'C1', user: 'U1', ts: '1.0', text: 'file', files: [file] });
-    assert.equal(delivered[0].attachments.length, legacy ? 1 : 0);
+    assert.equal(delivered[0].attachments.length, 1);
+    if (!legacy) assert.deepEqual(delivered[0].attachments[0], { channelId: 'C1', fileId: 'F1', name: 'note', mimeType: 'text/plain', isImage: false });
   }
 });
 
@@ -310,21 +312,26 @@ test('positive write/read paths make a fresh info call before each effect, prese
   await f.adapter.editMessage('C1', '1.0', 'new');
   await f.adapter.deleteMessage('C1', '1.0');
   await f.adapter.addReaction('C1', '1.0', ':eyes:');
-  await f.adapter.deleteFile('C1', 'F1');
+  await assert.rejects(f.adapter.deleteFile('C1', 'F1'), /recorded upload/);
   await f.adapter.readHistory('C1', {});
   await f.adapter.readThread('C1', '1.0', {});
   await f.adapter.fetchHistory('C1');
   await f.adapter.findUsers('human');
-  assert.deepEqual(f.methods(), ['info', 'post', 'info', 'edit', 'info', 'delete', 'info', 'react', 'info', 'deleteFile',
+  assert.deepEqual(f.methods(), ['info', 'post', 'info', 'edit', 'info', 'delete', 'info', 'react', 'info',
     'info', 'history', 'info', 'replies', 'info', 'history', 'users']);
   assert.deepEqual(f.calls[1].args, { channel: 'C1', text: 'hi', thread_ts: '1.0' });
 });
 
 
-test('policy upload gates the real byte transfer before sharing, without mocking fetch', async () => {
+test('policy upload gates the real byte transfer and rechecks before sharing', async (t) => {
   const endpoint = await uploadEndpoint();
   const f = accessFixture();
-  f.state.uploadUrl = `${endpoint.url}/policy-upload`;
+  f.state.uploadUrl = 'https://files.slack.com/upload/policy-upload';
+  const realFetch = globalThis.fetch;
+  t.mock.method(globalThis, 'fetch', async (url: string | URL | Request, init?: RequestInit) => {
+    assert.equal(url, f.state.uploadUrl);
+    return realFetch(`${endpoint.url}/policy-upload`, init);
+  });
   assert.deepEqual(await f.adapter.uploadFile('C1', { filename: 'x', data: Buffer.from('policy bytes') }), { fileId: 'F1', shareTs: undefined });
   assert.deepEqual(f.methods(), ['info', 'upload', 'info', 'complete']);
   assert.equal(endpoint.bytes.get('policy-upload')?.toString(), 'policy bytes');
@@ -613,10 +620,10 @@ const platformFailure = (error: string) => () =>
 for (const [cause, failure] of [
   ['HTTP 503', () => Object.assign(new Error('HTTP 503'), { code: ErrorCode.HTTPError, statusCode: 503 })],
   ...['internal_error', 'fatal_error', 'service_unavailable', 'request_timeout'].map((code) => [code, platformFailure(code)] as const),
-] as const) test(`a transient post-transfer admission failure (${cause}) asks for residue removal, not an immediate retry`, async () => {
-  const endpoint = await uploadEndpoint();
+] as const) test(`a transient post-transfer admission failure (${cause}) asks for residue removal, not an immediate retry`, async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => new Response('OK'));
   const f = accessFixture();
-  f.state.uploadUrl = `${endpoint.url}/transient-policy-upload`;
+  f.state.uploadUrl = 'https://files.slack.com/transient-policy-upload';
   const { explainSlackError } = await import('../src/slack-errors.js');
   let admissions = 0;
   f.web.conversations.info = async () => {
@@ -625,8 +632,8 @@ for (const [cause, failure] of [
   };
   await assert.rejects(f.adapter.uploadFile('C1', { filename: 'x', data: Buffer.from('bytes') }), (asyncError: unknown) => {
     const text = explainSlackError(asyncError, { tool: 'upload_file', args: { channelId: 'C1' } });
-    assert.match(text, /unshared file F1 may remain/);
-    assert.match(text, /inspect and remove the unshared file by ID before retrying/);
+    assert.match(text, /File "F1" may remain but was not shared/);
+    assert.match(text, /inspect and remove that file by ID/);
     assert.doesNotMatch(text, /Try again shortly/);
     return true;
   });
@@ -636,9 +643,10 @@ for (const [cause, failure] of [
 
 test('a post-transfer admission out of call time asks for residue removal, not a safe retry', async (t) => {
   virtualClock(t);
-  const endpoint = await uploadEndpoint();
+  let transferred = '';
+  t.mock.method(globalThis, 'fetch', async (_url: unknown, init?: RequestInit) => { transferred = Buffer.from(init!.body as Buffer).toString(); return new Response('OK'); });
   const f = accessFixture();
-  f.state.uploadUrl = `${endpoint.url}/deadline-policy-upload`;
+  f.state.uploadUrl = 'https://files.slack.com/deadline-policy-upload';
   const { explainSlackError } = await import('../src/slack-errors.js');
   // The real client refuses before sending, so this address is never reached.
   const client = new SlackWebClient(undefined, { ...SLACK_CLIENT_OPTIONS, slackApiUrl: 'http://127.0.0.1:1/' });
@@ -650,22 +658,23 @@ test('a post-transfer admission out of call time asks for residue removal, not a
   };
   await assert.rejects(withCallTime(clock.now(), () => f.adapter.uploadFile('C1', { filename: 'x', data: Buffer.from('bytes') })), (err: unknown) => {
     const text = explainSlackError(err, { tool: 'upload_file', args: { channelId: 'C1' } });
-    assert.match(text, /unshared file F1 may remain/);
+    assert.match(text, /File "F1" may remain but was not shared/);
     assert.match(text, /too few were left to send this request to Slack\. It wasn't sent\./);
-    assert.match(text, /inspect and remove the unshared file by ID before retrying/);
+    assert.match(text, /inspect and remove that file by ID/);
     assert.doesNotMatch(text, /calling again is safe/);
     return true;
   });
   assert.equal(admissions, 2);
-  assert.equal(endpoint.bytes.get('deadline-policy-upload')?.toString(), 'bytes');
+  assert.equal(transferred, 'bytes');
   assert.equal(f.methods().includes('complete'), false);
   await f.adapter.stop();
 });
 
-test('upload revocation after bytes prevents sharing', async () => {
-  const endpoint = await uploadEndpoint();
+test('upload revocation after bytes prevents sharing', async (t) => {
+  let transferred = '';
+  t.mock.method(globalThis, 'fetch', async (_url: unknown, init?: RequestInit) => { transferred = Buffer.from(init!.body as Buffer).toString(); return new Response('OK'); });
   const f = accessFixture();
-  f.state.uploadUrl = `${endpoint.url}/revoked-policy-upload`;
+  f.state.uploadUrl = 'https://files.slack.com/revoked-policy-upload';
   const { explainSlackError } = await import('../src/slack-errors.js');
   let admissions = 0;
   f.web.conversations.info = async () => {
@@ -676,12 +685,11 @@ test('upload revocation after bytes prevents sharing', async () => {
     assert.ok(asyncError instanceof SlackAccessDenied);
     const text = explainSlackError(asyncError, { tool: 'upload_file', args: { channelId: 'C1' } });
     assert.match(text, /not in conversation 'C1'/, 'the real admission failure is kept');
-    assert.match(text, /unshared file F1 may remain/);
-    assert.match(text, /inspect and remove the unshared file by ID/);
+    assert.match(text, /File "F1" may remain but was not shared/);
     return true;
   });
   assert.equal(admissions, 2);
-  assert.equal(endpoint.bytes.get('revoked-policy-upload')?.toString(), 'revoked bytes');
+  assert.equal(transferred, 'revoked bytes');
   assert.equal(f.methods().includes('complete'), false);
   f.web.conversations.info = async () => {
     if (++admissions === 4) throw Object.assign(new Error('http'), { code: ErrorCode.HTTPError, statusCode: 503 });
@@ -689,7 +697,7 @@ test('upload revocation after bytes prevents sharing', async () => {
   };
   await assert.rejects(f.adapter.uploadFile('C1', { filename: 'x', data: Buffer.from('again') }), err => {
     const text = explainSlackError(err, { tool: 'upload_file', args: { channelId: 'C1' } });
-    assert.match(text, /unshared file F1 may remain/);
+    assert.match(text, /File "F1" may remain but was not shared/);
     assert.match(text, /503/, 'the transient cause is not replaced by cleanup advice');
     return true;
   });
@@ -700,7 +708,7 @@ test('upload revocation after bytes prevents sharing', async () => {
     return { channel: joined() };
   };
   await assert.rejects(f.adapter.uploadFile('C1', { filename: 'x', data: Buffer.from('unknown refusal') }), err => {
-    assert.match(explainSlackError(err, { tool: 'upload_file', args: { channelId: 'C1' } }), /Nothing was shared; unshared file F1 may remain/);
+    assert.match(explainSlackError(err, { tool: 'upload_file', args: { channelId: 'C1' } }), /File "F1" may remain but was not shared/);
     return true;
   });
   assert.equal(f.methods().includes('complete'), false);
@@ -730,7 +738,7 @@ test('ambient admissions overlap behind an earlier addressed delivery', async (t
 });
 
 
-test('retryable ACK admission is retired after one direct and four timer-driven failures', async (t) => {
+test('retryable ACK admission is retired on the fifth failure: one immediate, four timer-driven', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const f = accessFixture({ ack: 'eyes' });
   await f.adapter.acknowledge('C1', '1.0');
@@ -779,12 +787,12 @@ test('listing vetoes excluded listed DM peers before metadata, but verifies allo
   assert.deepEqual(g.methods(), ['list', 'info']);
 });
 
-test('second upload admission explains the existing unshared file', async () => {
+test('second upload admission explains the existing unshared file', async (t) => {
   const { explainSlackError } = await import('../src/slack-errors.js');
-  const endpoint = await uploadEndpoint();
+  t.mock.method(globalThis, 'fetch', async () => new Response('OK'));
   for (const code of ['not_in_channel', 'http']) {
     const f = accessFixture();
-    f.state.uploadUrl = `${endpoint.url}/phase-${code}`;
+    f.state.uploadUrl = `https://files.slack.com/phase-${code}`;
     let count = 0;
     f.web.conversations.info = async () => {
       if (++count === 2) throw code === 'http'
@@ -794,7 +802,7 @@ test('second upload admission explains the existing unshared file', async () => 
     };
     await assert.rejects(f.adapter.uploadFile('C1', { filename: 'x', data: Buffer.from(code) }), err => {
       const explanation = explainSlackError(err, { tool: 'upload_file', args: { channelId: 'C1' } });
-      assert.match(explanation ?? '', /Nothing was shared; unshared file F1 may remain/);
+      assert.match(explanation ?? '', /(?:Nothing was shared; unshared file F1 may remain|File \"F1\" may remain but was not shared)/);
       assert.doesNotMatch(explanation ?? '', /Nothing was uploaded/);
       return true;
     });
@@ -1052,4 +1060,15 @@ test('a transient file-cleanup admission failure states its outcome once', async
   assert.ok(err);
   const text = explainSlackError(err, { tool: 'delete_file', args: { channelId: 'C1', fileId: 'F1' } });
   assert.equal(text.match(/Nothing was (?:deleted|done)/g)?.length, 1, text);
+});
+
+test('background registration names a malformed candidate as a local check, not a Slack failure', async () => {
+  const f = accessFixture();
+  f.state.listed = [{ id: 'bad' } as never, joined('C1')];
+  const listing = await f.adapter.listConversations(false, async () => {});
+  assert.deepEqual(listing.conversations.map(c => c.id), ['C1']);
+  const logged = (console.error as unknown as { mock: { calls: Array<{ arguments: unknown[] }> } }).mock.calls
+    .map(call => String(call.arguments[0])).filter(line => line.includes('Registration candidate'));
+  assert.deepEqual(logged, ['[slack-mcpl] Registration candidate unknown skipped: admission failed; count is incomplete: '
+    + 'No conversations were returned: malformed Slack listing candidate; retry once, then ask whoever runs this host to investigate']);
 });
