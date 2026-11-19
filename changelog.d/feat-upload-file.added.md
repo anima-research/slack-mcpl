@@ -26,5 +26,4 @@
   rolled back like a sent one's.
   **Operators:** the tool needs `files:write` on the bot token. After
   adding that scope, reinstall the app to the workspace through Slack's
-  OAuth flow so the installed token receives it; otherwise Slack refuses
-  uploads with `missing_scope`.
+  OAuth flow so the installed token receives it; otherwise legacy uploads receive Slack `missing_scope`; explicit policy refuses locally before requesting an upload.

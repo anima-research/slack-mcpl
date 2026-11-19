@@ -15,6 +15,8 @@ test('unset history accepts main-compatible null file IDs without changing metad
   const result = await fetchSlackHistory({ conversations: {
     history: async () => ({ messages: [legacyMessage] }),
   } }, { channel: 'C1', maxMessages: 10 });
-  assert.deepEqual(result.messages, [message]);
+  // Compare with an independent copy: the returned object may be the same input.
+  assert.deepEqual(result.messages, [{ ts: '1.0', text: 'legacy attachment',
+    files: [{ id: null, name: 'note.txt', mimetype: 'text/plain', url_private: 'https://files.slack.com/legacy' }] }]);
   assert.equal(result.truncated, false);
 });

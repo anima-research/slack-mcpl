@@ -81,7 +81,7 @@ test('server list/refresh report unavailable scopes and only probe auth.test', a
   await assert.rejects(h.host.sendRequest(method.CHANNELS_PUBLISH, {
     channelId: 'slack:C1', content: [{ type: 'text', text: 'hi' }],
   }), /scope/i);
-  // Both tools reached the scope probe; nothing else was asked.
+  // Aggregate only: registration also probes, so this does not prove each tool probed; nothing else was asked.
   assert.ok(f.calls.length >= 2, 'list and refresh each probed auth.test');
   assert.ok(f.calls.every(c => c.method === 'auth.test'));
 });
@@ -272,7 +272,7 @@ for (const destination of ['allowed', 'blocked', 'wrong peer', 'blocked user'] a
 test('list_channels and refresh_channels return admitted rows with an explicit incomplete notice when a candidate is rate-limited', async t => {
   const f = accessFixture(); t.after(() => f.adapter.stop());
   f.web.conversations.info = async (args: any) => {
-    if (args.channel === 'C1') throw Object.assign(new Error('limited'), { code: 'slack_webapi_rate_limited_error', retryAfter: 60 });
+    if (args.channel === 'C1') throw Object.assign(new Error('limited'), { code: 'slack_webapi_rate_limited_error', retryAfter: 45 });
     return { channel: joined(args.channel) };
   };
   const h = connectHost(new SlackMcplServer(f.adapter)); t.after(() => h.close());
@@ -284,12 +284,12 @@ test('list_channels and refresh_channels return admitted rows with an explicit i
   const listed = await call('list_channels');
   assert.notEqual(listed.isError, true);
   assert.match(listed.content[0].text, /"C0"/);
-  assert.match(listed.content.at(-1).text, /^Incomplete: candidate admission was rate-limited; .*Retry after 60 seconds/);
+  assert.match(listed.content.at(-1).text, /^Incomplete: candidate admission was rate-limited; .*Retry after 45 seconds/);
   const refreshed = await call('refresh_channels');
   assert.notEqual(refreshed.isError, true);
-  // Slack's 60-second Retry-After now holds the shared pacer past this call's
+  // Slack's 45-second Retry-After now holds the shared pacer past this call's
   // request deadline: the scan stops at once and reports that wait, not its deadline.
-  assert.match(refreshed.content[0].text, /Incomplete: candidate admission was rate-limited; .*Retry after 60 seconds/);
+  assert.match(refreshed.content[0].text, /Incomplete: candidate admission was rate-limited; .*Retry after 45 seconds/);
   assert.doesNotMatch(refreshed.content[0].text, /deadline left no room/);
   assert.doesNotMatch(refreshed.content[0].text, /already has every one/);
 });
@@ -321,7 +321,7 @@ test('with a policy, channels/open says refresh_channels registers only admitted
   await initialize(h, true);
   await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
   await assert.rejects(h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'slack:C9', type: 'slack', address: {} }),
-    (err: { message?: string }) => /refresh_channels registers the conversations this bot is in that the access policy admits, within its listing bounds/.test(String(err.message)));
+    (err: { message?: string }) => /refresh_channels registers only conversations admitted by this host’s access policy and Slack scopes, within its listing bounds/.test(String(err.message)));
 });
 
 test('send_dm states one outcome when post-open admission is rate-limited', async t => {
@@ -343,4 +343,19 @@ test('a policy host failure summary keeps only the code and says how to recover 
   const text = hostFailureSummary(Object.assign(new Error('agent said: secret text'), { code: -32000 }));
   assert.match(text, /^host request failed \(code -32000\); .*check the host's logs, then recover it with fetch_history or fetch_thread$/);
   assert.doesNotMatch(text, /secret/);
+});
+
+test('scope-evidence and frozen denials explain with one outcome and one remedy', async () => {
+  const { explainSlackError } = await import('../src/slack-errors.js');
+  const { SlackScopeEvidenceError, SlackAccessDenied, withAccessContext } = await import('../src/access-policy.js');
+  const scope = await withAccessContext('No users were returned', async () => {
+    throw new SlackScopeEvidenceError('Slack scope metadata is unavailable; ask whoever runs this host to refresh reported permissions or restart before retrying');
+  }).catch(err => err);
+  const text = explainSlackError(scope, { tool: 'find_user', args: { query: 'x' } });
+  assert.match(text, /^No users were returned: Slack scope metadata is unavailable/);
+  assert.doesNotMatch(text, /No users were listed/);
+  assert.equal(text.match(/refresh/g)?.length, 1);
+  const frozen = Object.freeze(new SlackAccessDenied('Writing is not allowed'));
+  const denied = await withAccessContext('Nothing was posted', async () => { throw frozen; }).catch(err => err);
+  assert.match(explainSlackError(denied, { tool: 'send_message', args: { channelId: 'C1' } }), /^Nothing was posted: Writing is not allowed\. Retrying unchanged will not help/);
 });

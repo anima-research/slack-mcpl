@@ -1,3 +1,5 @@
+import { parseAccessPolicy, type SlackAccessPolicyConfig } from './access-policy.js';
+
 /** Parse an operator switch. An absent value is off; a present value must
  *  say yes or no so a broken environment template cannot disable a guard. */
 export function booleanFlag(name: string, raw: string | undefined): boolean {
@@ -9,6 +11,7 @@ export function booleanFlag(name: string, raw: string | undefined): boolean {
 }
 
 export interface StartupSettings {
+  accessPolicy?: SlackAccessPolicyConfig;
   useStdio: boolean;
   tcpPort: number | undefined;
   botToken: string;
@@ -33,6 +36,16 @@ export function startupSettings(
   const appToken = env.SLACK_APP_TOKEN;
   if (!botToken || !appToken) return { refusal: 'SLACK_BOT_TOKEN and SLACK_APP_TOKEN environment variables are required' };
 
+  let accessPolicy: SlackAccessPolicyConfig | undefined;
+  if (env.SLACK_ACCESS_POLICY !== undefined) {
+    let value: unknown;
+    try { value = JSON.parse(env.SLACK_ACCESS_POLICY); }
+    catch { return { refusal: 'SLACK_ACCESS_POLICY must be valid JSON; value omitted' }; }
+    try { accessPolicy = parseAccessPolicy(value); }
+    catch (err) {
+      return { refusal: `SLACK_ACCESS_POLICY is invalid: ${policyRefusalReason(err instanceof Error ? err.message : '', value)}; value omitted` };
+    }
+  }
   const list = (raw: string | undefined) => raw?.split(',').map((s) => s.trim()).filter(Boolean);
   const dmUsers = list(env.SLACK_DM_USERS);
   if (env.SLACK_DM_USERS !== undefined && dmUsers!.length === 0) {
@@ -44,7 +57,7 @@ export function startupSettings(
   }
   const sendChannels = list(env.SLACK_SEND_CHANNELS);
   if (env.SLACK_SEND_CHANNELS !== undefined && sendChannels!.length === 0) {
-    return { refusal: 'SLACK_SEND_CHANNELS is set but names no conversation; unset it to allow writing anywhere' };
+    return { refusal: 'SLACK_SEND_CHANNELS is set but names no conversation; unset it to ' + (accessPolicy ? 'remove this additional write restriction' : 'allow writing anywhere') };
   }
   let disableDms: boolean;
   let subscribeMemberChannels: boolean;
@@ -52,10 +65,34 @@ export function startupSettings(
     disableDms = booleanFlag('SLACK_DISABLE_DMS', env.SLACK_DISABLE_DMS);
     subscribeMemberChannels = booleanFlag('SLACK_SUBSCRIBE_MEMBER_CHANNELS', env.SLACK_SUBSCRIBE_MEMBER_CHANNELS);
   } catch (err) {
-    return { refusal: (err as Error).message };
+    // With a policy, refusals never echo values (a pasted credential would otherwise reach stderr).
+    return { refusal: accessPolicy ? (err as Error).message.replace(/, got .*$/s, '; value omitted') : (err as Error).message };
   }
   const ackReaction = env.SLACK_ACK_REACTION?.replace(/:/g, '').trim() || undefined;
   return {
-    settings: { useStdio, tcpPort, botToken, appToken, dmUsers, sendChannels, disableDms, subscribeMemberChannels, ackReaction },
+    settings: { useStdio, tcpPort, botToken, appToken, dmUsers, sendChannels, disableDms, subscribeMemberChannels, ackReaction,
+      ...(accessPolicy ? { accessPolicy } : {}) },
   };
+}
+
+/** The parser's reason without the rejected value: the field and what it must
+ *  be, or the missing and unknown key names. Values are never echoed. */
+function policyRefusalReason(message: string, value: unknown): string {
+  const m = message.replace(/^Invalid Slack access policy:?\s*/, '');
+  const keys = /^missing keys (.*?); unknown keys /.exec(m);
+  if (keys) {
+    // Unknown key names are never echoed (one could be a pasted credential);
+    // a known key with the wrong case is named by its correct spelling.
+    const known = ['readJoinedChannels', 'writeChannels', 'dmUsers', 'groupDms'];
+    const unknown = value !== null && typeof value === 'object' ? Object.keys(value).filter(key => !known.includes(key)) : [];
+    const cased = known.filter(name => unknown.some(key => key.toLowerCase() === name.toLowerCase()));
+    return `missing keys ${keys[1]}; ${unknown.length} unknown key${unknown.length === 1 ? '' : 's'}` +
+      (cased.length ? ` (check the spelling of ${cased.join(', ')})` : '');
+  }
+  const entry = /^(readJoinedChannels|writeChannels|dmUsers|groupDms)\[(\d+)\] rejected .*; expected (.+)$/.exec(m);
+  if (entry) return `${entry[1]}[${entry[2]}] must be ${entry[3]}`;
+  const field = /^(readJoinedChannels|writeChannels|dmUsers|groupDms) (must .+)$/.exec(m);
+  if (field) return `${field[1]} ${field[2]}`;
+  if (/^readJoinedChannels:false requires /.test(m)) return m;
+  return 'expected a JSON object with readJoinedChannels, writeChannels and dmUsers (and optional groupDms)';
 }

@@ -1,4 +1,5 @@
-import test, { type TestContext } from 'node:test';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import test, { type TestContext, type TestOptions } from 'node:test';
 import { SlackAccessPolicy, parseAccessPolicy, type AccessConversation, type SlackAccessPolicyConfig } from '../src/access-policy.js';
 import { SlackAdapter, type SlackSocketLike, type SlackWebLike } from '../src/slack-adapter.js';
 
@@ -8,10 +9,7 @@ export const joined = (id = 'C1'): AccessConversation =>
   ({ id, is_im: false, is_mpim: false, is_private: false, is_member: true });
 export const accessConfig: SlackAccessPolicyConfig = { readJoinedChannels: true, writeChannels: ['C1', 'G1'], dmUsers: ['U1', 'W1'] };
 
-/** Deliberately test-local: this change provides no supported way to install policy. */
-export function installPolicy(adapter: SlackAdapter, config = accessConfig): void {
-  (adapter as unknown as { accessPolicy: SlackAccessPolicy }).accessPolicy = new SlackAccessPolicy(parseAccessPolicy(config));
-}
+export const fixturePolicy = (config = accessConfig) => new SlackAccessPolicy(parseAccessPolicy(config));
 
 export function accessFixture(options: { legacy?: boolean; scopes?: string[]; config?: SlackAccessPolicyConfig;
   sendChannels?: string[]; disableDms?: boolean; dmUsers?: string[]; ack?: string } = {}) {
@@ -38,8 +36,10 @@ export function accessFixture(options: { legacy?: boolean; scopes?: string[]; co
       // As Slack does, a listing returns only the conversation types it asked for.
       list: record('list', (args) => {
         const types = (args as { types?: unknown } | undefined)?.types;
-        const kind = (c: AccessConversation) => c?.is_im ? 'im' : c?.is_mpim ? 'mpim' : c?.is_private ? 'private_channel' : 'public_channel';
-        return { channels: typeof types === 'string' ? state.listed.filter(c => types.split(',').includes(kind(c))) : state.listed };
+        // A row with incomplete kind flags may be any kind its ID allows.
+        const kinds = (c: AccessConversation) => c?.is_im ? ['im'] : c?.is_mpim ? ['mpim'] : c?.is_private ? ['private_channel']
+          : c?.is_mpim === undefined && c?.id?.startsWith('G') ? ['mpim', 'private_channel', 'public_channel'] : ['public_channel'];
+        return { channels: typeof types === 'string' ? state.listed.filter(c => kinds(c).some(k => types.split(',').includes(k))) : state.listed };
       }),
       open: record('open', () => ({ channel: { id: state.openId } })),
       history: record('history', () => ({ messages: state.messages, has_more: state.more })),
@@ -55,8 +55,9 @@ export function accessFixture(options: { legacy?: boolean; scopes?: string[]; co
   let message: Parameters<SlackSocketLike['on']>[1];
   const socket: SlackSocketLike = { on(_event, handler) { message = handler; }, async start() {}, async disconnect() {} };
   const adapter = new SlackAdapter(web, socket, 'UBOT', 'test', options.dmUsers, options.sendChannels,
-    options.disableDms, options.ack, options.scopes ?? accessScopes);
-  if (!options.legacy) installPolicy(adapter, options.config);
+    options.disableDms, options.ack, options.scopes ?? accessScopes,
+    options.legacy ? undefined : fixturePolicy(options.config));
+  ownAdapter(adapter);
   return { adapter, web, calls, state, methods: () => calls.map((c) => c.method),
     async emit(event: Record<string, unknown>) {
       let acked = false;
@@ -67,10 +68,38 @@ export function accessFixture(options: { legacy?: boolean; scopes?: string[]; co
   };
 }
 
-/** One context-owned console mock per test, restored before unrelated tests run. */
+/** The adapters built while each owning test runs. */
+const owners = new AsyncLocalStorage<Set<SlackAdapter>>();
+
+/** Hands an adapter to the test now running, which stops it when it ends, so
+ *  no policy adapter's 60-second admission-log flush timer outlives the test
+ *  that built it or writes into a later test's console.error mock. Outside an
+ *  ownedTest or accessTest it throws instead of leaving the adapter live. */
+export function ownAdapter<T extends SlackAdapter>(adapter: T): T {
+  const owned = owners.getStore();
+  if (!owned) throw new Error('A test adapter was built outside ownedTest or accessTest, so no test would stop it');
+  owned.add(adapter);
+  return adapter;
+}
+
+/** node:test's test, owning (and stopping when it ends) every adapter built while it runs. */
+export function ownedTest(name: string, run: (t: TestContext) => unknown): void;
+export function ownedTest(name: string, options: TestOptions, run: (t: TestContext) => unknown): void;
+export function ownedTest(name: string, ...rest: [(t: TestContext) => unknown] | [TestOptions, (t: TestContext) => unknown]): void {
+  const [options, run] = rest.length === 1 ? [{}, rest[0]] : rest;
+  test(name, options, async (t) => {
+    const owned = new Set<SlackAdapter>();
+    t.after(async () => {
+      for (const adapter of owned) await adapter.stop().catch(() => {});
+    });
+    await owners.run(owned, () => run(t));
+  });
+}
+
+/** An ownedTest with one context-owned console mock, restored before unrelated tests run. */
 export function accessTest(name: string, run: (t: TestContext) => unknown): void {
-  test(name, async (t) => {
+  ownedTest(name, (t) => {
     t.mock.method(console, 'error', () => {});
-    await run(t);
+    return run(t);
   });
 }

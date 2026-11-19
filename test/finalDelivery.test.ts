@@ -109,7 +109,9 @@ for (const member of [false, undefined]) test(`fresh final metadata distinguishe
   f.state.conversation = member === false
     ? { id: 'C1', is_im: false, is_mpim: false, is_private: false, is_member: false }
     : undefined;
+  const before = f.methods().length;
   await f.deliver(message());
+  assert.deepEqual(f.methods().slice(before), ['info'], 'the final lookup was reached');
   assert.equal(f.h.hostSaw.filter(r => r.method === method.PUSH_EVENT).length, 0);
   assert.deepEqual(clears, ['1.0']);
 });
@@ -146,10 +148,11 @@ for (const code of ['token_expired', 'not_authed', 'ekm_access_denied', 'channel
   t.mock.method(f.adapter, 'acknowledge', async () => {});
   t.mock.method(f.adapter, 'clearAck', async (_c: string, id: string) => { clears.push(id); });
   t.mock.method(f.adapter, 'fetchHistory', async () => ({ messages: [] }));
-  t.mock.method(f.adapter, 'getConversationMeta', async () => {
+  const final = t.mock.method(f.adapter, 'getConversationMeta', async () => {
     throw Object.assign(new Error(code), { code: 'slack_webapi_platform_error', data: { error: code } });
   });
   await f.deliver(message());
+  assert.equal(final.mock.callCount(), 1, 'the final lookup was reached');
   assert.equal(f.h.hostSaw.filter(r => r.method === method.PUSH_EVENT).length, 0);
   assert.deepEqual(clears, ['1.0']);
 });
@@ -262,8 +265,9 @@ for (const result of [undefined, null]) test(`missing channel final result drops
   const clears: string[] = [];
   t.mock.method(f.adapter, 'fetchHistory', async () => ({ messages: [] }));
   t.mock.method(f.adapter, 'clearAck', async (_c: string, id: string) => { clears.push(id); });
-  t.mock.method(f.adapter, 'getConversationMeta', async () => result as any);
+  const final = t.mock.method(f.adapter, 'getConversationMeta', async () => result as any);
   await f.deliver(message());
+  assert.equal(final.mock.callCount(), 1, 'the final lookup was reached');
   assert.deepEqual(clears, ['1.0']);
   assert.equal(f.h.hostSaw.filter(r => r.method === method.PUSH_EVENT).length, 0);
 });
@@ -278,7 +282,9 @@ test('scope withdrawal reported by an earlier response vetoes a later real 429 f
   f.state.infoScopes = ['channels:read'];
   await f.adapter.getConversationMeta('C1');
   f.state.infoError = Object.assign(new Error('limited'), { code: 'slack_webapi_rate_limited_error', retryAfter: 20 });
+  f.calls.length = 0;
   await f.deliver(message());
+  assert.ok(f.methods().includes('info'), 'the final lookup reached its 429');
   assert.equal(f.h.hostSaw.filter(r => r.method === method.PUSH_EVENT).length, 0);
   assert.deepEqual(clears, ['1.0']);
 });

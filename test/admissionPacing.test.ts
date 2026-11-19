@@ -1,7 +1,8 @@
-import test from 'node:test';
 import assert from 'node:assert/strict';
 import { clock } from '../src/clock.js';
-import { accessFixture, joined } from './adapterAccessFixture.js';
+import { SlackAccessDenied } from '../src/access-policy.js';
+import type { SlackAdapter } from '../src/slack-adapter.js';
+import { ownedTest as test, accessFixture, joined } from './adapterAccessFixture.js';
 
 // Timers stay pending until explicitly released; time alone cannot start a call.
 function controlledClock(t: import('node:test').TestContext) {
@@ -325,6 +326,7 @@ async function until(check: () => boolean): Promise<void> {
 }
 
 for (const phase of ['pacing', 'retry'] as const) test(`stop wakes a pending ${phase} sleep and retires queued work`, { timeout: 5000 }, async t => {
+  t.mock.method(Math, 'random', () => 0);
   const time = controlledClock(t);
   const errors = t.mock.method(console, 'error', () => {});
   const f = accessFixture();
@@ -333,12 +335,12 @@ for (const phase of ['pacing', 'retry'] as const) test(`stop wakes a pending ${p
   f.adapter.onMessage(msg => { received.push(msg.id); });
   f.web.conversations.info = async ({ channel }) => {
     starts.push(channel);
-    if (phase === 'retry') throw Object.assign(new Error('limited'), { code: 'slack_webapi_rate_limited_error', retryAfter: 60 });
+    if (phase === 'retry') throw Object.assign(new Error('limited'), { code: 'slack_webapi_rate_limited_error', retryAfter: 6 });
     return { channel: joined(channel) };
   };
   if (phase === 'pacing') await f.emit(event('C0'));
   const pending = [f.emit(event('C1')), f.emit(event('C1', '<@UBOT> queued', '2.0'))];
-  await until(() => time.timers.some(timer => timer.due === (phase === 'retry' ? 60_000 : 1200)));
+  await until(() => time.timers.some(timer => timer.due === (phase === 'retry' ? 6000 : 1200)));
   assert.deepEqual(starts, phase === 'retry' ? ['C1'] : ['C0']);
   assert.ok((f.adapter as any).policyTurns.get('C1').length > 0, 'second event is queued');
   const before = starts.length;
@@ -408,4 +410,50 @@ test('direct foreground listings outside a host call are not evicted as ambient 
   await f.adapter.stop();
   time.advance(1e9); time.release();
   await Promise.allSettled(listings);
+});
+
+test('activation local veto retires turns before preparation but preserves denial accounting', async t => {
+  t.mock.method(console, 'error', () => {});
+  const f = accessFixture({ config: { readJoinedChannels: false, writeChannels: [], dmUsers: [] } });
+  const internal = f.adapter as unknown as {
+    policyTurns: Map<string, unknown[]>;
+    admissionFailures: Map<string, { count: number }>;
+    settlePolicyEvent: (event: unknown) => Promise<unknown>;
+  };
+  const prepare = t.mock.method(internal, 'settlePolicyEvent');
+  await f.emit(event('C1'));
+  await f.emit(event('D1'));
+  assert.equal(internal.policyTurns.size, 0);
+  assert.equal(prepare.mock.callCount(), 0);
+  assert.equal([...internal.admissionFailures.values()].reduce((sum, row) => sum + row.count, 0), 2);
+  await f.adapter.stop();
+});
+
+// The test that builds an adapter stops it: its 60-second admission-log flush
+// must not outlive that test or wait for a later accessTest to stop it.
+let builtByEarlierTest: SlackAdapter | undefined;
+test('a denied listing arms the admission-log flush while its own test runs', async t => {
+  t.mock.method(console, 'error', () => {});
+  const f = accessFixture();
+  f.state.listed = [joined()];
+  f.state.infoError = new SlackAccessDenied('denied');
+  assert.deepEqual((await f.adapter.listConversations()).conversations, []);
+  assert.ok((f.adapter as unknown as { admissionLogTimer?: unknown }).admissionLogTimer, 'the flush is pending while the test runs');
+  builtByEarlierTest = f.adapter;
+});
+
+test('the owning test stopped its adapter, so no admission-log flush is left pending', () => {
+  const adapter = builtByEarlierTest as unknown as { admissionLogTimer?: unknown; stopping: boolean };
+  assert.equal(adapter.stopping, true);
+  assert.equal(adapter.admissionLogTimer, undefined);
+});
+
+test('a Retry-After too large for milliseconds does not hold admission forever', async t => {
+  controlledClock(t);
+  t.mock.method(console, 'error', () => {});
+  const f = accessFixture(); t.after(() => f.adapter.stop());
+  (f.adapter as any).holdAdmissions({ seconds: 1e306, why: 'limited' });
+  assert.ok(Number.isFinite((f.adapter as any).nextEventAdmissionAt), 'no Infinity deadline');
+  (f.adapter as any).holdAdmissions({ seconds: 30, why: 'limited' });
+  assert.equal((f.adapter as any).nextEventAdmissionAt, 30_000);
 });

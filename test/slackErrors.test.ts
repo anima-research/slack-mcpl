@@ -6,6 +6,8 @@
  * own shape (`code`, Slack's answer in `data`, `retryAfter`, `statusCode`).
  * Named transport-code variants below are constructed locally, not produced
  * by a WebClient exchange.
+ * Policy and caller-input cases also construct local errors; those are not
+ * evidence of a WebClient exchange.
  */
 
 import { test, before, after } from 'node:test';
@@ -87,7 +89,7 @@ test('a value is named exactly as the call was given it, whitespace included', a
 /** Every call whose Slack errors reach the explainer: what its refusal says
  *  didn't happen, and whether it writes, so that Slack's own failure leaves
  *  its outcome unknown. The tools that call no Slack Web API method are
- *  listed apart: fetch_attachment downloads with its own fetch, whose texts
+ *  listed apart: legacy fetch_attachment uses only fetch; policy mode also calls files.info. Texts
  *  for a download out of its call's time and one that times out are tested
  *  in attachmentDownload.test.ts, and the subscription tools keep local
  *  state. */
@@ -108,7 +110,7 @@ const CALLS: Array<[tool: string, lead: string, writes: boolean]> = [
 ];
 const NO_SLACK_CALLS = ['fetch_attachment', 'subscribe_channel', 'unsubscribe_channel', 'list_subscriptions'];
 
-test('every tool is either explained, with its lead and whether it writes, or calls no Slack method', () => {
+test('every legacy tool is either explained, with its lead and whether it writes, or calls no Slack method', () => {
   const listed = toolDefinitions.map((t) => t.name).sort();
   const covered = [...CALLS.map(([tool]) => tool).filter((t) => t !== 'channels/publish'), ...NO_SLACK_CALLS].sort();
   assert.deepEqual(listed, covered, 'a new tool needs its place here, and in NOT_DONE and WRITES if it calls Slack');
@@ -725,4 +727,62 @@ test('a reaction already there answers as a success that says nothing changed', 
   })) as { isError?: boolean };
   assert.equal(refused.isError, true);
   await h.close();
+});
+
+test('agent-facing missing permission uses a real contextual policy refusal', async () => {
+  const { SlackAccessPolicy, withAccessContext } = await import('../src/access-policy.js');
+  const policy = new SlackAccessPolicy({ readJoinedChannels: true, writeChannels: [], dmUsers: [] });
+  let failure: unknown;
+  try { await withAccessContext('No users were returned', async () => policy.requireScope([], 'users:read')); }
+  catch (err) { failure = err; }
+  const text = explainSlackError(failure, { tool: 'find_user', args: { query: 'human' } });
+  assert.equal(text, 'No users were returned: The required Slack permission users:read is not granted. Retrying unchanged will not help; ask whoever runs this host to check access for this operation.');
+});
+
+test('unknown pre-write Slack refusal does not invent an authorization diagnosis', async t => {
+  const local = await fakeSlackApi(); t.after(() => local.close());
+  local.answerFor('conversations.info', { body: { ok: false, error: 'new_server_failure' } });
+  const web = new SlackWebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: local.url });
+  let failure: unknown;
+  try { await web.conversations.info({ channel: 'C1' }); } catch (err) { failure = err; }
+  assert.ok(failure);
+  const text = explainSlackError(failure, { tool: 'send_message', args: { channelId: 'C1' } });
+  assert.equal(text, 'An API error occurred: new_server_failure');
+  assert.doesNotMatch(text, /authorization failed/);
+});
+
+
+test('legacy upload ticket unknown refusal preserves main error text exactly', async t => {
+  const local = await fakeSlackApi(); t.after(() => local.close());
+  local.answerFor('files.getUploadURLExternal', { body: { ok: false, error: 'new_server_failure' } });
+  const web = new SlackWebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: local.url });
+  const socket: SlackSocketLike = { on() {}, async start() {}, async disconnect() {} };
+  const adapter = new SlackAdapter(web as unknown as SlackWebLike, socket, 'UBOT', 'test');
+  let failure: unknown;
+  try { await adapter.uploadFile('C1', { filename: 'probe.txt', data: Buffer.from('probe') }); }
+  catch (err) { failure = err; }
+  assert.ok(failure instanceof Error);
+  assert.equal(failure.message, 'An API error occurred: new_server_failure');
+  assert.equal(explainSlackError(failure, { tool: 'upload_file', args: { channelId: 'C1' } }), failure.message);
+});
+
+
+test('legacy malformed send_dm argument keeps the underlying pre-write error without assigning responsibility', async t => {
+  const local = await fakeSlackApi(); t.after(() => local.close());
+  const web = new SlackWebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: local.url });
+  const socket: SlackSocketLike = { on() {}, async start() {}, async disconnect() {} };
+  const adapter = new SlackAdapter(web as unknown as SlackWebLike, socket, 'UBOT', 'test');
+  let failure: unknown;
+  try { await adapter.sendDM('U\ud800', 'hello'); } catch (err) { failure = err; }
+  assert.ok(failure instanceof Error);
+  assert.equal(explainSlackError(failure, { tool: 'send_dm', args: { userId: 'U\ud800' } }), failure.message);
+  assert.doesNotMatch(explainSlackError(failure, { tool: 'send_dm', args: {} }), /Ask whoever runs this host/);
+});
+
+
+test('caller-controlled scope and ID wording in legacy refusals is not a policy diagnosis', () => {
+  for (const value of ['Slack scope metadata is unavailable', 'Invalid Slack conversation ID C1', 'Invalid Slack user ID U1']) {
+    const failure = new Error(`Nothing was posted: this bot may write only to C1, and ${value} is not one of them`);
+    assert.equal(explainSlackError(failure, { tool: 'send_message', args: { channelId: value } }), failure.message);
+  }
 });

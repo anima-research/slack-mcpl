@@ -266,12 +266,24 @@ export const toolDefinitions: ToolDefinition[] = [
 
 /** Keep the legacy tools/list surface unchanged when policy is absent. */
 export function policyListingTool(tool: ToolDefinition, policy: boolean): ToolDefinition {
+  if (policy && tool.name === 'refresh_channels') return { ...tool, description: 'Re-scan conversations this bot can currently access and register newly discovered eligible ones. Access restrictions can leave conversations out. Each eligible candidate needs a serial fresh metadata request, released through the inbound admission pacer (at least 1.2 seconds apart, shared with inbound events). A rate-limited candidate check, or a next candidate whose pacing slot or request no longer fits the 25-second call, ends the scan with the rows already admitted and an explicit incomplete notice; with fast responses and no other traffic about 13 candidates fit one call, and a new call starts over. A rate-limited conversations.list page fails the call. Background registration also shares inbound pacing, has no call deadline, and announces only after its scan finishes.' };
   if (!policy || tool.name !== 'list_channels') return tool;
   return {
     ...tool,
-    description: 'List freshly admitted joined public/private channels, allowed one-to-one DMs and named group DMs. Missing read scopes can omit conversation types; the result reports those gaps. includeNonMember has no effect in policy mode: unjoined public channels are never listed.',
+    description: 'List only freshly admitted policy conversations. includeNonMember has no effect in policy mode: unjoined public channels are never listed. Each eligible candidate needs a serial fresh metadata request, released through the inbound admission pacer (at least 1.2 seconds apart, shared with inbound events). A rate-limited candidate check, or a next candidate whose pacing slot or request no longer fits the 25-second call, ends the scan with the rows already admitted and an explicit incomplete notice; with fast responses and no other traffic about 13 candidates fit one call, and a new call starts over. A rate-limited conversations.list page fails the call.',
     inputSchema: { ...tool.inputSchema, properties: { ...tool.inputSchema.properties,
       includeNonMember: { type: 'boolean', description: 'Has no effect in policy mode; unjoined public channels are never listed.' },
     } },
   };
+}
+
+/** Subscription qualifiers apply only to the explicit policy surface. */
+export function policySubscriptionTool(tool: ToolDefinition, policy: boolean): ToolDefinition {
+  if (!policy) return tool;
+  if (tool.name === 'subscribe_channel') return { ...tool, description: tool.description!.replace(
+    'Direct mentions and DMs always come through regardless of subscriptions;',
+    'Direct mentions and DMs bypass subscriptions but remain subject to access admission and successful delivery;') };
+  if (tool.name === 'unsubscribe_channel') return { ...tool, description: tool.description!.replace(
+    'from there will still arrive.', 'from there remain eligible, subject to access admission and successful delivery.') };
+  return tool;
 }
