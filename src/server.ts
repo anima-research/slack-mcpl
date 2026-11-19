@@ -1,3 +1,4 @@
+import { SlackAccessDenied } from './access-policy.js';
 /**
  * SlackMcplServer — main MCPL server orchestrator.
  *
@@ -47,10 +48,12 @@ import {
   STATUS_REFRESH_MS,
   assertRequestFits,
   fileLeftByUpload,
+  failedAccessAdmission,
   leftOutNote,
   outsideCallTime,
   postLeftBy,
   refusedForGood,
+  policyFailureSummary,
   slackRefusal,
   withCallTime,
   type SlackAdapter,
@@ -64,7 +67,7 @@ import { ChannelManager, mcplChannelId, parseMcplChannelId, toDescriptor } from 
 import { StateTracker, type UploadedFile } from './state.js';
 import { CapabilityGrant } from './grant.js';
 import { McplRpcError, capabilityDenied } from './errors.js';
-import { explainSlackError } from './slack-errors.js';
+import { explainSlackError, isTransientSlackFailure } from './slack-errors.js';
 import { channelShown, mimeShown, nameShown, quotedLabel, senderText, toolResultJson, urlShown } from './framing.js';
 import { CHANNEL_IDS, NOTHING_RETURNED, PARENT_IDS, refuseUnknownArguments } from './history-read.js';
 import {
@@ -397,6 +400,7 @@ export class SlackMcplServer {
    *  during a connection, as a grant can. */
   private offeredTools() {
     return toolDefinitions.filter((t) =>
+      (t.name !== 'fetch_attachment' || !this.slack.hasAccessPolicy) &&
       (t.name !== 'send_dm' || this.slack.dmsWritable) && (t.name !== 'refresh_channels' || this.mcplEnabled));
   }
 
@@ -462,7 +466,7 @@ export class SlackMcplServer {
             // A registration that throws past its own catches is logged here,
             // so it doesn't end the process.
             void outsideCallTime(() => this.registerSlackChannels())
-              .catch((err) => console.error('[slack-mcpl] Channel registration failed:', err));
+              .catch((err) => console.error('[slack-mcpl] Channel registration failed:', this.slack.hasAccessPolicy ? policyFailureSummary(err) : err));
           }
           break;
         }
@@ -823,7 +827,7 @@ export class SlackMcplServer {
           await this.slack.addReaction(channelId, messageId, emoji);
         } catch (err) {
           // The reaction the call asks for is there, which is its intent.
-          if (slackRefusal(err) === 'already_reacted') {
+          if (!failedAccessAdmission(err) && slackRefusal(err) === 'already_reacted') {
             return `Nothing changed: message ${messageId} already has this bot's ${emoji} reaction.`;
           }
           throw err;
@@ -848,7 +852,7 @@ export class SlackMcplServer {
         try {
           await this.slack.deleteMessage(channelId, messageId);
         } catch (err) {
-          if (slackRefusal(err) === 'message_not_found') this.stateTracker.forgetSent(channelId, messageId);
+          if (!failedAccessAdmission(err) && !(err instanceof SlackAccessDenied) && slackRefusal(err) === 'message_not_found') this.stateTracker.forgetSent(channelId, messageId);
           throw err;
         }
         this.stateTracker.forgetSent(channelId, messageId);
@@ -916,6 +920,7 @@ export class SlackMcplServer {
       }
 
       case 'fetch_attachment': {
+        if (this.slack.hasAccessPolicy) throw new Error('Nothing was fetched: attachments are disabled under the Slack access policy on this version of the host. Retrying will not help; ask whoever runs this host about support for conversation-bound attachments.');
         // The bot token goes only to files.slack.com, never to workspace hosts:
         // parseSlackAttachmentUrl checks the url given, and fetch() drops
         // Authorization on a redirect to another origin (fetchAttachment.test.ts).
@@ -1120,7 +1125,7 @@ export class SlackMcplServer {
     }
 
     const generation = ++this.registrationGeneration;
-    const isCurrent = () => this.conn === conn && !conn.isClosed &&
+    const isCurrent = () => (!this.slack.hasAccessPolicy || !this.slack.isStopping) && this.conn === conn && !conn.isClosed &&
       this.registrationGeneration === generation && this.grant.has('channels.register');
     // Until it ends, however it ends, a refresh_channels answers at once.
     // A registration that ends clears only its own record, not a later
@@ -1140,15 +1145,20 @@ export class SlackMcplServer {
       // answers at once), so a request Slack rate-limits is waited out, as
       // Slack asks, and one that fails in a way that can pass is asked again
       // after a wait, and the listing goes on from there.
-      const { conversations: convs } = await this.slack.listConversations(false, (wait, inARow) =>
-        this.waitToAskAgain(wait, inARow, isCurrent));
+      const waitOut = (wait: SlackWait, inARow: number) => this.waitToAskAgain(wait, inARow, isCurrent);
+      const listing = this.slack.hasAccessPolicy
+        ? await this.slack.listConversations(false, waitOut, isCurrent)
+        : await this.slack.listConversations(false, waitOut);
+      const { conversations: convs, admissionFailures } = listing;
+      if (this.slack.hasAccessPolicy && !isCurrent()) return;
+      if (admissionFailures) console.error(`[slack-mcpl] Conversation registration incomplete: ${admissionFailures} candidate(s) skipped after failed admission; enumerated ${convs.length} eligible conversations. refresh_channels can retry skipped candidates.`);
       descriptors = convs.map((c) => toDescriptor(c, this.slack.teamName, this.slack.canWrite(c.id)));
     } catch (err) {
       // One superseded meanwhile stops without a word; the newer one reports.
       if (isCurrent()) {
         const why = err instanceof GaveUp
           ? `${err.message}, so registration stopped; refresh_channels can announce the conversations later`
-          : (err as Error).message;
+          : this.slack.hasAccessPolicy ? policyFailureSummary(err) : (err as Error).message;
         console.error('[slack-mcpl] Failed to enumerate conversations:', why);
       }
       return;
@@ -1471,6 +1481,7 @@ export class SlackMcplServer {
     // this server can't name counts as a message no delete can reach.
     const sent = { message: 0, file: 0 };
     const deleted = { message: 0, file: 0 };
+    const admissionCauses: string[] = [];
     /** Each item a delete didn't confirm gone, or that no delete could name,
      *  by kind, id (where known) and conversation, and whether Slack refused
      *  its delete for good. */
@@ -1483,8 +1494,9 @@ export class SlackMcplServer {
         await remove();
         deleted[kind]++;
       } catch (err) {
+        if (err instanceof SlackAccessDenied || failedAccessAdmission(err)) admissionCauses.push(`${kind} ${id} in ${channelId}: ` + explainSlackError(err, { tool: kind === 'file' ? 'delete_file' : 'delete_message', args: { channelId, ...(kind === 'file' ? { fileId: id } : { messageId: id }) } }));
         const refusal = slackRefusal(err);
-        if (refusal !== undefined && gone.includes(refusal)) {
+        if (!failedAccessAdmission(err) && !(err instanceof SlackAccessDenied) && refusal !== undefined && gone.includes(refusal)) {
           deleted[kind]++;
           return;
         }
@@ -1495,10 +1507,10 @@ export class SlackMcplServer {
         // branch, so no later rollback tries it again: the reason names it,
         // for the agent, and stderr says why, for an operator.
         const shared = sharedFile ? `, which shared file ${sharedFile}` : '';
-        left.push({ kind, named: `${kind} ${id} in ${channelId}${shared}`, forGood: refusedForGood(err) });
+        left.push({ kind, named: `${kind} ${id} in ${channelId}${shared}`, forGood: !(err instanceof SlackAccessDenied) && !failedAccessAdmission(err) && refusedForGood(err) });
         console.error(
           `[slack-mcpl] Rollback couldn't delete ${kind} ${id}${shared && `${shared},`} in ${channelId}: ` +
-            `${(err as Error)?.message ?? String(err)}`,
+            `${this.slack.hasAccessPolicy ? policyFailureSummary(err) : (err as Error)?.message ?? String(err)}`,
         );
       }
     };
@@ -1551,7 +1563,7 @@ export class SlackMcplServer {
     const namedMessageLeft = mayRemain.some((item) => item.kind === 'message' && !item.unnamed);
     const unnamedLeft = mayRemain.some((item) => item.unnamed);
     const remedy = [
-      ...(namedMessageLeft ? ['delete_message can try a message among them again, by its id'] : []),
+      ...(namedMessageLeft ? [(admissionCauses.length ? 'Once the reported cause is resolved (wait before retrying rate limits or temporary failures), ' : '') + 'delete_message can try a message among them again, by its id'] : []),
       ...(unnamedLeft
         ? [namedMessageLeft
           ? "fetch_history shows the id of one this server doesn't know (fetch_thread, for one in a thread)"
@@ -1562,6 +1574,7 @@ export class SlackMcplServer {
         : []),
     ].join(', and ');
     const notes = [
+      ...admissionCauses.map(cause => `Cleanup was not attempted: ${cause}`),
       ...(left.length > 0
         ? [[
             `Rolled back (${counts} deleted)`,
@@ -1589,6 +1602,9 @@ export class SlackMcplServer {
   // ── Slack Event Forwarding ──
 
   private setupSlackForwarding(): void {
+    // Optional for embedded legacy adapters; the real adapter applies this only
+    // with explicit policy. Delivery still rechecks subscriptions at its turn.
+    if (this.slack.hasAccessPolicy) this.slack.setAmbientMessageFilter?.(id => this.isChannelSubscribed(id));
     this.slack.onMessage((msg) => {
       const conn = this.conn;
       if (!conn || !this.mcplEnabled || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) {
@@ -1601,12 +1617,15 @@ export class SlackMcplServer {
       if (msg.mentionsBot || msg.isDM) void this.slack.acknowledge(msg.channelId, msg.id);
       const previous = this.forwarding.get(msg.channelId) ?? Promise.resolve();
       const pending = previous.then(() => this.handleSlackMessage(msg, conn)).catch((err) => {
-        console.error('[slack-mcpl] Error forwarding Slack message:', err);
+        if (this.slack.hasAccessPolicy && (msg.mentionsBot || msg.isDM)) void this.slack.clearAck(msg.channelId, msg.id);
+        if (this.slack.hasAccessPolicy) console.error(`[slack-mcpl] Error forwarding Slack message ${msg.id} in ${msg.channelId}:`, policyFailureSummary(err));
+        else console.error('[slack-mcpl] Error forwarding Slack message:', err);
       });
       this.forwarding.set(msg.channelId, pending);
       void pending.then(() => {
         if (this.forwarding.get(msg.channelId) === pending) this.forwarding.delete(msg.channelId);
       });
+      if (this.slack.hasAccessPolicy) return pending;
     });
   }
 
@@ -1620,23 +1639,21 @@ export class SlackMcplServer {
     return `[attachments: ${attachments.length}]\n${lines.join('\n')}`;
   }
 
-  /** Optional delivery context must not hold a conversation behind a stalled
-   *  Slack call. A late result is ignored; the client may still finish its call.
-   *  A give-up or a failure is logged, since the message goes without what it
-   *  looked up. */
-  private async deliveryLookup<T>(lookup: Promise<T>, what: string): Promise<T> {
+  /** Bound the wait for optional context or mandatory final admission. Late
+   * results are ignored, not cancelled. Expired final admission drops delivery. */
+  private async deliveryLookup<T>(lookup: Promise<T>, what: string, fallback = 'delivering without it'): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     let gaveUp = false;
     try {
       return await Promise.race([
         lookup.catch((err: unknown) => {
-          if (!gaveUp) console.error(`[slack-mcpl] Couldn't get ${what} (${(err as Error).message}); delivering without it`);
+          if (!gaveUp) console.error(`[slack-mcpl] Couldn't get ${what} (${this.slack.hasAccessPolicy ? policyFailureSummary(err) : (err as Error).message}); ${fallback}`);
           throw err;
         }),
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => {
             gaveUp = true;
-            console.error(`[slack-mcpl] Gave up on ${what} after 5 s; delivering without it`);
+            console.error(`[slack-mcpl] Gave up on ${what} after 5 s; ${fallback}`);
             reject(new Error(`Gave up on ${what} after 5 s`));
           }, 5000);
         }),
@@ -1654,7 +1671,7 @@ export class SlackMcplServer {
   }
 
   private async handleSlackMessage(msg: SlackMessageData, conn: McplConnection): Promise<void> {
-    const isCurrent = () => this.conn === conn && !conn.isClosed && this.mcplEnabled &&
+    const isCurrent = () => (!this.slack.hasAccessPolicy || !this.slack.isStopping) && this.conn === conn && !conn.isClosed && this.mcplEnabled &&
       this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET);
     dbg('handleSlackMessage:enter', {
       msgId: msg.id,
@@ -1677,9 +1694,10 @@ export class SlackMcplServer {
     // left, or slack.messaging isn't active, before the message reaches it,
     // the message is dropped; an addressed one says so once on stderr.
     const abandon = () => {
-      if (!isAddressed) return;
-      const why = this.conn === conn && !conn.isClosed ? 'slack.messaging is not active' : 'its peer disconnected';
-      console.error(`[slack-mcpl] Dropped addressed message ${msg.id} in ${msg.channelId} before delivery: ${why}`);
+      const stopping = this.slack.hasAccessPolicy && this.slack.isStopping;
+      if (!isAddressed && !stopping) return;
+      const why = stopping ? 'adapter stopping' : this.conn === conn && !conn.isClosed ? 'slack.messaging is not active' : 'its peer disconnected';
+      console.error(`[slack-mcpl] Dropped ${isAddressed ? 'addressed' : 'ambient'} message ${msg.id} in ${msg.channelId} before delivery: ${why}`);
       releaseAck();
     };
     // §6.7: a disabled slack.messaging stops its traffic at once — incoming
@@ -1697,11 +1715,10 @@ export class SlackMcplServer {
     // A mention may also auto-subscribe the conversation, with a system note
     // (below). Both are committed in taken(), once the host has the message
     // that carries them.
-    this.ensureSubscriptionsLoaded();
-    const isFirstInteraction = !this.forwardedWatermark.has(msg.channelId);
-    // The conversation's metadata is looked up at most once per message: the
-    // first interaction's note and backscroll and the location header share it.
-    // A DM's header says DM and a DM gets no note, so a DM looks up none.
+    if (!this.slack.hasAccessPolicy) this.ensureSubscriptionsLoaded();
+    let isFirstInteraction = !this.forwardedWatermark.has(msg.channelId);
+    // Legacy optional context shares one metadata lookup. Policy mode uses
+    // the final admission result below instead of another name request.
     let meta: Awaited<ReturnType<typeof this.slack.getConversationMeta>> | undefined;
     let backscroll: Awaited<ReturnType<typeof this.slack.fetchHistory>>['messages'] = [];
     if (isFirstInteraction && isAddressed) {
@@ -1709,30 +1726,60 @@ export class SlackMcplServer {
         const res = await this.deliveryLookup(this.slack.fetchHistory(msg.channelId, {
           limit: this.backscrollLimit,
           latest: msg.id, // never include the triggering message itself
-        }), `the backscroll for message ${msg.id} in ${msg.channelId}`);
+        }), `the backscroll for message ${msg.id} in ${msg.channelId}`,
+          this.slack.hasAccessPolicy ? 'omitting optional backscroll; final delivery admission still applies' : undefined);
         // Drop the bot's own past messages — already in the agent's
         // chronicle as assistant turns, no need to re-echo.
         backscroll = res.messages.filter((m) => m.authorId !== this.slack.botUserId);
       } catch (err) {
-        dbg('backscroll:fetch-failed', { channelId: msg.channelId, error: (err as Error).message });
+        // Optional content failure is not itself a delivery failure. Its
+        // lasting refusal is ordered evidence at the client boundary, so a
+        // transient final check still meets it unless newer evidence won.
+        dbg('backscroll:fetch-failed', { channelId: msg.channelId, error: this.slack.hasAccessPolicy ? policyFailureSummary(err) : (err as Error).message });
       }
       if (!isCurrent()) return abandon();
-      if (!msg.isDM) {
+      if (!this.slack.hasAccessPolicy && !msg.isDM) {
         meta = await this.lookUpMeta(msg);
         if (!isCurrent()) return abandon();
       }
     }
 
-    // The conversation is named only when it differs from the last context
-    // this peer was sent, which is read here, after the lookups above, since
-    // another conversation's message can go out while they run. The
-    // conversation's ID, the thread and the message ID are given every time:
-    // two threads in one channel are otherwise indistinguishable, and replying
-    // or reacting to a message needs its conversation's ID and its own.
-    const contextChanged = this.lastChannelId !== msg.channelId;
-    if (contextChanged && meta === undefined && !msg.isDM) {
-      meta = await this.lookUpMeta(msg);
+    let contextChanged: boolean;
+    // Policy delivery uses one bounded fresh admission, also supplying the
+    // channel label. Transient failure keeps the original event admission;
+    // all other failures drop the message.
+    if (this.slack.hasAccessPolicy) {
+      try {
+        meta = await this.deliveryLookup(this.slack.getConversationMeta(msg.channelId, true),
+          `delivery admission for message ${msg.id} in ${msg.channelId}`,
+          'retaining original admission only for classified transient Slack failures');
+        if (meta === undefined || (meta === null && !msg.isDM)) throw new TypeError('Final admission returned no result');
+      } catch (err) {
+        try {
+          this.slack.assertKnownDeliveryAdmission(msg.channelId);
+        } catch (veto) { err = veto; }
+        if (!isTransientSlackFailure(err)) {
+          console.error(`[slack-mcpl] Dropped message ${msg.id} in ${msg.channelId}: delivery admission failed: ${policyFailureSummary(err)}`);
+          releaseAck();
+          return;
+        }
+        console.error(`[slack-mcpl] Delivery admission unavailable for message ${msg.id} in ${msg.channelId}; using original admission`);
+      }
       if (!isCurrent()) return abandon();
+      contextChanged = this.lastChannelId !== msg.channelId;
+    } else {
+      // Preserve legacy header snapshot timing across its optional lookup.
+      contextChanged = this.lastChannelId !== msg.channelId;
+      if (contextChanged && meta === undefined && !msg.isDM) {
+        meta = await this.lookUpMeta(msg);
+        if (!isCurrent()) return abandon();
+      }
+    }
+    // Read policy delivery-visible state only after final admission settles.
+    if (this.slack.hasAccessPolicy) {
+      this.ensureSubscriptionsLoaded();
+      if (!isAddressed && !this.isChannelSubscribed(msg.channelId)) return;
+      isFirstInteraction = !this.forwardedWatermark.has(msg.channelId);
     }
 
     // Nothing is awaited from here to the send, so what is decided here is
@@ -1860,7 +1907,7 @@ export class SlackMcplServer {
         res = await conn.sendRequest(method.CHANNELS_INCOMING, incomingParams) as typeof res;
         dbg('handleSlackMessage:sent', { method: 'channels/incoming', channelMcplId });
       } catch (err) {
-        console.error(`[slack-mcpl] channels/incoming failed for message ${msg.id} in ${msg.channelId}:`, (err as Error).message);
+        console.error(`[slack-mcpl] channels/incoming failed for message ${msg.id} in ${msg.channelId}:`, this.slack.hasAccessPolicy ? policyFailureSummary(err) : (err as Error).message);
         notTaken();
         return;
       }
@@ -1894,7 +1941,7 @@ export class SlackMcplServer {
         res = await conn.sendRequest(method.PUSH_EVENT, pushParams) as typeof res;
         dbg('handleSlackMessage:sent', { method: 'push/event', channelMcplId });
       } catch (err) {
-        console.error(`[slack-mcpl] push/event failed for message ${msg.id} in ${msg.channelId}:`, (err as Error).message);
+        console.error(`[slack-mcpl] push/event failed for message ${msg.id} in ${msg.channelId}:`, this.slack.hasAccessPolicy ? policyFailureSummary(err) : (err as Error).message);
         notTaken();
         return;
       }
