@@ -20,3 +20,18 @@ test('a sleep waits out its time, and holds the process meanwhile unless it is u
   await unref;
   clearTimeout(holding);
 });
+
+test('abort wakes a real referenced sleep and removes its timer and listener', async () => {
+  const { default: EventEmitter } = await import('node:events');
+  const getEventListeners = EventEmitter.getEventListeners;
+  const controller = new AbortController();
+  const before = timers();
+  const pending = clock.sleep(60000, { signal: controller.signal });
+  assert.equal(timers(), before + 1);
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 1);
+  controller.abort(); await pending;
+  assert.equal(timers(), before);
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+  await clock.sleep(60000, { signal: controller.signal });
+  assert.equal(timers(), before, 'already-aborted sleep never arms a timer');
+});

@@ -24,10 +24,10 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-latest, node: '22.12.0', suite: true }
-          - { os: ubuntu-latest, node: 'latest' }
-          - { os: ubuntu-latest, node: '24' }
+          - { os: ubuntu-latest, node: 'latest', suite: true }
+          - { os: ubuntu-latest, node: '24', suite: true }
           - { os: macos-latest, node: '22.12.0' }
-          - { os: macos-latest, node: 'latest' }
+          - { os: macos-latest, node: 'latest', suite: true }
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
