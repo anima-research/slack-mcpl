@@ -1,0 +1,1 @@
+- Internal preparation only: strict access-policy parsing and immutable snapshots are not active at runtime in this layer. No setting or supported adapter API enables them yet.
