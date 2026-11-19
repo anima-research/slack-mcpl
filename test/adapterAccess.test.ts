@@ -717,6 +717,66 @@ test('upload revocation after bytes prevents sharing', async (t) => {
 
 });
 
+// The byte POST carries no bot token, so Slack can't refuse it for one: a
+// token refusal observed while the ticket was pending stops the bytes here.
+test('a token refusal observed while the upload ticket is pending sends no bytes', async (t) => {
+  let posts = 0;
+  t.mock.method(globalThis, 'fetch', async () => { posts++; return new Response('OK'); });
+  const f = accessFixture();
+  f.state.uploadUrl = 'https://files.slack.com/token-revoked-upload';
+  const { explainSlackError } = await import('../src/slack-errors.js');
+  let entered!: () => void, release!: () => void;
+  const reached = new Promise<void>(r => { entered = r; });
+  const held = new Promise<void>(r => { release = r; });
+  f.web.files.getUploadURLExternal = async () => { entered(); await held; return { file_id: 'F1', upload_url: f.state.uploadUrl }; };
+  const upload = f.adapter.uploadFile('C1', { filename: 'x', data: Buffer.from('sample') }).then(() => undefined, (err: unknown) => err);
+  await reached;
+  f.state.infoError = Object.assign(new Error('token_revoked'), { code: ErrorCode.PlatformError, data: { ok: false, error: 'token_revoked' } });
+  await assert.rejects(f.adapter.getConversationMeta('C2'));
+  release();
+  const err = await upload;
+  assert.equal(posts, 0, 'no bytes after an observed token refusal');
+  assert.equal(f.methods().includes('complete'), false);
+  const text = explainSlackError(err, { tool: 'upload_file', args: { channelId: 'C1' } });
+  assert.match(text, /bot token/);
+  assert.match(text, /F1/);
+});
+
+// A refusal whose request was issued after the upload's admission but before
+// its ticket, answered while the ticket is pending: the ticket's newer-issued
+// success clears the latch, but the refusal was observed while the upload was
+// pending, so no bytes leave.
+test('a newer-issued upload ticket does not clear a token refusal observed while the upload was pending', async (t) => {
+  let posts = 0;
+  t.mock.method(globalThis, 'fetch', async () => { posts++; return new Response('OK'); });
+  const f = accessFixture();
+  f.state.uploadUrl = 'https://files.slack.com/older-refusal-upload';
+  const barrier = () => { let release!: () => void; const reached = new Promise<void>(r => { release = r; }); return { reached, release }; };
+  const c1Issued = barrier(), c1Held = barrier(), c2Issued = barrier(), c2Held = barrier(), ticketIssued = barrier(), ticketHeld = barrier();
+  f.web.conversations.info = async ({ channel }: { channel: string }) => {
+    if (channel !== 'C2') { c1Issued.release(); await c1Held.reached; return { channel: joined() }; }
+    c2Issued.release(); await c2Held.reached;
+    throw Object.assign(new Error('token_revoked'), { code: ErrorCode.PlatformError, data: { ok: false, error: 'token_revoked' } });
+  };
+  f.web.files.getUploadURLExternal = async () => {
+    ticketIssued.release(); await ticketHeld.reached;
+    return { file_id: 'F1', upload_url: f.state.uploadUrl };
+  };
+  const upload = f.adapter.uploadFile('C1', { filename: 'x', data: Buffer.from('sample') }).then(() => undefined, (err: unknown) => err);
+  await c1Issued.reached;
+  const other = f.adapter.getConversationMeta('C2');
+  await c2Issued.reached;
+  c1Held.release();
+  await ticketIssued.reached;
+  c2Held.release();
+  await assert.rejects(other, /token_revoked/);
+  ticketHeld.release();
+  const err = await upload;
+  assert.match(String(err), /token_revoked/, 'the observed refusal is the upload\'s failure');
+  assert.equal(posts, 0, 'no bytes after a token refusal observed while the upload was pending');
+  assert.equal(f.methods().includes('complete'), false);
+});
+
 test('ambient admissions overlap behind an earlier addressed delivery', async (t) => {
   const f = accessFixture();
   f.adapter.setAmbientMessageFilter(() => true);
@@ -865,6 +925,23 @@ test('legacy DM peer listing veto is independent of policy peers and disabled DM
   await f.adapter.stop();
 });
 
+
+test('policy stop fences subsequent handlers without joining an in-flight handler', async () => {
+  const f = accessFixture();
+  let entered!: () => void, release!: () => void;
+  const started = new Promise<void>(r => { entered = r; });
+  const held = new Promise<void>(r => { release = r; });
+  let later = 0;
+  f.adapter.onMessage(async () => { entered(); await held; });
+  f.adapter.onMessage(() => { later++; });
+  const event = f.emit({ type: 'message', channel: 'C1', user: 'U1', ts: '1.0', text: '<@UBOT> hi' });
+  await started;
+  await f.adapter.stop();
+  release();
+  await event;
+  assert.equal(later, 0);
+});
+
 test('delivery recheck requires history grants even when metadata stays readable', async () => {
   const f = accessFixture();
   await f.adapter.getConversationMeta('C1');
@@ -926,10 +1003,10 @@ for (const result of ['success', 'failure']) test(`background stop ends held can
   assert.equal(pages, 1); assert.equal(waits, 0); assert.ok(!logs.some(line => line.includes('candidate C1 skipped')));
 });
 
-test('background malformed candidates skip and count; foreground unverified metadata fails visibly', async () => {
+test('a malformed candidate refuses its page in the background too; foreground unverified metadata fails visibly', async () => {
   const f = accessFixture(); f.state.listed = [{ id: 'invalid' }];
-  const listing = await f.adapter.listConversations(false, async () => {});
-  assert.equal(listing.admissionFailures, 1);
+  // The page validator runs before any candidate: no skip-and-count of a malformed page.
+  await assert.rejects(f.adapter.listConversations(false, async () => {}), /malformed Slack listing candidate/);
   f.state.listed = [joined()]; f.state.conversation = undefined;
   await assert.rejects(f.adapter.listConversations(), (err: unknown) => err instanceof SlackAccessDenied && !err.authoritative);
 });
@@ -1100,15 +1177,12 @@ test('a transient file-cleanup admission failure states its outcome once', async
   assert.equal(text.match(/Nothing was (?:deleted|done)/g)?.length, 1, text);
 });
 
-test('background registration names a malformed candidate as a local check, not a Slack failure', async () => {
+test('a malformed listing candidate refuses the page as a local check, not a Slack failure', async () => {
   const f = accessFixture();
   f.state.listed = [{ id: 'bad' } as never, joined('C1')];
-  const listing = await f.adapter.listConversations(false, async () => {});
-  assert.deepEqual(listing.conversations.map(c => c.id), ['C1']);
-  const logged = (console.error as unknown as { mock: { calls: Array<{ arguments: unknown[] }> } }).mock.calls
-    .map(call => String(call.arguments[0])).filter(line => line.includes('Registration candidate'));
-  assert.deepEqual(logged, ['[slack-mcpl] Registration candidate unknown skipped: admission failed; count is incomplete: '
-    + 'No conversations were returned: malformed Slack listing candidate; retry once, then ask whoever runs this host to investigate']);
+  const err = await f.adapter.listConversations(false, async () => {}).then(() => undefined, (e: unknown) => e);
+  assert.equal(policyFailureSummary(err),
+    'No conversations were returned: malformed Slack listing candidate; retry once, then ask whoever runs this host to investigate');
 });
 
 for (const field of ['userId', 'fileId'] as const) test(`caller-controlled ${field} text cannot select channelId advice`, async t => {

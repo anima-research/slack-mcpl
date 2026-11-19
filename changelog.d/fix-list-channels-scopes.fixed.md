@@ -7,9 +7,8 @@
   too; it now lists the public, private and DM conversations it can see, and
   a token without `im:read` likewise drops `im`. Nothing changes for a token
   that has all four read scopes. A listing whose answer changes which types
-  the token can read starts over with them, as often as they change, so a
-  scope granted while the server runs is listed by the listing whose answer
-  first reports it. `list_channels` and `refresh_channels` say which kinds a
+  the token can read starts over with them while its page budget permits;
+  newly granted types cannot be scanned once that budget is exhausted. `list_channels` and `refresh_channels` say which kinds a
   listing left out and the scopes they need. A listing that starts with no
   readable type asks `auth.test` for the token's current scopes, and if they
   still read no type, the call fails naming the read scopes. One whose refusal

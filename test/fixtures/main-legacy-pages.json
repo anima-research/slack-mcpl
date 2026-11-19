@@ -1,0 +1,1506 @@
+{
+  "find_user: container undefined": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"found\":false,\"note\":\"No users matched \\\"match\\\". find_user matches part of a username, real name or display name, ignoring case, and leaves out bots and deactivated accounts. Try a shorter part or another spelling.\"}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "find_user: container null": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"found\":false,\"note\":\"No users matched \\\"match\\\". find_user matches part of a username, real name or display name, ignoring case, and leaves out bots and deactivated accounts. Try a shorter part or another spelling.\"}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "find_user: container 42": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "number 42 is not iterable (cannot read property Symbol(Symbol.iterator))"
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "find_user: container 0": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "number 0 is not iterable (cannot read property Symbol(Symbol.iterator))"
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "find_user: container {}": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "object is not iterable (cannot read property Symbol(Symbol.iterator))"
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "find_user: container false": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "boolean false is not iterable (cannot read property Symbol(Symbol.iterator))"
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "find_user: container true": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "boolean true is not iterable (cannot read property Symbol(Symbol.iterator))"
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "find_user: container \"ab\"": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"found\":false,\"note\":\"No users matched \\\"match\\\". find_user matches part of a username, real name or display name, ignoring case, and leaves out bots and deactivated accounts. Try a shorter part or another spelling.\"}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "find_user: container []": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"found\":false,\"note\":\"No users matched \\\"match\\\". find_user matches part of a username, real name or display name, ignoring case, and leaves out bots and deactivated accounts. Try a shorter part or another spelling.\"}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "find_user: container [null]": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "Cannot read properties of null (reading 'id')"
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "find_user: container [42]": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"found\":false,\"note\":\"No users matched \\\"match\\\". find_user matches part of a username, real name or display name, ignoring case, and leaves out bots and deactivated accounts. Try a shorter part or another spelling.\"}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "find_user: container [\"x\"]": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"found\":false,\"note\":\"No users matched \\\"match\\\". find_user matches part of a username, real name or display name, ignoring case, and leaves out bots and deactivated accounts. Try a shorter part or another spelling.\"}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "find_user: container [[]]": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"found\":false,\"note\":\"No users matched \\\"match\\\". find_user matches part of a username, real name or display name, ignoring case, and leaves out bots and deactivated accounts. Try a shorter part or another spelling.\"}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "find_user: container [{}]": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"found\":false,\"note\":\"No users matched \\\"match\\\". find_user matches part of a username, real name or display name, ignoring case, and leaves out bots and deactivated accounts. Try a shorter part or another spelling.\"}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "find_user: row {\"id\":\"U1\",\"name\":\"match\"}": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"found\":true,\"users\":[{\"userId\":\"U1\",\"username\":\"match\",\"mentionSyntax\":\"<@U1>\"}]}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "find_user: row {\"id\":\"U2\",\"name\":\"other\"}": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"found\":false,\"note\":\"No users matched \\\"match\\\". find_user matches part of a username, real name or display name, ignoring case, and leaves out bots and deactivated accounts. Try a shorter part or another spelling.\"}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "find_user: row {\"name\":\"match\"}": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"found\":false,\"note\":\"No users matched \\\"match\\\". find_user matches part of a username, real name or display name, ignoring case, and leaves out bots and deactivated accounts. Try a shorter part or another spelling.\"}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "find_user: row {\"id\":\"U3\",\"name\":\"match\",\"deleted\":true}": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"found\":false,\"note\":\"No users matched \\\"match\\\". find_user matches part of a username, real name or display name, ignoring case, and leaves out bots and deactivated accounts. Try a shorter part or another spelling.\"}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "find_user: row {\"id\":\"U4\",\"name\":\"match\",\"is_bot\":true}": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"found\":false,\"note\":\"No users matched \\\"match\\\". find_user matches part of a username, real name or display name, ignoring case, and leaves out bots and deactivated accounts. Try a shorter part or another spelling.\"}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "find_user: row {\"id\":\"U5\",\"real_name\":\"MATCH\"}": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"found\":true,\"users\":[{\"userId\":\"U5\",\"realName\":\"MATCH\",\"mentionSyntax\":\"<@U5>\"}]}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "find_user: row {\"id\":\"U6\",\"profile\":{\"display_name\":\"match\"}}": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"found\":true,\"users\":[{\"userId\":\"U6\",\"displayName\":\"match\",\"mentionSyntax\":\"<@U6>\"}]}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "find_user: row {\"id\":\"U7\",\"profile\":null}": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"found\":false,\"note\":\"No users matched \\\"match\\\". find_user matches part of a username, real name or display name, ignoring case, and leaves out bots and deactivated accounts. Try a shorter part or another spelling.\"}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "find_user: row {\"id\":\"U8\",\"name\":42}": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "raw.name?.toLowerCase is not a function"
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "find_user: row {\"id\":\"U9\",\"profile\":{\"display_name\":5}}": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "raw.profile?.display_name?.toLowerCase is not a function"
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "find_user: row {\"id\":0,\"name\":\"match\"}": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"found\":false,\"note\":\"No users matched \\\"match\\\". find_user matches part of a username, real name or display name, ignoring case, and leaves out bots and deactivated accounts. Try a shorter part or another spelling.\"}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "find_user: cursor undefined": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"found\":true,\"users\":[{\"userId\":\"U1\",\"username\":\"match\",\"mentionSyntax\":\"<@U1>\"}]}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "find_user: cursor \"\"": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"found\":true,\"users\":[{\"userId\":\"U1\",\"username\":\"match\",\"mentionSyntax\":\"<@U1>\"}]}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "find_user: cursor \"next\"": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"found\":true,\"users\":[{\"userId\":\"U1\",\"username\":\"match\",\"mentionSyntax\":\"<@U1>\"}]}"
+        }
+      ]
+    },
+    "requests": 2
+  },
+  "find_user: cursor 0": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"found\":true,\"users\":[{\"userId\":\"U1\",\"username\":\"match\",\"mentionSyntax\":\"<@U1>\"}]}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "find_user: cursor null": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"found\":true,\"users\":[{\"userId\":\"U1\",\"username\":\"match\",\"mentionSyntax\":\"<@U1>\"}]}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "find_user: cursor false": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"found\":true,\"users\":[{\"userId\":\"U1\",\"username\":\"match\",\"mentionSyntax\":\"<@U1>\"}]}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "find_user: cursor {}": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"found\":true,\"users\":[{\"userId\":\"U1\",\"username\":\"match\",\"mentionSyntax\":\"<@U1>\"}]}"
+        }
+      ]
+    },
+    "requests": 2
+  },
+  "find_user: cursor 7": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"found\":true,\"users\":[{\"userId\":\"U1\",\"username\":\"match\",\"mentionSyntax\":\"<@U1>\"}]}"
+        }
+      ]
+    },
+    "requests": 2
+  },
+  "find_user: page null": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "Cannot read properties of null (reading 'members')"
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "find_user: metadata null": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"found\":true,\"users\":[{\"userId\":\"U1\",\"username\":\"match\",\"mentionSyntax\":\"<@U1>\"}]}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "list_channels: container undefined": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "[]"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "list_channels: container null": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "[]"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "list_channels: container 42": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "number 42 is not iterable (cannot read property Symbol(Symbol.iterator))"
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "list_channels: container 0": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "number 0 is not iterable (cannot read property Symbol(Symbol.iterator))"
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "list_channels: container {}": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "object is not iterable (cannot read property Symbol(Symbol.iterator))"
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "list_channels: container false": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "boolean false is not iterable (cannot read property Symbol(Symbol.iterator))"
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "list_channels: container true": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "boolean true is not iterable (cannot read property Symbol(Symbol.iterator))"
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "list_channels: container \"ab\"": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "[]"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "list_channels: container []": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "[]"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "list_channels: container [null]": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "Cannot read properties of null (reading 'id')"
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "list_channels: container [42]": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "[]"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "list_channels: container [\"x\"]": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "[]"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "list_channels: container [[]]": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "[]"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "list_channels: container [{}]": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "[]"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "list_channels: row {\"id\":\"C1\",\"name\":\"general\",\"is_channel\":true,\"is_member\":true}": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "[{\"id\":\"C1\",\"kind\":\"channel\",\"name\":\"general\",\"isMember\":true,\"writable\":true}]"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "list_channels: row {\"id\":\"C2\",\"name\":\"random\",\"is_channel\":true,\"is_member\":false}": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "[]"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "list_channels: row {\"id\":\"G1\",\"name\":\"secret\",\"is_group\":true,\"is_private\":true,\"is_member\":true}": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "[{\"id\":\"G1\",\"kind\":\"private_channel\",\"name\":\"secret\",\"isMember\":true,\"writable\":true}]"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "list_channels: row {\"id\":\"D1\",\"is_im\":true,\"user\":\"U1\"}": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "[{\"id\":\"D1\",\"kind\":\"dm\",\"name\":\"DM: @U1\",\"writable\":true}]"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "list_channels: row {\"id\":\"C3\",\"is_member\":true}": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "[{\"id\":\"C3\",\"kind\":\"channel\",\"name\":\"C3\",\"isMember\":true,\"writable\":true}]"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "list_channels: row {\"name\":\"noid\",\"is_member\":true}": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "[]"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "list_channels: row {\"id\":42,\"is_member\":true}": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "[{\"id\":42,\"kind\":\"channel\",\"name\":42,\"isMember\":true,\"writable\":true}]"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "list_channels: cursor undefined": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "[{\"id\":\"C1\",\"kind\":\"channel\",\"name\":\"general\",\"isMember\":true,\"writable\":true}]"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "list_channels: cursor \"\"": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "[{\"id\":\"C1\",\"kind\":\"channel\",\"name\":\"general\",\"isMember\":true,\"writable\":true}]"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "list_channels: cursor \"next\"": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "[{\"id\":\"C1\",\"kind\":\"channel\",\"name\":\"general\",\"isMember\":true,\"writable\":true}]"
+        }
+      ]
+    },
+    "requests": 2
+  },
+  "list_channels: cursor 0": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "[{\"id\":\"C1\",\"kind\":\"channel\",\"name\":\"general\",\"isMember\":true,\"writable\":true}]"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "list_channels: cursor null": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "[{\"id\":\"C1\",\"kind\":\"channel\",\"name\":\"general\",\"isMember\":true,\"writable\":true}]"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "list_channels: cursor false": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "[{\"id\":\"C1\",\"kind\":\"channel\",\"name\":\"general\",\"isMember\":true,\"writable\":true}]"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "list_channels: cursor {}": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "[{\"id\":\"C1\",\"kind\":\"channel\",\"name\":\"general\",\"isMember\":true,\"writable\":true}]"
+        }
+      ]
+    },
+    "requests": 2
+  },
+  "list_channels: cursor 7": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "[{\"id\":\"C1\",\"kind\":\"channel\",\"name\":\"general\",\"isMember\":true,\"writable\":true}]"
+        }
+      ]
+    },
+    "requests": 2
+  },
+  "list_channels: page null": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "Cannot read properties of null (reading 'response_metadata')"
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "list_channels: metadata null": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "[{\"id\":\"C1\",\"kind\":\"channel\",\"name\":\"general\",\"isMember\":true,\"writable\":true}]"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "backscroll: container undefined": {
+    "value": {
+      "messages": [],
+      "truncated": false
+    },
+    "requests": 1
+  },
+  "backscroll: container null": {
+    "value": {
+      "messages": [],
+      "truncated": false
+    },
+    "requests": 1
+  },
+  "backscroll: container 42": {
+    "error": "TypeError: Spread syntax requires ...iterable[Symbol.iterator] to be a function",
+    "requests": 1
+  },
+  "backscroll: container 0": {
+    "error": "TypeError: Spread syntax requires ...iterable[Symbol.iterator] to be a function",
+    "requests": 1
+  },
+  "backscroll: container {}": {
+    "error": "TypeError: Spread syntax requires ...iterable[Symbol.iterator] to be a function",
+    "requests": 1
+  },
+  "backscroll: container false": {
+    "error": "TypeError: Spread syntax requires ...iterable[Symbol.iterator] to be a function",
+    "requests": 1
+  },
+  "backscroll: container true": {
+    "error": "TypeError: Spread syntax requires ...iterable[Symbol.iterator] to be a function",
+    "requests": 1
+  },
+  "backscroll: container \"ab\"": {
+    "value": {
+      "messages": [
+        {
+          "id": "",
+          "authorName": "bot",
+          "content": "",
+          "rootTs": "",
+          "timestamp": "1970-01-01T00:00:00.000Z",
+          "attachments": []
+        },
+        {
+          "id": "",
+          "authorName": "bot",
+          "content": "",
+          "rootTs": "",
+          "timestamp": "1970-01-01T00:00:00.000Z",
+          "attachments": []
+        }
+      ],
+      "truncated": false
+    },
+    "requests": 1
+  },
+  "backscroll: container []": {
+    "value": {
+      "messages": [],
+      "truncated": false
+    },
+    "requests": 1
+  },
+  "backscroll: container [null]": {
+    "error": "TypeError: Cannot read properties of null (reading 'user')",
+    "requests": 1
+  },
+  "backscroll: container [42]": {
+    "value": {
+      "messages": [
+        {
+          "id": "",
+          "authorName": "bot",
+          "content": "",
+          "rootTs": "",
+          "timestamp": "1970-01-01T00:00:00.000Z",
+          "attachments": []
+        }
+      ],
+      "truncated": false
+    },
+    "requests": 1
+  },
+  "backscroll: container [\"x\"]": {
+    "value": {
+      "messages": [
+        {
+          "id": "",
+          "authorName": "bot",
+          "content": "",
+          "rootTs": "",
+          "timestamp": "1970-01-01T00:00:00.000Z",
+          "attachments": []
+        }
+      ],
+      "truncated": false
+    },
+    "requests": 1
+  },
+  "backscroll: container [[]]": {
+    "value": {
+      "messages": [
+        {
+          "id": "",
+          "authorName": "bot",
+          "content": "",
+          "rootTs": "",
+          "timestamp": "1970-01-01T00:00:00.000Z",
+          "attachments": []
+        }
+      ],
+      "truncated": false
+    },
+    "requests": 1
+  },
+  "backscroll: container [{}]": {
+    "value": {
+      "messages": [
+        {
+          "id": "",
+          "authorName": "bot",
+          "content": "",
+          "rootTs": "",
+          "timestamp": "1970-01-01T00:00:00.000Z",
+          "attachments": []
+        }
+      ],
+      "truncated": false
+    },
+    "requests": 1
+  },
+  "backscroll: row {\"ts\":\"1.0\",\"text\":\"hi\",\"user\":\"U1\"}": {
+    "value": {
+      "messages": [
+        {
+          "id": "1.0",
+          "authorId": "U1",
+          "authorName": "U1",
+          "content": "hi",
+          "rootTs": "1.0",
+          "timestamp": "1970-01-01T00:00:01.000Z",
+          "attachments": []
+        }
+      ],
+      "truncated": false
+    },
+    "requests": 1
+  },
+  "backscroll: row {\"ts\":\"9999999999999999\",\"text\":\"far\"}": {
+    "value": {
+      "messages": [
+        {
+          "id": "9999999999999999",
+          "authorName": "bot",
+          "content": "far",
+          "rootTs": "9999999999999999",
+          "timestamp": null,
+          "attachments": []
+        }
+      ],
+      "truncated": false
+    },
+    "requests": 1
+  },
+  "backscroll: row {\"ts\":\"x\",\"text\":\"bad\"}": {
+    "value": {
+      "messages": [
+        {
+          "id": "x",
+          "authorName": "bot",
+          "content": "bad",
+          "rootTs": "x",
+          "timestamp": null,
+          "attachments": []
+        }
+      ],
+      "truncated": false
+    },
+    "requests": 1
+  },
+  "backscroll: row {\"text\":\"no ts\"}": {
+    "value": {
+      "messages": [
+        {
+          "id": "",
+          "authorName": "bot",
+          "content": "no ts",
+          "rootTs": "",
+          "timestamp": "1970-01-01T00:00:00.000Z",
+          "attachments": []
+        }
+      ],
+      "truncated": false
+    },
+    "requests": 1
+  },
+  "backscroll: row {\"ts\":\"2.0\",\"thread_ts\":\"1.0\",\"reply_count\":1}": {
+    "value": {
+      "messages": [
+        {
+          "id": "2.0",
+          "authorName": "bot",
+          "content": "",
+          "threadTs": "1.0",
+          "rootTs": "1.0",
+          "replyCount": 1,
+          "timestamp": "1970-01-01T00:00:02.000Z",
+          "attachments": []
+        }
+      ],
+      "truncated": false
+    },
+    "requests": 1
+  },
+  "backscroll: row {\"ts\":3}": {
+    "value": {
+      "messages": [
+        {
+          "id": "3",
+          "authorName": "bot",
+          "content": "",
+          "rootTs": "3",
+          "timestamp": "1970-01-01T00:00:03.000Z",
+          "attachments": []
+        }
+      ],
+      "truncated": false
+    },
+    "requests": 1
+  },
+  "backscroll: cursor undefined": {
+    "value": {
+      "messages": [
+        {
+          "id": "1.0",
+          "authorId": "U1",
+          "authorName": "U1",
+          "content": "hi",
+          "rootTs": "1.0",
+          "timestamp": "1970-01-01T00:00:01.000Z",
+          "attachments": []
+        }
+      ],
+      "truncated": false
+    },
+    "requests": 1
+  },
+  "backscroll: cursor \"\"": {
+    "value": {
+      "messages": [
+        {
+          "id": "1.0",
+          "authorId": "U1",
+          "authorName": "U1",
+          "content": "hi",
+          "rootTs": "1.0",
+          "timestamp": "1970-01-01T00:00:01.000Z",
+          "attachments": []
+        }
+      ],
+      "truncated": false
+    },
+    "requests": 1
+  },
+  "backscroll: cursor \"next\"": {
+    "value": {
+      "messages": [
+        {
+          "id": "9999999999999999",
+          "authorName": "bot",
+          "content": "far",
+          "rootTs": "9999999999999999",
+          "timestamp": null,
+          "attachments": []
+        },
+        {
+          "id": "1.0",
+          "authorId": "U1",
+          "authorName": "U1",
+          "content": "hi",
+          "rootTs": "1.0",
+          "timestamp": "1970-01-01T00:00:01.000Z",
+          "attachments": []
+        }
+      ],
+      "truncated": false
+    },
+    "requests": 2
+  },
+  "backscroll: cursor 0": {
+    "value": {
+      "messages": [
+        {
+          "id": "1.0",
+          "authorId": "U1",
+          "authorName": "U1",
+          "content": "hi",
+          "rootTs": "1.0",
+          "timestamp": "1970-01-01T00:00:01.000Z",
+          "attachments": []
+        }
+      ],
+      "truncated": false
+    },
+    "requests": 1
+  },
+  "backscroll: cursor null": {
+    "value": {
+      "messages": [
+        {
+          "id": "1.0",
+          "authorId": "U1",
+          "authorName": "U1",
+          "content": "hi",
+          "rootTs": "1.0",
+          "timestamp": "1970-01-01T00:00:01.000Z",
+          "attachments": []
+        }
+      ],
+      "truncated": false
+    },
+    "requests": 1
+  },
+  "backscroll: cursor false": {
+    "value": {
+      "messages": [
+        {
+          "id": "1.0",
+          "authorId": "U1",
+          "authorName": "U1",
+          "content": "hi",
+          "rootTs": "1.0",
+          "timestamp": "1970-01-01T00:00:01.000Z",
+          "attachments": []
+        }
+      ],
+      "truncated": false
+    },
+    "requests": 1
+  },
+  "backscroll: cursor {}": {
+    "value": {
+      "messages": [
+        {
+          "id": "9999999999999999",
+          "authorName": "bot",
+          "content": "far",
+          "rootTs": "9999999999999999",
+          "timestamp": null,
+          "attachments": []
+        },
+        {
+          "id": "1.0",
+          "authorId": "U1",
+          "authorName": "U1",
+          "content": "hi",
+          "rootTs": "1.0",
+          "timestamp": "1970-01-01T00:00:01.000Z",
+          "attachments": []
+        }
+      ],
+      "truncated": false
+    },
+    "requests": 2
+  },
+  "backscroll: cursor 7": {
+    "value": {
+      "messages": [
+        {
+          "id": "9999999999999999",
+          "authorName": "bot",
+          "content": "far",
+          "rootTs": "9999999999999999",
+          "timestamp": null,
+          "attachments": []
+        },
+        {
+          "id": "1.0",
+          "authorId": "U1",
+          "authorName": "U1",
+          "content": "hi",
+          "rootTs": "1.0",
+          "timestamp": "1970-01-01T00:00:01.000Z",
+          "attachments": []
+        }
+      ],
+      "truncated": false
+    },
+    "requests": 2
+  },
+  "backscroll: page null": {
+    "error": "TypeError: Cannot read properties of null (reading 'messages')",
+    "requests": 1
+  },
+  "backscroll: metadata null": {
+    "value": {
+      "messages": [
+        {
+          "id": "1.0",
+          "authorId": "U1",
+          "authorName": "U1",
+          "content": "hi",
+          "rootTs": "1.0",
+          "timestamp": "1970-01-01T00:00:01.000Z",
+          "attachments": []
+        }
+      ],
+      "truncated": false
+    },
+    "requests": 1
+  },
+  "fetch_history: container undefined": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "No messages were returned: Slack's answer for a page of messages held no list of them. Calling again may work; if it fails the same way, this server can't read Slack's answer for this range."
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "fetch_history: container null": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "No messages were returned: Slack's answer for a page of messages held no list of them. Calling again may work; if it fails the same way, this server can't read Slack's answer for this range."
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "fetch_history: container 42": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "No messages were returned: Slack's answer for a page of messages held no list of them. Calling again may work; if it fails the same way, this server can't read Slack's answer for this range."
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "fetch_history: container 0": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "No messages were returned: Slack's answer for a page of messages held no list of them. Calling again may work; if it fails the same way, this server can't read Slack's answer for this range."
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "fetch_history: container {}": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "No messages were returned: Slack's answer for a page of messages held no list of them. Calling again may work; if it fails the same way, this server can't read Slack's answer for this range."
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "fetch_history: container false": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "No messages were returned: Slack's answer for a page of messages held no list of them. Calling again may work; if it fails the same way, this server can't read Slack's answer for this range."
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "fetch_history: container true": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "No messages were returned: Slack's answer for a page of messages held no list of them. Calling again may work; if it fails the same way, this server can't read Slack's answer for this range."
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "fetch_history: container \"ab\"": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "No messages were returned: Slack's answer for a page of messages held no list of them. Calling again may work; if it fails the same way, this server can't read Slack's answer for this range."
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "fetch_history: container []": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"messages\":[],\"channel\":{\"id\":\"C1\",\"writable\":true},\"pagination\":{\"scanned\":0,\"matched\":0,\"returned\":0,\"pages\":1,\"scanComplete\":true,\"stopReason\":\"exhausted\",\"threadRepliesSearched\":false,\"scope\":\"channel_messages\"}}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "fetch_history: container [null]": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "No messages were returned: Slack gave a message without a valid timestamp, so this read can't place it. Calling again may work; if it fails the same way, this server can't read Slack's answer for this range."
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "fetch_history: container [42]": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "No messages were returned: Slack gave a message without a valid timestamp, so this read can't place it. Calling again may work; if it fails the same way, this server can't read Slack's answer for this range."
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "fetch_history: container [\"x\"]": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "No messages were returned: Slack gave a message without a valid timestamp, so this read can't place it. Calling again may work; if it fails the same way, this server can't read Slack's answer for this range."
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "fetch_history: container [[]]": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "No messages were returned: Slack gave a message without a valid timestamp, so this read can't place it. Calling again may work; if it fails the same way, this server can't read Slack's answer for this range."
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "fetch_history: container [{}]": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "No messages were returned: Slack gave a message without a valid timestamp, so this read can't place it. Calling again may work; if it fails the same way, this server can't read Slack's answer for this range."
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "fetch_history: row {\"ts\":\"1.0\",\"text\":\"hi\",\"user\":\"U1\"}": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"messages\":[{\"id\":\"1.0\",\"authorId\":\"U1\",\"author\":\"U1\",\"timestamp\":\"1970-01-01T00:00:01.000Z\",\"content\":\"hi\",\"rootTs\":\"1.0\"}],\"channel\":{\"id\":\"C1\",\"writable\":true},\"pagination\":{\"scanned\":1,\"matched\":1,\"returned\":1,\"pages\":1,\"scanComplete\":true,\"stopReason\":\"exhausted\",\"threadRepliesSearched\":false,\"scope\":\"channel_messages\"}}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "fetch_history: row {\"ts\":\"9999999999999999\",\"text\":\"far\"}": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "No messages were returned: Slack gave a message without a valid timestamp, so this read can't place it. Calling again may work; if it fails the same way, this server can't read Slack's answer for this range."
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "fetch_history: row {\"ts\":\"x\",\"text\":\"bad\"}": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "No messages were returned: Slack gave a message without a valid timestamp, so this read can't place it. Calling again may work; if it fails the same way, this server can't read Slack's answer for this range."
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "fetch_history: row {\"text\":\"no ts\"}": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "No messages were returned: Slack gave a message without a valid timestamp, so this read can't place it. Calling again may work; if it fails the same way, this server can't read Slack's answer for this range."
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "fetch_history: row {\"ts\":\"2.0\",\"thread_ts\":\"1.0\",\"reply_count\":1}": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"messages\":[{\"id\":\"2.0\",\"author\":\"bot\",\"timestamp\":\"1970-01-01T00:00:02.000Z\",\"content\":\"\",\"threadTs\":\"1.0\",\"rootTs\":\"1.0\",\"replyCount\":1}],\"channel\":{\"id\":\"C1\",\"writable\":true},\"pagination\":{\"scanned\":1,\"matched\":1,\"returned\":1,\"pages\":1,\"scanComplete\":true,\"stopReason\":\"exhausted\",\"threadRepliesSearched\":false,\"scope\":\"channel_messages\"}}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "fetch_history: row {\"ts\":3}": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "No messages were returned: Slack gave a message without a valid timestamp, so this read can't place it. Calling again may work; if it fails the same way, this server can't read Slack's answer for this range."
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "fetch_history: cursor undefined": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"messages\":[{\"id\":\"1.0\",\"authorId\":\"U1\",\"author\":\"U1\",\"timestamp\":\"1970-01-01T00:00:01.000Z\",\"content\":\"hi\",\"rootTs\":\"1.0\"}],\"channel\":{\"id\":\"C1\",\"writable\":true},\"pagination\":{\"scanned\":1,\"matched\":1,\"returned\":1,\"pages\":1,\"scanComplete\":true,\"stopReason\":\"exhausted\",\"threadRepliesSearched\":false,\"scope\":\"channel_messages\"}}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "fetch_history: cursor \"\"": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"messages\":[{\"id\":\"1.0\",\"authorId\":\"U1\",\"author\":\"U1\",\"timestamp\":\"1970-01-01T00:00:01.000Z\",\"content\":\"hi\",\"rootTs\":\"1.0\"}],\"channel\":{\"id\":\"C1\",\"writable\":true},\"pagination\":{\"scanned\":1,\"matched\":1,\"returned\":1,\"pages\":1,\"scanComplete\":true,\"stopReason\":\"exhausted\",\"threadRepliesSearched\":false,\"scope\":\"channel_messages\"}}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "fetch_history: cursor \"next\"": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "No messages were returned: Slack gave a message without a valid timestamp, so this read can't place it. Calling again may work; if it fails the same way, this server can't read Slack's answer for this range."
+        }
+      ],
+      "isError": true
+    },
+    "requests": 2
+  },
+  "fetch_history: cursor 0": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"messages\":[{\"id\":\"1.0\",\"authorId\":\"U1\",\"author\":\"U1\",\"timestamp\":\"1970-01-01T00:00:01.000Z\",\"content\":\"hi\",\"rootTs\":\"1.0\"}],\"channel\":{\"id\":\"C1\",\"writable\":true},\"pagination\":{\"scanned\":1,\"matched\":1,\"returned\":1,\"pages\":1,\"scanComplete\":true,\"stopReason\":\"exhausted\",\"threadRepliesSearched\":false,\"scope\":\"channel_messages\"}}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "fetch_history: cursor null": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"messages\":[{\"id\":\"1.0\",\"authorId\":\"U1\",\"author\":\"U1\",\"timestamp\":\"1970-01-01T00:00:01.000Z\",\"content\":\"hi\",\"rootTs\":\"1.0\"}],\"channel\":{\"id\":\"C1\",\"writable\":true},\"pagination\":{\"scanned\":1,\"matched\":1,\"returned\":1,\"pages\":1,\"scanComplete\":true,\"stopReason\":\"exhausted\",\"threadRepliesSearched\":false,\"scope\":\"channel_messages\"}}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "fetch_history: cursor false": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"messages\":[{\"id\":\"1.0\",\"authorId\":\"U1\",\"author\":\"U1\",\"timestamp\":\"1970-01-01T00:00:01.000Z\",\"content\":\"hi\",\"rootTs\":\"1.0\"}],\"channel\":{\"id\":\"C1\",\"writable\":true},\"pagination\":{\"scanned\":1,\"matched\":1,\"returned\":1,\"pages\":1,\"scanComplete\":true,\"stopReason\":\"exhausted\",\"threadRepliesSearched\":false,\"scope\":\"channel_messages\"}}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "fetch_history: cursor {}": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"messages\":[{\"id\":\"1.0\",\"authorId\":\"U1\",\"author\":\"U1\",\"timestamp\":\"1970-01-01T00:00:01.000Z\",\"content\":\"hi\",\"rootTs\":\"1.0\"}],\"channel\":{\"id\":\"C1\",\"writable\":true},\"pagination\":{\"scanned\":1,\"matched\":1,\"returned\":1,\"pages\":1,\"scanComplete\":true,\"stopReason\":\"exhausted\",\"threadRepliesSearched\":false,\"scope\":\"channel_messages\"}}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "fetch_history: cursor 7": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"messages\":[{\"id\":\"1.0\",\"authorId\":\"U1\",\"author\":\"U1\",\"timestamp\":\"1970-01-01T00:00:01.000Z\",\"content\":\"hi\",\"rootTs\":\"1.0\"}],\"channel\":{\"id\":\"C1\",\"writable\":true},\"pagination\":{\"scanned\":1,\"matched\":1,\"returned\":1,\"pages\":1,\"scanComplete\":true,\"stopReason\":\"exhausted\",\"threadRepliesSearched\":false,\"scope\":\"channel_messages\"}}"
+        }
+      ]
+    },
+    "requests": 1
+  },
+  "fetch_history: page null": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "Cannot read properties of null (reading 'messages')\n\nNo messages were returned."
+        }
+      ],
+      "isError": true
+    },
+    "requests": 1
+  },
+  "fetch_history: metadata null": {
+    "value": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"messages\":[{\"id\":\"1.0\",\"authorId\":\"U1\",\"author\":\"U1\",\"timestamp\":\"1970-01-01T00:00:01.000Z\",\"content\":\"hi\",\"rootTs\":\"1.0\"}],\"channel\":{\"id\":\"C1\",\"writable\":true},\"pagination\":{\"scanned\":1,\"matched\":1,\"returned\":1,\"pages\":1,\"scanComplete\":true,\"stopReason\":\"exhausted\",\"threadRepliesSearched\":false,\"scope\":\"channel_messages\"}}"
+        }
+      ]
+    },
+    "requests": 1
+  }
+}

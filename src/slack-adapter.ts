@@ -21,6 +21,7 @@
  */
 
 import { setMaxListeners } from 'node:events';
+import { isConversationRow, isDirectoryRow, isMemberRow, pageProblem, paginationLimits, type PaginationLimits, type PageTruncation } from './pagination.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { WebClient, ErrorCode, LogLevel, type Logger, type WebAPICallResult, type WebClientOptions } from '@slack/web-api';
 import { SocketModeClient } from '@slack/socket-mode';
@@ -207,6 +208,8 @@ export function policyFailureSummary(err: unknown): string {
     const scope = /granted scope '([a-z]+:[a-z.]+)'/.exec(accessContextOriginalMessage(err) ?? err.message)?.[1];
     return `missing Slack grant${scope ? ` ${scope}` : ''}; whoever runs this host can add it to the app and reinstall`;
   }
+  // The listing's malformed-cursor refusal is fixed text naming no conversation, so it is kept like a cycle's.
+  if (err instanceof SlackAccessUnverified && err.message === LISTING_CURSOR_UNVERIFIED) return err.message;
   if (err instanceof SlackAccessDenied) return err.authoritative ? 'access refused' : 'access evidence unavailable';
   if (err instanceof LocalFailure || err instanceof SlackScopeEvidenceError) return err.message;
   const kind = (err as { code?: unknown } | null)?.code;
@@ -312,14 +315,15 @@ function reportedScopes(metadata: unknown, policy = false): string[] | undefined
 /** A listing's conversations, and the enabled types it left out because the
  *  token's scopes can't read them. */
 export interface SlackListing {
+  truncation?: PageTruncation;
   conversations: SlackConversationInfo[];
   leftOut: string[];
   /** Background candidates skipped because fresh admission failed, or, in a
    *  foreground scan, the candidates its early stop left unchecked (at least 1). */
   admissionFailures?: number;
   /** Why a foreground scan stopped early and returned only the rows it had
-   *  admitted: a rate limit, the host call's deadline (the next candidate's
-   *  pacing slot or request no longer fit), or shutdown. */
+   *  admitted: a rate limit (including a shared Retry-After that leaves no
+   *  room) or the host call's deadline. Shutdown throws instead. */
   admissionStop?: { reason: 'rate_limited' | 'call_deadline'; retryAfterSeconds?: number };
 }
 
@@ -559,7 +563,24 @@ export interface SlackUserMatch {
   displayName?: string;
 }
 
+/** Why a policy listing refused a page whose cursor isn't a string. */
+const LISTING_CURSOR_UNVERIFIED = 'Conversation listing could not be verified: Slack returned a malformed pagination cursor; retry once, then ask the host operator to investigate';
+
+/** Complete searches retain the legacy array; partial searches must be handled explicitly. */
+/** Why findUsers refused a policy directory page (pageProblem). */
+const DIRECTORY_PAGE_REFUSALS = {
+  container: 'Slack returned an invalid directory; retry once, then ask the host to investigate',
+  row: 'Slack returned a malformed directory row; retry once, then ask the host to investigate',
+  cursor: 'Slack returned a malformed pagination cursor; retry once, then ask the host to investigate',
+  cycle: 'Slack repeated a pagination cursor (cursor cycle). Retry once; if it persists, ask whoever runs this host to investigate the Slack response.',
+} as const;
+
+export type SlackUserSearchResult = SlackUserMatch[] | {
+  matches: SlackUserMatch[]; truncated: true; reason: 'page_limit' | 'match_limit'; pages: number; limit: number;
+};
+
 export interface SlackAdapterConfig {
+  pagination?: Partial<PaginationLimits>;
   accessPolicy?: SlackAccessPolicyConfig;
   botToken: string;
   appToken: string;
@@ -653,7 +674,11 @@ const failedRequests = new WeakMap<object, string>();
  *  of SlackWebClient's threw. */
 export function failedRequest(err: unknown): string | undefined {
   if (err instanceof OutOfCallTime) return err.method;
-  return errorChain(err).map(value => failedRequests.get(value)).find(method => method !== undefined);
+  const chain = errorChain(err);
+  // Main's lookup is direct: only a chain holding a policy client occurrence
+  // carries request provenance through causes.
+  if (!chain.some(value => clientErrorSources.has(value))) return err !== null && typeof err === 'object' ? failedRequests.get(err) : undefined;
+  return chain.map(value => failedRequests.get(value)).find(method => method !== undefined);
 }
 
 /** The file an upload left when it failed after its first step, and whether
@@ -960,6 +985,7 @@ export function slackClients(
  * slackClients' is.
  */
 export async function connectSlack(config: SlackAdapterConfig, slackApiUrl?: string): Promise<SlackAdapter> {
+  const pagination = paginationLimits(config.pagination);
   const policy = config.accessPolicy === undefined ? undefined : new SlackAccessPolicy(config.accessPolicy);
   const clients = slackClients(config.botToken, config.appToken, slackApiUrl);
   const auth = await clients.auth.auth.test();
@@ -981,6 +1007,7 @@ export async function connectSlack(config: SlackAdapterConfig, slackApiUrl?: str
     // Granted scopes, from the x-oauth-scopes header of auth.test.
     scopes,
     policy,
+    pagination,
   );
 }
 
@@ -1071,9 +1098,10 @@ export class SlackAdapter {
   get isStopping(): boolean { return this.stopping; }
 
   /** The bot token's scopes, as Slack has reported them with auth.test's
-   *  answers and with the listings' answers and refusals, each added to those
-   *  before in legacy mode, replacing them in policy mode; undefined while Slack hasn't. */
+   *  answers and with metadata/listing answers and refusals. Policy reports
+   *  replace the known set; legacy reports accumulate. Undefined while unknown. */
   private scopes: string[] | undefined;
+  private readonly pagination: Readonly<PaginationLimits>;
 
   constructor(
     private web: SlackWebLike,
@@ -1088,6 +1116,7 @@ export class SlackAdapter {
      *  empty list, is unknown; only legacy listings ask for every type. */
     scopes?: string[],
     private readonly accessPolicy?: SlackAccessPolicy,
+    pagination?: Partial<PaginationLimits>,
   ) {
     this.web = isolateClientErrors(web, () => this.hasAccessPolicy, (method, args, answer, error, issued) => {
       const payload = error ? (answer as { data?: unknown } | null)?.data : answer;
@@ -1103,7 +1132,10 @@ export class SlackAdapter {
       // A token-wide refusal holds for every conversation until any newer
       // request succeeds; a channel's own refusal only for that channel.
       // A success is remembered even with no refusal stored, so an older refusal answered later can't latch.
-      if (code !== undefined && TOKEN_REFUSALS.has(code) && issued >= (this.tokenRefusal?.issued ?? 0) && issued > this.tokenWorkedIssued) this.tokenRefusal = { issued, refusal: answer };
+      if (code !== undefined && TOKEN_REFUSALS.has(code) && issued >= (this.tokenRefusal?.issued ?? 0) && issued > this.tokenWorkedIssued) {
+        this.tokenRefusal = { issued, refusal: answer };
+        this.tokenRefusalSeen = { count: this.tokenRefusalSeen.count + 1, refusal: answer };
+      }
       else if (!error && issued > this.tokenWorkedIssued) {
         this.tokenWorkedIssued = issued;
         if (this.tokenRefusal && issued > this.tokenRefusal.issued) this.tokenRefusal = undefined;
@@ -1114,6 +1146,7 @@ export class SlackAdapter {
       }
     });
     setMaxListeners(0, this.admissionStop.signal);
+    this.pagination = paginationLimits(pagination);
     this.scopes = reportedScopes({ scopes }, this.accessPolicy !== undefined);
     if (this.accessPolicy) {
       const missing = this.accessPolicy.diagnosticScopes(this.disableDms, this.dmUsers, this.sendChannels).filter((scope) => !this.scopes?.includes(scope));
@@ -1168,8 +1201,6 @@ export class SlackAdapter {
   }
 
   private enqueuePolicyEvent(event: SlackMessageEvent): void {
-    // An event acknowledged after stop began is still named, not dropped silently.
-    if (this.stopping) { this.dropAtStop(event, 'after shutdown began'); return; }
     if (!event || event.type !== 'message' || !CONTENT_SUBTYPES.has(event.subtype)
         || event.bot_id || event.user === this.botUserId || !event.channel || !event.user || !event.ts) return;
     const key = typeof event?.channel === 'string' ? event.channel : '';
@@ -1181,6 +1212,8 @@ export class SlackAdapter {
           || (this.dmUsers && !this.dmUsers.includes(event.user))))) return this.noteAdmissionFailure('event');
     if (!key.startsWith('D') && !this.accessPolicy!.joinedChannelsReadable
         && !this.accessPolicy!.namesGroupDm(key)) return this.noteAdmissionFailure('event');
+    // An eligible event acknowledged after stop began is named, not dropped silently.
+    if (this.stopping) { this.dropAtStop(event, 'after shutdown began'); return; }
     // Waiting ambient envelopes own no preparation. Only the bounded batch
     // selected by the delivery loop may start lookups.
     const item = { event, addressed, prepared: addressed ? this.settlePolicyEvent(event) : undefined };
@@ -1238,6 +1271,13 @@ export class SlackAdapter {
   }
 
   private ambientMessageFilter?: (channelId: string) => boolean;
+
+  /** An ambient event the subscription filter now drops, unless an addressed
+   *  delivery in its conversation (which may subscribe it) is still pending. */
+  private ambientUnsubscribed(channel: string, priority: { addressed: boolean }): boolean {
+    return !priority.addressed && !this.policyAddressedPending.has(channel)
+      && !!this.ambientMessageFilter && !this.ambientMessageFilter(channel);
+  }
 
   /** Cheap delivery veto only, never authorization. Addressed events bypass it. */
   setAmbientMessageFilter(filter: (channelId: string) => boolean): void {
@@ -1340,10 +1380,9 @@ export class SlackAdapter {
    *  types they change, by its own answer or another listing's, starts over
    *  with the new types, whether the change is seen at one of its answers or as
    *  it ends, so its answer reflects the scopes known when it returns, and
-   *  `leftOut` names the enabled types it didn't ask for. With no type to ask
+   *  `leftOut` names the enabled types its token cannot read (newly granted types may remain unscanned at a page limit). With no type to ask
    *  for, auth.test is asked for the scopes, and if they read no type either,
-   *  NoReadableConversations says so (with a policy and reported grants, the
-   *  listing is instead empty, with those types in `leftOut`). conversations.list also returns public
+   *  legacy mode throws NoReadableConversations; policy mode returns an empty listing with leftOut. conversations.list also returns public
    *  channels the bot is NOT a member of (no events, no posting without
    *  joining) — those are excluded here; list_channels with includeNonMember
    *  surfaces them.
@@ -1382,12 +1421,22 @@ export class SlackAdapter {
       if (!types.length) return { conversations: [], leftOut: this.conversationTypes() };
     }
     let out: SlackConversationInfo[] = [];
+    const rowScopes = new Map<string, string>();
     let cursor: string | undefined;
     let limited = 0;
     let admissionFailures = 0;
     const checked = new Set<string>();
     const cursors = new Set<string>();
     const names = { waitOut };
+    let pages = 0;
+    const listing = (truncation?: PageTruncation): SlackListing => ({
+      conversations: this.accessPolicy ? out.filter(row => {
+        const needed = rowScopes.get(row.id);
+        return !needed || this.scopes?.includes(needed);
+      }) : out, leftOut: this.conversationTypes().filter((type) => !types.includes(type)),
+      ...(truncation ? { truncation } : {}),
+      ...(admissionFailures ? { admissionFailures } : {}),
+    });
     // A listing keeps its types while it pages, so a cursor keeps its meaning,
     // and starts over whenever the types the token can read change. Once
     // Slack has reported scopes, legacy observations only grow; policy mode
@@ -1395,9 +1444,13 @@ export class SlackAdapter {
     const startOver = (): boolean => {
       const now = this.readableTypes();
       if (now.join(',') === types.join(',')) return false;
-      if (now.length === 0) throw noneReadable();
+      // At the cap, reconcile withdrawals against each retained row instead
+      // of fetching another page or exposing rows under withdrawn grants.
+      if (pages >= this.pagination.conversations) return true;
+      if (now.length === 0 && !this.accessPolicy) throw noneReadable();
       types = now;
       out = [];
+      rowScopes.clear();
       cursor = undefined;
       limited = 0;
       admissionFailures = 0;
@@ -1408,13 +1461,23 @@ export class SlackAdapter {
     // A foreground scan that can't check its next candidate returns the rows it
     // admitted, marked incomplete, rather than discarding them: unless the
     // readable types changed meanwhile, whose rows startOver discards.
+    // Its rows pass the same filter as any other return, and a scan that also
+    // reached its page cap keeps that signal.
+    let pageHasMore = false;
     const stopEarly = (stop: NonNullable<SlackListing['admissionStop']>): SlackListing => {
       startOver();
-      return { conversations: out, leftOut: this.conversationTypes().filter((type) => !types.includes(type)),
+      const capped = pageHasMore && pages >= this.pagination.conversations;
+      return { ...listing(capped ? { reason: 'page_limit', pages, limit: this.pagination.conversations } : undefined),
         admissionFailures: admissionFailures + 1, admissionStop: stop };
     };
     for (;;) {
       checkCurrent();
+      if (this.accessPolicy && Array.isArray(this.scopes) && types.length === 0) return listing();
+      if (pages >= this.pagination.conversations) {
+        // Refresh diagnostics; listing() also filters rows under withdrawn scopes.
+        types = this.readableTypes();
+        return listing({ reason: 'page_limit', pages, limit: this.pagination.conversations });
+      }
       let result: Awaited<ReturnType<SlackWebLike['conversations']['list']>>;
       try {
         // Slack refuses the whole call when one type lacks its read scope, and
@@ -1455,16 +1518,28 @@ export class SlackAdapter {
         throw err;
       }
       checkCurrent();
+      pages++; // Count even empty pages and responses discarded by a scope restart.
+      pageHasMore = !!result.response_metadata?.next_cursor;
       limited = 0;
       this.takeScopes(reportedScopes(result.response_metadata));
-      if (startOver()) continue;
-      if (this.accessPolicy && !Array.isArray(result.channels)) throw new Error('Slack conversation page is malformed; retry once, then ask the host to investigate');
+      // The whole page, every row and its cursor, repetition included, is
+      // validated (pageProblem) before anything can return or start over: a
+      // scope restart, a candidate's rate limit or the call's deadline must
+      // not turn a malformed page into a complete or partial listing. A
+      // non-string cursor (0, null, an object) is malformed, not the end.
+      if (this.accessPolicy) {
+        const problem = pageProblem(result.channels, result.response_metadata?.next_cursor as unknown, cursors, isConversationRow);
+        if (problem === 'container') throw new LocalFailure('Slack conversation page is malformed; retry once, then ask the host to investigate');
+        if (problem === 'cursor') throw new SlackAccessUnverified(LISTING_CURSOR_UNVERIFIED);
+        if (problem === 'row') throw new LocalFailure('No conversations were returned: malformed Slack listing candidate; retry once, then ask whoever runs this host to investigate');
+        if (problem === 'cycle') throw new LocalFailure('No listing was returned: Slack repeated a pagination cursor (cursor cycle). Retry once; if it persists, ask whoever runs this host to investigate the Slack response.');
+      }
+      if (startOver() && pages < this.pagination.conversations) continue;
       for (let raw of (result.channels ?? []) as SlackApiConversation[]) {
         checkCurrent();
         if (this.accessPolicy) {
           let admitted: SlackApiConversation | undefined;
           try {
-          if (!raw || typeof raw !== 'object' || typeof raw.id !== 'string' || !/^[CGD][A-Z0-9]+$/.test(raw.id)) throw new LocalFailure('No conversations were returned: malformed Slack listing candidate; retry once, then ask whoever runs this host to investigate');
           if (!raw.id || checked.has(raw.id)) continue;
           // Avoid a metadata request for every unjoined public workspace channel.
           if (raw.is_im === false && raw.is_mpim === false && raw.is_member === false && !this.accessPolicy.namesGroupDm(raw.id)) continue;
@@ -1517,17 +1592,17 @@ export class SlackAdapter {
         if (this.accessPolicy) checkCurrent();
         if (!info) continue;
         if (!includeNonMember && info.kind === 'channel' && !info.isMember) continue;
+        if (this.accessPolicy) rowScopes.set(info.id, raw.is_mpim ? 'mpim:read' : raw.is_im ? 'im:read' : raw.is_private ? 'groups:read' : 'channels:read');
         out.push(info);
       }
+      // A cursor from an obsolete type scan has no meaning after a restart.
+      // Policy only: main's unset listing asks for its next page first.
       if (this.accessPolicy && startOver()) continue;
       cursor = result.response_metadata?.next_cursor || undefined;
-      if (this.hasAccessPolicy && cursor && cursors.has(cursor)) throw new LocalFailure('No listing was returned: Slack repeated a pagination cursor (cursor cycle). Retry once; if it persists, ask whoever runs this host to investigate the Slack response.');
-      if (this.accessPolicy && cursor) cursors.add(cursor);
       // Another listing's answer may have changed the scopes while this page's
       // DM names were looked up, so they're checked once more before it ends.
       if (!cursor && !startOver()) {
-        return { conversations: out, leftOut: this.conversationTypes().filter((type) => !types.includes(type)),
-          ...(admissionFailures ? { admissionFailures } : {}) };
+        return listing();
       }
     }
   }
@@ -1574,6 +1649,9 @@ export class SlackAdapter {
 
   private tokenRefusal?: { issued: number; refusal: unknown };
   private tokenWorkedIssued = 0;
+  /** Every token refusal latched, kept after a newer success clears the
+   *  latch, so an upload can tell one observed while it was pending. */
+  private tokenRefusalSeen: { count: number; refusal: unknown } = { count: 0, refusal: undefined };
 
   private assertNoKnownDeliveryRefusal(channelId: string): void {
     const observation = this.deliveryObservations.get(channelId);
@@ -1644,15 +1722,13 @@ export class SlackAdapter {
     for (let page = 0; page < 5; page++) {
       const result = await this.web.conversations.members({ channel, limit: 200, ...(cursor ? { cursor } : {}) });
       const issued = responseIssued.get(result)!;
-      const members = result?.members;
-      const next = result?.response_metadata?.next_cursor;
-      if (!Array.isArray(members) || !Array.from(members).every((id) => typeof id === 'string' && /^[UW][A-Z0-9]+$/.test(id))
-          || (next !== undefined && (typeof next !== 'string' || next.trim() !== next))) return undefined;
-      if (members.includes(this.botUserId)) return { member: true, issued };
+      const next: unknown = result?.response_metadata?.next_cursor;
+      // The whole page is validated (pageProblem) before either answer:
+      // a malformed or repeated cursor leaves membership unverified.
+      if (pageProblem(result?.members, next, seen, isMemberRow) || (typeof next === 'string' && next.trim() !== next)) return undefined;
+      if ((result.members as string[]).includes(this.botUserId)) return { member: true, issued };
       if (!next) return { member: false, issued };
-      if (seen.has(next)) return undefined;
-      seen.add(next);
-      cursor = next;
+      cursor = next as string;
     }
     return undefined;
   }
@@ -1900,7 +1976,8 @@ export class SlackAdapter {
       return 'ok';
     } catch (err) {
       if (!status || !this.statusRefusedFor(channelId, threadTs)) {
-        console.error(`[slack-mcpl] thread status on ${channelId} failed:`, this.accessPolicy ? policyFailureSummary(err) : err instanceof Error ? err.message : err);
+        if (this.accessPolicy) console.error(`[slack-mcpl] thread status ${status ? 'set' : 'clear'} on ${channelId} failed${status ? '' : ' (the previous status may still be visible)'}:`, policyFailureSummary(err));
+        else console.error(`[slack-mcpl] thread status on ${channelId} failed:`, err instanceof Error ? err.message : err);
       }
       const refused = refusedForGood(err);
       // Refusals Slack evidenced latch: its lasting refusals and authoritative
@@ -1939,7 +2016,11 @@ export class SlackAdapter {
       // add, such as the DM check's conversations.info. Slack answers a
       // removal of one that isn't there with no_reaction.
       (err: unknown) => {
-        if (failedAccessAdmission(err)) return false;
+        if (failedAccessAdmission(err)) {
+          // Not an outcome to keep quiet: the ACK is missing because admission refused it.
+          if (this.accessPolicy) console.error(`[slack-mcpl] acknowledgement reaction on ${ts} in ${channelId} not added: ${policyFailureSummary(err)}`);
+          return false;
+        }
         const failed = failedRequest(err);
         if (failed !== undefined && failed !== 'reactions.add') return false;
         return !cannotHaveLanded(err);
@@ -2109,6 +2190,7 @@ export class SlackAdapter {
     channelId: string,
     file: { filename: string; data: Buffer; title?: string; comment?: string; threadTs?: string },
   ): Promise<{ fileId: string; shareTs?: string }> {
+    const refusalsBefore = this.tokenRefusalSeen.count;
     await this.requireWritableConversation(channelId, 'files:write', 'Nothing was uploaded');
     await this.assertNotDm(channelId, 'Nothing was uploaded');
     const target = await this.web.files.getUploadURLExternal({ filename: file.filename, length: file.data.byteLength });
@@ -2144,6 +2226,16 @@ export class SlackAdapter {
       if (this.accessPolicy) {
         const targetUrl = new URL(url);
         if (targetUrl.protocol !== 'https:' || targetUrl.username || targetUrl.password) throw new Error('Invalid Slack upload URL');
+        // Evidence observed while the upload was pending (a token refusal, a
+        // withdrawn files:write grant or a newer refusal of the conversation)
+        // stops the bytes before they leave: the byte POST carries no bot
+        // token, so Slack can't refuse it for one. A token refusal observed
+        // since the upload began stops them even if a newer-issued success,
+        // such as the ticket's own, has since cleared the latch.
+        if (this.tokenRefusal) throw refusalOccurrence(this.tokenRefusal.refusal);
+        if (this.tokenRefusalSeen.count !== refusalsBefore) throw refusalOccurrence(this.tokenRefusalSeen.refusal);
+        this.accessPolicy.requireScope(this.scopes, 'files:write');
+        this.assertNoKnownDeliveryRefusal(channelId);
       }
       await this.postFileBytes(url, file.data);
     } catch (err) {
@@ -2360,6 +2452,7 @@ export class SlackAdapter {
     await this.requireHistoryConversation(channelId, NOTHING_RETURNED);
     return readBounded(opts, {
       policyAttachments: this.hasAccessPolicy,
+      strictPages: this.hasAccessPolicy,
       page: (at, limit) => this.web.conversations.history({
         channel: channelId, limit, inclusive: false,
         // Each page sends latest alone, the position or the read's latest, or
@@ -2385,6 +2478,7 @@ export class SlackAdapter {
     await this.requireHistoryConversation(channelId, NOTHING_RETURNED);
     return readBounded(opts, {
       policyAttachments: this.hasAccessPolicy,
+      strictPages: this.hasAccessPolicy,
       page: (at, limit) => this.web.conversations.replies({
         channel: channelId, ts: threadTs, limit, inclusive: false,
         ...(at ? { oldest: at } : {}), ...(opts.latest ? { latest: opts.latest } : {}),
@@ -2401,16 +2495,18 @@ export class SlackAdapter {
   async fetchHistory(
     channelId: string,
     opts: { limit?: number; oldest?: string; latest?: string } = {},
-  ): Promise<{ messages: HistoryMessage[]; truncated: boolean }> {
+  ): Promise<{ messages: HistoryMessage[]; truncated: boolean; stopReason?: 'message_limit' | 'page_limit' }> {
     await this.requireHistoryConversation(channelId, 'Nothing was read');
     if (this.accessPolicy && this.stopping) throw new Error('History stopped before requesting a page');
-    const { messages, truncated } = await fetchSlackHistory(this.web, {
+    const { messages, truncated, stopReason } = await fetchSlackHistory(this.web, {
       channel: channelId,
       ...(opts.oldest !== undefined ? { oldest: opts.oldest } : {}),
       ...(opts.latest !== undefined ? { latest: opts.latest } : {}),
       maxMessages: opts.limit ?? 50,
+      maxPages: this.pagination.backscroll,
+      rejectCursorCycles: this.hasAccessPolicy,
     });
-    return { messages: await this.shapeHistory(messages, channelId), truncated };
+    return { messages: await this.shapeHistory(messages, channelId), truncated, ...(stopReason ? { stopReason } : {}) };
   }
 
   private async shapeHistory(messages: SlackHistoryMessage[], channelId: string): Promise<HistoryMessage[]> {
@@ -2451,13 +2547,14 @@ export class SlackAdapter {
 
   // ── Users ──
 
-  async findUsers(query: string, max = 25): Promise<SlackUserMatch[]> {
-    await withAccessContext('No users were returned', async () => this.accessPolicy?.requireScope(this.scopes, 'users:read'));
+  /** Without a policy, keep the original directory search, including its
+   *  match-limit and cursor decisions. The tool opts into bounded search. */
+  async findUsers(query: string, max = 25): Promise<SlackUserSearchResult> {
+    if (this.accessPolicy) return this.findUsersBounded(query, max);
     const q = query.toLowerCase();
     if (!q) throw new Error('query is required');
     const matches: SlackUserMatch[] = [];
     let cursor: string | undefined;
-    const cursors = new Set<string>();
     do {
       const result = await this.web.users.list({ limit: 200, cursor });
       for (const raw of (result.members ?? []) as Array<{
@@ -2481,8 +2578,101 @@ export class SlackAdapter {
       cursor = matches.length >= max
         ? undefined
         : (result.response_metadata?.next_cursor || undefined);
-      if (this.hasAccessPolicy && cursor && cursors.has(cursor)) throw new Error('No users were returned: Slack repeated a pagination cursor (cursor cycle). Retry once; if it persists, ask whoever runs this host to investigate the Slack response.');
-      if (this.hasAccessPolicy && cursor) cursors.add(cursor);
+    } while (cursor);
+    return matches;
+  }
+
+  /** Directory search for find_user and callers opting into page bounds. */
+  async findUsersBounded(query: string, max = 25): Promise<SlackUserSearchResult> {
+    if (!this.accessPolicy) return this.findUsersBoundedUnset(query, max);
+    await withAccessContext('No users were returned', async () => this.accessPolicy?.requireScope(this.scopes, 'users:read'));
+    const q = query.toLowerCase();
+    if (!q) throw new Error('query is required');
+    const matches: SlackUserMatch[] = [];
+    let cursor: string | undefined;
+    const cursors = new Set<string>();
+    let pages = 0;
+    do {
+      const result = await this.web.users.list({ limit: 200, cursor });
+      pages++;
+      // The whole page, every row and its cursor, repetition included, is
+      // validated (pageProblem) before a match is taken or the search stops
+      // at its match or page limit.
+      const next: unknown = result?.response_metadata?.next_cursor;
+      const problem = pageProblem(result?.members, next, cursors, isDirectoryRow);
+      if (problem) throw new Error(`No users were returned: ${DIRECTORY_PAGE_REFUSALS[problem]}`);
+      const members = result.members as Array<{
+        id: string; name?: string; real_name?: string; deleted?: boolean; is_bot?: boolean;
+        profile?: { display_name?: string } | null;
+      }>;
+      let unexamined = false;
+      for (let index = 0; index < members.length; index++) {
+        const raw = members[index]!;
+        if (raw.deleted || raw.is_bot) continue;
+        const name = raw.name?.toLowerCase() ?? '';
+        const realName = raw.real_name?.toLowerCase() ?? '';
+        const displayName = raw.profile?.display_name?.toLowerCase() ?? '';
+        if (name.includes(q) || realName.includes(q) || displayName.includes(q)) {
+          matches.push({
+            userId: raw.id,
+            username: raw.name,
+            realName: raw.real_name,
+            displayName: raw.profile?.display_name,
+          });
+          if (matches.length >= max) { unexamined = index < members.length - 1; break; }
+        }
+      }
+      if (matches.length >= max && (unexamined || next)) {
+        return { matches, truncated: true, reason: 'match_limit', pages, limit: max };
+      }
+      cursor = matches.length >= max ? undefined : ((next as string | undefined) || undefined);
+      if (cursor && pages >= this.pagination.users) {
+        return { matches, truncated: true, reason: 'page_limit', pages, limit: this.pagination.users };
+      }
+    } while (cursor);
+    return matches;
+  }
+
+  /** The bounded search keeps legacy member iteration without page validation. */
+  private async findUsersBoundedUnset(query: string, max: number): Promise<SlackUserSearchResult> {
+    const q = query.toLowerCase();
+    if (!q) throw new Error('query is required');
+    const matches: SlackUserMatch[] = [];
+    let cursor: string | undefined;
+    let pages = 0;
+    do {
+      const result = await this.web.users.list({ limit: 200, cursor });
+      pages++;
+      let examined = 0;
+      for (const raw of (result.members ?? []) as Array<{
+        id?: string; name?: string; real_name?: string; deleted?: boolean; is_bot?: boolean;
+        profile?: { display_name?: string };
+      }>) {
+        examined++;
+        if (!raw.id || raw.deleted || raw.is_bot) continue;
+        const name = raw.name?.toLowerCase() ?? '';
+        const realName = raw.real_name?.toLowerCase() ?? '';
+        const displayName = raw.profile?.display_name?.toLowerCase() ?? '';
+        if (name.includes(q) || realName.includes(q) || displayName.includes(q)) {
+          matches.push({
+            userId: raw.id,
+            username: raw.name,
+            realName: raw.real_name,
+            displayName: raw.profile?.display_name,
+          });
+          if (matches.length >= max) break;
+        }
+      }
+      if (matches.length >= max && (examined < ((result.members ?? []) as unknown[]).length || result.response_metadata?.next_cursor)) {
+        return { matches, truncated: true, reason: 'match_limit', pages, limit: max };
+      }
+      cursor = matches.length >= max
+        ? undefined
+        : (result.response_metadata?.next_cursor || undefined);
+      // Documented limit: the page budget.
+      if (cursor && pages >= this.pagination.users) {
+        return { matches, truncated: true, reason: 'page_limit', pages, limit: this.pagination.users };
+      }
     } while (cursor);
     return matches;
   }
@@ -2576,6 +2766,9 @@ export class SlackAdapter {
     for (let attempt = 1; ; attempt++) {
       if (this.stopping) throw new Error('Conversation admission stopped');
       if (!forDelivery && !await this.paceEventAdmission(channel, priority)) return undefined;
+      // Unsubscribed while it waited for its slot: the server would filter it,
+      // so it spends no admission quota.
+      if (this.ambientUnsubscribed(channel, priority)) return undefined;
       if (this.stopping) throw new Error('Conversation admission stopped');
       try { return await this.requireHistoryConversation(channel, 'Nothing was delivered'); }
       catch (err) {
@@ -2613,7 +2806,6 @@ export class SlackAdapter {
     if (!event.channel || !event.user || !event.ts) return;
 
     let channelType = event.channel_type;
-    if (this.accessPolicy && this.stopping) throw EVENT_SHUTDOWN;
     let isDM = event.channel_type === 'im' || event.channel.startsWith('D');
     if (this.accessPolicy) {
       // Skip undeliverable ambient traffic before spending the shared info quota.
@@ -2622,6 +2814,7 @@ export class SlackAdapter {
       const addressed = event.channel.startsWith('D') || (this.botUserId !== null
         && typeof event.text === 'string' && extractSlackUserIds(event.text).includes(this.botUserId));
       if (!addressed && this.ambientMessageFilter && !this.ambientMessageFilter(event.channel)) return;
+      if (this.stopping) throw EVENT_SHUTDOWN;
       // Local checks can only deny; fresh metadata remains authoritative.
       if ((event.channel_type === 'mpim' && (this.disableDms || !this.accessPolicy.namesGroupDm(event.channel)))
           || (event.channel.startsWith('D') && !this.accessPolicy.namesGroupDm(event.channel) && (this.dmsDisabled || !this.accessPolicy.mayDmUser(event.user)
@@ -2634,7 +2827,10 @@ export class SlackAdapter {
         const conversation = await this.sharedEventAdmission(event.channel, addressed);
         if (this.stopping) throw EVENT_SHUTDOWN;
         // Each event sharing a retired admission is named, not only the slot.
-        if (!conversation) { droppedEvent(event, 'its admission slot was retired from the 32-entry ambient admission backlog'); return; }
+        if (!conversation) {
+          if (!this.ambientUnsubscribed(event.channel, { addressed })) droppedEvent(event, 'its admission slot was retired from the 32-entry ambient admission backlog');
+          return;
+        }
         isDM = conversation?.is_im === true;
         channelType = conversation?.is_im ? 'im' : conversation?.is_mpim ? 'mpim' : conversation?.is_private ? 'group' : 'channel';
         if (isDM && conversation?.user !== event.user) throw new SlackAccessDenied('DM peer mismatch');
