@@ -268,19 +268,30 @@ test('scope evidence on a refused policy auth probe is consumed', async () => {
  assert.equal(probes,1);
 });
 
-test('a scope restart discards the old cursor before cycle classification', async () => {
+test('a cursor repeated within one type scan is a cycle on arrival, before a candidate can restart the scan', async () => {
+ const f=accessFixture({scopes:['im:read','users:read']});
+ let pages=0;
+ f.web.conversations.list=async()=>{
+  pages++;
+  if(pages===1)return {channels:[],response_metadata:{next_cursor:'same'}};
+  return {channels:[{id:'D1',is_im:true,user:'U1'}],response_metadata:{next_cursor:'same'}};
+ };
+ f.web.conversations.info=async()=>({channel:{id:'D1',is_im:true,user:'U1'},
+  response_metadata:{scopes:['im:read','users:read','channels:read']}});
+ await assert.rejects(f.adapter.listConversations(),/cursor cycle/);
+ assert.equal(pages,2);
+});
+
+test('a scope restart before a cursor repeats discards the old cursor', async () => {
  const f=accessFixture({scopes:['im:read','users:read']});
  let pages=0;
  f.web.conversations.list=async(args)=>{
   pages++;
-  if(pages===1)return {channels:[],response_metadata:{next_cursor:'same'}};
-  if(pages===2)return {channels:[{id:'D1',is_im:true,user:'U1'}],response_metadata:{next_cursor:'same'}};
-  assert.equal(pages,3);
-  assert.equal(args.cursor,undefined);
+  if(pages===1)return {channels:[],response_metadata:{next_cursor:'same',scopes:['im:read','users:read','channels:read']}};
+  if(pages===2){assert.equal(args.cursor,undefined);return {channels:[],response_metadata:{next_cursor:'same'}};}
+  assert.equal(args.cursor,'same');
   return {channels:[]};
  };
- f.web.conversations.info=async()=>({channel:{id:'D1',is_im:true,user:'U1'},
-  response_metadata:{scopes:['im:read','users:read','channels:read']}});
  const result=await f.adapter.listConversations();
  assert.deepEqual(result.conversations,[]);
  assert.equal(pages,3);

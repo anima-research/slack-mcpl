@@ -513,6 +513,40 @@ test('R1-5 file metadata rate limits preserve retry information', async t => {
   await assert.rejects(f.adapter.resolveFileDownload('C1', 'F1'), err => { assert.equal((err as { retryAfter?: number }).retryAfter, 12); return true; });
 });
 
+for (const veto of ['files:write withdrawal', 'conversation refusal']) test(`an upload ticket pending during ${veto} never sends bytes`, async t => {
+  const f = accessFixture();
+  t.after(() => f.adapter.stop());
+  const bytes = t.mock.method(globalThis, 'fetch', async () => new Response('OK'));
+  let issued!: () => void, release!: () => void;
+  const ticketIssued = new Promise<void>(resolve => { issued = resolve; });
+  const ticketHeld = new Promise<void>(resolve => { release = resolve; });
+  f.web.files.getUploadURLExternal = async () => {
+    issued();
+    await ticketHeld;
+    return { file_id: 'F1', upload_url: 'https://files.slack.com/upload' };
+  };
+  const upload = f.adapter.uploadFile('C1', { filename: 'x', data: Buffer.from('x') })
+    .then(() => undefined, (err: unknown) => err);
+  await ticketIssued;
+  try {
+    if (veto === 'files:write withdrawal') {
+      f.state.infoScopes = accessScopes.filter(scope => scope !== 'files:write');
+      await f.adapter.getConversationMeta('C1');
+    } else {
+      f.state.conversation = { ...joined(), is_member: false };
+      await assert.rejects(f.adapter.getConversationMeta('C1'), /a member can invite it/);
+      f.state.conversation = joined(); // A later fresh lookup alone would succeed.
+    }
+  } finally {
+    release();
+  }
+  const err = await upload;
+  assert.equal(bytes.mock.callCount(), 0, 'known veto must take effect before the byte request');
+  assert.equal(f.methods().includes('complete'), false);
+  assert.match(String(err), veto === 'files:write withdrawal' ? /files:write/ : /a member can invite it/);
+  assert.deepEqual(fileLeftByUpload(err), { fileId: 'F1', mayHaveShared: false, policy: true });
+});
+
 for (const failure of ['redirect', 'recheck', 'membership', 'unexpected', 'denied', 'bytes', 'timeout', 'scope'] as const) {
   test(`upload ${failure} retains issued ID without claiming nothing uploaded`, async t => {
     const f = accessFixture();

@@ -73,10 +73,10 @@ test('missing files:read withholds refs without withholding admitted text', asyn
   f.state.messages = [message];
   const withheld = files.map(file => ({ channelId: 'C1', name: 'attachment (download unavailable)', downloadUnavailable: 'files:read', isImage: file.mimetype?.startsWith('image/') ?? false }));
   assert.deepEqual((await f.adapter.fetchHistory('C1')).messages[0].attachments, withheld);
-  const received: unknown[] = [];
-  f.adapter.onMessage((msg) => { received.push(msg.attachments); assert.equal(msg.content, 'text'); });
+  const received: { attachments: unknown; content: unknown }[] = [];
+  f.adapter.onMessage((msg) => { received.push({ attachments: msg.attachments, content: msg.content }); });
   await f.emit({ type: 'message', channel: 'C1', user: 'U1', ts: '2.0', text: 'text', files });
-  assert.deepEqual(received, [withheld]);
+  assert.deepEqual(received, [{ attachments: withheld, content: 'text' }]);
   for (const ref of (await f.adapter.fetchHistory('C1')).messages[0].attachments) {
     assert.match(policyFileNote(ref as import('../src/file-access.js').PolicyFileRef), /file access.*host.*restore.*re-read.*current attachment reference/);
   }

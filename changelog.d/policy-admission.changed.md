@@ -16,8 +16,10 @@
   request only enabled DM types. With no enabled type there is nothing to list.
 - A final verification failure can drop delivery; a bounded transient fallback
   is allowed only without a known lasting refusal or withdrawn grant. A refused
-  acknowledgement cleanup can leave the reaction visible. Routine admission
-  failures are counted on stderr without message IDs; shut-down and overload
+  acknowledgement cleanup can leave the reaction visible. Routine inbound
+  admission failures are counted on stderr without message IDs; an admission
+  failure that prevents adding an acknowledgement is logged per message.
+  Shutdown and overload
   diagnostics identify dropped work where available. Server-side policy drop
   logs include the thread root for replies. Slack does not replay
   acknowledged messages.
