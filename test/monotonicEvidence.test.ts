@@ -1,14 +1,13 @@
 import assert from 'node:assert/strict';
-import { accessTest as test, accessFixture, accessScopes, joined } from './adapterAccessFixture.js';
+import { accessTest as test, accessFixture, accessScopes, joined, ownedTest } from './adapterAccessFixture.js';
 import { postLeftBy, failedRequest, SlackWebClient, SLACK_CLIENT_OPTIONS, withCallTime } from '../src/slack-adapter.js';
 import { clock } from '../src/clock.js';
 import { withAccessContext } from '../src/access-policy.js';
-import nodeTest from 'node:test';
 import { setImmediate } from 'node:timers/promises';
 import { WebClient } from '@slack/web-api';
 import { fakeSlackApi } from './slackApi.js';
 
-for (const negative of ['membership', 'metadata grant'] as const) nodeTest(`A/B/C: an old success cannot postpone recovery after ${negative} restoration`, { timeout: 5000 }, async t => {
+for (const negative of ['membership', 'metadata grant'] as const) ownedTest(`A/B/C: an old success cannot postpone recovery after ${negative} restoration`, { timeout: 5000 }, async t => {
   const api = await fakeSlackApi();
   const f = accessFixture();
   let releaseA!: () => void, releaseC!: () => void;
@@ -207,7 +206,7 @@ test('each operation rethrowing a stored refusal gets its own carrier', async t 
   assert.doesNotMatch(read.message, /Nothing was posted/);
 });
 
-nodeTest('a rate-limited request resent after the client wait is ordered at its resend, not its first send', { timeout: 5000 }, async t => {
+ownedTest('a rate-limited request resent after the client wait is ordered at its resend, not its first send', { timeout: 5000 }, async t => {
   t.mock.method(console, 'error', () => {});
   const api = await fakeSlackApi();
   const f = accessFixture();

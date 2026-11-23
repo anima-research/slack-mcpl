@@ -5,7 +5,6 @@
   deletion still removes the file from its other shares too. Unshared or unverifiable
   files are left for manual cleanup. Upload provenance is capped at 1000 entries;
   evicted entries also require manual cleanup. Checks cannot make concurrent unsharing atomic.
-  Embedded policy callers use these protections; legacy URL fetching and rollback stay unchanged.
   A download needs the conversation's metadata read grant and `files:read`, not its
   history grant: a caller that knows a conversation ID and an associated file ID can
   fetch that file even where `fetch_history`, `fetch_thread` and inbound delivery

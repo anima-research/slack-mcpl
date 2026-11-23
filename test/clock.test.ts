@@ -35,3 +35,21 @@ test('abort wakes a real referenced sleep and removes its timer and listener', a
   await clock.sleep(60000, { signal: controller.signal });
   assert.equal(timers(), before, 'already-aborted sleep never arms a timer');
 });
+
+test('abortable sleeps resolve and remove listeners on every exit path', async () => {
+  const { EventEmitter } = await import('node:events');
+  const getEventListeners = EventEmitter.getEventListeners;
+  const already = new AbortController();
+  already.abort();
+  await clock.sleep(60_000, { signal: already.signal });
+  assert.equal(getEventListeners(already.signal, 'abort').length, 0);
+  const pending = new AbortController();
+  const sleep = clock.sleep(60_000, { signal: pending.signal });
+  assert.equal(getEventListeners(pending.signal, 'abort').length, 1);
+  pending.abort();
+  await sleep;
+  assert.equal(getEventListeners(pending.signal, 'abort').length, 0);
+  const completed = new AbortController();
+  await clock.sleep(1, { signal: completed.signal });
+  assert.equal(getEventListeners(completed.signal, 'abort').length, 0);
+});

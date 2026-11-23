@@ -299,7 +299,7 @@ test('invalid conversation IDs refuse before metadata; readJoinedChannels=false 
     await assert.rejects(f.adapter.sendMessage(id, 'hi'), /Invalid Slack conversation ID/);
   }
   assert.deepEqual(f.calls, []);
-  const g = accessFixture({ config: { readJoinedChannels: false, writeChannels: ['C1'], dmUsers: ['U1'] } });
+  const g = accessFixture({ config: { readJoinedChannels: false, writeChannels: [], dmUsers: ['U1'] } });
   await assert.rejects(g.adapter.getConversationMeta('C1'), /excluded/);
   g.state.conversation = { id: 'D1', is_im: true, user: 'U1' };
   await g.adapter.readThread('D1', '1.0', {});
@@ -345,7 +345,7 @@ test('listing never requests DM scopes/types when the policy names no DM peers',
     types: 'public_channel,private_channel', exclude_archived: true, limit: 200, cursor: undefined,
   } }]);
   const g = accessFixture({ config, scopes: ['im:read'] });
-  await assert.rejects(g.adapter.listConversations(), /none of the read scopes/);
+  assert.deepEqual(await g.adapter.listConversations(), { conversations: [], leftOut: ['public_channel', 'private_channel'] });
   assert.deepEqual(g.methods(), ['auth.test']);
 });
 
@@ -386,7 +386,7 @@ test('foreground rate limits retain partial rows; background retries can recover
     f.state.infoError = undefined;
   });
   assert.equal(result.conversations.length, 1);
-  assert.deepEqual(waits, [[{ method: 'conversations.info', seconds: 2, why: 'limited' }, 1]]);
+  assert.deepEqual(waits, [[{ method: 'conversations.info', seconds: 2, why: 'limited', attempts: 5 }, 1]]);
 });
 
 
@@ -431,6 +431,7 @@ test('a foreground scan that runs out of call time for its next paced candidate 
   assert.equal((f.adapter as any).eventAdmissionQueue.length, 0, 'the late slot left the queue');
 });
 test('inbound rate limit retries in order, and exhausted retries log the dropped message', async (t) => {
+  t.mock.method(Math, 'random', () => 0.5);
   const { slept } = virtualClock(t);
   const f = accessFixture();
   const event = { type: 'message', channel: 'C1', user: 'U1', ts: '1.0', text: 'hi' };
@@ -444,14 +445,15 @@ test('inbound rate limit retries in order, and exhausted retries log the dropped
   };
   await Promise.all([f.emit(event), f.emit({ ...event, ts: '2.0' })]);
   assert.deepEqual(delivered, ['1.0', '2.0']);
-  assert.deepEqual(slept, [2000]);
+  assert.deepEqual(slept, [2125]);
   f.web.conversations.info = async () => { throw error; };
   const logs: unknown[][] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => logs.push(args));
   assert.equal(await f.emit({ ...event, ts: '3.0' }), true);
-  assert.deepEqual(slept, [2000, 1200, 2000, 2000]);
+  assert.deepEqual(slept, [2125, 1200, 2125, 2125]);
+  await f.adapter.stop();
   assert.equal(logs.length, 1);
-  assert.match(String(logs[0][0]), /Dropped message 3.0 in C1: admission failed: slack_webapi_rate_limited_error. Slack will not replay it; recover it with fetch_history./);
+  assert.match(String(logs[0][0]), /message dropped: 1/);
   assert.equal(delivered.length, 2);
 });
 
@@ -527,7 +529,7 @@ test('R2-3 disabled DM hints and reads refuse without metadata; R2-4 hides peer'
 });
 
 test('joined-channel-disabled policy vetoes metadata before spending Slack quota', async () => {
-  const f = accessFixture({ config: { readJoinedChannels: false, writeChannels: ['C1'], dmUsers: ['U1'] }, ack: 'eyes' });
+  const f = accessFixture({ config: { readJoinedChannels: false, writeChannels: [], dmUsers: ['U1'] }, ack: 'eyes' });
   await assert.rejects(f.adapter.readHistory('C1', {}), /excluded/);
   await assert.rejects(f.adapter.sendMessage('C1', 'hi'), /not allowed/);
   await f.adapter.acknowledge('C1', '1.0');
@@ -779,7 +781,7 @@ test('ambient admissions overlap behind an earlier addressed delivery', async (t
 });
 
 
-test('retryable ACK admission is retired on the fifth failure: one immediate, four timer-driven', async (t) => {
+test('retryable ACK admission is retired after the initial failure and four timer retries', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const f = accessFixture({ ack: 'eyes' });
   await f.adapter.acknowledge('C1', '1.0');
@@ -867,6 +869,40 @@ test('sequential inbound admission attempts are paced without caching evidence',
   await f.emit({ type: 'message', channel: 'C1', user: 'U1', ts: '5.0', text: '<@UBOT> hello' });
   assert.deepEqual(time.slept, [1200, 1200, 1200, 1200]);
   assert.equal(f.methods().filter(m => m === 'info').length, 5);
+  await f.adapter.stop();
+});
+
+test('malformed legacy send targets cannot enable policy DM opening', async () => {
+  for (const id of ['D', 'D…', 'Dnot-an-id', 'd1', 'D1 ', 'D1\n']) {
+    const f = accessFixture({ sendChannels: [id] });
+    assert.equal(f.adapter.dmsWritable, false);
+    await assert.rejects(f.adapter.sendDM('U1', 'hello'), SlackAccessDenied);
+    assert.deepEqual(f.methods(), []);
+  }
+});
+
+test('listing vetoes a disallowed listed IM peer before metadata', async () => {
+  for (const legacy of [false, true]) {
+    const f = accessFixture(legacy ? { dmUsers: ['U2'] } : {});
+    f.state.listed = [{ id: 'D1', is_im: true, user: 'UOTHER' }];
+    assert.deepEqual((await f.adapter.listConversations()).conversations, []);
+    assert.deepEqual(f.methods(), ['list']);
+  }
+  const f = accessFixture();
+  f.state.listed = [{ id: 'D1', is_im: true, user: 'U1' }];
+  f.state.conversation = { id: 'D1', is_im: true, user: 'UOTHER' };
+  assert.deepEqual((await f.adapter.listConversations()).conversations, []);
+  assert.deepEqual(f.methods(), ['list', 'info'], 'listed permission never grants admission');
+});
+
+
+test('legacy DM peer listing veto is independent of policy peers and disabled DM mode', async () => {
+  const f = accessFixture({ dmUsers: ['U1'], config: { readJoinedChannels: true, writeChannels: ['C1'], dmUsers: ['U1', 'U2'] } });
+  assert.equal(f.adapter.dmsWritable, true);
+  f.state.listed = [{ id: 'D2', is_im: true, user: 'U2' }];
+  f.state.conversation = { id: 'D2', is_im: true, user: 'U2' };
+  assert.deepEqual((await f.adapter.listConversations()).conversations, []);
+  assert.deepEqual(f.methods(), ['list'], 'legacy peer veto avoids info despite policy permission');
   await f.adapter.stop();
 });
 
@@ -1081,17 +1117,19 @@ test('without a policy, a callable client namespace keeps its methods', async ()
   assert.ok(f.methods().includes('users'), 'users.list was called through the callable namespace');
 });
 
-for (const [code, unreadable] of [['not_in_channel', true], ['invalid_arguments', false]] as const) {
-  test(`an admission refusal ${code} ${unreadable ? 'also' : 'does not'} block the recovering read in the drop log`, async (t) => {
-    const f = accessFixture();
-    f.state.infoError = Object.assign(new Error(code), { code: ErrorCode.PlatformError, data: { ok: false, error: code } });
-    await f.emit({ type: 'message', channel: 'C1', user: 'U1', ts: '2.0', text: '<@UBOT> hi' });
-    const logged = (console.error as unknown as { mock: { calls: Array<{ arguments: unknown[] }> } }).mock.calls
-      .map((call) => String(call.arguments[0])).filter((line) => line.includes('Dropped message 2.0'));
-    assert.equal(logged.length, 1, logged.join('\n'));
-    assert.equal(/same access refusal also blocks reading/.test(logged[0]), unreadable, logged[0]);
-  });
-}
+test('an admission failure is counted in a summary that says it names no message', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const f = accessFixture();
+  f.state.infoError = Object.assign(new Error('not_in_channel'), { code: ErrorCode.PlatformError, data: { ok: false, error: 'not_in_channel' } });
+  await f.emit({ type: 'message', channel: 'C1', user: 'U1', ts: '2.0', thread_ts: '1.0', text: '<@UBOT> hi' });
+  t.mock.timers.tick(60_000);
+  const logged = (console.error as unknown as { mock: { calls: Array<{ arguments: unknown[] }> } }).mock.calls
+    .map((call) => String(call.arguments[0])).filter((line) => line.includes('Access admission'));
+  assert.equal(logged.length, 1, logged.join('\n'));
+  assert.match(logged[0]!, /verification failed \(event, not_in_channel\): 1; .*this summary names no conversation, message or thread/);
+  assert.doesNotMatch(logged[0]!, /original thread root|2\.0|C1/);
+  await f.adapter.stop();
+});
 
 test('a transient file-cleanup admission failure states its outcome once', async () => {
   const { explainSlackError } = await import('../src/slack-errors.js');
@@ -1112,4 +1150,17 @@ test('background registration names a malformed candidate as a local check, not 
     .map(call => String(call.arguments[0])).filter(line => line.includes('Registration candidate'));
   assert.deepEqual(logged, ['[slack-mcpl] Registration candidate unknown skipped: admission failed; count is incomplete: '
     + 'No conversations were returned: malformed Slack listing candidate; retry once, then ask whoever runs this host to investigate']);
+});
+
+for (const field of ['userId', 'fileId'] as const) test(`caller-controlled ${field} text cannot select channelId advice`, async t => {
+  const { explainSlackError } = await import('../src/slack-errors.js');
+  const f = accessFixture(); t.after(() => f.adapter.stop());
+  const invalid = 'Invalid Slack conversation ID embedded-in-value';
+  const pending = field === 'userId' ? f.adapter.sendDM(invalid, 'hi') : f.adapter.resolveFileDownload('C1', invalid);
+  await assert.rejects(pending, err => {
+    const text = explainSlackError(err, { tool: field === 'userId' ? 'send_dm' : 'fetch_attachment', args: { [field]: invalid } });
+    assert.doesNotMatch(text, /Correct channelId/);
+    return true;
+  });
+  assert.deepEqual(f.methods(), []);
 });
