@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
+import { virtualClock } from './virtualClock.js';
 import { method } from '@animalabs/mcpl-core';
 import { SlackMcplServer } from '../src/server.js';
 import { SlackAccessDenied, withAccessContext } from '../src/access-policy.js';
 import type { SlackMessageData } from '../src/slack-adapter.js';
-import { virtualClock } from './virtualClock.js';
 import { FULL_GRANT, connectHost, initialize } from './harness.js';
 import { accessTest as test, accessFixture } from './adapterAccessFixture.js';
 
@@ -122,6 +122,7 @@ test('policy delivery does not read header state before final admission settles'
   t.mock.method(f.adapter, 'acknowledge', async () => {});
   t.mock.method(f.adapter, 'fetchHistory', async () => ({ messages: [] }));
   let settled = false;
+  let finalChecks = 0;
   let readsBeforeAdmission = 0;
   let lastChannel: string | null = null;
   Object.defineProperty(f.server, 'lastChannelId', {
@@ -131,11 +132,13 @@ test('policy delivery does not read header state before final admission settles'
   });
   t.mock.method(f.adapter, 'getConversationMeta', async () => {
     await Promise.resolve();
+    finalChecks++;
     settled = true;
     return { id: 'C1', name: 'alpha', kind: 'channel', isMember: true, writable: true } as any;
   });
   await f.deliver(message());
   assert.equal(readsBeforeAdmission, 0);
+  assert.equal(finalChecks, 1);
   assert.equal(lastChannel, 'C1');
 });
 
@@ -296,6 +299,24 @@ test('policy DM unknown post reaches rollback with its opened destination', asyn
   assert.match(result.reason, /message in D1 whose id this server doesn't know/);
 });
 
+test('policy shutdown during server forwarding names recovery for an acknowledged reply', async t => {
+  const f = await fixture(t);
+  const logs: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logs.push(args.join(' ')); });
+  let entered!: () => void, release!: () => void;
+  const started = new Promise<void>(r => { entered = r; });
+  const held = new Promise<void>(r => { release = r; });
+  t.mock.method(f.adapter, 'fetchHistory', async () => {
+    entered(); await held; return { messages: [] };
+  });
+  const delivery = f.deliver({ ...message('C1', '2.0'), threadTs: '1.0' });
+  await started;
+  await f.adapter.stop();
+  release(); await delivery;
+  assert.match(logs.find(line => line.includes('Dropped ')) ?? '',
+    /message 2\.0 in C1 \(thread 1\.0\).*stopping.*Slack will not replay it; after restart, recover it in Slack/);
+});
+
 for (const addressed of [true, false]) test(`unset shutdown abandonment preserves main diagnostics and cleanup: addressed=${addressed}`, async t => {
   const f = accessFixture({ legacy: true });
   const server = new SlackMcplServer(f.adapter, { subscribeMemberChannels: true });
@@ -321,20 +342,16 @@ for (const addressed of [true, false]) test(`unset shutdown abandonment preserve
   assert.deepEqual(clears, addressed ? ['1.0'] : []);
 });
 
-test('policy shutdown during server forwarding names recovery for an acknowledged reply', async t => {
+test('a final-admission drop of a thread reply names its root and fetch_thread', async t => {
   const f = await fixture(t);
-  const logs: string[] = [];
-  t.mock.method(console, 'error', (...args: unknown[]) => { logs.push(args.join(' ')); });
-  let entered!: () => void, release!: () => void;
-  const started = new Promise<void>(r => { entered = r; });
-  const held = new Promise<void>(r => { release = r; });
-  t.mock.method(f.adapter, 'fetchHistory', async () => {
-    entered(); await held; return { messages: [] };
+  t.mock.method(f.adapter, 'acknowledge', async () => {});
+  t.mock.method(f.adapter, 'clearAck', async () => {});
+  t.mock.method(f.adapter, 'getConversationMeta', async () => {
+    throw Object.assign(new Error('not_in_channel'), { code: 'slack_webapi_platform_error', data: { error: 'not_in_channel' } });
   });
-  const delivery = f.deliver({ ...message('C1', '2.0'), threadTs: '1.0' });
-  await started;
-  await f.adapter.stop();
-  release(); await delivery;
-  assert.match(logs.find(line => line.includes('Dropped ')) ?? '',
-    /message 2\.0 in C1 \(thread 1\.0\).*stopping.*Slack will not replay it; after restart, recover it in Slack/);
+  await f.deliver({ ...message('C1', '2.0'), threadTs: '1.0' });
+  const logged = (console.error as unknown as { mock: { calls: Array<{ arguments: unknown[] }> } }).mock.calls
+    .map(call => String(call.arguments[0])).filter(line => line.includes('Dropped message 2.0'));
+  assert.equal(logged.length, 1);
+  assert.match(logged[0]!, /Dropped message 2\.0 in C1 \(thread 1\.0\): delivery admission failed: .*recover it with fetch_thread for thread 1\.0\./);
 });

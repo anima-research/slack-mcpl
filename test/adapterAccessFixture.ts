@@ -18,6 +18,7 @@ export function accessFixture(options: { legacy?: boolean; scopes?: string[]; co
   const calls: Array<{ method: string; args: unknown }> = [];
   const state = {
     conversation: joined() as AccessConversation | undefined,
+    conversations: undefined as Record<string, AccessConversation | undefined> | undefined,
     listed: [] as AccessConversation[],
     messages: [] as Array<Record<string, unknown>>,
     more: false,
@@ -26,15 +27,20 @@ export function accessFixture(options: { legacy?: boolean; scopes?: string[]; co
     openId: 'D1',
     uploadUrl: 'https://example.invalid',
   };
-  const record = <T>(method: string, result: () => T) => async (args?: unknown): Promise<T> => {
+  const record = <T>(method: string, result: (args?: unknown) => T) => async (args?: unknown): Promise<T> => {
     calls.push({ method, args });
-    return result();
+    return result(args);
   };
   const web: SlackWebLike = {
     auth: { test: record('auth.test', () => ({})) },
     conversations: {
-      info: record('info', () => { if (state.infoError) throw state.infoError; return { channel: state.conversation, response_metadata: { scopes: state.infoScopes } }; }),
-      list: record('list', () => ({ channels: state.listed })),
+      info: record('info', (args) => { if (state.infoError) throw state.infoError; return { response_metadata: { scopes: state.infoScopes }, channel: state.conversations ? state.conversations[(args as { channel: string }).channel] : state.conversation }; }),
+      // As Slack does, a listing returns only the conversation types it asked for.
+      list: record('list', (args) => {
+        const types = (args as { types?: unknown } | undefined)?.types;
+        const kind = (c: AccessConversation) => c?.is_im ? 'im' : c?.is_mpim ? 'mpim' : c?.is_private ? 'private_channel' : 'public_channel';
+        return { channels: typeof types === 'string' ? state.listed.filter(c => types.split(',').includes(kind(c))) : state.listed };
+      }),
       open: record('open', () => ({ channel: { id: state.openId } })),
       history: record('history', () => ({ messages: state.messages, has_more: state.more })),
       replies: record('replies', () => ({ messages: state.messages, has_more: state.more })),

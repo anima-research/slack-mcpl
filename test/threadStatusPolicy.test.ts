@@ -146,6 +146,7 @@ for (const terminal of [false, true]) test(`status admission failure cannot beco
     : { code: 'slack_webapi_http_error', statusCode: 503 });
   await f.adapter.setThreadStatus('C1', '1.0');
   const attempts = f.methods().length;
+  assert.deepEqual(f.methods(), ['info'], 'the start reached its failing admission');
   await f.adapter.clearThreadStatuses();
   assert.equal(f.methods().length, attempts, 'no clear of a status never attempted');
   f.state.infoError = undefined;

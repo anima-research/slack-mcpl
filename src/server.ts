@@ -58,9 +58,10 @@ import {
   withCallTime,
   type SlackAdapter,
   type SlackMessageData,
+  type SlackListing,
   type SlackWait,
 } from './slack-adapter.js';
-import { toolDefinitions } from './tools.js';
+import { policyListingTool, toolDefinitions } from './tools.js';
 import { withToolClasses } from './tool-classes.js';
 import { buildFeatureSets, buildServerCapabilities, featureSetForTool, MESSAGING_FEATURE_SET, TYPING_FEATURE_SET } from './feature-sets.js';
 import { ChannelManager, mcplChannelId, parseMcplChannelId, toDescriptor } from './channels.js';
@@ -180,13 +181,37 @@ export function backscrollLine(m: {
 /** The `<backscroll>` block given with the first message from a conversation. */
 export function backscrollBlock(
   messages: Parameters<typeof backscrollLine>[0][],
-  where: { channelName?: string; isDM: boolean },
+  where: { channelName?: string; isDM: boolean; isGroupDM?: boolean },
 ): string {
   const attrs: string[] = [];
-  if (where.channelName && !where.isDM) attrs.push(`channel=${quotedLabel(`#${where.channelName}`)}`);
+  if (where.channelName && !where.isDM) attrs.push(`channel=${quotedLabel(where.isGroupDM ? where.channelName : `#${where.channelName}`)}`);
   if (where.isDM) attrs.push('dm="true"');
+  if (where.isGroupDM) attrs.push('group_dm="true"');
   attrs.push(`count="${messages.length}"`);
   return [`<backscroll ${attrs.join(' ')}>`, ...messages.map(backscrollLine), '</backscroll>'].join('\n');
+}
+
+/** Content-free policy summary of a host request's failure: the host, not
+ *  Slack, refused or failed it. */
+function hostFailureSummary(err: unknown): string {
+  const code = (err as { code?: unknown } | null)?.code;
+  return `host request failed${typeof code === 'number' ? ` (code ${code})` : ''}`;
+}
+
+/** The note a foreground policy listing carries when it stopped before
+ *  checking every candidate: the conversations it found are admitted and usable. */
+export function admissionIncompleteNote(stop: SlackListing['admissionStop'], refresh = false): string {
+  if (stop?.reason === 'call_deadline') {
+    const deadline = "Incomplete: this call's 25-second deadline left no room to continue listing (candidate checks share " +
+      'inbound admission pacing, at least 1.2 seconds apart); ';
+    if (refresh) return deadline + 'more conversations may exist. A new refresh skips already registered IDs but does not resume this scan.';
+    // No continuation: a scan larger than one call never reaches its tail.
+    return deadline + 'conversations found so far are usable but more may exist. ' +
+      'A new call starts over and stops near the same place, so conversations past it may never be listed or registered ' +
+      'by calling again; if one you need is missing, ask whoever runs this host for its ID.';
+  }
+  const after = stop?.retryAfterSeconds !== undefined ? ` after ${Math.ceil(stop.retryAfterSeconds)} seconds` : ' later';
+  return `Incomplete: the conversation scan was rate-limited; conversations found so far are usable but more may exist. Retry${after}; a new call starts over.`;
 }
 
 export class SlackMcplServer {
@@ -399,7 +424,7 @@ export class SlackMcplServer {
    *  connection has no host to register conversations with. Neither changes
    *  during a connection, as a grant can. */
   private offeredTools() {
-    return toolDefinitions.filter((t) =>
+    return toolDefinitions.map(t => policyListingTool(t, this.slack.hasAccessPolicy)).filter((t) =>
       (t.name !== 'fetch_attachment' || !this.slack.hasAccessPolicy) &&
       (t.name !== 'send_dm' || this.slack.dmsWritable) && (t.name !== 'refresh_channels' || this.mcplEnabled));
   }
@@ -860,11 +885,11 @@ export class SlackMcplServer {
       }
 
       case 'list_channels': {
-        const { conversations, leftOut } = await this.slack.listConversations(args.includeNonMember === true);
+        const { conversations, leftOut, admissionFailures, admissionStop } = await this.slack.listConversations(args.includeNonMember === true);
         const listed = conversations.map((c) => ({
           id: c.id,
           kind: c.kind,
-          name: c.kind === 'dm' ? `DM: @${c.name}` : c.name,
+          name: c.kind === 'dm' ? `DM: @${c.name}` : this.slack.hasAccessPolicy && c.policyGroupDm ? `Group DM: ${nameShown(c.name)}` : c.name,
           ...(c.topic ? { topic: c.topic } : {}),
           ...(c.kind === 'channel' || c.kind === 'private_channel' ? { isMember: c.isMember } : {}),
           writable: this.slack.canWrite(c.id),
@@ -874,8 +899,10 @@ export class SlackMcplServer {
         // from "the token can't read them"; one that left none out answers
         // with the list alone. Types the host has turned off aren't listed
         // or noted, as the tool's description says.
-        if (leftOut.length === 0) return listed;
-        return { _content: [textContent(toolResultJson(listed)), textContent(leftOutNote(leftOut))] };
+        if (leftOut.length === 0 && !admissionFailures) return listed;
+        return { _content: [textContent(toolResultJson(listed)),
+          ...(leftOut.length ? [textContent(leftOutNote(leftOut))] : []),
+          ...(admissionFailures ? [textContent(admissionIncompleteNote(admissionStop))] : [])] };
       }
 
       case 'refresh_channels':
@@ -1308,7 +1335,12 @@ export class SlackMcplServer {
       );
     }
     const gone = () => this.conn !== conn || !!conn?.isClosed;
-    const { conversations: convs, leftOut: typesLeftOut } = await this.slack.listConversations();
+    const { conversations: convs, leftOut: typesLeftOut, admissionFailures, admissionStop, skippedKnown = 0 } = await (this.slack.hasAccessPolicy
+      ? this.slack.listConversations(false, undefined, undefined, id => !!this.channelManager.get(mcplChannelId(id)))
+      : this.slack.listConversations());
+    const visible = convs.length + skippedKnown;
+    const knownNote = skippedKnown ? ` The visible count includes ${skippedKnown} already registered ID(s) seen in this scan; their access was not rechecked.` : '';
+    const incompleteNote = admissionFailures ? ` ${admissionIncompleteNote(admissionStop, true)}` : '';
     // The host keeps the label a conversation is first announced with, and a
     // refresh never announces a known one again, so a new DM whose user's name
     // this server couldn't get from Slack just now waits for a later refresh
@@ -1322,9 +1354,9 @@ export class SlackMcplServer {
     // has since gone neither writes the registry nor announces.
     if (gone()) {
       return {
-        visible: convs.length,
+        visible,
         added: [],
-        note: "The host's connection closed while Slack was listing conversations; nothing was announced.",
+        note: "The host's connection closed while Slack was listing conversations; nothing was announced." + incompleteNote + knownNote,
       };
     }
     const added = this.registerAndNotifyNew(descriptors);
@@ -1336,15 +1368,15 @@ export class SlackMcplServer {
         `again in about ${wait} second${wait === 1 ? '' : 's'} to announce them by name. This server still sends ` +
         'their messages to the host meanwhile.';
     return {
-      visible: convs.length,
+      visible,
       added: added.map((d) => ({ id: d.id, label: d.label })),
       note:
         (added.length > 0
           ? `Registered ${added.length} newly-visible conversation(s).`
-          : unnamed.length > 0
+          : unnamed.length > 0 || admissionFailures
             ? 'No conversation was registered.'
             : 'No new conversations: the host already has every one this listing found.') + leftOut +
-        (typesLeftOut.length > 0 ? ` ${leftOutNote(typesLeftOut)}` : ''),
+        (typesLeftOut.length > 0 ? ` ${leftOutNote(typesLeftOut)}` : '') + incompleteNote + knownNote,
     };
   }
 
@@ -1397,7 +1429,7 @@ export class SlackMcplServer {
    *  conversations come to be registered with the host, or that they can't. */
   private howChannelsRegister(): string {
     return this.grant.has('channels.register')
-      ? `refresh_channels registers the conversations this bot is in${this.slack.dmsDisabled ? ', channels only while direct messages are turned off' : ''}; open one by the id it announces.`
+      ? `refresh_channels registers the conversations this bot is in${(this.slack.hasAccessPolicy ? this.slack.listsChannelsOnly : this.slack.dmsDisabled) ? ', channels only while direct messages are turned off' : ''}; open one by the id it announces.`
       : "This host hasn't granted this server channels.register, so this server can't register conversations with it.";
   }
 
@@ -1763,7 +1795,9 @@ export class SlackMcplServer {
           this.slack.assertKnownDeliveryAdmission(msg.channelId);
         } catch (veto) { err = veto; }
         if (!isTransientSlackFailure(err)) {
-          console.error(`[slack-mcpl] Dropped message ${msg.id} in ${msg.channelId}: delivery admission failed: ${policyFailureSummary(err)}`);
+          const root = msg.threadTs && msg.threadTs !== msg.id ? msg.threadTs : undefined;
+          console.error(`[slack-mcpl] Dropped message ${msg.id} in ${msg.channelId}${root ? ` (thread ${root})` : ''}: delivery admission failed: ` +
+            `${policyFailureSummary(err)}. Slack will not replay it; once access allows, recover it with ${root ? `fetch_thread for thread ${root}` : 'fetch_history'}.`);
           releaseAck();
           return;
         }
@@ -1796,7 +1830,9 @@ export class SlackMcplServer {
       !this.unsubscribedByAgent.has(msg.channelId) && !this.isChannelSubscribed(msg.channelId);
     const blocks: string[] = [];
     if (autoSubscribe) {
-      const where = meta?.name ? channelShown(meta.name) : `conversation ${msg.channelId}`;
+      const where = meta?.name
+        ? (this.slack.hasAccessPolicy && meta.policyGroupDm ? `Group DM: ${nameShown(meta.name)}` : channelShown(meta.name))
+        : `conversation ${msg.channelId}`;
       blocks.push(
         `<system>Auto-subscribed to ${where} because you were mentioned. ` +
           `Ambient (non-mention) messages from this conversation will now arrive in your context. ` +
@@ -1805,7 +1841,7 @@ export class SlackMcplServer {
       );
     }
     if (backscroll.length > 0) {
-      blocks.push(backscrollBlock(backscroll, { channelName: meta?.name, isDM: msg.isDM }));
+      blocks.push(backscrollBlock(backscroll, { channelName: meta?.name, isDM: msg.isDM, isGroupDM: this.slack.hasAccessPolicy && meta?.policyGroupDm }));
     }
     // Told with the first message the agent gets from here, addressed or not.
     // Counted as told only once the host has taken that message.
@@ -1821,7 +1857,9 @@ export class SlackMcplServer {
     const channelMcplId = mcplChannelId(msg.channelId);
     const channelIsOpen = this.channelManager.isOpen(channelMcplId);
     // A conversation whose name Slack didn't give is named by its ID.
-    const conversation = !contextChanged ? undefined : msg.isDM ? 'DM' : meta?.name ? channelShown(meta.name) : msg.channelId;
+    const conversation = !contextChanged ? undefined : msg.isDM ? 'DM'
+      : this.slack.hasAccessPolicy && meta?.policyGroupDm ? `Group DM: ${nameShown(meta.name || msg.channelId)}`
+      : meta?.name ? channelShown(meta.name) : msg.channelId;
     const location = locationHeader({
       conversation,
       teamName: contextChanged ? this.slack.teamName : undefined,
@@ -1911,7 +1949,7 @@ export class SlackMcplServer {
         res = await conn.sendRequest(method.CHANNELS_INCOMING, incomingParams) as typeof res;
         dbg('handleSlackMessage:sent', { method: 'channels/incoming', channelMcplId });
       } catch (err) {
-        console.error(`[slack-mcpl] channels/incoming failed for message ${msg.id} in ${msg.channelId}:`, this.slack.hasAccessPolicy ? policyFailureSummary(err) : (err as Error).message);
+        console.error(`[slack-mcpl] channels/incoming failed for message ${msg.id} in ${msg.channelId}:`, this.slack.hasAccessPolicy ? hostFailureSummary(err) : (err as Error).message);
         notTaken();
         return;
       }
@@ -1945,7 +1983,7 @@ export class SlackMcplServer {
         res = await conn.sendRequest(method.PUSH_EVENT, pushParams) as typeof res;
         dbg('handleSlackMessage:sent', { method: 'push/event', channelMcplId });
       } catch (err) {
-        console.error(`[slack-mcpl] push/event failed for message ${msg.id} in ${msg.channelId}:`, this.slack.hasAccessPolicy ? policyFailureSummary(err) : (err as Error).message);
+        console.error(`[slack-mcpl] push/event failed for message ${msg.id} in ${msg.channelId}:`, this.slack.hasAccessPolicy ? hostFailureSummary(err) : (err as Error).message);
         notTaken();
         return;
       }

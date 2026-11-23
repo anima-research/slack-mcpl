@@ -263,3 +263,15 @@ export const toolDefinitions: ToolDefinition[] = [
     },
   },
 ];
+
+/** Keep the legacy tools/list surface unchanged when policy is absent. */
+export function policyListingTool(tool: ToolDefinition, policy: boolean): ToolDefinition {
+  if (!policy || tool.name !== 'list_channels') return tool;
+  return {
+    ...tool,
+    description: 'List freshly admitted joined public/private channels, allowed one-to-one DMs and named group DMs. Missing read scopes can omit conversation types; the result reports those gaps. includeNonMember has no effect in policy mode: unjoined public channels are never listed.',
+    inputSchema: { ...tool.inputSchema, properties: { ...tool.inputSchema.properties,
+      includeNonMember: { type: 'boolean', description: 'Has no effect in policy mode; unjoined public channels are never listed.' },
+    } },
+  };
+}
