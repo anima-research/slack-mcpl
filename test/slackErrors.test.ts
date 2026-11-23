@@ -1,9 +1,11 @@
 /**
- * Slack's failed calls, explained (src/slack-errors.ts). Each error here is
- * the one @slack/web-api throws, with this server's client settings, for what
+ * Slack's failed calls, explained (src/slack-errors.ts). Most errors here are
+ * the ones @slack/web-api throws, with this server's client settings, for what
  * Slack answers: a real WebClient calls a local endpoint that answers as
  * Slack's Web API does (test/slackApi.ts), so the explainer reads the client's
  * own shape (`code`, Slack's answer in `data`, `retryAfter`, `statusCode`).
+ * Named transport-code variants below are constructed locally, not produced
+ * by a WebClient exchange.
  */
 
 import { test, before, after } from 'node:test';
@@ -465,7 +467,8 @@ test("a connection that couldn't be made says nothing was done, even for a write
     /\n\nNo messages were returned: Slack couldn't be reached\. Try again shortly\. If it keeps failing, whoever runs this host has to check its connection to Slack\.$/,
   );
   // The other codes Node gives for a connection never made can't be produced
-  // here, so each is put on the client's own error in place of ECONNREFUSED.
+  // here; withNodeCode constructs a local outer/original error pair using the
+  // observed client shape, rather than exercising a real transport for each code.
   const withNodeCode = (code: string) => Object.assign(new Error((refused as Error).message), {
     code: (refused as { code: unknown }).code,
     original: Object.assign(new Error(`connect ${code}`), { code }),
