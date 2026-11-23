@@ -206,16 +206,18 @@ test('a pending final lookup drops at the five-second delivery wait bound', asyn
   assert.equal(f.h.hostSaw.filter(r => r.method === method.PUSH_EVENT).length, 0);
 });
 
-for (const earlier of ['membership refusal', 'history grant withdrawal'] as const) test(`transient final admission cannot override ${earlier}`, async t => {
+for (const earlier of ['membership refusal', 'history grant withdrawal', 'history page refusal'] as const) test(`transient final admission cannot override ${earlier}`, async t => {
   const f = await fixture(t);
   const clears: string[] = [];
   t.mock.method(f.adapter, 'clearAck', async (_c: string, id: string) => { clears.push(id); });
   // The membership refusal reaches the ordered evidence through the real
   // backscroll admission, not through a server-side flag.
   if (earlier === 'membership refusal') f.state.conversation = { ...f.state.conversation, is_member: false };
+  // A real history page refusal, observed at the client boundary.
+  if (earlier === 'history page refusal') f.web.conversations.history = async () => { throw Object.assign(new Error('not in channel'), { code: 'slack_webapi_platform_error', data: { error: 'not_in_channel' } }); };
   const real = f.adapter.fetchHistory.bind(f.adapter);
   const backscroll = t.mock.method(f.adapter, 'fetchHistory', async (...args: Parameters<typeof real>) => {
-    if (earlier === 'membership refusal') return real(...args);
+    if (earlier !== 'history grant withdrawal') return real(...args);
     (f.adapter as any).scopes = ['channels:read'];
     throw Object.assign(new Error('limited after withdrawal'), { code: 'slack_webapi_rate_limited_error', retryAfter: 20 });
   });
@@ -297,6 +299,26 @@ test('policy DM unknown post reaches rollback with its opened destination', asyn
   await call('send_dm', { userId: 'U1', content: 'named' });
   const result = await f.h.host.sendRequest(method.STATE_ROLLBACK, { featureSet: 'slack.messaging', checkpoint: base.state.checkpoint }) as any;
   assert.match(result.reason, /message in D1 whose id this server doesn't know/);
+});
+
+for (const open of [false, true]) test(`a policy host request failure names the thread root: open=${open}`, async t => {
+  const f = await fixture(t);
+  if (open) {
+    (f.server as any).channelManager.register({ id: 'slack:C1' });
+    (f.server as any).channelManager.open('slack:C1');
+  }
+  const deliveryMethod = open ? method.CHANNELS_INCOMING : method.PUSH_EVENT;
+  const original = f.h.serverConn.sendRequest.bind(f.h.serverConn);
+  t.mock.method(f.h.serverConn, 'sendRequest', async (m: string, params: unknown) => {
+    if (m === deliveryMethod) throw Object.assign(new Error('host echoed private content'), { code: -32000 });
+    return original(m, params);
+  });
+  const logs: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logs.push(args.join(' ')); });
+  await f.deliver({ ...message('C1', '2.0'), threadTs: '1.0' });
+  const line = logs.find(l => l.includes(`${deliveryMethod} failed`)) ?? '';
+  assert.match(line, /message 2\.0 in C1 \(thread 1\.0\).*host request failed \(code -32000\)/);
+  assert.doesNotMatch(line, /private content/);
 });
 
 test('policy shutdown during server forwarding names recovery for an acknowledged reply', async t => {

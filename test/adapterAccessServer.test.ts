@@ -55,7 +55,8 @@ test('host publish is admitted afresh; rollback after revocation never deletes',
   }) as { success: boolean; reason?: string };
   // Rollback moves the checkpoint even when best-effort cleanup is denied.
   assert.equal(rolled.success, true);
-  assert.match(rolled.reason ?? '', /Cleanup was not attempted/);
+  assert.match(rolled.reason ?? '', /Cleanup was not attempted for message 1\.0 in C1: [A-Z]/);
+  assert.doesNotMatch(rolled.reason ?? '', /Nothing was deleted/, 'the cleanup outcome is stated once');
   assert.match(rolled.reason ?? '', /0\/1 messages deleted.*May remain: message 1\.0 in C1/);
   assert.deepEqual(f.methods(), ['info', 'info']);
   f.state.conversation = joined();
@@ -86,19 +87,19 @@ test('server list/refresh report unavailable scopes and only probe auth.test', a
 });
 
 
-test('policy hides fetch_attachment and refuses direct invocation before fetch', async (t) => {
+test('policy exposes conversation-bound fetch_attachment and refuses URL-only invocation', async (t) => {
   const f = accessFixture();
   const h = connectHost(new SlackMcplServer(f.adapter));
   t.after(() => h.close());
   await initialize(h, false);
   const listed = await h.host.sendRequest('tools/list', {}) as { tools: Array<{ name: string }> };
-  assert.equal(listed.tools.some(tool => tool.name === 'fetch_attachment'), false);
+  assert.equal(listed.tools.some(tool => tool.name === 'fetch_attachment'), true);
   const fetch = t.mock.method(globalThis, 'fetch', async () => { throw new Error('must not fetch'); });
   const result = await h.host.sendRequest('tools/call', {
     name: 'fetch_attachment', arguments: { url: 'https://files.slack.com/secret' },
   }) as { isError?: boolean; content: unknown };
   assert.equal(result.isError, true);
-  assert.match(JSON.stringify(result.content), /attachments are disabled/);
+  assert.match(JSON.stringify(result.content), /channelId|fileId|url/);
   assert.equal(fetch.mock.callCount(), 0);
 });
 
@@ -312,4 +313,34 @@ test('the deadline notice states that a new call cannot continue past its stop',
   assert.match(note, /conversations found so far are usable/);
   assert.match(note, /may never be listed or registered by calling again; if one you need is missing, ask whoever runs this host for its ID/);
   assert.doesNotMatch(note, /rows above/);
+});
+
+test('with a policy, channels/open says refresh_channels registers only admitted conversations', async t => {
+  const f = accessFixture(); t.after(() => f.adapter.stop());
+  const h = connectHost(new SlackMcplServer(f.adapter)); t.after(() => h.close());
+  await initialize(h, true);
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await assert.rejects(h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'slack:C9', type: 'slack', address: {} }),
+    (err: { message?: string }) => /refresh_channels registers the conversations this bot is in that the access policy admits, within its listing bounds/.test(String(err.message)));
+});
+
+test('send_dm states one outcome when post-open admission is rate-limited', async t => {
+  const f = accessFixture({ sendChannels: ['D1'] }); t.after(() => f.adapter.stop());
+  f.state.conversation = { id: 'D1', is_im: true, user: 'U1' };
+  const h = connectHost(new SlackMcplServer(f.adapter)); t.after(() => h.close());
+  await initialize(h, false);
+  f.state.infoError = Object.assign(new Error('limited'), { code: 'slack_webapi_rate_limited_error', retryAfter: 30 });
+  const result = await h.host.sendRequest('tools/call', { name: 'send_dm', arguments: { userId: 'U1', content: 'hello' } }) as { isError?: boolean; content: { text: string }[] };
+  const text = result.content.map(c => c.text).join('\n');
+  assert.equal(result.isError, true);
+  assert.match(text, /DM D1 was opened, but nothing was posted/);
+  assert.match(text, /rate-limiting/);
+  assert.doesNotMatch(text, /Nothing was sent/);
+});
+
+test('a policy host failure summary keeps only the code and says how to recover the message', async () => {
+  const { hostFailureSummary } = await import('../src/server.js');
+  const text = hostFailureSummary(Object.assign(new Error('agent said: secret text'), { code: -32000 }));
+  assert.match(text, /^host request failed \(code -32000\); .*check the host's logs, then recover it with fetch_history or fetch_thread$/);
+  assert.doesNotMatch(text, /secret/);
 });

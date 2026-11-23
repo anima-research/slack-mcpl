@@ -53,6 +53,9 @@ for (const operation of ['clear', 'switch', 'refresh'] as const) {
     await f.adapter.setThreadStatus('C1', operation === 'clear' ? undefined : operation === 'switch' ? '2.0' : '1.0');
     assert.ok(f.methods().filter(m => m === 'info').length > lookups, 'fresh admission reached');
     assert.equal(f.effects.length, 1, 'no new Slack effect after revocation');
+    f.state.conversation!.is_member = true;
+    await f.adapter.setThreadStatus('C1', undefined);
+    assert.deepEqual(f.effects.map((x: any) => [x.thread_ts, x.status]), [['1.0', 'is thinking…'], ['1.0', '']], 'failed refresh admission retains ownership for a later clear');
   });
 }
 
