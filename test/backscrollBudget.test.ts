@@ -1,6 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { backscrollBlock, SlackMcplServer } from '../src/server.js';
+import { backscrollBlock } from '../src/server.js';
+
+// Give each config case a first read without disturbing the regular module's cache.
+let serverModuleInstance = 0;
+function freshServerModule(): Promise<typeof import('../src/server.js')> {
+  return import(`../src/server.js?backscroll-limit-test=${serverModuleInstance++}`);
+}
 
 const message = (id: number, content: string) => ({id: `${id}.000001`, timestamp: new Date(id * 1000), authorName: 'Ann', content, attachments: []});
 test('oversized backscroll message has an in-position omission placeholder', () => {
@@ -37,21 +43,23 @@ test('older backscroll summary uses singular when one message is outside the win
 
 test('configured thousand-message backscroll is bounded on first-interaction delivery', async (t) => {
   const { method } = await import('@animalabs/mcpl-core');
-  const { harness, initialize, FULL_GRANT, until } = await import('./harness.js');
+  const { connectHost, fakeSlack, initialize, FULL_GRANT, until } = await import('./harness.js');
   const previous = process.env.SLACK_BACKSCROLL_LIMIT;
   process.env.SLACK_BACKSCROLL_LIMIT = '1000';
   t.after(() => {
     if (previous === undefined) delete process.env.SLACK_BACKSCROLL_LIMIT;
     else process.env.SLACK_BACKSCROLL_LIMIT = previous;
   });
-  const h = harness({historyMessages: Array.from({length: 1000}, (_, i) => ({
+  const { SlackMcplServer } = await freshServerModule();
+  const { slack, socket } = fakeSlack({historyMessages: Array.from({length: 1000}, (_, i) => ({
     ts: `${1000 - i}.000001`, user: 'U2', text: 'x'.repeat(33000),
   }))});
+  const h = connectHost(new SlackMcplServer(slack));
   t.after(() => h.close());
   await initialize(h, true);
   await h.host.sendRequest(method.FEATURE_SETS_UPDATE, {effectiveCapabilities: FULL_GRANT});
   await until(() => h.hostSaw.some(r => r.method === method.CHANNELS_REGISTER), 'registration');
-  await h.socket.emitMessage({type: 'message', channel: 'C1', user: 'U1', ts: '2000.000001', text: '<@UBOT> hi'});
+  await socket.emitMessage({type: 'message', channel: 'C1', user: 'U1', ts: '2000.000001', text: '<@UBOT> hi'});
   await until(() => h.hostSaw.some(r => r.method === method.PUSH_EVENT), 'delivery');
   const push = h.hostSaw.find(r => r.method === method.PUSH_EVENT)!.params as {payload: {content: Array<{text: string}>}};
   const block = push.payload.content.map(c => c.text).join('\n').match(/<backscroll [\s\S]*?<\/backscroll>/)![0];
@@ -128,21 +136,37 @@ test('an empty retained window still gives pagination instructions', () => {
 });
 
 
-test('backscroll limit accepts only whole values in range', (t) => {
+test('backscroll limit is read once, warning only for a rejected value', async (t) => {
   const previous = process.env.SLACK_BACKSCROLL_LIMIT;
   t.after(() => {
     if (previous === undefined) delete process.env.SLACK_BACKSCROLL_LIMIT;
     else process.env.SLACK_BACKSCROLL_LIMIT = previous;
   });
-  const server = Object.create(SlackMcplServer.prototype) as any;
-  for (const raw of ['1000.9', '12oops', '0', '1001', '-1', 'NaN', '', '0x10', '0b10', '1e2', '12.0', '+ 12', '++12', ' 1 2 ', ' +1001 ', '  ']) {
+  const loadServerPrototype = async () =>
+    (await freshServerModule()).SlackMcplServer.prototype;
+  const errors = t.mock.method(console, 'error', () => {});
+  for (const raw of ['1000.9', '12oops', '0', '1001', '-1', 'NaN', '', '0x10', '0b10', '1e2', '12.0', '+ 12', '++12', ' 1 2 ', ' +1001 ', '  ', '9'.repeat(2000)]) {
     process.env.SLACK_BACKSCROLL_LIMIT = raw;
+    const prototype = await loadServerPrototype();
+    const server = Object.create(prototype);
     assert.equal(server.backscrollLimit, 50, raw);
+    assert.equal(server.backscrollLimit, 50, raw);
+    assert.equal(Object.create(prototype).backscrollLimit, 50, raw);
+    process.env.SLACK_BACKSCROLL_LIMIT = '12';
+    assert.equal(server.backscrollLimit, 50, 'keep the first result');
+    assert.equal(errors.mock.callCount(), 1);
+    assert.deepEqual(errors.mock.calls[0].arguments, [
+      '[slack-mcpl] Invalid SLACK_BACKSCROLL_LIMIT: expected a decimal integer from 1 to 1000; using 50',
+    ]);
+    errors.mock.resetCalls();
   }
+  delete process.env.SLACK_BACKSCROLL_LIMIT;
+  assert.equal(Object.create(await loadServerPrototype()).backscrollLimit, 50);
   for (const raw of ['1', '0001', '0050', '50', '1000', '+12', ' 12', '12 ', ' +0012 ']) {
     process.env.SLACK_BACKSCROLL_LIMIT = raw;
-    assert.equal(server.backscrollLimit, Number(raw), raw);
+    assert.equal(Object.create(await loadServerPrototype()).backscrollLimit, Number(raw), raw);
   }
+  assert.equal(errors.mock.callCount(), 0, 'unset and valid values do not warn');
 });
 
 

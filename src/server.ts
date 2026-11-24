@@ -221,6 +221,19 @@ export function backscrollBlock(
     ...lines.reverse(), '</backscroll>'].join('\n');
 }
 
+let backscrollLimit: number | undefined;
+
+function readBackscrollLimit(): number {
+  const raw = process.env.SLACK_BACKSCROLL_LIMIT?.trim();
+  if (raw === undefined) return 50;
+  if (/^\+?[0-9]+$/.test(raw)) {
+    const n = Number(raw);
+    if (Number.isInteger(n) && n > 0 && n <= 1000) return n;
+  }
+  console.error('[slack-mcpl] Invalid SLACK_BACKSCROLL_LIMIT: expected a decimal integer from 1 to 1000; using 50');
+  return 50;
+}
+
 export class SlackMcplServer {
   private conn: McplConnection | null = null;
   private mcplEnabled = false;
@@ -272,13 +285,10 @@ export class SlackMcplServer {
   private lastChannelId: string | null = null;
 
   /** How many backscroll messages to fetch for an addressed delivery when no
-   *  delivery in the conversation has yet been accepted. Tunable via
-   *  SLACK_BACKSCROLL_LIMIT; only integers in [1, 1000] are accepted; otherwise default 50. */
+   *  delivery in the conversation has yet been accepted. Read SLACK_BACKSCROLL_LIMIT
+   *  once on first use, sharing the result across server instances. */
   private get backscrollLimit(): number {
-    const raw = process.env.SLACK_BACKSCROLL_LIMIT?.trim() ?? '';
-    if (!/^\+?[0-9]+$/.test(raw)) return 50;
-    const n = Number(raw);
-    return Number.isInteger(n) && n > 0 && n <= 1000 ? n : 50;
+    return backscrollLimit ??= readBackscrollLimit();
   }
 
   /** Conversations muted with unsubscribe_channel while every member channel
