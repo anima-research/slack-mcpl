@@ -471,11 +471,13 @@ budget**, with a 10-second request timeout and at most 5 seconds of rate-limit
 waiting per call. If a rate limit or the deadline stops a page request first,
 `find_user` and legacy conversation listings return an error, not partial
 results. With an explicit policy, `list_channels` and `refresh_channels`
-instead return the rows admitted so far with an explicit incomplete notice
-when a rate limit or the deadline stops a page or candidate check. The
-default 1,000-page ceilings are unlikely to be reached interactively. Lowering
-a ceiling can make a page-limit stop more likely but does not guarantee
-complete discovery. Retrying starts the scan over.
+instead report an incomplete scan when a rate limit or the deadline stops a
+page or candidate check. They return the rows admitted so far unless the
+token's readable conversation types changed during the scan, in which case
+those rows are discarded. The default 1,000-page ceilings are unlikely to be
+reached interactively. Lowering a ceiling can make a page-limit stop more
+likely but does not guarantee complete discovery. Retrying starts the scan
+over.
 
 | Optional environment variable | Default |
 | --- | ---: |
@@ -511,7 +513,10 @@ Background registration announces the eligible subset and logs incomplete
 enumeration, separately from host acceptance. `refresh_channels` marks partial
 scans with `truncated: true` and reports unresolved **page-limit-only** background enumeration in
 `registration.enumerationIncomplete`; a subsequent complete scan clears that
-status. This flag does not describe give-up, cursor-cycle or other registration errors. `visible` counts only eligible conversations observed in that scan.
+status. This flag does not describe give-up, cursor-cycle or other registration
+errors. `visible` counts conversations observed in that scan. Under a policy,
+a refresh also counts already-registered IDs it saw but did not recheck, and
+says how many.
 A repeated listing or refresh starts over, **not** at a continuation cursor, and
 may repeatedly return the same subset. Review the limits with the operator;
 increasing them cannot guarantee complete discovery or bypass rate limits. In explicit-policy mode at the page cap, scope withdrawals remove retained rows requiring the withdrawn grants; newly granted types are not scanned without another invocation.
