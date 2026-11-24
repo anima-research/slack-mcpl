@@ -236,16 +236,20 @@ test('review supplemental display uses the author cache or raw ID without fresh 
   assert.deepEqual(live!.mentionIds, []);
 });
 
-test('review traversal budget and array/depth cuts carry one final marker', async () => {
-  for (const payload of [
-    { attachments: Array.from({ length: 2001 }, () => ({})), blocks: [section('lost')] },
-    { blocks: [richBlock(Array.from({length: 14}).reduce<any>(e => richSection(e), literal('deep')))] },
-  ]) {
-    const result = await shaped(payload);
-    for (const text of result.contents) {
-      assert.ok(text.endsWith('[…truncated]'));
-      assert.equal(text.split('[…truncated]').length, 2);
-    }
+test('review exhausted attachment traversal keeps top-level blocks and one final marker', async () => {
+  await expectText({
+    attachments: Array.from({ length: 2001 }, () => ({})),
+    blocks: [section('kept')],
+  }, 'kept[…truncated]');
+});
+
+test('review depth cut carries one final marker', async () => {
+  const result = await shaped({
+    blocks: [richBlock(Array.from({length: 14}).reduce<any>(e => richSection(e), literal('deep')))],
+  });
+  for (const text of result.contents) {
+    assert.ok(text.endsWith('[…truncated]'));
+    assert.equal(text.split('[…truncated]').length, 2);
   }
 });
 
