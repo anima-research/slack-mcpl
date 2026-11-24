@@ -1,1 +1,0 @@
-- Preserve readable attachment block order when its text matches a deferred omission notice.

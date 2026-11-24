@@ -318,9 +318,9 @@ export const connectionNeverMade = (nodeCode: unknown): boolean =>
  * restart asks again, as it does for a renamed user. A lookup that fails
  * otherwise (a rate limit, a failure in transit, Slack failing, or an answer
  * not in Slack's form) isn't cached, so the next message that names the user
- * asks again; meanwhile a mention shows the label Slack sent with it, else
- * the raw ID, and an author shows the raw ID (best-effort). Returns the
- * error of each lookup left uncached, by user ID.
+ * asks again. In the meantime only original-text mentions can use Slack's
+ * fallback label; supplemental mentions and authors show the raw ID when
+ * uncached. Returns the error of each lookup left uncached, by user ID.
  */
 export async function resolveSlackUserNames(
   client: SlackUserInfoClient,

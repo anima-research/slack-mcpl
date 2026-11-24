@@ -261,7 +261,7 @@ test('old queued and in-flight messages cannot change a new peer or hold up its 
   }
 });
 
-test('a DM whose peer leaves during its backscroll fetch changes nothing for the next peer', async (t) => {
+test('disconnect aborts a pending DM backscroll without affecting the next peer', async (t) => {
   // A DM looks up no name, so the check after its backscroll fetch is the
   // last one before it would be sent.
   const gate = deferred<HistoryMessage[]>();
@@ -277,6 +277,7 @@ test('a DM whose peer leaves during its backscroll fetch changes nothing for the
 
   const next = connect(f.server);
   try {
+    assert.equal(f.historySignals[0]?.aborted, true, 'disconnect aborts backscroll before the fetch returns');
     await next.ready();
     gate.resolve([historyMessage]);
     await until(() => f.cleared.length > 0, 'the abandoned DM releases its reaction');

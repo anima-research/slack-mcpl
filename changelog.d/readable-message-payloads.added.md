@@ -11,6 +11,7 @@
   client_msg_id is a string (including
   an empty string; null and other non-string values do not suppress app rich text). Bound supplemental traversal and output with
   visible truncation markers, and prioritize attachment-nested readable blocks over their omission labels.
+  Preserve readable attachment block order when its text matches a deferred omission notice.
   Top-level blocks retain input order, including omission labels.
   Supplemental mentions use cached names or raw IDs (even when the same ID has
   an original-text fallback label), without extra lookups

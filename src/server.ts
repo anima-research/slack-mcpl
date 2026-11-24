@@ -235,6 +235,8 @@ export class SlackMcplServer {
   private stateTracker = new StateTracker();
   /** Serial delivery within a conversation; different conversations stay independent. */
   private forwarding = new Map<string, Promise<void>>();
+  /** Pending backscroll lookups for the connection being served. */
+  private backscrollAborts = new Set<AbortController>();
 
   /** Conversations the agent has opted into for ambient (non-mention,
    *  non-DM) message delivery. Mentions and DMs always come through
@@ -273,8 +275,8 @@ export class SlackMcplServer {
    *  delivery in the conversation has yet been accepted. Tunable via
    *  SLACK_BACKSCROLL_LIMIT; only integers in [1, 1000] are accepted; otherwise default 50. */
   private get backscrollLimit(): number {
-    const raw = process.env.SLACK_BACKSCROLL_LIMIT;
-    if (!raw || !/^[0-9]+$/.test(raw)) return 50;
+    const raw = process.env.SLACK_BACKSCROLL_LIMIT?.trim() ?? '';
+    if (!/^\+?[0-9]+$/.test(raw)) return 50;
     const n = Number(raw);
     return Number.isInteger(n) && n > 0 && n <= 1000 ? n : 50;
   }
@@ -363,6 +365,8 @@ export class SlackMcplServer {
       }
     } finally {
       this.conn = null;
+      for (const controller of this.backscrollAborts) controller.abort();
+      this.backscrollAborts.clear();
       // A failed handshake ends here too: close the connection, so a TCP
       // client isn't left on a socket nobody serves.
       conn.close();
@@ -1742,6 +1746,7 @@ export class SlackMcplServer {
     let backscroll: Awaited<ReturnType<typeof this.slack.fetchHistory>>['messages'] = [];
     if (isFirstInteraction && isAddressed) {
       const backscrollAbort = new AbortController();
+      this.backscrollAborts.add(backscrollAbort);
       try {
         const res = await this.deliveryLookup(this.slack.fetchHistory(msg.channelId, {
           limit: this.backscrollLimit,
@@ -1753,6 +1758,8 @@ export class SlackMcplServer {
         backscroll = res.messages.filter((m) => m.authorId !== this.slack.botUserId);
       } catch (err) {
         dbg('backscroll:fetch-failed', { channelId: msg.channelId, error: (err as Error).message });
+      } finally {
+        this.backscrollAborts.delete(backscrollAbort);
       }
       if (!isCurrent()) return abandon();
       if (!msg.isDM) {

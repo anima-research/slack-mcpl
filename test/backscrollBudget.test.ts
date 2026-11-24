@@ -135,11 +135,11 @@ test('backscroll limit accepts only whole values in range', (t) => {
     else process.env.SLACK_BACKSCROLL_LIMIT = previous;
   });
   const server = Object.create(SlackMcplServer.prototype) as any;
-  for (const raw of ['1000.9', '12oops', '0', '1001', '-1', 'NaN', '', '0x10', '0b10', '1e2', '12.0', '+12', ' 12', '12 ']) {
+  for (const raw of ['1000.9', '12oops', '0', '1001', '-1', 'NaN', '', '0x10', '0b10', '1e2', '12.0', '+ 12', '++12', ' 1 2 ', ' +1001 ', '  ']) {
     process.env.SLACK_BACKSCROLL_LIMIT = raw;
     assert.equal(server.backscrollLimit, 50, raw);
   }
-  for (const raw of ['1', '0001', '0050', '50', '1000']) {
+  for (const raw of ['1', '0001', '0050', '50', '1000', '+12', ' 12', '12 ', ' +0012 ']) {
     process.env.SLACK_BACKSCROLL_LIMIT = raw;
     assert.equal(server.backscrollLimit, Number(raw), raw);
   }

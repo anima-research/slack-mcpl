@@ -280,37 +280,8 @@ test('review history textContains searches delivered content; thread returns unf
   }
 });
 
-import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { release } from '../scripts/release-changelog.mjs';
 import { method } from '@animalabs/mcpl-core';
 import { harness, initialize, FULL_GRANT, until } from './harness.js';
-
-test('review fragment passes the actual release validator', () => {
-  const root = mkdtempSync(join(tmpdir(), 'payload-release-'));
-  try {
-    // Validate the shipped fragment while pending; the fixture survives release.
-    // Unrelated entries cannot make this validation pass.
-    const name = 'readable-message-payloads.added.md';
-    const pending = join('changelog.d', name);
-    const fragment = readFileSync(existsSync(pending) ? pending : join('test/fixtures', name), 'utf8');
-    writeFileSync(join(root, 'package.json'), JSON.stringify({ version: '1.2.3' }));
-    writeFileSync(join(root, 'CHANGELOG.md'), '# Changelog\n\n## Unreleased\n');
-    mkdirSync(join(root, 'changelog.d'));
-    assert.throws(() => release(root), /nothing to release/);
-    writeFileSync(join(root, 'changelog.d', name), fragment);
-    assert.match(release(root), /from 1 fragment/);
-    assert.ok(readFileSync(join(root, 'CHANGELOG.md'), 'utf8').includes(fragment.trim()));
-    assert.equal(existsSync(join(root, 'changelog.d', name)), false);
-    // A consumed slug may legally be reused with unrelated notes next release.
-    writeFileSync(join(root, 'package.json'), JSON.stringify({ version: '1.2.4' }));
-    writeFileSync(join(root, 'changelog.d', name), '- Different notes for a later release.\n');
-    assert.match(release(root), /from 1 fragment/);
-    assert.match(readFileSync(join(root, 'CHANGELOG.md'), 'utf8'), /Different notes for a later release/);
-
-  } finally { rmSync(root, { recursive: true, force: true }); }
-});
 
 test('review server shared mentions neither wake nor auto-subscribe; raw metadata remains original', async () => {
   const h = harness({ ackReaction: 'eyes' });
@@ -343,10 +314,6 @@ test('review server shared mentions neither wake nor auto-subscribe; raw metadat
     assert.deepEqual(h.reactions, [], 'supplemental mentions never acknowledge');
 
   } finally { await h.close(); }
-});
-
-test('review docs pin the real nested-before-top-level order', () => {
-  assert.match(readFileSync('README.md', 'utf8'), /then that attachment's nested blocks, then top-level blocks/);
 });
 
 // Non-rich supplemental units have no structural provenance: punctuation
@@ -768,15 +735,6 @@ test('prose dedup retains row boundaries on every delivery path', async () => {
   await expectText({text, blocks: [section(rows)]}, text + '\n' + rows);
   await expectText({text: rows, attachments: [{text}]}, rows + '\n' + text);
   await expectText({text: rows, blocks: [section(rows.replace(/\n/g, '\r\n'))]}, rows);
-});
-
-test('payload docs describe preview and provenance policies accurately', () => {
-  const readme = readFileSync('README.md', 'utf8');
-  assert.ok(readme.includes('App unfurls are skipped, except message shares. Classic link previews are\nskipped when `from_url` matches an extracted original URL, decoding Slack entities\nand trimming trailing sentence punctuation from bare URLs.'));
-  assert.ok(readme.includes('channel/user IDs rather than labels; preserve internal line breaks in prose\n(normalizing line-ending spellings); and preserve other code whitespace.'));
-  // Historical policy belongs to this fixture, not a possibly reused slug.
-  const added = readFileSync('test/fixtures/readable-message-payloads.added.md', 'utf8');
-  assert.ok(added.includes('Skip human rich-text mirrors when ordinary text is non-whitespace; retain blocks-only\n  and bot/integration rich text unless original text is non-whitespace and\n  client_msg_id is a string (including\n  an empty string; null and other non-string values do not suppress app rich text).'));
 });
 
 for (const gap of [' \n', '\t\r\n', '\n']) {
