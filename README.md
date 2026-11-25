@@ -19,9 +19,11 @@ that grant arrives; plain MCP tool calls are unaffected.
 - **Channels**: eligible conversations discovered within listing limits, subject to token scopes and explicit-policy admission, are registered as an MCPL channel (`slack:<conversationId>`) when the host grants `channels.register`, and `refresh_channels` can register newly discovered eligible conversations; it does not guarantee complete enumeration. `channels/publish` posts in the thread of the last message from that conversation the host took, which can change while the agent is answering. Use [`reply_message` for an explicit thread](#reply-to-a-specific-thread).
 - **Real-time events** via Socket Mode — no public webhook URL needed, so the
   server can be spawned over stdio like any other MCPL server.
-- **Addressing model**: mentions (`<@bot>`) and DMs bypass subscription filtering, but still require access admission and successful delivery;
-  ambient channel chatter flows only from subscribed conversations
-  (auto-subscribe on first mention, opt out with `unsubscribe_channel`).
+- **Addressing model**: mentions (`<@bot>`) and DMs bypass ambient subscriptions, subject to admission controls;
+  a subscription only makes admitted ambient messages eligible for delivery.
+  Delivery requires active `slack.messaging`, and the host can still reject
+  individual messages. The first accepted mention can auto-subscribe a
+  conversation; opt out with `unsubscribe_channel`.
   With `SLACK_SUBSCRIBE_MEMBER_CHANNELS`, each admitted, discovered conversation the bot is in is
   subscribed and `unsubscribe_channel` mutes one instead.
   Events carry MCPL RFC-001 `chat:*` tags for host-side wake gating.
@@ -253,8 +255,9 @@ Both tools return `messages`, each with `id`, `author`, `timestamp`, `content`,
 optional `threadTs` and (without a policy) attachment hints, as before, and add:
 
 - `authorId` when Slack supplies a user ID, and `authorBotId` when supplied.
-  Authors' and mentioned users' names are looked up as before, and an author
-  whose name can't be had is shown by their ID.
+  Authors' and original-text mentions' names are looked up as before;
+  supplemental-only mentions use cached names or raw IDs, without lookups.
+  An author whose name can't be had is shown by their ID.
 - `rootTs`, the thread a message belongs to: its parent's ts, as Slack reports
   it on a reply or a broadcast reply, or the message's own. `threadTs`
   continues to identify a reply's parent. `replyCount` is included only when
@@ -350,6 +353,134 @@ words, which say nothing ran. Existing tool names, default match counts and
 `list_channels.writable` remain stable in legacy mode; policy hints also reflect configured write pins and DM controls. No new legacy scopes, regex, bulk expansion,
 native search or interaction-token handling are included.
 
+### Readable message payloads
+
+History, threads, backscroll and eligible live messages keep Slack's original
+`text` first. Posts that carry `bot_id` are dropped live by default;
+see [Bot message delivery](#bot-message-delivery) for opt-in admission.
+Their bodies remain available through `fetch_history` and `fetch_thread`; backscroll also includes
+other bots. Backscroll always excludes this server's own user ID; it also excludes
+its own bot ID when bot delivery is opted in. With `SLACK_BOT_MESSAGES` unset,
+legacy backscroll is preserved, including user-less own bot posts.
+
+In order, append each classic attachment's readable body (pretext, title with
+link, text, fields as `title: value`, else fallback), then that attachment's nested blocks, then top-level blocks.
+Readable nested blocks take precedence over fallback; attachment-nested omission placeholders do
+not suppress fallback and are appended after that attachment's readable content.
+Top-level blocks (including omission labels) retain input order and may exhaust
+the supplemental budget before later readable blocks. With an access policy
+active, shares and message unfurls (`is_share` or `is_msg_unfurl`) render only
+`[shared message omitted]`, since the source conversation may not be admitted.
+Without a policy they have a `[shared message from NAME (uid:ID), SOURCE]` header
+and `> `-prefixed lines. Other attachments with `author_name` are attributed in either mode.
+These in-body headers are display hints, not authenticated provenance: message
+text can imitate them. Do not use them to authorize actions.
+Unknown share authors/sources are marked unknown. Header fields are single-line,
+control-safe and use the same quoted name/channel rule as sender framing,
+with each input capped at 100 UTF-16 code units before quoting (including an
+ellipsis when shortened).
+Every logical body line is quoted, including CR, LF, CRLF, U+2028/U+2029, NEL,
+VT and FF breaks (the same set used by sender framing).
+
+Header, section, context, rich_text, markdown, alert, card, video and table text
+are supported. Rich lists retain indentation/offsets, quotes and code retain
+structure, and links/mentions retain styles. Image/interactive controls are
+ignored (`image`, `actions`, `input`, `divider` and `file`; files are reported
+separately); other unsupported block types have an `[TYPE omitted]` placeholder.
+Literal plain text, rich text, link labels and date fallbacks are escaped.
+Classic attachment fields (including titles and fallback) format Slack tokens
+and entities regardless of `mrkdwn_in`; basic styling passes through verbatim.
+
+#### Limits
+
+When `text` contains non-whitespace and either `client_msg_id` is a string (including an empty string) or all of
+`bot_id`, `app_id` and `bot_profile` are absent,
+**top-level human `rich_text` is not rendered**: it is treated as the client's
+mirror. Even a differing rich block is ignored. Other block types and attachment-nested rich text still render.
+Blocks-only messages still render rich text, including an app posting as a user
+with only blocks. App-as-user posts without `bot_id` remain eligible for live
+delivery under `chat:from-human` by default, including their rendered app bodies; this tag
+is not proof of human authorship. Bot/integration messages carrying `bot_id`, `app_id` or
+`bot_profile`, without a string-valued `client_msg_id`, also retain rich text.
+Null and other non-string client IDs do not suppress app rich text.
+
+Unattributed supplemental units deduplicate against original text. Attributed
+units deduplicate by source channel ID and message timestamp when present, plus
+the displayed attribution header (including capped
+author name, valid author ID and, for shares, channel or footer). Other source fields such as author_link are not
+identity keys; names differing only beyond the display cap may deduplicate.
+Comparison keys normalize horizontal prose whitespace, Slack encodings, combined
+bold/italic marker order and newlines directly inside code fences; compare
+channel/user IDs rather than labels; preserve internal line breaks in prose
+(normalizing line-ending spellings); and preserve other code whitespace.
+Line-end horizontal prose whitespace is ignored in keys. Rich-section joining
+reuses a trailing line break rather than adding a phantom blank row; intentional
+blank rows remain distinct.
+This is display dedup, not typed equality: a link and identical rendered literal
+may collapse, while differing markup may appear twice for bots/integrations.
+Angle tokens use a linear scan; unclosed or malformed tokens (such as `<http://|label>`)
+are left literal. Multiline angle tokens are now literal, including in original text.
+Multiline mentions therefore do not trigger mention-based wake or auto-subscription.
+The original Slack text is preserved in channels/incoming raw metadata, while display text is formatted.
+push/event does not expose rawContent. Nested angle openers restart the token scan.
+
+Only original Slack text supplies mention-based addressing, wake or auto-subscription.
+DM addressing is independent of text, including for blocks-only DMs.
+Supplemental attachment/shared/block mentions are display content only; quoted
+mentions in original text still participate in addressing. Authors and original-text
+mentions retain their name lookups, which can delay live delivery, reaction ack
+and host wake. Supplemental-only mentions use cached names or raw IDs without
+lookups in live messages, backscroll and explicit history/thread reads. There is
+no supplemental-ID lookup quota. Live channels/incoming `metadata.rawContent` remains original
+Slack text; live `content` blocks include supplemental text (the adapter's
+internal `cleanContent` field is not exposed on the wire). History
+`textContains` searches rendered content with user-ID mentions; threads have no
+filters.
+
+App unfurls are skipped, except message shares. Classic link previews are
+skipped when `from_url` matches an extracted original URL, decoding Slack entities
+and trimming trailing sentence punctuation from bare URLs. Labelled Slack URL
+targets are compared exactly. No URL canonicalization is performed: trailing
+slashes, scheme/host case, default ports and fragments can prevent a match. Such
+previews remain visible and can consume the entire supplemental allowance. Bare
+URL punctuation trimming is heuristic and can hide a distinct punctuation-ending URL.
+It does not trim closing parentheses: `(https://example.com/a)` can retain a
+preview whose `from_url` is `https://example.com/a`.
+
+The supplemental suffix cap is **pre-formatting**: 16,384 UTF-16 code units including
+separator and a single final `[…truncated]` marker. It does **not** bound delivered
+size: names and formatting may expand it. Each of attachment and top-level traversal allows max(2,000, 14 × original
+UTF-16 length + 2) work units, charging visits/list entries and reserving room for
+rich mirror containers. Reused channel labels instead spend a separate output
+allowance of max(16,384, original UTF-16 length + 1) code units.
+Traversal cuts and nesting (12 levels) also carry that marker; it reports
+unvisited payload, not a guarantee that readable text was omitted; cuts preserve code points, complete Slack angle tokens and Slack entities. Unsupported blocks remain omitted on explicit reads; the 16,384-unit explicit-read
+cap cannot be bypassed by rereading through history or threads. Original text is
+never truncated. The compact markers do not distinguish recoverable content:
+backscroll cuts may expose more on explicit reads, but unsupported blocks and
+explicit-read supplemental cuts cannot be recovered by repeating those reads.
+Unsupported labels are normalized and deduplicated before charging the deferred
+notice allowance; label-length and traversal limits still apply. Cuts keep a conservative marker even when the retained prefix deduplicates
+or is whitespace-only, since the unseen tail may be distinct.
+Backscroll uses a lower **2,000 UTF-16 code unit supplemental cap per
+message**, and the framed backscroll block has an overall **32 KiB byte budget**.
+It keeps a contiguous newest window. Messages that exceed the remaining byte
+budget (even if they fit the full budget on their own) get an in-position
+placeholder with timestamp, ID, author and framed byte size saying the message
+was omitted. If even a placeholder cannot fit, one leading line counts the older
+messages not shown. When history access is granted, markers suggest
+`try fetch_history`; the summary includes `latest=<oldest shown ID>` when a row
+is shown (otherwise use the triggering message's ID from the location header).
+These are recovery hints, not guarantees: history tools have their own result
+limits. Placeholders, this summary, any page-limit note and framing all count against the byte budget,
+preserving positions instead of leaving silent gaps.
+
+Backscroll yields between rendering batches, not during the later whole-window
+mention scans and formatting. Its lower suffix cap does not lower intermediate
+render limits (max(16,384, original UTF-16 length + 1)). Human rich-text-only
+mirrors also still incur original-text scanning/key construction before being
+skipped. These output limits are not per-window CPU or latency guarantees.
+
 ## Environment
 
 Switches take `true`/`false` (also `1`/`0`, `yes`/`no`); any other value stops the server, so a typo cannot leave a guard off.
@@ -359,13 +490,14 @@ Switches take `true`/`false` (also `1`/`0`, `yes`/`no`); any other value stops t
 | `SLACK_BOT_TOKEN` | yes | Bot token (`xoxb-…`) for Web API calls |
 | `SLACK_ACCESS_POLICY` | no | Complete JSON conversation/file policy; see below. Absent preserves legacy; empty or invalid stops startup |
 | `SLACK_APP_TOKEN` | yes | App-level token (`xapp-…`, `connections:write`) for Socket Mode |
+| `SLACK_BOT_MESSAGES` | no | Opt in to live messages from other bots: `all`, or comma-separated bot IDs/user IDs (e.g. `B012ABC,U034DEF`). Unset keeps the legacy bot-event filter; empty or invalid values stop startup. Known own identities are dropped (opt-in requires both bot and user identities at startup). See [Bot message delivery](#bot-message-delivery). |
 | `SLACK_DM_USERS` | no | Comma-separated user-ID whitelist for DMs; others' DMs are dropped. Without an access policy it filters incoming DMs only, not group DMs, history reads or the conversation list. Set but naming no user is refused at startup |
 | `SLACK_SEND_CHANNELS` | no | Comma-separated conversation-ID allow-list for writes (send, upload, DM, edit, delete, reaction, and the host's `channels/publish`); write effects elsewhere are refused before reaching Slack (send_dm may open first to learn its exact destination). Other admitted conversations can be registered `inbound`, `list_channels` shows `writable: false`, and the first message the agent gets from one, addressed or not, carries a read-only note. A mention there is eligible only after access admission and successful delivery; whether it wakes is the host's policy. `send_dm` is refused before a DM is opened, and not offered, unless the list names a DM. In policy mode, Slack must first open the DM to return its exact ID; if that ID fails admission, the error reports the opened DM and that nothing was posted. Set but empty is refused at startup; the effective list is logged |
 | `SLACK_SUBSCRIBE_MEMBER_CHANNELS` | no | `true` makes ambient messages from member channels eligible, subject to access admission and successful delivery; membership alone does not bypass policy. `unsubscribe_channel` then mutes a conversation (`subscribe_channel` unmutes it) and `list_subscriptions` lists the muted ones. Takes `true` or `false` (also `1`/`0`, `yes`/`no`); unset is off, and any other value, empty included, stops startup |
 | `SLACK_DISABLE_DMS` | no | `true` drops incoming DMs and group DMs, refuses every write to them and both history reads on them, and leaves them out of `conversations.list`, so they are neither listed nor registered; `send_dm` is not offered. Only a conversation Slack confirms as a channel passes: a group DM ID looks like a channel ID, and a user ID posts into that user's DM. An unknown ID is asked about until Slack confirms it. One Slack won't describe is refused; when the question can't be answered just now (a rate limit, a failure on the way or on Slack's side, or too little of the call's time), nothing is written, and the error says why and that the call can be made again. Without an access policy, incoming events pass only when Slack marks them `channel` or `group`; policy mode instead uses fresh conversation metadata. Takes `true` or `false` (also `1`/`0`, `yes`/`no`); unset is off, and any other value, empty included, stops startup |
 | `SLACK_ACK_REACTION` | no | Emoji name (e.g. `eyes`) put on a message that addresses the bot. It means "received": it is removed at the bot's next post in that conversation that Slack confirms, after 10 minutes, or cleanup is requested at once if the host does not accept the message. Under a policy, adding it needs fresh write admission and reactions:write; cleanup also needs admission and may leave the reaction visible if refused. A removal that fails in a way that can pass (a rate limit, an HTTP error, a network failure, or Slack's own failure such as `internal_error`) is tried again every minute, up to 5 tries in all; one Slack refuses is dropped. An add that fails isn't tried again. One that may have landed is removed as usual: `already_reacted` says it's there, and Slack's failure while handling it (`internal_error`, `fatal_error`, `service_unavailable`), an HTTP error, an answer not in Slack's form or one the client can't read, or a failure in transit after the request may have reached Slack leaves it unknown. One Slack refused, rate-limited or received only in part (`request_timeout`), one whose connection was never made, and one this server refused itself, such as outside `SLACK_SEND_CHANNELS`, isn't there. On SIGTERM, SIGINT or the host closing stdin, pending reactions are removed (5 s at most); a crash cannot, so removal is best-effort. For a typing signal see **Typing** above. |
 | `SLACK_SUBSCRIPTIONS_FILE` | no | JSON file persisting ambient subscriptions across restarts: an array of IDs, or `{subscribed, muted}` while anything is muted (older versions read the object form as empty) |
-| `SLACK_BACKSCROLL_LIMIT` | no | Messages fetched on first interaction with a conversation (default 50) |
+| `SLACK_BACKSCROLL_LIMIT` | no | Messages fetched for an addressed interaction before host acceptance when no accepted interaction has recorded a watermark (rejection can therefore discard fetched backscroll; an accepted ambient message prevents later initial backscroll; default 50; accepts decimal integers in [1, 1,000] with optional surrounding whitespace and an optional leading `+`, otherwise falls back to 50); shown in a newest contiguous window within 32 KiB including framing, in-position omission placeholders and a leading summary for older messages that cannot fit |
 | `SLACK_CONVERSATION_PAGE_LIMIT` | no | Maximum Slack pages per conversation listing (default 1000; range 1–10000). An invalid value stops startup; see [Bounded pagination](#bounded-pagination) |
 | `SLACK_USER_PAGE_LIMIT` | no | Maximum Slack pages per bounded user-directory search (default 1000; range 1–10000). An invalid value stops startup; see [Bounded pagination](#bounded-pagination) |
 | `SLACK_BACKSCROLL_PAGE_LIMIT` | no | Maximum Slack pages per backscroll fetch (default 100; range 1–10000). An invalid value stops startup; see [Bounded pagination](#bounded-pagination) |
@@ -498,15 +630,17 @@ portion scanned. A small or empty partial result does not prove absence.
 When a page limit is reached, `list_channels` adds an incomplete-listing text block. `find_user` marks partial
 results with `truncated: true`, `stopReason` and a note, including its existing
 25-match stop when unexamined results remain. Backscroll carries
-`truncated="true"` and a visible note only when its page limit stops
-it, even if filtering leaves no displayed messages. Delivery gives up waiting for
+`truncated="true"` and a visible incomplete-history note only when its page limit stops
+it, even if filtering leaves no displayed messages. The note suggests `fetch_history`
+only when the host has granted history. Delivery gives up waiting for
 backscroll after **5 seconds**; the first rate limit also rejects the fetch. In
 either case delivery continues without backscroll or an incomplete note, even
 if earlier pages succeeded. With an explicit policy the bounded final admission
 still applies: only classified rate-limit, transport and Slack service failures
 retain the original event admission only without a known lasting refusal or withdrawn grant; other failures and expired delivery waits drop
-and request ACK cleanup, which can itself fail. The page limit bounds requests from an abandoned
-fetch that continues after delivery gives up. The normal latest-N-message backscroll window is not labelled incomplete. History/thread tools retain
+and request ACK cleanup, which can itself fail. The timeout stops further backscroll page requests;
+after a host disconnect they stop once the server finishes the host request it is
+handling, or at the timeout, whichever is first. An in-flight request can still finish. The normal latest-N-message backscroll window is not labelled incomplete. History/thread tools retain
 `pagination.scanComplete`, their existing stop reasons and continuation cursors.
 
 Background registration announces the eligible subset and logs incomplete
@@ -590,11 +724,100 @@ one-request/minute installation, a rate limit on page two drops the backscroll;
 the 100-page default also bounds sparse/empty-page traversal. These defaults are
 server safety choices, not Slack guarantees of workspace coverage.
 
+## Bot message delivery
+
+With `SLACK_BOT_MESSAGES` unset, tool descriptions, subscription results and
+notices, the feature-set manifest, startup logs, refresh guidance and registration
+retry behavior remain unchanged from before bot delivery was introduced. Bot-delivery-specific guidance and the
+`chat:from-bot` ontology addition apply only when bot delivery is enabled.
+
+`SLACK_BOT_MESSAGES=all` admits other bots' live messages. For narrower
+admission, use an allow-list such as `SLACK_BOT_MESSAGES=B012ABC,U034DEF`:
+either the event's bot ID or its author user ID must match (`U…` and `W…`
+user IDs are accepted). A bot event without a user ID uses its bot ID as
+author ID, and Slack's username as its display name when supplied.
+For legacy/incoming-webhook posts, list the **bot ID** (`B…`), exposed by
+`fetch_history` as `authorBotId`; the member ID (`U…`) shown in Slack's UI
+does not match user-less events. List both IDs for apps that post both ways.
+With an ID allow-list, explicitly listed user or bot IDs pass even when
+`users.info` fails; unknown listed senders are conservatively marked as bot,
+never human. In opt-in modes, Slackbot (`USLACKBOT`) is always classified as
+a bot despite Slack reporting `is_bot: false`; list its user ID to admit it.
+Unlisted senders pass only after Slack verifies they are human.
+Verification is in memory only: after every restart, every unlisted sender
+starts unverified. All messages from unlisted senders not verified since startup,
+including mentions and DMs, are dropped throughout a `users.info` outage and
+for 30 seconds after each failed or inconclusive lookup. Rate limits instead
+honor Slack's Retry-After while cached. The 256-entry failure cache can evict
+any cooldown early, permitting an earlier retry and renewed warning. Permanent refusals stay negative until restart or
+eviction. Addressed drops log the sender ID and reason on stderr once per
+sender per cooldown (once per cached permanent refusal).
+A lookup not sent because a host call ran out of time creates no negative entry.
+For unlisted, unverified authors in list mode, mention names are resolved only
+after author admission; other lookups stay batched.
+Allow-list startup requires `users:read` when Slack reports token scopes;
+unknown scopes defer verification to lookups.
+Failures are never cached as human: non-abortable live/host lookups coalesce per user, with at most
+256 negative entries (oldest evicted). Verified humans pass without being listed.
+Abortable backscroll lookups can join live/host work but are not shared as owners,
+so concurrent backscroll and live lookups may send separate requests.
+Unset and `all` modes retain best-effort delivery when a lookup fails.
+Opt-in bot-delivery startup requires both authenticated self IDs so messages from this
+connector are dropped by user ID **or** bot ID, even if explicitly allowed.
+
+Admitted bot messages carry `chat:from-bot` (not `chat:from-human`) and a
+`[Slack source: bot]` text marker. Both delivery lanes expose `isBot` and,
+when available, `authorBotId` in metadata/origin. In `all` mode, user-only
+senders whose lookup fails or is inconclusive remain unknown: they are not
+verified human, but receive no bot tag without evidence of a bot. Delivery
+continues via the normal non-bot lane (`chat:from-human`); this tag is not proof
+of verified humanity. Known bots and explicit bot events still receive bot tags.
+For reliable user-only bot classification, grant `users:read` and reinstall the
+app in the workspace. In `all` mode, known missing scopes at startup or a `missing_scope`
+lookup refusal produce one operator warning per adapter, naming `users:read`.
+In `all` mode, permanent refusals remain cached until restart; in list mode,
+they can also be evicted from the bounded failure cache.
+Existing subscriptions, mention/DM wake
+policy, and DM controls still apply. With an explicit access policy, bot and
+human events use the same conversation admission and final delivery checks.
+A bot ID alone cannot establish the peer of a one-to-one DM. Enabling this option alone does not
+subscribe to channels or grant access, but an admitted bot mention can auto-subscribe
+a channel under the existing first-interaction rules and can receive the
+configured acknowledgement reaction. To make admitted ambient messages eligible
+for delivery, subscribe to the channel or enable `SLACK_SUBSCRIBE_MEMBER_CHANNELS`.
+Delivery requires active `slack.messaging`, and the host can still reject
+individual messages.
+
+**Loop risk:** self-filtering prevents reacting to this connector's own
+messages, not cycles between different bots. A bot mentioning another bot,
+or sending it a DM, can trigger a reply loop under the host's wake policy.
+Prefer an allow-list and configure host-side bot wake restrictions/rate
+limits before enabling this option. Unset it to restore the legacy filter:
+`bot_id` and `bot_message` events are dropped, but user-only bot events can pass.
+No bot-message startup status is printed when the option is unset; this is not a
+guarantee that every bot identity is excluded. The current suggested rules wake immediately on `chat:addressed`;
+hosts should restrict/rate-limit the `chat:addressed` + `chat:from-bot` pair.
+That pair alone does not cover user-only bots in `all` mode whose identity lookup
+fails or is inconclusive: they use `chat:from-human`. Use an allow-list or
+rate-limit addressed messages regardless of the bot tag to cover that case.
+An admitted ambient bot message can also change the last-taken thread used by
+`channels/publish` while an answer is being composed; use `reply_message` with
+an explicit target to avoid this.
+
+Edits (`chat.update`) are never delivered live: only the initial post is seen,
+including placeholders or initial CI status. Use `fetch_history` for the
+current channel state, or `fetch_thread` for a thread reply. This option does not filter history reads. In list mode their name
+lookups share verification state: failed author lookups show cached names or raw IDs; inconclusive answers retain any returned display name without verifying identity;
+mentions can retain a Slack-provided fallback label. These failures start that user's cooldown, which also affects live admission. Live original-text mention lookups share this same cache: a failed lookup for someone mentioned can start that person's admission cooldown before they send a message. Live delivery, backscroll and explicit history/thread tools use cached names or raw IDs for supplemental-only mentions without starting lookups.
+
 ## Tests
 
 ```bash
 npm test
 ```
+
+Bot delivery tests cover admission/self-filtering, startup parsing, and both
+live MCPL lanes, including attachment/block-only payloads from integrations.
 
 ## Contributing
 

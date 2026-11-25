@@ -2,11 +2,13 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
+  cpSync,
   mkdirSync,
   mkdtempSync,
   lstatSync,
   readdirSync,
   readFileSync,
+  rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -91,6 +93,19 @@ function section(text: string, version: string): string {
 
 const changelog = (dir: string) => readFileSync(join(dir, "CHANGELOG.md"), "utf8");
 const pending = (dir: string) => readdirSync(join(dir, "changelog.d")).sort();
+
+test("pending changelog fragments pass the release validator", (t) => {
+  const source = fileURLToPath(new URL("../changelog.d/", import.meta.url));
+  if (readdirSync(source).every((name) => name === "README.md")) {
+    return t.skip("no pending fragments");
+  }
+  const dir = setup({});
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  cpSync(source, join(dir, "changelog.d"), { recursive: true, verbatimSymlinks: true });
+  const result = run(dir);
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(pending(dir), ["README.md"]);
+});
 
 test("folds fragments into a versioned section in canonical order and deletes them", () => {
   const dir = setup({

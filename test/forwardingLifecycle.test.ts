@@ -29,6 +29,7 @@ function fixture(
   const handlers: Array<(msg: SlackMessageData) => void> = [];
   const posts: Array<{ channel: string; threadTs?: string }> = [];
   const histories: string[] = [];
+  const historySignals: Array<AbortSignal | undefined> = [];
   const cleared: string[] = [];
   const acknowledged: string[] = [];
   const slack = {
@@ -42,8 +43,9 @@ function fixture(
       await beforeMeta();
       return { id, name: 'general', kind: 'channel', isMember: true };
     },
-    async fetchHistory(channel: string) {
+    async fetchHistory(channel: string, opts: { signal?: AbortSignal } = {}) {
       histories.push(channel);
+      historySignals.push(opts.signal);
       return { messages: await history(channel), truncated: false };
     },
     async acknowledge(channel: string, ts: string) { acknowledged.push(`${channel}/${ts}`); },
@@ -55,7 +57,7 @@ function fixture(
   } as unknown as SlackAdapter;
   const server = new SlackMcplServer(slack);
   return {
-    server, slack, handlers, histories, posts, cleared, acknowledged,
+    server, slack, handlers, histories, historySignals, posts, cleared, acknowledged,
     emit(id: string, channelId = 'C1', overrides: Partial<SlackMessageData> = {}) {
       const msg: SlackMessageData = {
         channelId, id, authorId: 'U2', authorName: 'Ann', content: 'hello', cleanContent: 'hello',
@@ -259,7 +261,7 @@ test('old queued and in-flight messages cannot change a new peer or hold up its 
   }
 });
 
-test('a DM whose peer leaves during its backscroll fetch changes nothing for the next peer', async (t) => {
+test('disconnect aborts a pending DM backscroll without affecting the next peer', async (t) => {
   // A DM looks up no name, so the check after its backscroll fetch is the
   // last one before it would be sent.
   const gate = deferred<HistoryMessage[]>();
@@ -275,6 +277,7 @@ test('a DM whose peer leaves during its backscroll fetch changes nothing for the
 
   const next = connect(f.server);
   try {
+    assert.equal(f.historySignals[0]?.aborted, true, 'disconnect aborts backscroll before the fetch returns');
     await next.ready();
     gate.resolve([historyMessage]);
     await until(() => f.cleared.length > 0, 'the abandoned DM releases its reaction');
@@ -468,8 +471,8 @@ test("an agent's unsubscribe holds across reconnects: a new peer's first mention
     f.emit('112.1');
     f.emit('112.2', 'C1', { mentionsBot: false, mentionIds: [] });
     await until(() => next.deliveries().length > 0, 'the new peer\'s mention');
-    await settle();
-    assert.equal(next.deliveries().length, 1, 'the ambient message is still dropped');
+    await (f.server as any).forwarding.get('C1');
+    assert.equal(next.deliveries().length, 1, 'the completed ambient message was dropped');
     const text = pushText(next.deliveries()[0]);
     assert.match(text, /<backscroll/, 'the new peer\'s own first interaction');
     assert.doesNotMatch(text, /Auto-subscribed/);
@@ -567,6 +570,32 @@ const subscriptions = async (peer: ReturnType<typeof connect>) => {
   return JSON.stringify(result);
 };
 
+test('backscroll aborted on disconnect logs the drop, not a fallback delivery', async (t) => {
+  const f = fixture();
+  const errors = t.mock.method(console, 'error', () => {});
+  let started = false;
+  t.mock.method(f.slack, 'fetchHistory', async (_channel: string, opts: { signal?: AbortSignal }) => {
+    const signal = opts.signal;
+    assert.ok(signal, 'backscroll receives an abort signal');
+    return new Promise((_, reject) => {
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      started = true;
+    });
+  });
+  const peer = connect(f.server);
+  try {
+    await peer.ready();
+    f.emit('111.1');
+    await until(() => started, 'backscroll fetch started');
+  } finally {
+    await peer.close();
+  }
+  await until(() => f.cleared.length === 1, 'the dropped message releases its reaction');
+  const lines = logLines(errors).join('\n');
+  assert.match(lines, /Dropped addressed message 111\.1 in C1 before delivery: its peer disconnected/);
+  assert.doesNotMatch(lines, /Couldn't get the backscroll.*delivering without it/);
+});
+
 test('arrival drops name addressed messages with no peer or messaging off, but stay quiet for plain MCP', async (t) => {
   const f = fixture();
   const errors = t.mock.method(console, 'error', () => {});
@@ -629,9 +658,11 @@ for (const lookup of ['history', 'name', 'location'] as const) {
       t.mock.timers.tick(4999);
       await settle();
       assert.equal(peer.deliveries().length, before, 'still waiting just short of five seconds');
+      if (lookup === 'history') assert.equal(f.historySignals[0]?.aborted, false);
       t.mock.timers.tick(1);
       for (let i = 0; i < 50 && peer.deliveries().length < before + 2; i++) await settle();
       assert.equal(peer.deliveries().length, before + 2, 'optional data cannot hold the conversation indefinitely');
+      if (lookup === 'history') assert.equal(f.historySignals[0]?.aborted, true, 'give-up cancels backscroll shaping');
       const [first, second] = peer.deliveries().slice(before).map(pushText);
       assert.equal(/<backscroll/.test(first), lookup === 'name');
       assert.doesNotMatch(second, /<backscroll/);

@@ -63,9 +63,9 @@ import {
   type SlackListing,
   type SlackWait,
 } from './slack-adapter.js';
-import { policySubscriptionTool, policyListingTool, toolDefinitions } from './tools.js';
+import { buildToolDefinitions, policySubscriptionTool, policyListingTool } from './tools.js';
 import { withToolClasses } from './tool-classes.js';
-import { buildFeatureSets, buildServerCapabilities, featureSetForTool, MESSAGING_FEATURE_SET, TYPING_FEATURE_SET } from './feature-sets.js';
+import { buildFeatureSets, buildServerCapabilities, featureSetForTool, MESSAGING_FEATURE_SET, HISTORY_FEATURE_SET, TYPING_FEATURE_SET, SUBSCRIPTIONS_FEATURE_SET } from './feature-sets.js';
 import { ChannelManager, mcplChannelId, parseMcplChannelId, toDescriptor } from './channels.js';
 import { StateTracker, type UploadedFile } from './state.js';
 import { CapabilityGrant } from './grant.js';
@@ -183,20 +183,71 @@ export function backscrollLine(m: {
   return `[${m.timestamp.toISOString()}${thread} id=${m.id}] ${nameShown(m.authorName)}${att}: ${senderText(m.content)}`;
 }
 
-/** The `<backscroll>` block given with the first message from a conversation. */
+/** Context fetched for addressed delivery before any accepted delivery in this conversation. */
 export function backscrollBlock(
   messages: Parameters<typeof backscrollLine>[0][],
   where: { channelName?: string; isDM: boolean; isGroupDM?: boolean; truncated?: boolean; policyAttachments?: boolean },
+  historyGranted: boolean = false,
 ): string {
   const attrs: string[] = [];
-  if (where.channelName && !where.isDM) attrs.push(`channel=${quotedLabel(where.isGroupDM ? where.channelName : `#${where.channelName}`)}`);
+  if (where.channelName && !where.isDM) {
+    const label = Array.from(where.channelName).slice(0, 100).join('');
+    attrs.push(`channel=${quotedLabel(where.isGroupDM ? label : `#${label}`)}`);
+  }
   if (where.isDM) attrs.push('dm="true"');
   if (where.isGroupDM) attrs.push('group_dm="true"');
-  attrs.push(`count="${messages.length}"`);
-  if (where.truncated) attrs.push('truncated="true"');
-  return [`<backscroll ${attrs.join(' ')}>`, ...messages.map(m => where.policyAttachments ? backscrollLine({ ...m, policyAttachments: true }) : backscrollLine(m)),
-    ...(where.truncated ? ['Backscroll is incomplete; older messages may be missing. Use fetch_history to inspect earlier history.'] : []),
-    '</backscroll>'].join('\n');
+  // Keep a contiguous newest window. An oversized body gets an in-position
+  // placeholder rather than a silent gap; if even that cannot fit, summarize
+  // the older prefix. Both forms count against the same hard byte budget.
+  const maxBytes = 32_768;
+  const historyAvailable = historyGranted === true;
+  const unavailable = '; history unavailable: host has not selected feature set slack.history';
+  const lines: string[] = [];
+  const summary = (count: number, before?: string) =>
+    `[${count} older backscroll ${count === 1 ? 'message' : 'messages'} not shown${historyAvailable ? '; try fetch_history' + (before ? ' latest=' + before : '; follow nextCursor until the omitted window is reached') : unavailable}]`;
+  const opening = (count: number) => `<backscroll ${[...attrs, `count="${count}"`, ...(where.truncated ? ['truncated="true"'] : [])].join(' ')}>`;
+  const ending = [
+    ...(where.truncated ? ['Backscroll is incomplete; older messages may be missing.' +
+      (historyAvailable ? ' Use fetch_history to inspect earlier history.' : '')] : []),
+    '</backscroll>',
+  ];
+  const rendered = messages.map(m => where.policyAttachments ? backscrollLine({ ...m, policyAttachments: true }) : backscrollLine(m));
+  const complete = [opening(messages.length), ...rendered, ...ending].join('\n');
+  if (Buffer.byteLength(complete) <= maxBytes) return complete;
+  let bytes = 0;
+  let oldest = messages.length;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    const line = rendered[i];
+    const size = Buffer.byteLength(line);
+    const reserved = Buffer.byteLength([opening(lines.length + 1), ...ending].join('\n')) +
+      (i ? Buffer.byteLength(summary(i, message.id)) + 1 : 0);
+    let shown = line;
+    if (bytes + size + 1 + reserved > maxBytes) {
+      shown = `[backscroll notice: message omitted (${size} bytes); timestamp=${message.timestamp.toISOString()}${message.threadTs ? ' thread=' + message.threadTs : ''} id=${message.id}; author=${quotedLabel(message.authorName)}${historyAvailable ? '; try fetch_history; follow nextCursor until this id is reached' : unavailable}]`;
+    }
+    const shownBytes = Buffer.byteLength(shown) + 1;
+    if (bytes + shownBytes + reserved > maxBytes) break;
+    lines.push(shown);
+    bytes += shownBytes;
+    oldest = i;
+  }
+  return [opening(lines.length),
+    ...(oldest ? [summary(oldest, messages[oldest]?.id)] : []),
+    ...lines.reverse(), ...ending].join('\n');
+}
+
+let backscrollLimit: number | undefined;
+
+function readBackscrollLimit(): number {
+  const raw = process.env.SLACK_BACKSCROLL_LIMIT?.trim();
+  if (raw === undefined) return 50;
+  if (/^\+?[0-9]+$/.test(raw)) {
+    const n = Number(raw);
+    if (Number.isInteger(n) && n > 0 && n <= 1000) return n;
+  }
+  console.error('[slack-mcpl] Invalid SLACK_BACKSCROLL_LIMIT: expected a decimal integer from 1 to 1000; using 50');
+  return 50;
 }
 
 /** Policy diagnostics include the root needed to recover a thread reply. */
@@ -233,7 +284,7 @@ export function admissionIncompleteNote(stop: SlackListing['admissionStop'], ref
 export class SlackMcplServer {
   private conn: McplConnection | null = null;
   private mcplEnabled = false;
-  private grant = new CapabilityGrant(buildFeatureSets());
+  private grant: CapabilityGrant;
   private channelManager = new ChannelManager();
   /** A new registration supersedes work started under an earlier grant. */
   private registrationGeneration = 0;
@@ -245,18 +296,20 @@ export class SlackMcplServer {
   private stateTracker = new StateTracker();
   /** Serial delivery within a conversation; different conversations stay independent. */
   private forwarding = new Map<string, Promise<void>>();
+  /** Pending backscroll lookups for the connection being served. */
+  private backscrollAborts = new Set<AbortController>();
 
   /** Conversations the agent has opted into for ambient (non-mention,
-   *  non-DM) message delivery. Mentions and DMs bypass this filter (an access
-   *  policy can still drop them) — this only gates passive awareness of channel chatter.
+   *  non-DM) message delivery. Admitted mentions and DMs bypass subscriptions
+   *  regardless — this only gates passive awareness of channel chatter.
    *  Persisted to `SLACK_SUBSCRIPTIONS_FILE` (a JSON array of conversation
    *  IDs) so the list survives restarts. */
   private subscribedChannels = new Set<string>();
   private subscriptionsLoaded = false;
 
   /** Per-conversation ts of the newest message this peer has taken. Its
-   *  presence marks the peer's first interaction with the conversation as
-   *  done, so a new peer gets its own first-interaction backscroll. */
+   *  presence suppresses initial backscroll, including after ambient delivery.
+   *  A new peer starts without these accepted-delivery watermarks. */
   private forwardedWatermark = new Map<string, string>();
 
   /** Conversations the agent has unsubscribed from with unsubscribe_channel
@@ -279,13 +332,11 @@ export class SlackMcplServer {
    *  the host didn't take, unless another conversation is current by then. */
   private lastChannelId: string | null = null;
 
-  /** How many backscroll messages to fetch on first interaction. Tunable via
-   *  SLACK_BACKSCROLL_LIMIT; clamped to [1, 1000], default 50. */
+  /** How many backscroll messages to fetch for an addressed delivery when no
+   *  delivery in the conversation has yet been accepted. Read SLACK_BACKSCROLL_LIMIT
+   *  once on first use, sharing the result across server instances. */
   private get backscrollLimit(): number {
-    const raw = process.env.SLACK_BACKSCROLL_LIMIT;
-    if (!raw) return 50;
-    const n = parseInt(raw, 10);
-    return Number.isFinite(n) && n > 0 && n <= 1000 ? n : 50;
+    return backscrollLimit ??= readBackscrollLimit();
   }
 
   /** Conversations muted with unsubscribe_channel while every member channel
@@ -304,6 +355,7 @@ export class SlackMcplServer {
     private slack: SlackAdapter,
     private opts: { subscribeMemberChannels?: boolean } = {},
   ) {
+    this.grant = new CapabilityGrant(buildFeatureSets(slack.hasAccessPolicy, !!slack.botMessages));
     // Once for the server's life: the adapter keeps every handler it's
     // given, and each forwards to whichever connection is being served, so
     // one per connection forwarded each message once per connection served.
@@ -373,6 +425,8 @@ export class SlackMcplServer {
       }
     } finally {
       this.conn = null;
+      for (const controller of this.backscrollAborts) controller.abort();
+      this.backscrollAborts.clear();
       // A failed handshake ends here too: close the connection, so a TCP
       // client isn't left on a socket nobody serves.
       this.registrationIncomplete = undefined;
@@ -409,7 +463,7 @@ export class SlackMcplServer {
     // the host publishes text-only turns to the conversational locus via
     // channels/publish, so no contextHooks are declared here (same rationale
     // as discord-mcpl; see LOCUS-ROUTING-DESIGN.md).
-    const serverCaps: McplCapabilities = buildServerCapabilities(this.slack.hasAccessPolicy);
+    const serverCaps: McplCapabilities = buildServerCapabilities(this.slack.hasAccessPolicy, !!this.slack.botMessages);
 
     const capabilities: InitializeCapabilities = {
       tools: {},
@@ -443,7 +497,9 @@ export class SlackMcplServer {
    *  connection has no host to register conversations with. Neither changes
    *  during a connection, as a grant can. */
   private offeredTools() {
-    return toolDefinitions.map(t => policySubscriptionTool(policyListingTool(t, this.slack.hasAccessPolicy), this.slack.hasAccessPolicy)).filter((t) =>
+    const policy = this.slack.hasAccessPolicy;
+    const botDelivery = !!this.slack.botMessages;
+    return buildToolDefinitions(botDelivery).map(t => policySubscriptionTool(policyListingTool(t, policy), policy && !botDelivery)).filter((t) =>
       (t.name !== 'send_dm' || this.slack.dmsWritable) && (t.name !== 'refresh_channels' || this.mcplEnabled)).map((t) =>
         t.name === 'fetch_attachment' && this.slack.hasAccessPolicy ? {
           ...t,
@@ -1035,8 +1091,8 @@ export class SlackMcplServer {
         const channelId = this.requireString(args, 'channelId');
         return this.subscribe(channelId)
           ? this.opts.subscribeMemberChannels
-            ? (this.slack.hasAccessPolicy ? `Unmuted conversation ${channelId}: its ambient messages are eligible again, subject to access admission and successful delivery.` : `Unmuted conversation ${channelId}: its ambient messages arrive again.`)
-            : `Subscribed to ambient messages from conversation ${channelId}.`
+            ? (this.slack.botMessages ? `Unmuted conversation ${channelId}: its admitted ambient messages are eligible for delivery again. Delivery requires active slack.messaging, and the host can still reject messages.` : this.slack.hasAccessPolicy ? `Unmuted conversation ${channelId}: its ambient messages are eligible again, subject to access admission and successful delivery.` : `Unmuted conversation ${channelId}: its ambient messages arrive again.`)
+            : (this.slack.botMessages ? `Subscribed to conversation ${channelId}: its admitted ambient messages are eligible for delivery. Delivery requires active slack.messaging, and the host can still reject messages.` : `Subscribed to ambient messages from conversation ${channelId}.`)
           : this.opts.subscribeMemberChannels
             ? `Conversation ${channelId} is not muted.`
             : `Already subscribed to conversation ${channelId}.`;
@@ -1048,8 +1104,8 @@ export class SlackMcplServer {
         this.unsubscribedByAgent.add(channelId);
         return this.unsubscribe(channelId)
           ? this.opts.subscribeMemberChannels
-            ? `Muted ambient messages in conversation ${channelId} until you subscribe_channel it again. ${this.slack.hasAccessPolicy ? 'Admitted mentions and DMs remain eligible; delivery can still fail.' : 'Mentions and DMs from there will still arrive.'}`
-            : `Unsubscribed from ambient messages in conversation ${channelId}. ${this.slack.hasAccessPolicy ? 'Admitted mentions and DMs remain eligible; delivery can still fail.' : 'Mentions and DMs from there will still arrive.'}`
+            ? (this.slack.botMessages ? `Muted ambient messages in conversation ${channelId} until you subscribe_channel it again. Admitted mentions and DMs from there still bypass ambient subscriptions.` : `Muted ambient messages in conversation ${channelId} until you subscribe_channel it again. ${this.slack.hasAccessPolicy ? 'Admitted mentions and DMs remain eligible; delivery can still fail.' : 'Mentions and DMs from there will still arrive.'}`)
+            : (this.slack.botMessages ? `Unsubscribed from ambient messages in conversation ${channelId}. Admitted mentions and DMs from there still bypass ambient subscriptions.` : `Unsubscribed from ambient messages in conversation ${channelId}. ${this.slack.hasAccessPolicy ? 'Admitted mentions and DMs remain eligible; delivery can still fail.' : 'Mentions and DMs from there will still arrive.'}`)
           : this.opts.subscribeMemberChannels
             ? `Conversation ${channelId} is already muted.`
             : `Conversation ${channelId} was not subscribed.`;
@@ -1062,8 +1118,8 @@ export class SlackMcplServer {
             mode: 'member-channels',
             muted: [...this.mutedChannels].sort(),
             note:
-              (this.slack.hasAccessPolicy ? 'Ambient messages from unmuted member conversations are eligible, subject to access admission and successful delivery. ' : 'Ambient messages arrive from every conversation the bot is a member of, except the muted ones. ') +
-              (this.slack.hasAccessPolicy ? 'Mentions and DMs bypass subscription filtering after access admission; delivery can still fail.' : 'Mentions and DMs always come through.'),
+              (this.slack.botMessages ? 'Admitted ambient messages are eligible for delivery from every conversation the bot is a member of, except the muted ones. Delivery requires active slack.messaging, and the host can still reject messages. ' : this.slack.hasAccessPolicy ? 'Ambient messages from unmuted member conversations are eligible, subject to access admission and successful delivery. ' : 'Ambient messages arrive from every conversation the bot is a member of, except the muted ones. ') +
+              (this.slack.botMessages ? 'Mentions and DMs bypass subscriptions, subject to admission controls.' : this.slack.hasAccessPolicy ? 'Mentions and DMs bypass subscription filtering after access admission; delivery can still fail.' : 'Mentions and DMs always come through.'),
           };
         }
         return {
@@ -1071,8 +1127,8 @@ export class SlackMcplServer {
           count: this.subscribedChannels.size,
           note:
             this.subscribedChannels.size === 0
-              ? (this.slack.hasAccessPolicy ? 'No ambient subscriptions. Admitted mentions and DMs remain eligible; delivery can still fail.' : 'No ambient subscriptions. Mentions and DMs are always delivered.')
-              : (this.slack.hasAccessPolicy ? 'These ambient subscriptions and all mentions/DMs remain subject to access admission and successful delivery.' : 'Ambient messages from these conversations are delivered. Mentions and DMs always come through regardless.'),
+              ? (this.slack.botMessages ? 'No ambient subscriptions. Mentions and DMs bypass subscriptions, subject to admission controls.' : this.slack.hasAccessPolicy ? 'No ambient subscriptions. Admitted mentions and DMs remain eligible; delivery can still fail.' : 'No ambient subscriptions. Mentions and DMs are always delivered.')
+              : (this.slack.botMessages ? 'Admitted ambient messages from these conversations are eligible for delivery. Delivery requires active slack.messaging, and the host can still reject messages. Mentions and DMs bypass subscriptions, subject to admission controls.' : this.slack.hasAccessPolicy ? 'These ambient subscriptions and all mentions/DMs remain subject to access admission and successful delivery.' : 'Ambient messages from these conversations are delivered. Mentions and DMs always come through regardless.'),
         };
       }
 
@@ -1280,9 +1336,25 @@ export class SlackMcplServer {
       throw new GaveUp(`Slack rate-limited or failed the same request ${inARow} times in a row`);
     }
     const what = wait.why === 'limited' ? `Slack rate-limited ${wait.method}` : `${wait.method} failed`;
-    console.error(`[slack-mcpl] ${what} (try ${inARow} of ${wait.attempts ?? REGISTRATION_TRIES}); registration asks again in ${wait.seconds} s`);
-    await clock.sleep(wait.seconds * 1000, { unref: true });
-    if (!isCurrent()) throw superseded();
+    if (!this.slack.botMessages) {
+      console.error(`[slack-mcpl] ${what} (try ${inARow} of ${wait.attempts ?? REGISTRATION_TRIES}); registration asks again in ${wait.seconds} s`);
+      await clock.sleep(wait.seconds * 1000, { unref: true });
+      if (!isCurrent()) throw superseded();
+      return;
+    }
+    // Node clamps overflowing timer delays to 1 ms. Preserve Slack's wait
+    // in safe chunks, checking for supersession before starting another.
+    if (!Number.isFinite(wait.seconds * 1000)) {
+      throw new GaveUp('Slack supplied a non-finite registration wait');
+    }
+    let remaining = Math.max(0, Math.ceil(wait.seconds * 1000));
+    console.error(`[slack-mcpl] ${what} (try ${inARow} of ${wait.attempts ?? REGISTRATION_TRIES}); registration asks again in ${remaining / 1000} s`);
+    while (remaining > 0) {
+      const chunk = Math.min(remaining, 2 ** 31 - 1);
+      await clock.sleep(chunk, { unref: true });
+      if (!isCurrent()) throw superseded();
+      remaining -= chunk;
+    }
   }
 
   /**
@@ -1421,13 +1493,17 @@ export class SlackMcplServer {
     const added = this.registerAndNotifyNew(descriptors);
     // Only a scan that completed clears an earlier page-limit record; an admission-stopped one did not.
     if (!truncation && !admissionFailures) this.registrationIncomplete = undefined;
-    const wait = Math.max(1, ...unnamed.map((c) => c.nameWait?.seconds ?? 0));
+    const wait = this.slack.botMessages
+      ? Math.ceil(Math.max(0, ...unnamed.map((c) => c.nameWait?.seconds ?? 0)))
+      : Math.max(1, ...unnamed.map((c) => c.nameWait?.seconds ?? 0));
     const unnamedIds = unnamed.map((c) => `${mcplChannelId(c.id)} (user ${c.userId})`).join(', ');
     const leftOut = unnamed.length === 0 ? '' :
       ` Left out ${unnamed.length} DM(s) whose user's name this server couldn't get from Slack just now, since ` +
         `the host keeps the label a conversation is first announced with: ${unnamedIds}. Call refresh_channels ` +
-        `again in about ${wait} second${wait === 1 ? '' : 's'} to announce them by name. This server still sends ` +
-        'their messages to the host meanwhile.';
+        `again ${!this.slack.botMessages || wait > 0 ? `in about ${wait} second${wait === 1 ? '' : 's'}` : 'now'} to announce them by name. ` +
+        (Array.isArray(this.slack.botMessages)
+          ? 'Until Slack verifies these users, this server drops their messages unless their IDs are on the bot-delivery allow-list.'
+          : 'This server still sends their messages to the host meanwhile.');
     return {
       visible,
       added: added.map((d) => ({ id: d.id, label: d.label })),
@@ -1750,19 +1826,24 @@ export class SlackMcplServer {
   }
 
   /** Bound the wait for optional context or mandatory final admission. Late
-   * results are ignored, not cancelled. Expired final admission drops delivery. */
-  private async deliveryLookup<T>(lookup: Promise<T>, what: string, fallback = 'delivering without it'): Promise<T> {
+   * results are ignored; an in-flight Slack request may finish. Expired final
+   * admission drops delivery. */
+  private async deliveryLookup<T>(lookup: Promise<T>, what: string, fallback = 'delivering without it', onGiveUp?: () => void): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     let gaveUp = false;
     try {
       return await Promise.race([
         lookup.catch((err: unknown) => {
-          if (!gaveUp) console.error(`[slack-mcpl] Couldn't get ${what} (${this.slack.hasAccessPolicy ? policyFailureSummary(err) : (err as Error).message}); ${fallback}`);
+          const aborted = (err as Error | undefined)?.name === 'AbortError';
+          if (!gaveUp && !(aborted && (onGiveUp || !this.slack.hasAccessPolicy))) {
+            console.error(`[slack-mcpl] Couldn't get ${what} (${this.slack.hasAccessPolicy ? policyFailureSummary(err) : (err as Error).message}); ${fallback}`);
+          }
           throw err;
         }),
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => {
             gaveUp = true;
+            onGiveUp?.();
             console.error(`[slack-mcpl] Gave up on ${what} after 5 s; ${fallback}`);
             reject(new Error(`Gave up on ${what} after 5 s`));
           }, 5000);
@@ -1792,7 +1873,7 @@ export class SlackMcplServer {
       current: isCurrent(),
       mcplEnabled: this.mcplEnabled,
     });
-    // Direct address (mention or DM) bypasses subscription filtering. Ambient
+    // Admitted direct address (mention or DM) bypasses subscriptions. Ambient
     // messages only flow from subscribed conversations — otherwise every
     // visible channel would pour unbounded noise into context. The wake
     // decision is the host's, via the chat:* tags below.
@@ -1821,11 +1902,10 @@ export class SlackMcplServer {
       return;
     }
 
-    // First-interaction handling: when the very first message from this
-    // conversation for this peer is addressed, pull backscroll for context.
-    // A mention may also auto-subscribe the conversation, with a system note
-    // (below). Both are committed in taken(), once the host has the message
-    // that carries them.
+    // Fetch context for addressed delivery before any accepted delivery in
+    // this conversation for this peer. A rejected delivery can fetch again;
+    // an accepted ambient delivery suppresses later initial backscroll.
+    // Auto-subscription and the watermark commit only in taken() below.
     if (!this.slack.hasAccessPolicy) this.ensureSubscriptionsLoaded();
     let isFirstInteraction = !this.forwardedWatermark.has(msg.channelId);
     // Legacy optional context shares one metadata lookup. Policy mode uses
@@ -1834,21 +1914,28 @@ export class SlackMcplServer {
     let backscroll: Awaited<ReturnType<typeof this.slack.fetchHistory>>['messages'] = [];
     let backscrollTruncated = false;
     if (isFirstInteraction && isAddressed) {
+      const backscrollAbort = new AbortController();
+      this.backscrollAborts.add(backscrollAbort);
       try {
         const res = await this.deliveryLookup(this.slack.fetchHistory(msg.channelId, {
           limit: this.backscrollLimit,
+          signal: backscrollAbort.signal,
           latest: msg.id, // never include the triggering message itself
         }), `the backscroll for message ${msg.id} in ${msg.channelId}`,
-          this.slack.hasAccessPolicy ? 'omitting optional backscroll; final delivery admission still applies' : undefined);
-        // Drop the bot's own past messages — already in the agent's
-        // chronicle as assistant turns, no need to re-echo.
+          this.slack.hasAccessPolicy ? 'omitting optional backscroll; final delivery admission still applies' : undefined,
+          () => backscrollAbort.abort());
         backscrollTruncated = res.stopReason === 'page_limit';
-        backscroll = res.messages.filter((m) => m.authorId !== this.slack.botUserId);
+        // Always exclude our own user ID. Exclude our bot ID only with
+        // bot delivery opted in; unset preserves legacy user-less own posts.
+        backscroll = res.messages.filter((m) => m.authorId !== this.slack.botUserId &&
+          (!this.slack.botMessages || !this.slack.botId || m.authorBotId !== this.slack.botId));
       } catch (err) {
         // Optional content failure is not itself a delivery failure. Its
         // lasting refusal is ordered evidence at the client boundary, so a
         // transient final check still meets it unless newer evidence won.
         dbg('backscroll:fetch-failed', { channelId: msg.channelId, error: this.slack.hasAccessPolicy ? policyFailureSummary(err) : (err as Error).message });
+      } finally {
+        this.backscrollAborts.delete(backscrollAbort);
       }
       if (!isCurrent()) return abandon();
       if (!this.slack.hasAccessPolicy && !msg.isDM) {
@@ -1901,7 +1988,7 @@ export class SlackMcplServer {
     // what the host is told. An unsubscribe_channel handled by now withholds
     // the note; one handled during the send still stops the subscribe in
     // taken(). In member mode every conversation is subscribed unless muted,
-    // and a mention must not undo a mute. DMs always come through, so no
+    // and a mention must not undo a mute. Admitted DMs bypass subscriptions, so no
     // subscription note for them — just the backscroll.
     const autoSubscribe = isFirstInteraction && isAddressed && !msg.isDM && !this.opts.subscribeMemberChannels &&
       !this.unsubscribedByAgent.has(msg.channelId) && !this.isChannelSubscribed(msg.channelId);
@@ -1911,14 +1998,26 @@ export class SlackMcplServer {
         ? (this.slack.hasAccessPolicy && meta.policyGroupDm ? `Group DM: ${nameShown(meta.name)}` : channelShown(meta.name))
         : `conversation ${msg.channelId}`;
       blocks.push(
-        (this.slack.hasAccessPolicy ? `<system>Accepting this message will subscribe you to ${where} because you were mentioned (unless muted before acceptance). ` : `<system>Auto-subscribed to ${where} because you were mentioned. `) +
-          (this.slack.hasAccessPolicy ? 'Ambient (non-mention) messages from this conversation are eligible for your context, subject to access admission and successful delivery. ' : 'Ambient (non-mention) messages from this conversation will now arrive in your context. ') +
-          (this.slack.hasAccessPolicy ? 'Mentions and DMs bypass subscriptions after access admission; delivery can still fail. ' : 'Mentions and DMs always come through regardless of subscriptions. ') +
-          `To stop ambient delivery from here: unsubscribe_channel("${msg.channelId}").</system>`,
+        this.slack.botMessages ? (
+          `<system>Auto-subscription to ${where} requested because you were mentioned. Subscription takes effect only after host acceptance. ` +
+            `Once subscribed, admitted ambient (non-mention) messages from this conversation are eligible for delivery until you unsubscribe. Delivery requires active slack.messaging, and the host can still reject messages. ` +
+            `Admitted mentions and DMs bypass ambient subscriptions. ` +
+            (this.grant.has('tools') && this.grant.isFeatureSetActive(SUBSCRIPTIONS_FEATURE_SET)
+              ? `To stop ambient delivery from here: unsubscribe_channel("${msg.channelId}").`
+              : 'Subscription tools are unavailable under the current host grant. Ask the host to enable slack.subscriptions and tools to stop ambient delivery; retrying without a grant change will not help.') + '</system>'
+        ) : (
+          (this.slack.hasAccessPolicy ? `<system>Accepting this message will subscribe you to ${where} because you were mentioned (unless muted before acceptance). ` : `<system>Auto-subscribed to ${where} because you were mentioned. `) +
+            (this.slack.hasAccessPolicy ? 'Ambient (non-mention) messages from this conversation are eligible for your context, subject to access admission and successful delivery. ' : 'Ambient (non-mention) messages from this conversation will now arrive in your context. ') +
+            (this.slack.hasAccessPolicy ? 'Mentions and DMs bypass subscriptions after access admission; delivery can still fail. ' : 'Mentions and DMs always come through regardless of subscriptions. ') +
+            `To stop ambient delivery from here: unsubscribe_channel("${msg.channelId}").</system>`
+        ),
       );
     }
     if (backscroll.length > 0 || backscrollTruncated) {
-      blocks.push(backscrollBlock(backscroll, { channelName: meta?.name, isDM: msg.isDM, isGroupDM: this.slack.hasAccessPolicy && meta?.policyGroupDm, truncated: backscrollTruncated, policyAttachments: this.slack.hasAccessPolicy }));
+      blocks.push(backscrollBlock(backscroll, {
+        channelName: meta?.name, isDM: msg.isDM, isGroupDM: this.slack.hasAccessPolicy && meta?.policyGroupDm,
+        truncated: backscrollTruncated, policyAttachments: this.slack.hasAccessPolicy,
+      }, this.grant.isFeatureSetActive(HISTORY_FEATURE_SET)));
     }
     // Told with the first message the agent gets from here, addressed or not.
     // Counted as told only once the host has taken that message.
@@ -1947,7 +2046,8 @@ export class SlackMcplServer {
     // The context is recorded as the message goes out, so the next message
     // is compared with what this peer was sent last.
     this.lastChannelId = msg.channelId;
-    const renderedContent = `${prefixBlock}${location}${nameShown(msg.authorName)}: ${senderText(msg.cleanContent)}`;
+    const sourceLabel = this.slack.botMessages && msg.isBot ? '[Slack source: bot]\n' : '';
+    const renderedContent = `${prefixBlock}${location}${sourceLabel}${nameShown(msg.authorName)}: ${senderText(msg.cleanContent)}`;
 
     const contentBlocks: ContentBlock[] = [textContent(renderedContent)];
     if (msg.attachments.length > 0) {
@@ -1955,14 +2055,13 @@ export class SlackMcplServer {
     }
 
     // MCPL RFC-001 event tags — reserved chat:* core, umbrellas included.
-    // The host's wake gate routes on these. Other bots' messages never get
-    // here (the adapter self-filters bot_id), so from-human is uniform.
+    // The host's wake gate routes on these, including opted-in bot messages.
     const eventTags: string[] = (() => {
       const t = new Set<string>();
       if (msg.mentionsBot) t.add('chat:mention');
       if (msg.isDM) { t.add('chat:dm'); t.add('chat:private'); }
       t.add(isAddressed ? 'chat:addressed' : 'chat:ambient');
-      t.add('chat:from-human');
+      t.add(this.slack.botMessages && msg.isBot ? 'chat:from-bot' : 'chat:from-human');
       if (msg.threadTs) t.add('chat:thread');
       for (const a of msg.attachments) {
         t.add(a.isImage ? 'chat:has-image' : 'chat:has-file');
@@ -1970,7 +2069,12 @@ export class SlackMcplServer {
       return [...t];
     })();
 
+    const botIdentity = !this.slack.botMessages || msg.isBot === undefined ? {} : {
+      isBot: msg.isBot,
+      ...(msg.authorBotId ? { authorBotId: msg.authorBotId } : {}),
+    };
     const metadata = {
+      ...botIdentity,
       mentionIds: msg.mentionIds,
       mentioned: msg.mentionsBot,
       isMention: msg.mentionsBot,
@@ -1978,7 +2082,7 @@ export class SlackMcplServer {
       thread_ts: msg.threadTs,
       channel_type: msg.channelType,
       team: msg.teamId,
-      rawContent: msg.content,
+      rawContent: msg.rawContent ?? msg.content,
       botUserId: this.slack.botUserId ?? undefined,
       ...(msg.attachments.length > 0 ? { attachments: msg.attachments } : {}),
     };
@@ -2039,6 +2143,7 @@ export class SlackMcplServer {
         timestamp: msg.timestamp.toISOString(),
         origin: {
           source: 'slack',
+          ...botIdentity,
           messageId: msg.id,
           channelId: msg.channelId,
           // The MCPL channel ID, so a host can route and type to a channel it

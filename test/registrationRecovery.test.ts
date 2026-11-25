@@ -1062,15 +1062,18 @@ test("on a connection the host hasn't granted yet, or a plain MCP one, a refresh
   assert.equal(plain.requests.length, 0);
 });
 
-test("refresh_channels leaves out a new DM whose user's name Slack didn't give, says when to call again, and keeps a known DM's label", { timeout: 5000 }, async (t) => {
+test("list-mode refresh_channels leaves out a new DM whose user's name Slack didn't give, says when to call again, and keeps a known DM's label", { timeout: 5000 }, async (t) => {
   const dm = (id: string, user: string, nameWait?: SlackWait): SlackConversationInfo =>
     ({ id, name: user, kind: 'dm', userId: user, isMember: true, ...(nameWait ? { nameWait } : {}) });
   const listings = [
     [conversation()], // registration's
-    [conversation(), dm('D1', 'ann'), dm('D2', 'U2', limited(7))],
+    // Remaining fractional seconds round up in user-facing guidance.
+    [conversation(), dm('D1', 'ann'), dm('D2', 'U2', limited(6.999))],
     [conversation(), dm('D1', 'U1', failed(30)), dm('D2', 'bob')],
+    [conversation(), dm('D3', 'U3', limited(0))],
   ];
   const { slack } = fakeSlack(async () => listings.shift()!);
+  (slack as any).botMessages = ['B012ABC'];
   const h = connect(new SlackMcplServer(slack));
   t.after(() => h.close());
   await h.initialize();
@@ -1087,13 +1090,16 @@ test("refresh_channels leaves out a new DM whose user's name Slack didn't give, 
     first.note,
     "Registered 1 newly-visible conversation(s). Left out 1 DM(s) whose user's name this server couldn't get from Slack just now, " +
       'since the host keeps the label a conversation is first announced with: slack:D2 (user U2). Call ' +
-      'refresh_channels again in about 7 seconds to announce them by name. This server still sends their messages ' +
-      'to the host meanwhile.',
+      'refresh_channels again in about 7 seconds to announce them by name. ' +
+      'Until Slack verifies these users, this server drops their messages unless their IDs are on the bot-delivery allow-list.',
   );
   // The name came; and a DM the host knows keeps its label while its user's name is missing.
   const second = await refresh();
   assert.deepEqual(second.added, [{ id: 'slack:D2', label: 'DM: @bob (acme)' }]);
   assert.equal(second.note, 'Registered 1 newly-visible conversation(s).');
+  const expired = await refresh();
+  assert.deepEqual(expired.added, []);
+  assert.match(expired.note, /refresh_channels again now to announce them by name/);
   const labels = (await h.listed()).channels.map((d) => [d.id, d.label]);
   assert.deepEqual(labels, [['slack:C1', '#general (acme)'], ['slack:D1', 'DM: @ann (acme)'], ['slack:D2', 'DM: @bob (acme)']]);
 });
@@ -1131,4 +1137,118 @@ ownedTest('policy incomplete registration gives operators distinct retry and acc
   assert.match(line, /2 candidate\(s\).*enumerated 1 eligible/);
   assert.match(line, /Transient failures.*retry.*Lasting access refusals.*restore/i);
   assert.doesNotMatch(line, /refresh_channels/);
+});
+
+test('registration chunks oversized Retry-After and awaits each chunk', async t => {
+  const { slack } = fakeSlack();
+  (slack as any).botMessages = 'all';
+  const server = new SlackMcplServer(slack);
+  const sleeps: number[] = [];
+  const pending = [deferred<void>(), deferred<void>()];
+  t.mock.method(console, 'error', () => {});
+  t.mock.method(clock, 'sleep', (ms: number) => {
+    sleeps.push(ms);
+    return pending[sleeps.length - 1].promise;
+  });
+  const seconds = 2_592_000;
+  let completed = false;
+  const waiting = (server as any).waitToAskAgain(
+    { method: 'users.info', seconds, why: 'limited' }, 1, () => true,
+  ).finally(() => { completed = true; });
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(sleeps, [2 ** 31 - 1], 'no second chunk before the first resolves');
+    assert.equal(completed, false);
+    pending[0].resolve();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(sleeps, [2 ** 31 - 1, seconds * 1000 - (2 ** 31 - 1)]);
+    assert.equal(completed, false, 'the final chunk must also be awaited');
+    pending[1].resolve();
+    await waiting;
+    assert.equal(completed, true);
+  } finally {
+    for (const sleep of pending) sleep.resolve();
+    await waiting;
+  }
+});
+
+test('registration checks supersession after a held chunk before starting another', async t => {
+  const { slack } = fakeSlack();
+  (slack as any).botMessages = 'all';
+  const server = new SlackMcplServer(slack);
+  const sleeps: number[] = [];
+  const held = deferred<void>();
+  let current = true;
+  t.mock.method(console, 'error', () => {});
+  t.mock.method(clock, 'sleep', (ms: number) => { sleeps.push(ms); return held.promise; });
+  const waiting = (server as any).waitToAskAgain(
+    { method: 'users.info', seconds: 2_592_000, why: 'limited' }, 1, () => current,
+  );
+  // Attach rejection handling before releasing the sleep.
+  const rejected = assert.rejects(waiting, /superseded/);
+  void rejected.catch(() => {}); // Retain failures until cleanup can await them.
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(sleeps, [2 ** 31 - 1]);
+    current = false;
+  } finally {
+    held.resolve();
+    await rejected;
+  }
+  assert.deepEqual(sleeps, [2 ** 31 - 1], 'superseded registration starts no further timers');
+});
+
+test('registration rounds fractional milliseconds up and awaits the sleep', async t => {
+  const { slack } = fakeSlack();
+  (slack as any).botMessages = 'all';
+  const server = new SlackMcplServer(slack);
+  const sleeps: number[] = [];
+  const logs: string[] = [];
+  const held = deferred<void>();
+  t.mock.method(console, 'error', (line: string) => { logs.push(line); });
+  t.mock.method(clock, 'sleep', (ms: number) => { sleeps.push(ms); return held.promise; });
+  let completed = false;
+  const waiting = (server as any).waitToAskAgain(
+    { method: 'users.info', seconds: 1.0011, why: 'failed' }, 2, () => true,
+  ).finally(() => { completed = true; });
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(sleeps, [1002], 'timer truncation cannot end the cooldown early');
+    assert.match(logs[0], /registration asks again in 1\.002 s$/);
+    assert.equal(completed, false, 'registration cannot resume before the timer');
+  } finally {
+    held.resolve();
+    await waiting;
+  }
+});
+
+for (const seconds of [NaN, Infinity, -Infinity, Number.MAX_VALUE]) {
+  test(`registration rejects a non-finite timer duration: ${seconds}`, async t => {
+    const { slack } = fakeSlack();
+    (slack as any).botMessages = 'all';
+    const server = new SlackMcplServer(slack);
+    const logs: string[] = [];
+    t.mock.method(console, 'error', (line: string) => { logs.push(line); });
+    const sleep = t.mock.method(clock, 'sleep', async () => { assert.fail('must not start a timer'); });
+    await assert.rejects(
+      (server as any).waitToAskAgain({ method: 'users.info', seconds, why: 'limited' }, 1, () => true),
+      GaveUp,
+    );
+    assert.equal(sleep.mock.callCount(), 0);
+    assert.deepEqual(logs, [], 'no retry is announced for an invalid wait');
+  });
+}
+
+
+test('registration logs zero rather than a negative retry wait', async t => {
+  const { slack } = fakeSlack();
+  (slack as any).botMessages = 'all';
+  const server = new SlackMcplServer(slack);
+  const logs: string[] = [];
+  t.mock.method(console, 'error', (line: string) => { logs.push(line); });
+  const sleep = t.mock.method(clock, 'sleep', async () => { assert.fail('zero wait needs no timer'); });
+  await (server as any).waitToAskAgain({ method: 'users.info', seconds: -1, why: 'limited' }, 1, () => true);
+  assert.equal(sleep.mock.callCount(), 0);
+  assert.equal(logs.length, 1);
+  assert.match(logs[0], /registration asks again in 0 s$/);
 });

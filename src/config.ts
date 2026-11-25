@@ -1,5 +1,11 @@
 import { paginationSettings, PAGE_SETTINGS, type PaginationLimits } from './pagination.js';
 import { parseAccessPolicy, type SlackAccessPolicyConfig } from './access-policy.js';
+import { SLACK_ID } from './slack-angle.js';
+
+const BOT_MESSAGE_ID = new RegExp(`^[BUW]${SLACK_ID}$`);
+
+/** An expected startup refusal: report its operator guidance without a stack. */
+export class StartupRefusal extends Error {}
 
 /** Parse an operator switch. An absent value is off; a present value must
  *  say yes or no so a broken environment template cannot disable a guard. */
@@ -10,6 +16,9 @@ export function booleanFlag(name: string, raw: string | undefined): boolean {
   // Quoted as JSON, so whitespace shows and the line stays one line.
   throw new Error(`${name} must be true or false, got ${JSON.stringify(raw)}`);
 }
+
+/** Other bots admitted to live delivery: all, or bot/user IDs. */
+export type BotMessagePolicy = 'all' | string[];
 
 export interface StartupSettings {
   pagination?: Readonly<PaginationLimits>;
@@ -23,6 +32,7 @@ export interface StartupSettings {
   disableDms: boolean;
   subscribeMemberChannels: boolean;
   ackReaction: string | undefined;
+  botMessages: BotMessagePolicy | undefined;
 }
 
 export function startupSettings(
@@ -64,6 +74,18 @@ export function startupSettings(
   if (env.SLACK_SEND_CHANNELS !== undefined && sendChannels!.length === 0) {
     return { refusal: 'SLACK_SEND_CHANNELS is set but names no conversation; unset it to ' + (accessPolicy ? 'remove this additional write restriction' : 'allow writing anywhere') };
   }
+  let botMessages: BotMessagePolicy | undefined;
+  if (env.SLACK_BOT_MESSAGES !== undefined) {
+    const value = env.SLACK_BOT_MESSAGES.trim();
+    const ids = value.split(',').map((s) => s.trim());
+    if (value === 'all') botMessages = 'all';
+    else if (ids.every((id) => BOT_MESSAGE_ID.test(id))) botMessages = ids;
+    else {
+      const bad = ids.findIndex((id) => !BOT_MESSAGE_ID.test(id));
+      return { refusal: 'SLACK_BOT_MESSAGES must be all or a comma-separated list of bot/user IDs; ' +
+        `invalid entry ${bad + 1}: ${ids[bad] ? 'expected a bot/user ID' : 'empty entry'}; use uppercase B/U/W-prefixed IDs (for example B123 or U456), or unset it to restore the legacy bot-event filter` };
+    }
+  }
   let disableDms: boolean;
   let subscribeMemberChannels: boolean;
   try {
@@ -75,7 +97,7 @@ export function startupSettings(
   }
   const ackReaction = env.SLACK_ACK_REACTION?.replace(/:/g, '').trim() || undefined;
   return {
-    settings: { ...(Object.values(PAGE_SETTINGS).some(name => env[name] !== undefined) ? { pagination } : {}), useStdio, tcpPort, botToken, appToken, dmUsers, sendChannels, disableDms, subscribeMemberChannels, ackReaction,
+    settings: { ...(Object.values(PAGE_SETTINGS).some(name => env[name] !== undefined) ? { pagination } : {}), useStdio, tcpPort, botToken, appToken, dmUsers, sendChannels, disableDms, subscribeMemberChannels, ackReaction, botMessages,
       ...(accessPolicy ? { accessPolicy } : {}) },
   };
 }
