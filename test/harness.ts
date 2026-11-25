@@ -132,9 +132,17 @@ function fakeWeb(
       async open() {
         return { channel: { id: 'D1' } };
       },
-      async history({ channel }) {
+      async history({ channel, limit, cursor, latest, oldest, inclusive }) {
         reads.push(`history:${channel}`);
-        return { messages: historyMessages.filter((m) => !m.thread_ts || m.thread_ts === m.ts) };
+        // Page as Slack does, so a read that under-asks or stops early shows.
+        const all = historyMessages.filter((m) =>
+          (!m.thread_ts || m.thread_ts === m.ts) &&
+          (!latest || (inclusive ? Number(m.ts) <= Number(latest) : Number(m.ts) < Number(latest))) &&
+          (!oldest || (inclusive ? Number(m.ts) >= Number(oldest) : Number(m.ts) > Number(oldest)))
+        ).sort((a, b) => Number(b.ts) - Number(a.ts));
+        const start = Number(cursor) || 0;
+        const end = start + (typeof limit === 'number' ? limit : 100);
+        return { messages: all.slice(start, end), ...(end < all.length ? { has_more: true, response_metadata: { next_cursor: String(end) } } : {}) };
       },
       async replies({ channel, ts }) {
         reads.push(`replies:${channel}:${ts}`);

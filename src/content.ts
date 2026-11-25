@@ -7,6 +7,7 @@
  * Salvaged from zulip-mcp PR #8 (multi-platform branch), Slack halves only.
  */
 
+import { mapSlackAngles, SLACK_ID } from './slack-angle.js';
 import { DEFAULT_PAGINATION, isHistoryRow, pageLimit, pageProblem } from './pagination.js';
 import type { PolicyFileRef } from './file-access.js';
 import { channelShown, mimeShown, nameShown } from './framing.js';
@@ -275,43 +276,37 @@ export function classifyExtension(name: string): { mimeType: string; isImage: bo
   return { mimeType: 'application/octet-stream', isImage: false };
 }
 
-// Slack user/channel IDs are documented as uppercase alphanumerics. Single
-// source of truth for every mention regex below — if Slack ever widens the
-// ID alphabet, this is the only line to change. Fresh RegExp per use: 'g'
-// regexes carry lastIndex state and must not be shared between callers.
-const SLACK_ID = '[A-Z0-9]+';
-const slackUserMentionRe = () => new RegExp(`<@(${SLACK_ID})(?:\\|([^>]*))?>`, 'g');
-const slackChannelMentionRe = () => new RegExp(`<#(${SLACK_ID})(?:\\|([^>]*))?>`, 'g');
+const USER_ANGLE = new RegExp(`^<@(${SLACK_ID})(?:\\|([^>]*))?>$`);
+const USERGROUP_ANGLE = new RegExp(`^<!subteam\\^(${SLACK_ID})(?:\\|([^>]*))?>$`);
+const CHANNEL_ANGLE = new RegExp(`^<#(${SLACK_ID})(?:\\|([^>]*))?>$`);
 
 // Slack message text uses mrkdwn escapes: <@U123> user mentions,
 // <#C123|name> channel mentions, <!here>/<!channel> broadcasts, and
-// <url|label> links. Rewrite them into a readable shape
+// <http(s)://url|label> links. Rewrite them into a readable shape
 // (`@name (uid:U123)` and `#name`, with a name that isn't plain quoted),
 // resolving user IDs via the provided map (best-effort: an unresolved ID shows
 // the label Slack sent with it, else the raw ID).
 export function formatSlackText(text: string, userNames: Map<string, string>): string {
-  let formatted = text;
-
-  // User mentions: <@U123> or <@U123|fallback>. The name goes in with its `&`
-  // escaped as Slack escapes it, so the unescape below gives it back as it is.
-  formatted = formatted.replace(slackUserMentionRe(), (_m, id: string, fallback?: string) => {
-    const name = userNames.get(id) || (fallback && unescapeSlack(fallback)) || id;
-    return `@${nameShown(name).replace(/&/g, '&amp;')} (uid:${id})`;
+  const formatted = mapSlackAngles(text, token => {
+    let match: RegExpExecArray | null;
+    if ((match = USER_ANGLE.exec(token))) {
+      const [, id, fallback] = match;
+      const name = userNames.get(id) || (fallback && unescapeSlack(fallback)) || id;
+      return `@${nameShown(name).replace(/&/g, '&amp;')} (uid:${id})`;
+    }
+    if ((match = CHANNEL_ANGLE.exec(token))) {
+      const [, id, name] = match;
+      return name ? channelShown(unescapeSlack(name)).replace(/&/g, '&amp;') : `#${id}`;
+    }
+    if ((match = USERGROUP_ANGLE.exec(token))) {
+      return '@' + nameShown(unescapeSlack(match[2] || match[1]).replace(/^@/, '')).replace(/&/g, '&amp;');
+    }
+    if ((match = /^<!(here|channel|everyone)(?:\|[^>]*)?>$/.exec(token))) return '@' + match[1];
+    if ((match = /^<(https?:\/\/[^|>]+)(?:\|([^>]*))?>$/.exec(token))) {
+      return match[2] === undefined ? match[1] : `${match[2]} (${match[1]})`;
+    }
+    return token;
   });
-
-  // Channel mentions: <#C123|name> or <#C123>. The label is whatever the
-  // poster sent, so it's shown by the name rule, as a user mention's name is.
-  formatted = formatted.replace(slackChannelMentionRe(), (_m, id: string, name?: string) => {
-    return name ? channelShown(unescapeSlack(name)).replace(/&/g, '&amp;') : `#${id}`;
-  });
-
-  // Broadcasts: <!here>, <!channel>, <!everyone>
-  formatted = formatted.replace(/<!(here|channel|everyone)(?:\|[^>]*)?>/g, '@$1');
-
-  // Links: <url|label> → label (url), <url> → url
-  formatted = formatted.replace(/<(https?:\/\/[^|>]+)\|([^>]*)>/g, '$2 ($1)');
-  formatted = formatted.replace(/<(https?:\/\/[^>]+)>/g, '$1');
-
   return unescapeSlack(formatted);
 }
 
@@ -330,9 +325,11 @@ export function reactionName(emoji: string): string {
 /** Extract user IDs referenced as <@U123> in Slack mrkdwn, for pre-resolution. */
 export function extractSlackUserIds(text: string): string[] {
   const ids = new Set<string>();
-  const re = slackUserMentionRe();
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(text)) !== null) ids.add(m[1]);
+  mapSlackAngles(text, token => {
+    const match = USER_ANGLE.exec(token);
+    if (match) ids.add(match[1]);
+    return token;
+  });
   return Array.from(ids);
 }
 
@@ -374,14 +371,15 @@ export const connectionNeverMade = (nodeCode: unknown): boolean =>
  * restart asks again, as it does for a renamed user. A lookup that fails
  * otherwise (a rate limit, a failure in transit, Slack failing, or an answer
  * not in Slack's form) isn't cached, so the next message that names the user
- * asks again; meanwhile a mention shows the label Slack sent with it, else
- * the raw ID, and an author shows the raw ID (best-effort). Returns the
- * error of each lookup left uncached, by user ID.
+ * asks again. In the meantime only original-text mentions can use Slack's
+ * fallback label; supplemental mentions and authors show the raw ID when
+ * uncached. Returns the error of each lookup left uncached, by user ID.
  */
 export async function resolveSlackUserNames(
   client: SlackUserInfoClient,
   cache: Map<string, string>,
   userIds: string[],
+  signal?: AbortSignal,
 ): Promise<Map<string, unknown>> {
   const failed = new Map<string, unknown>();
   const unresolved = Array.from(new Set(userIds)).filter(id => id && !cache.has(id));
@@ -390,6 +388,7 @@ export async function resolveSlackUserNames(
   // rate limit for users.info.
   const CONCURRENCY = 8;
   for (let i = 0; i < unresolved.length; i += CONCURRENCY) {
+    signal?.throwIfAborted();
     await Promise.all(unresolved.slice(i, i + CONCURRENCY).map(async (id) => {
       try {
         const { user } = await client.users.info({ user: id });
@@ -409,6 +408,9 @@ export async function resolveSlackUserNames(
 /** The fields of a conversations.history message the server reads —
  * structurally satisfied by @slack/web-api's MessageElement. */
 export interface SlackHistoryMessage {
+  client_msg_id?: string;
+  attachments?: unknown;
+  blocks?: unknown;
   ts?: string;
   user?: string;
   username?: string;
@@ -464,6 +466,7 @@ export async function fetchSlackHistory(
     latest?: string;
     inclusive?: boolean;
     maxMessages: number;
+    signal?: AbortSignal;
     maxPages?: number;
     /** Policy callers refuse cycles and malformed pages; legacy callers stop via their page cap. */
     rejectCursorCycles?: boolean;
@@ -477,6 +480,7 @@ export async function fetchSlackHistory(
   let stopReason: 'message_limit' | 'page_limit' | undefined;
   const cursors = new Set<string>();
   do {
+    params.signal?.throwIfAborted();
     const result = await client.conversations.history({
       channel: params.channel,
       ...(params.oldest !== undefined ? { oldest: params.oldest } : {}),
@@ -485,6 +489,7 @@ export async function fetchSlackHistory(
       limit: Math.min(200, params.maxMessages - collected.length),
       cursor,
     });
+    params.signal?.throwIfAborted();
     pages++;
     // Policy callers validate the whole page (pageProblem) before using any
     // of it or stopping at the message limit: a missing container, a row that

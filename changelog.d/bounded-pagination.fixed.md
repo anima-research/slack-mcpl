@@ -21,7 +21,9 @@
   far with an incomplete notice if either stop affects a page or candidate check.
   The default 1000-page ceilings are unlikely to be reached in a tool call.
   Backscroll delivery gives up after 5 seconds or the first rate limit, without
-  context or an incomplete note; page caps bound abandoned fetch requests too.
+  context or an incomplete note; after the timeout no further pages are
+  requested, and after a disconnect none once the host request being handled
+  finishes (or at the timeout), though an in-flight request may still finish.
 - Incomplete `list_channels` results add a text block; `refresh_channels` adds
   `truncated`/`stopReason` and registration enumeration metadata where applicable.
   Page-limited backscroll uses `truncated="true"` and an incomplete-history note.

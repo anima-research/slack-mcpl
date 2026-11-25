@@ -65,7 +65,7 @@ import {
 } from './slack-adapter.js';
 import { policySubscriptionTool, policyListingTool, toolDefinitions } from './tools.js';
 import { withToolClasses } from './tool-classes.js';
-import { buildFeatureSets, buildServerCapabilities, featureSetForTool, MESSAGING_FEATURE_SET, TYPING_FEATURE_SET } from './feature-sets.js';
+import { buildFeatureSets, buildServerCapabilities, featureSetForTool, MESSAGING_FEATURE_SET, HISTORY_FEATURE_SET, TYPING_FEATURE_SET } from './feature-sets.js';
 import { ChannelManager, mcplChannelId, parseMcplChannelId, toDescriptor } from './channels.js';
 import { StateTracker, type UploadedFile } from './state.js';
 import { CapabilityGrant } from './grant.js';
@@ -183,20 +183,71 @@ export function backscrollLine(m: {
   return `[${m.timestamp.toISOString()}${thread} id=${m.id}] ${nameShown(m.authorName)}${att}: ${senderText(m.content)}`;
 }
 
-/** The `<backscroll>` block given with the first message from a conversation. */
+/** Context fetched for addressed delivery before any accepted delivery in this conversation. */
 export function backscrollBlock(
   messages: Parameters<typeof backscrollLine>[0][],
   where: { channelName?: string; isDM: boolean; isGroupDM?: boolean; truncated?: boolean; policyAttachments?: boolean },
+  historyGranted: boolean = false,
 ): string {
   const attrs: string[] = [];
-  if (where.channelName && !where.isDM) attrs.push(`channel=${quotedLabel(where.isGroupDM ? where.channelName : `#${where.channelName}`)}`);
+  if (where.channelName && !where.isDM) {
+    const label = Array.from(where.channelName).slice(0, 100).join('');
+    attrs.push(`channel=${quotedLabel(where.isGroupDM ? label : `#${label}`)}`);
+  }
   if (where.isDM) attrs.push('dm="true"');
   if (where.isGroupDM) attrs.push('group_dm="true"');
-  attrs.push(`count="${messages.length}"`);
-  if (where.truncated) attrs.push('truncated="true"');
-  return [`<backscroll ${attrs.join(' ')}>`, ...messages.map(m => where.policyAttachments ? backscrollLine({ ...m, policyAttachments: true }) : backscrollLine(m)),
-    ...(where.truncated ? ['Backscroll is incomplete; older messages may be missing. Use fetch_history to inspect earlier history.'] : []),
-    '</backscroll>'].join('\n');
+  // Keep a contiguous newest window. An oversized body gets an in-position
+  // placeholder rather than a silent gap; if even that cannot fit, summarize
+  // the older prefix. Both forms count against the same hard byte budget.
+  const maxBytes = 32_768;
+  const historyAvailable = historyGranted === true;
+  const unavailable = '; history unavailable: host has not selected feature set slack.history';
+  const lines: string[] = [];
+  const summary = (count: number, before?: string) =>
+    `[${count} older backscroll ${count === 1 ? 'message' : 'messages'} not shown${historyAvailable ? '; try fetch_history' + (before ? ' latest=' + before : '; follow nextCursor until the omitted window is reached') : unavailable}]`;
+  const opening = (count: number) => `<backscroll ${[...attrs, `count="${count}"`, ...(where.truncated ? ['truncated="true"'] : [])].join(' ')}>`;
+  const ending = [
+    ...(where.truncated ? ['Backscroll is incomplete; older messages may be missing.' +
+      (historyAvailable ? ' Use fetch_history to inspect earlier history.' : '')] : []),
+    '</backscroll>',
+  ];
+  const rendered = messages.map(m => where.policyAttachments ? backscrollLine({ ...m, policyAttachments: true }) : backscrollLine(m));
+  const complete = [opening(messages.length), ...rendered, ...ending].join('\n');
+  if (Buffer.byteLength(complete) <= maxBytes) return complete;
+  let bytes = 0;
+  let oldest = messages.length;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    const line = rendered[i];
+    const size = Buffer.byteLength(line);
+    const reserved = Buffer.byteLength([opening(lines.length + 1), ...ending].join('\n')) +
+      (i ? Buffer.byteLength(summary(i, message.id)) + 1 : 0);
+    let shown = line;
+    if (bytes + size + 1 + reserved > maxBytes) {
+      shown = `[backscroll notice: message omitted (${size} bytes); timestamp=${message.timestamp.toISOString()}${message.threadTs ? ' thread=' + message.threadTs : ''} id=${message.id}; author=${quotedLabel(message.authorName)}${historyAvailable ? '; try fetch_history; follow nextCursor until this id is reached' : unavailable}]`;
+    }
+    const shownBytes = Buffer.byteLength(shown) + 1;
+    if (bytes + shownBytes + reserved > maxBytes) break;
+    lines.push(shown);
+    bytes += shownBytes;
+    oldest = i;
+  }
+  return [opening(lines.length),
+    ...(oldest ? [summary(oldest, messages[oldest]?.id)] : []),
+    ...lines.reverse(), ...ending].join('\n');
+}
+
+let backscrollLimit: number | undefined;
+
+function readBackscrollLimit(): number {
+  const raw = process.env.SLACK_BACKSCROLL_LIMIT?.trim();
+  if (raw === undefined) return 50;
+  if (/^\+?[0-9]+$/.test(raw)) {
+    const n = Number(raw);
+    if (Number.isInteger(n) && n > 0 && n <= 1000) return n;
+  }
+  console.error('[slack-mcpl] Invalid SLACK_BACKSCROLL_LIMIT: expected a decimal integer from 1 to 1000; using 50');
+  return 50;
 }
 
 /** Policy diagnostics include the root needed to recover a thread reply. */
@@ -245,6 +296,8 @@ export class SlackMcplServer {
   private stateTracker = new StateTracker();
   /** Serial delivery within a conversation; different conversations stay independent. */
   private forwarding = new Map<string, Promise<void>>();
+  /** Pending backscroll lookups for the connection being served. */
+  private backscrollAborts = new Set<AbortController>();
 
   /** Conversations the agent has opted into for ambient (non-mention,
    *  non-DM) message delivery. Mentions and DMs bypass this filter (an access
@@ -255,8 +308,8 @@ export class SlackMcplServer {
   private subscriptionsLoaded = false;
 
   /** Per-conversation ts of the newest message this peer has taken. Its
-   *  presence marks the peer's first interaction with the conversation as
-   *  done, so a new peer gets its own first-interaction backscroll. */
+   *  presence suppresses initial backscroll, including after ambient delivery.
+   *  A new peer starts without these accepted-delivery watermarks. */
   private forwardedWatermark = new Map<string, string>();
 
   /** Conversations the agent has unsubscribed from with unsubscribe_channel
@@ -279,13 +332,11 @@ export class SlackMcplServer {
    *  the host didn't take, unless another conversation is current by then. */
   private lastChannelId: string | null = null;
 
-  /** How many backscroll messages to fetch on first interaction. Tunable via
-   *  SLACK_BACKSCROLL_LIMIT; clamped to [1, 1000], default 50. */
+  /** How many backscroll messages to fetch for an addressed delivery when no
+   *  delivery in the conversation has yet been accepted. Read SLACK_BACKSCROLL_LIMIT
+   *  once on first use, sharing the result across server instances. */
   private get backscrollLimit(): number {
-    const raw = process.env.SLACK_BACKSCROLL_LIMIT;
-    if (!raw) return 50;
-    const n = parseInt(raw, 10);
-    return Number.isFinite(n) && n > 0 && n <= 1000 ? n : 50;
+    return backscrollLimit ??= readBackscrollLimit();
   }
 
   /** Conversations muted with unsubscribe_channel while every member channel
@@ -373,6 +424,8 @@ export class SlackMcplServer {
       }
     } finally {
       this.conn = null;
+      for (const controller of this.backscrollAborts) controller.abort();
+      this.backscrollAborts.clear();
       // A failed handshake ends here too: close the connection, so a TCP
       // client isn't left on a socket nobody serves.
       this.registrationIncomplete = undefined;
@@ -1750,19 +1803,24 @@ export class SlackMcplServer {
   }
 
   /** Bound the wait for optional context or mandatory final admission. Late
-   * results are ignored, not cancelled. Expired final admission drops delivery. */
-  private async deliveryLookup<T>(lookup: Promise<T>, what: string, fallback = 'delivering without it'): Promise<T> {
+   * results are ignored; an in-flight Slack request may finish. Expired final
+   * admission drops delivery. */
+  private async deliveryLookup<T>(lookup: Promise<T>, what: string, fallback = 'delivering without it', onGiveUp?: () => void): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     let gaveUp = false;
     try {
       return await Promise.race([
         lookup.catch((err: unknown) => {
-          if (!gaveUp) console.error(`[slack-mcpl] Couldn't get ${what} (${this.slack.hasAccessPolicy ? policyFailureSummary(err) : (err as Error).message}); ${fallback}`);
+          const aborted = (err as Error | undefined)?.name === 'AbortError';
+          if (!gaveUp && !(aborted && (onGiveUp || !this.slack.hasAccessPolicy))) {
+            console.error(`[slack-mcpl] Couldn't get ${what} (${this.slack.hasAccessPolicy ? policyFailureSummary(err) : (err as Error).message}); ${fallback}`);
+          }
           throw err;
         }),
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => {
             gaveUp = true;
+            onGiveUp?.();
             console.error(`[slack-mcpl] Gave up on ${what} after 5 s; ${fallback}`);
             reject(new Error(`Gave up on ${what} after 5 s`));
           }, 5000);
@@ -1821,11 +1879,10 @@ export class SlackMcplServer {
       return;
     }
 
-    // First-interaction handling: when the very first message from this
-    // conversation for this peer is addressed, pull backscroll for context.
-    // A mention may also auto-subscribe the conversation, with a system note
-    // (below). Both are committed in taken(), once the host has the message
-    // that carries them.
+    // Fetch context for addressed delivery before any accepted delivery in
+    // this conversation for this peer. A rejected delivery can fetch again;
+    // an accepted ambient delivery suppresses later initial backscroll.
+    // Auto-subscription and the watermark commit only in taken() below.
     if (!this.slack.hasAccessPolicy) this.ensureSubscriptionsLoaded();
     let isFirstInteraction = !this.forwardedWatermark.has(msg.channelId);
     // Legacy optional context shares one metadata lookup. Policy mode uses
@@ -1834,12 +1891,16 @@ export class SlackMcplServer {
     let backscroll: Awaited<ReturnType<typeof this.slack.fetchHistory>>['messages'] = [];
     let backscrollTruncated = false;
     if (isFirstInteraction && isAddressed) {
+      const backscrollAbort = new AbortController();
+      this.backscrollAborts.add(backscrollAbort);
       try {
         const res = await this.deliveryLookup(this.slack.fetchHistory(msg.channelId, {
           limit: this.backscrollLimit,
+          signal: backscrollAbort.signal,
           latest: msg.id, // never include the triggering message itself
         }), `the backscroll for message ${msg.id} in ${msg.channelId}`,
-          this.slack.hasAccessPolicy ? 'omitting optional backscroll; final delivery admission still applies' : undefined);
+          this.slack.hasAccessPolicy ? 'omitting optional backscroll; final delivery admission still applies' : undefined,
+          () => backscrollAbort.abort());
         // Drop the bot's own past messages — already in the agent's
         // chronicle as assistant turns, no need to re-echo.
         backscrollTruncated = res.stopReason === 'page_limit';
@@ -1849,6 +1910,8 @@ export class SlackMcplServer {
         // lasting refusal is ordered evidence at the client boundary, so a
         // transient final check still meets it unless newer evidence won.
         dbg('backscroll:fetch-failed', { channelId: msg.channelId, error: this.slack.hasAccessPolicy ? policyFailureSummary(err) : (err as Error).message });
+      } finally {
+        this.backscrollAborts.delete(backscrollAbort);
       }
       if (!isCurrent()) return abandon();
       if (!this.slack.hasAccessPolicy && !msg.isDM) {
@@ -1918,7 +1981,10 @@ export class SlackMcplServer {
       );
     }
     if (backscroll.length > 0 || backscrollTruncated) {
-      blocks.push(backscrollBlock(backscroll, { channelName: meta?.name, isDM: msg.isDM, isGroupDM: this.slack.hasAccessPolicy && meta?.policyGroupDm, truncated: backscrollTruncated, policyAttachments: this.slack.hasAccessPolicy }));
+      blocks.push(backscrollBlock(backscroll, {
+        channelName: meta?.name, isDM: msg.isDM, isGroupDM: this.slack.hasAccessPolicy && meta?.policyGroupDm,
+        truncated: backscrollTruncated, policyAttachments: this.slack.hasAccessPolicy,
+      }, this.grant.isFeatureSetActive(HISTORY_FEATURE_SET)));
     }
     // Told with the first message the agent gets from here, addressed or not.
     // Counted as told only once the host has taken that message.
@@ -1955,8 +2021,9 @@ export class SlackMcplServer {
     }
 
     // MCPL RFC-001 event tags — reserved chat:* core, umbrellas included.
-    // The host's wake gate routes on these. Other bots' messages never get
-    // here (the adapter self-filters bot_id), so from-human is uniform.
+    // The host's wake gate routes on these. Messages with a bot_id never get
+    // here (the adapter self-filters them); every delivered message carries a
+    // user, apps posting as one included, so from-human is uniform.
     const eventTags: string[] = (() => {
       const t = new Set<string>();
       if (msg.mentionsBot) t.add('chat:mention');
@@ -1978,7 +2045,7 @@ export class SlackMcplServer {
       thread_ts: msg.threadTs,
       channel_type: msg.channelType,
       team: msg.teamId,
-      rawContent: msg.content,
+      rawContent: msg.rawContent ?? msg.content,
       botUserId: this.slack.botUserId ?? undefined,
       ...(msg.attachments.length > 0 ? { attachments: msg.attachments } : {}),
     };
