@@ -111,7 +111,9 @@ for (const member of [false, undefined]) test(`fresh final metadata distinguishe
   f.state.conversation = member === false
     ? { id: 'C1', is_im: false, is_mpim: false, is_private: false, is_member: false }
     : undefined;
+  const before = f.methods().length;
   await f.deliver(message());
+  assert.deepEqual(f.methods().slice(before), ['info'], 'the final lookup was reached');
   assert.equal(f.h.hostSaw.filter(r => r.method === method.PUSH_EVENT).length, 0);
   assert.deepEqual(clears, ['1.0']);
 });
@@ -148,10 +150,11 @@ for (const code of ['token_expired', 'not_authed', 'ekm_access_denied', 'channel
   t.mock.method(f.adapter, 'acknowledge', async () => {});
   t.mock.method(f.adapter, 'clearAck', async (_c: string, id: string) => { clears.push(id); });
   t.mock.method(f.adapter, 'fetchHistory', async () => ({ messages: [] }));
-  t.mock.method(f.adapter, 'getConversationMeta', async () => {
+  const final = t.mock.method(f.adapter, 'getConversationMeta', async () => {
     throw Object.assign(new Error(code), { code: 'slack_webapi_platform_error', data: { error: code } });
   });
   await f.deliver(message());
+  assert.equal(final.mock.callCount(), 1, 'the final lookup was reached');
   assert.equal(f.h.hostSaw.filter(r => r.method === method.PUSH_EVENT).length, 0);
   assert.deepEqual(clears, ['1.0']);
 });
@@ -264,8 +267,9 @@ for (const result of [undefined, null]) test(`missing channel final result drops
   const clears: string[] = [];
   t.mock.method(f.adapter, 'fetchHistory', async () => ({ messages: [] }));
   t.mock.method(f.adapter, 'clearAck', async (_c: string, id: string) => { clears.push(id); });
-  t.mock.method(f.adapter, 'getConversationMeta', async () => result as any);
+  const final = t.mock.method(f.adapter, 'getConversationMeta', async () => result as any);
   await f.deliver(message());
+  assert.equal(final.mock.callCount(), 1, 'the final lookup was reached');
   assert.deepEqual(clears, ['1.0']);
   assert.equal(f.h.hostSaw.filter(r => r.method === method.PUSH_EVENT).length, 0);
 });
@@ -280,7 +284,9 @@ test('scope withdrawal reported by an earlier response vetoes a later real 429 f
   f.state.infoScopes = ['channels:read'];
   await f.adapter.getConversationMeta('C1');
   f.state.infoError = Object.assign(new Error('limited'), { code: 'slack_webapi_rate_limited_error', retryAfter: 20 });
+  f.calls.length = 0;
   await f.deliver(message());
+  assert.ok(f.methods().includes('info'), 'the final lookup reached its 429');
   assert.equal(f.h.hostSaw.filter(r => r.method === method.PUSH_EVENT).length, 0);
   assert.deepEqual(clears, ['1.0']);
 });
@@ -319,6 +325,27 @@ for (const open of [false, true]) test(`a policy host request failure names the 
   const line = logs.find(l => l.includes(`${deliveryMethod} failed`)) ?? '';
   assert.match(line, /message 2\.0 in C1 \(thread 1\.0\).*host request failed \(code -32000\)/);
   assert.doesNotMatch(line, /private content/);
+});
+
+test('policy delivery logs name the thread root for a disconnected or missing peer', async t => {
+  const f = await fixture(t);
+  const logs: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logs.push(args.join(' ')); });
+  let entered!: () => void, release!: () => void;
+  const started = new Promise<void>(r => { entered = r; });
+  const held = new Promise<void>(r => { release = r; });
+  t.mock.method(f.adapter, 'fetchHistory', async () => {
+    entered(); await held; return { messages: [] };
+  });
+  const delivery = f.deliver({ ...message('C1', '2.0'), threadTs: '1.0' });
+  await started;
+  await f.h.close();
+  release(); await delivery;
+  await f.deliver({ ...message('C1', '3.0'), threadTs: '1.0' });
+  assert.deepEqual(logs.filter(line => line.includes('Dropped addressed message')), [
+    '[slack-mcpl] Dropped addressed message 2.0 in C1 (thread 1.0) before delivery: its peer disconnected',
+    '[slack-mcpl] Dropped addressed message 3.0 in C1 (thread 1.0) before delivery: no peer is connected',
+  ]);
 });
 
 test('policy shutdown during server forwarding names recovery for an acknowledged reply', async t => {

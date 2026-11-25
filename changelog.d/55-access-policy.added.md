@@ -1,1 +1,1 @@
-- Preparation for an explicit Slack access policy. There is no new setting and no change to runtime access decisions.
+- The opt-in access policy checks its complete configuration at startup; invalid values stop startup rather than falling back to legacy access.

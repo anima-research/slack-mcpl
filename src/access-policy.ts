@@ -1,7 +1,7 @@
 import { inspect } from 'node:util';
 
-/** Trusted host data only; getters and iterators may execute host code.
- * Internal preparation only: no connector setting installs this policy yet. */
+/** Explicit, restart-only operator policy. Trusted host data, not a sandbox
+ * for hostile JavaScript getters, iterators, proxies or prototypes. */
 export interface SlackAccessPolicyConfig {
   readonly readJoinedChannels: boolean;
   readonly writeChannels: readonly string[];
@@ -74,6 +74,8 @@ export function parseAccessPolicy(value: unknown): SlackAccessPolicyConfig {
   validateIds(channels, CHANNEL_ID, 'writeChannels');
   validateIds(users, USER_ID, 'dmUsers');
   if (keys.has('groupDms')) validateIds(groups, GROUP_DM_ID, 'groupDms');
+
+  if (!readJoinedChannels && channels.some(id => !(groups as string[] | undefined)?.includes(id))) throw new Error('readJoinedChannels:false requires every writeChannels entry to also be in groupDms');
   return Object.freeze({ readJoinedChannels, writeChannels: Object.freeze(channels), dmUsers: Object.freeze(users),
     ...(keys.has('groupDms') ? { groupDms: Object.freeze(groups as string[]) } : {}) });
 }
@@ -97,6 +99,9 @@ export class SlackFileUnavailable extends SlackAccessDenied { override name = 'S
 
 /** Invalid caller input, distinct from host-owned access restrictions. */
 export class SlackAccessInputError extends Error { override name = 'SlackAccessInputError'; }
+
+/** Missing or malformed grant evidence, distinct from caller-controlled text. */
+export class SlackScopeEvidenceError extends Error {}
 
 /** A missing reported grant is lasting until installation or scope evidence changes. */
 export class SlackAccessGrantDenied extends SlackAccessDenied {}
@@ -141,8 +146,7 @@ export async function withAccessContext<T>(notDone: string, run: () => Promise<T
  * Snapshots provide consistency, not isolation from hostile JavaScript inputs.
  * The user directory is outside this policy's confinement: find_user is gated
  * only on users:read and searches the whole workspace directory, not just
- * admitted DM peers or conversation members. Directory filtering remains a
- * decision for the later activation PR. */
+ * admitted DM peers or conversation members. */
 export class SlackAccessPolicy {
   private readonly writeChannels: ReadonlySet<string>;
   private readonly dmUsers: ReadonlySet<string>;
@@ -164,6 +168,30 @@ export class SlackAccessPolicy {
   get groupDmsReadable(): boolean { return this.groupDms.size > 0; }
   get joinedChannelsReadable(): boolean { return this.readJoinedChannels; }
 
+  /** Configuration hints, not fresh authorization. Deduplicate exactly as enforcement does. */
+  capabilities(disableDms = false, dmUsers?: readonly string[], sendChannels?: readonly string[]) {
+    const peers = disableDms ? [] : [...this.dmUsers].filter(id => !dmUsers || dmUsers.includes(id));
+    const groups = disableDms ? [] : [...this.groupDms];
+    const pins = [...this.writeChannels].filter(id => (!disableDms || this.readJoinedChannels || !this.groupDms.has(id))
+      && (!sendChannels?.length || sendChannels.includes(id)));
+    const dmTargets = peers.length ? sendChannels?.filter(id => /^D[A-Z0-9]+$/.test(id)) : [];
+    return { peers, groups, pins, dmTargets: dmTargets && [...new Set(dmTargets)],
+      dmWrites: peers.length > 0 && (!sendChannels?.length || !!dmTargets?.length) };
+  }
+
+  /** Diagnostics only; operation gates remain authoritative. */
+  diagnosticScopes(disableDms = false, dmUsers?: readonly string[], sendChannels?: readonly string[]): string[] {
+    const effective = this.capabilities(disableDms, dmUsers, sendChannels);
+    return [...new Set([
+      ...(this.readJoinedChannels ? ['channels:read', 'groups:read', 'channels:history', 'groups:history'] : []),
+      ...(effective.peers.length ? ['im:read', 'im:history'] : []),
+      ...(effective.dmWrites ? ['im:write'] : []),
+      ...(effective.groups.length ? ['mpim:read', 'mpim:history'] : []),
+      ...(effective.pins.length || effective.dmWrites ? ['chat:write', 'files:write', 'reactions:write'] : []),
+      ...(this.readJoinedChannels || effective.peers.length || effective.groups.length ? ['files:read'] : []), 'users:read',
+    ])];
+  }
+
   get dmsWritable(): boolean { return this.dmUsers.size > 0; }
 
   /** A synchronous configuration hint, never an authorization decision. */
@@ -176,7 +204,7 @@ export class SlackAccessPolicy {
 
   requireScope(scopes: readonly string[] | undefined, needed: string): void {
     scopes = Array.isArray(scopes) ? Array.from(scopes) : scopes;
-    if (!Array.isArray(scopes) || !scopes.every(scope => typeof scope === 'string')) throw new Error(`Slack scope metadata is unavailable or malformed; requires granted scope evidence for ${rejectedValue(needed)}; ask whoever runs this host to refresh Slack-reported permission evidence with list_channels or restart`);
+    if (!Array.isArray(scopes) || !scopes.every(scope => typeof scope === 'string')) throw new SlackScopeEvidenceError(`Slack scope metadata is unavailable or malformed; requires granted scope evidence for ${rejectedValue(needed)}; ask whoever runs this host to refresh Slack-reported permission evidence with list_channels or restart`);
     if (!scopes.includes(needed)) throw new SlackAccessGrantDenied(`Slack access requires granted scope ${rejectedValue(needed)}`);
   }
 

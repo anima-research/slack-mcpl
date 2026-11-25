@@ -9,6 +9,18 @@ import { FULL_GRANT, MENTION_EVENT, answerAsHost, connectHost, fakeSlack, harnes
 import { fakeSlackApi } from './slackApi.js';
 import { virtualClock, elapse } from './virtualClock.js';
 
+/** Counts only this file's thread-status lines. Policy test adapters are
+ *  stopped by the test that builds them (ownedTest, accessTest), so no earlier
+ *  test's 60-second admission-log flush is left to write here; the filter only
+ *  keeps these counts to this file's own diagnostics. */
+function statusLog(t: { mock: { method: (o: object, k: string, f: (...a: unknown[]) => void) => unknown } }) {
+  const calls: Array<{ arguments: unknown[] }> = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => {
+    if (String(args[0]).startsWith('[slack-mcpl] thread status')) calls.push({ arguments: args });
+  });
+  return { mock: { calls, callCount: () => calls.length } };
+}
+
 const GRANT = [...FULL_GRANT, 'channels.typing'];
 const typing = (h: { host: ReturnType<typeof harness>['host'] }, op = 'start', name: string = method.CHANNELS_TYPING) =>
   h.host.sendNotification(name, { channelId: 'slack:C1', op });
@@ -429,7 +441,7 @@ for (const answer of ['missing_scope', 'internal_error', 'rate limit'] as const)
   test(`with DMs off, conversations.info ${answer} is ${answer === 'missing_scope' ? 'suppressed until the peer changes' : 'retryable'}`, async (t) => {
     const api = await fakeSlackApi();
     t.after(() => api.close());
-    const log = t.mock.method(console, 'error', () => {});
+    const log = statusLog(t);
     api.answerFor('conversations.info', answer === 'rate limit'
       ? { status: 429, headers: { 'retry-after': '1' }, body: { ok: false, error: 'ratelimited' } }
       : { body: { ok: false, error: answer } });
@@ -454,7 +466,7 @@ for (const retryAfter of [undefined, 'not-a-timeout']) {
   test(`with DMs off, a conversations.info 429 with Retry-After ${retryAfter ?? 'absent'} permits a later status`, async (t) => {
     const api = await fakeSlackApi();
     t.after(() => api.close());
-    const log = t.mock.method(console, 'error', () => {});
+    const log = statusLog(t);
     api.answerFor('conversations.info',
       { status: 429, headers: retryAfter === undefined ? {} : { 'retry-after': retryAfter }, body: { ok: false, error: 'ratelimited' } },
       { body: { ok: true, channel: { id: 'C9', name: 'general', is_im: false, is_mpim: false } } });
@@ -474,7 +486,7 @@ for (const retryAfter of [undefined, 'not-a-timeout']) {
 
 for (const channel of [{ id: 'G1', is_mpim: true }, { id: 'G1' }]) {
   test(`with DMs off, a confirmed ${channel.is_mpim ? 'group DM' : 'non-channel'} refusal is remembered until peer change`, async (t) => {
-    const log = t.mock.method(console, 'error', () => {});
+    const log = statusLog(t);
     const { a, calls } = adapter({ disableDms: true, info: { channel } });
     const check = t.mock.method(a['web'].conversations, 'info');
     for (let i = 0; i < 3; i++) await a.setThreadStatus('G1', '1.0');
@@ -535,7 +547,7 @@ for (const code of ['method_deprecated', 'method_not_supported_for_channel_type'
   test(`real WebClient ${code} is ${code === 'internal_error' ? 'retryable' : 'suppressed'}`, async (t) => {
     const api = await fakeSlackApi();
     t.after(() => api.close());
-    const log = t.mock.method(console, 'error', () => {});
+    const log = statusLog(t);
     api.answerFor('assistant.threads.setStatus', { body: { ok: false, error: code } });
     const web = new SlackWebClient('xoxb-test', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: api.url });
     const socket = { on() {}, async start() {}, async disconnect() {} } as any;

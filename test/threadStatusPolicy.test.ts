@@ -1,4 +1,4 @@
-import test from 'node:test';
+import { ownedTest as test } from './adapterAccessFixture.js';
 import assert from 'node:assert/strict';
 import { accessFixture } from './adapterAccessFixture.js';
 import { fakeSlack } from './harness.js';
@@ -13,17 +13,28 @@ async function fixture(options = {}) {
 
 for (const denial of ['revoked membership', 'missing chat scope', 'missing read scope', 'non-write channel', 'lookup failure']) {
   test(`policy composition: thread status denies ${denial} without an effect`, async t => {
-    t.mock.method(console, 'error', () => {});
+    const log = t.mock.method(console, 'error', () => {});
     const f = await fixture(denial === 'missing chat scope' ? { scopes: ['channels:read', 'reactions:write'] }
       : denial === 'missing read scope' ? { scopes: ['chat:write'] }
       : denial === 'non-write channel' ? { config: { readJoinedChannels: true, writeChannels: [], dmUsers: [] } } : {});
     t.after(() => f.adapter.stop());
     if (denial === 'revoked membership') f.state.conversation!.is_member = false;
     if (denial === 'lookup failure') f.state.infoError = new Error('offline');
+    const writable = t.mock.method(f.adapter, 'canWrite');
+    log.mock.resetCalls();
     await f.adapter.setThreadStatus('C1', '1.0');
     assert.deepEqual(f.effects, []);
     // Each denial is reached at admission, not by an earlier silent drop.
     assert.deepEqual(f.methods(), denial === 'non-write channel' ? [] : ['info']);
+    const reasons: Record<string, RegExp> = {
+      'revoked membership': /access refused/, 'missing chat scope': /missing Slack grant chat:write/,
+      'missing read scope': /missing Slack grant channels:read/, 'non-write channel': /not allowed/,
+      'lookup failure': /unclassified failure \(details withheld\); outcome may be unknown/,
+    };
+    if (denial === 'non-write channel') {
+      assert.equal(writable.mock.callCount(), 1);
+      assert.equal(writable.mock.calls[0].result, false);
+    } else assert.match(log.mock.calls.map(call => call.arguments.join(' ')).join('\n'), reasons[denial]);
   });
 }
 
@@ -148,6 +159,7 @@ for (const terminal of [false, true]) test(`status admission failure cannot beco
     ? { code: 'slack_webapi_platform_error', data: { error: 'channel_not_found' } }
     : { code: 'slack_webapi_http_error', statusCode: 503 });
   await f.adapter.setThreadStatus('C1', '1.0');
+  assert.deepEqual(f.methods(), ['info'], 'the failing admission really ran');
   const attempts = f.methods().length;
   assert.deepEqual(f.methods(), ['info'], 'the start reached its failing admission');
   await f.adapter.clearThreadStatuses();
@@ -302,4 +314,19 @@ for (const terminal of [false, true]) test(`attempted clear retires ownership be
   await f.adapter.setThreadStatus('C1', undefined);
   assert.equal(f.methods().length, attempts);
   assert.equal(f.effects.length, 2);
+});
+
+test('a latched start still retries clearing the owned old-thread status once admission is restored', async t => {
+  t.mock.method(console, 'error', () => {});
+  const f = await fixture();
+  t.after(() => f.adapter.stop());
+  await f.adapter.setThreadStatus('C1', '1.0');
+  assert.equal(f.effects.length, 1);
+  f.state.infoError = Object.assign(new Error('gone'), { code: 'slack_webapi_platform_error', data: { error: 'channel_not_found' } });
+  await f.adapter.setThreadStatus('C1', '2.0'); // its clear of 1.0 is refused, and the channel latched
+  assert.equal(f.effects.length, 1);
+  f.state.infoError = undefined;
+  await f.adapter.setThreadStatus('C1', '3.0');
+  assert.deepEqual(f.effects.slice(1), [{ channel_id: 'C1', thread_ts: '1.0', status: '' }],
+    'thread 1 is cleared even though the latch prevents starting thread 3');
 });

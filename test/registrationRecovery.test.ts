@@ -10,7 +10,7 @@ import { GaveUp } from '../src/slack-adapter.js';
 import type { SlackAdapter, SlackConversationInfo, SlackWait, SlackWaitOut } from '../src/slack-adapter.js';
 import { FULL_GRANT, until } from './harness.js';
 import { clock } from '../src/clock.js';
-import { accessFixture, joined } from './adapterAccessFixture.js';
+import { accessFixture, joined, ownedTest } from './adapterAccessFixture.js';
 import { virtualClock } from './virtualClock.js';
 
 function deferred<T>() {
@@ -736,7 +736,7 @@ test('registration gives up on a request tried ten times in a row, after nine wa
   assert.equal(h.requests.length, 0);
 });
 
-test('policy refresh skips host-known IDs before pacing and reaches a late new channel', { timeout: 5000 }, async (t) => {
+ownedTest('policy refresh skips host-known IDs before pacing and reaches a late new channel', { timeout: 5000 }, async (t) => {
   virtualClock(t);
   const f = accessFixture();
   const known = Array.from({ length: 20 }, (_, i) => joined(`C${i + 10}`));
@@ -1098,7 +1098,24 @@ test("refresh_channels leaves out a new DM whose user's name Slack didn't give, 
   assert.deepEqual(labels, [['slack:C1', '#general (acme)'], ['slack:D1', 'DM: @ann (acme)'], ['slack:D2', 'DM: @bob (acme)']]);
 });
 
-test('policy incomplete registration gives operators distinct retry and access remedies', async t => {
+test('with a policy, a cursor-cycle registration failure keeps its local reason and the refresh_channels remedy', async (t) => {
+  const log = serverLog(t);
+  const { LocalFailure } = await import('../src/slack-adapter.js');
+  const { slack } = fakeSlack(async () => {
+    throw new LocalFailure('No listing was returned: Slack repeated a pagination cursor (cursor cycle). Retry once; if it persists, ask whoever runs this host to investigate the Slack response.');
+  });
+  Object.assign(slack, { hasAccessPolicy: true, isStopping: false });
+  const h = connect(new SlackMcplServer(slack));
+  t.after(() => h.close());
+  await h.initialize();
+  await h.grant();
+  await until(() => log.some((l) => l.includes('Failed to enumerate conversations')), 'the failure');
+  assert.deepEqual(log.filter((l) => l.includes('Failed to enumerate conversations')), [
+    '[slack-mcpl] Failed to enumerate conversations: No listing was returned: Slack repeated a pagination cursor (cursor cycle). ' +
+      'Retry once; if it persists, ask whoever runs this host to investigate the Slack response; registration stopped, and refresh_channels can retry it',
+  ]);
+});
+ownedTest('policy incomplete registration gives operators distinct retry and access remedies', async t => {
   const { slack } = fakeSlack();
   Object.defineProperty(slack, 'hasAccessPolicy', { value: true });
   t.mock.method(slack, 'listConversations', async () => ({
