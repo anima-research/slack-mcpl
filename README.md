@@ -632,8 +632,9 @@ either case delivery continues without backscroll or an incomplete note, even
 if earlier pages succeeded. With an explicit policy the bounded final admission
 still applies: only classified rate-limit, transport and Slack service failures
 retain the original event admission only without a known lasting refusal or withdrawn grant; other failures and expired delivery waits drop
-and request ACK cleanup, which can itself fail. Timeout or host disconnect stops further backscroll
-page requests; an in-flight request can still finish. The normal latest-N-message backscroll window is not labelled incomplete. History/thread tools retain
+and request ACK cleanup, which can itself fail. The timeout stops further backscroll page requests;
+after a host disconnect they stop once the server finishes the host request it is
+handling, or at the timeout, whichever is first. An in-flight request can still finish. The normal latest-N-message backscroll window is not labelled incomplete. History/thread tools retain
 `pagination.scanComplete`, their existing stop reasons and continuation cursors.
 
 Background registration announces the eligible subset and logs incomplete

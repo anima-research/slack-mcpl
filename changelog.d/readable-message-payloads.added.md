@@ -36,8 +36,9 @@
   Classic link previews can appear in reads and match textContains; they are
   skipped only when from_url exactly matches an extracted original URL. App
   unfurls are skipped separately. Shares and message unfurls retain their source
-  bodies only without an access policy; with a policy they render as
-  `[shared message omitted]`.
+  bodies only without an access policy; with a policy, attachments flagged
+  `is_share` or `is_msg_unfurl` render as `[shared message omitted]`. Unflagged
+  attachments and the message's own text are rendered as usual.
   Supplemental deduplication preserves internal prose row boundaries and code
   whitespace, while normalizing equivalent line endings, trailing horizontal
   prose whitespace and rich-section separators. Closed code fences normalize
