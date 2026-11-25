@@ -78,6 +78,7 @@ const headerChannel = (value: string) => escape(channelShown(headerPrefix(value)
 export function renderMessageText(
   message: { text?: unknown; attachments?: unknown; blocks?: unknown; bot_id?: unknown; app_id?: unknown; bot_profile?: unknown; client_msg_id?: unknown },
   maxAppend = MAX_MESSAGE_TEXT_APPEND,
+  omitSharedMessages = false,
 ): string {
   const original = string(message.text);
   if (!list(message.attachments).length && !list(message.blocks).length) return original;
@@ -272,15 +273,20 @@ export function renderMessageText(
   for (const raw of take(message.attachments)) {
     if (full() || !visit()) break;
     const a = object(raw);
+    const shared = a.is_share === true || a.is_msg_unfurl === true;
+    // Admission of the containing conversation does not admit the source.
+    if (shared && omitSharedMessages) {
+      emit('[shared message omitted]');
+      continue;
+    }
     // App unfurls are URL previews, not message bodies. Classic URL previews
     // are omitted when the URL is already in text; standalone previews survive.
-    if (a.is_share !== true && a.is_msg_unfurl !== true &&
+    if (!shared &&
         (a.is_app_unfurl === true || (typeof a.from_url === 'string' &&
           urls.has(a.from_url)))) continue;
     // Classic attachment fields carry Slack tokens/entities independently of
     // mrkdwn_in (which governs basic styling, passed through here either way).
     const fieldText = bounded;
-    const shared = a.is_share === true || a.is_msg_unfurl === true;
     let header = '';
     if (shared || string(a.author_name)) {
       const name = string(a.author_name) ? headerName(string(a.author_name)) : 'unknown';

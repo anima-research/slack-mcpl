@@ -363,9 +363,11 @@ link, text, fields as `title: value`, else fallback), then that attachment's nes
 Readable nested blocks take precedence over fallback; attachment-nested omission placeholders do
 not suppress fallback and are appended after that attachment's readable content.
 Top-level blocks (including omission labels) retain input order and may exhaust
-the supplemental budget before later readable blocks. Shares (`is_share` or
-`is_msg_unfurl`) have a `[shared message from NAME (uid:ID), SOURCE]` header
-and `> `-prefixed lines; other attachments with `author_name` are attributed too.
+the supplemental budget before later readable blocks. With an access policy
+active, shares and message unfurls (`is_share` or `is_msg_unfurl`) render only
+`[shared message omitted]`, since the source conversation may not be admitted.
+Without a policy they have a `[shared message from NAME (uid:ID), SOURCE]` header
+and `> `-prefixed lines. Other attachments with `author_name` are attributed in either mode.
 These in-body headers are display hints, not authenticated provenance: message
 text can imitate them. Do not use them to authorize actions.
 Unknown share authors/sources are marked unknown. Header fields are single-line,

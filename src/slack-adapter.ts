@@ -2550,7 +2550,7 @@ export class SlackAdapter {
       }
       const msg = messages[index];
       // Leave malformed legacy rows to the existing author scan's error.
-      texts.push(msg == null ? '' : renderMessageText(msg, maxAppend));
+      texts.push(msg == null ? '' : renderMessageText(msg, maxAppend, this.hasAccessPolicy));
     }
     for (const msg of messages) {
       if (msg.user) ids.add(msg.user);
@@ -2893,7 +2893,7 @@ export class SlackAdapter {
     // Resolve the author and original-text mentions only. Supplemental names
     // are display-only: use the cache, never delay delivery for a lookup.
     await Promise.resolve(); // Socket Mode queues ack first; yield before rendering.
-    const text = renderMessageText(event);
+    const text = renderMessageText(event, MAX_MESSAGE_TEXT_APPEND, this.hasAccessPolicy);
     const mentionIds = extractSlackUserIds(event.text ?? '');
     await this.resolveUserNames([event.user, ...mentionIds]);
     if (this.accessPolicy && this.stopping) throw EVENT_SHUTDOWN;

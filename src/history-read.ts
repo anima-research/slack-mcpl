@@ -6,7 +6,7 @@
  */
 import { setImmediate } from 'node:timers/promises';
 import { createHash } from 'node:crypto';
-import { renderMessageText } from './message-text.js';
+import { MAX_MESSAGE_TEXT_APPEND, renderMessageText } from './message-text.js';
 import { isPolicyFileRef, policyFileNote } from './file-access.js';
 import { SLACK_TS, isSlackTimestamp } from './pagination.js';
 import { formatSlackText, type SlackHistoryMessage } from './content.js';
@@ -268,7 +268,7 @@ export interface ReadSource {
   shape(messages: SlackHistoryMessage[]): Promise<HistoryMessage[]>;
   writable: boolean;
   stopped(err: unknown): ReadStop | undefined;
-  /** Explicit-policy reads render policy file references. */
+  /** Explicit-policy reads render policy file references and omit shared message bodies. */
   policyAttachments?: boolean;
   /** Explicit-policy reads refuse a page whose sign of more (has_more, or
    *  response_metadata's next_cursor) is malformed, before any of its rows is
@@ -363,7 +363,9 @@ export async function readBounded(opts: ReadOptions, source: ReadSource): Promis
       if (end >= 0) rows.splice(end);
       const isMatch = (m: SlackHistoryMessage) =>
         (!opts.authorIds.length || [m.user, m.bot_id].some((id) => id !== undefined && opts.authorIds.includes(id))) &&
-        (needle === undefined || fold(formatSlackText(renderMessageText(m), BY_ID)).includes(needle));
+        (needle === undefined || fold(formatSlackText(
+          renderMessageText(m, MAX_MESSAGE_TEXT_APPEND, source.policyAttachments), BY_ID,
+        )).includes(needle));
       // Stop before rendering rows excluded by the author, scan or match limit.
       const matches: SlackHistoryMessage[] = [];
       let candidates = 0;

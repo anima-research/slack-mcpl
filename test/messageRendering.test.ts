@@ -5,6 +5,7 @@ import { renderMessageText } from '../src/message-text.js';
 import { formatSlackText } from '../src/content.js';
 import { SlackAdapter } from '../src/slack-adapter.js';
 import { backscrollBlock } from '../src/server.js';
+import { accessFixture, ownedTest } from './adapterAccessFixture.js';
 
 const section = (text: string) => ({ type: 'section', text: { type: 'mrkdwn', text } });
 const rich = (text: string) => ({ type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [{ type: 'text', text }] }] });
@@ -16,6 +17,47 @@ test('shares, message unfurls and author attachments carry attribution and quote
   }
   assert.equal(clean({ attachments: [{ author_name: 'CI', text: 'OK' }] }), '[attachment from CI]\n> OK');
 });
+const sharedPayload = {
+  user: 'U1', ts: '100.000001', text: 'thoughts?',
+  attachments: [
+    { is_share: true, author_name: 'Bob', author_id: 'U2', channel_name: 'ops',
+      text: 'copied body', blocks: [section('copied block')] },
+    { is_msg_unfurl: true, channel_id: 'C2', fallback: 'copied fallback' },
+    { author_name: 'CI', text: 'build passed', blocks: [section('build details')] },
+  ],
+  blocks: [section('top-level block')],
+};
+for (const legacy of [false, true]) {
+  const mode = legacy ? 'legacy mode' : 'active policy';
+  for (const path of ['live', 'history', 'thread', 'backscroll']) {
+    ownedTest(`${mode}: shared attachments in ${path}`, async () => {
+      const f = accessFixture({ legacy });
+      f.state.messages = [sharedPayload];
+      let output: string | undefined;
+      if (path === 'live') {
+        f.adapter.onMessage(event => { output = event.cleanContent; });
+        assert.equal(await f.emit({ ...sharedPayload, type: 'message', channel: 'C1' }), true);
+      } else if (path === 'backscroll') {
+        output = (await f.adapter.fetchHistory('C1')).messages[0]?.content;
+      } else {
+        const result = path === 'history' ? await f.adapter.readHistory('C1', {})
+          : await f.adapter.readThread('C1', sharedPayload.ts, {});
+        output = result.messages[0]?.content;
+      }
+      const shared = legacy
+        ? '[shared message from Bob (uid:U2), #ops]\n> copied body\n> copied block\n' +
+          '[shared message from unknown, #C2]\n> copied fallback'
+        : '[shared message omitted]\n[shared message omitted]';
+      assert.equal(output, `thoughts?\n${shared}\n[attachment from CI]\n> build passed\n> build details\ntop-level block`);
+    });
+  }
+  ownedTest(`${mode}: history searches rendered shared attachments`, async () => {
+    const f = accessFixture({ legacy });
+    f.state.messages = [sharedPayload];
+    const result = await f.adapter.readHistory('C1', { textContains: 'copied fallback' });
+    assert.equal(result.messages.length, legacy ? 1 : 0);
+  });
+}
 test('plain objects, labels and date fallbacks remain literal; IDs cannot inject', () => {
   assert.equal(clean({ blocks: [ { type: 'header', text: { type: 'plain_text', text: 'Ping <@UBOT> &lt;tag&gt;' } },
     { type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [
