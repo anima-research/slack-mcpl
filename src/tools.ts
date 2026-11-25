@@ -287,3 +287,18 @@ export function policySubscriptionTool(tool: ToolDefinition, policy: boolean): T
     'from there will still arrive.', 'from there remain eligible, subject to access admission and successful delivery.') };
   return tool;
 }
+
+/** Admission-qualified guidance is part of opt-in bot delivery only. */
+export function buildToolDefinitions(botDelivery = false): ToolDefinition[] {
+  if (!botDelivery) return toolDefinitions;
+  return toolDefinitions.map((tool) => {
+    if (tool.name === 'subscribe_channel') return { ...tool, description:
+      'Subscribe to ambient (non-mention) messages from a Slack conversation. ' +
+      'Admitted direct mentions and DMs bypass ambient subscriptions; ' +
+      'this only controls passive awareness of channel chatter. Persisted across restarts.' };
+    if (tool.name === 'unsubscribe_channel') return { ...tool, description:
+      'Stop receiving ambient messages from a Slack conversation. Admitted mentions and DMs ' +
+      'from there still bypass ambient subscriptions. Persisted across restarts.' };
+    return tool;
+  });
+}

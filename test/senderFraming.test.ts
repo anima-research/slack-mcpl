@@ -9,6 +9,7 @@ import { backscrollBlock, backscrollLine, locationHeader } from '../src/server.j
 import { attachmentName, formatSlackText, parseSlackAttachmentUrl, toFetchResult } from '../src/content.js';
 import { toDescriptor } from '../src/channels.js';
 import { senderText, toolResultJson } from '../src/framing.js';
+import { harness as botHarness } from './botHarness.js';
 import { FULL_GRANT, harness, initialize, until, type Harness } from './harness.js';
 
 const BREAKS = ['\n', '\r\n', '\r', '\u2028', '\u2029', '\u0085', '\u000b', '\u000c'];
@@ -402,4 +403,40 @@ test('a plain single-line body reads as it did, byte for byte', async (t) => {
     const line = backscrollLine({ id: '1.5', authorName: 'Ann', content: body, attachments: [], timestamp: new Date(0) });
     assert.equal(line, `[1970-01-01T00:00:00.000Z id=1.5] Ann: ${body}`);
   }
+});
+
+
+test('auto-subscription guidance does not offer tools disabled by the host', async t => {
+  const h = botHarness({ botMessages: 'all' });
+  t.after(() => h.close());
+  await initialize(h, true);
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, {
+    effectiveCapabilities: FULL_GRANT, disabled: ['slack.subscriptions'],
+  });
+  await until(() => h.hostSaw.some(r => r.method === method.CHANNELS_REGISTER), 'channels/register');
+  const [text] = await delivered(h, { text: 'hello' });
+  assert.match(text!, /Subscription takes effect only after host acceptance\./);
+  assert.match(text!, /Once subscribed, admitted ambient \(non-mention\) messages from this conversation are eligible for delivery until you unsubscribe\. Delivery requires active slack\.messaging, and the host can still reject messages\./);
+  assert.match(text!, /Subscription tools are unavailable under the current host grant\./);
+  assert.match(text!, /Ask the host to enable slack\.subscriptions and tools/);
+  assert.match(text!, /retrying without a grant change will not help/);
+  assert.doesNotMatch(text!, /unsubscribe_channel/);
+  assert.equal(text!.match(/<system>Auto-subscription[\s\S]*?<\/system>/)?.[0],
+    "<system>Auto-subscription to #general requested because you were mentioned. Subscription takes effect only after host acceptance. Once subscribed, admitted ambient (non-mention) messages from this conversation are eligible for delivery until you unsubscribe. Delivery requires active slack.messaging, and the host can still reject messages. Admitted mentions and DMs bypass ambient subscriptions. Subscription tools are unavailable under the current host grant. Ask the host to enable slack.subscriptions and tools to stop ambient delivery; retrying without a grant change will not help.</system>");
+});
+
+
+test('fully granted auto-subscription notice names the unsubscribe tool and channel', async t => {
+  const h = botHarness({ botMessages: 'all' });
+  t.after(() => h.close());
+  await initialize(h, true);
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await until(() => h.hostSaw.some(r => r.method === method.CHANNELS_REGISTER), 'channels/register');
+  const [text] = await delivered(h, { text: 'hello' });
+  assert.match(text!, /Subscription takes effect only after host acceptance\./);
+  assert.match(text!, /Once subscribed, admitted ambient \(non-mention\) messages from this conversation are eligible for delivery until you unsubscribe\. Delivery requires active slack\.messaging, and the host can still reject messages\./);
+  assert.ok(text!.includes('To stop ambient delivery from here: unsubscribe_channel("C1").'));
+  assert.doesNotMatch(text!, /Subscription tools are unavailable/);
+  assert.equal(text!.match(/<system>Auto-subscription[\s\S]*?<\/system>/)?.[0],
+    "<system>Auto-subscription to #general requested because you were mentioned. Subscription takes effect only after host acceptance. Once subscribed, admitted ambient (non-mention) messages from this conversation are eligible for delivery until you unsubscribe. Delivery requires active slack.messaging, and the host can still reject messages. Admitted mentions and DMs bypass ambient subscriptions. To stop ambient delivery from here: unsubscribe_channel(\"C1\").</system>");
 });

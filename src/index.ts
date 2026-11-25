@@ -14,6 +14,8 @@
  *   SLACK_DM_USERS    - Optional additional restriction:
  *                       comma-separated user-ID whitelist for DMs.
  *                       When set, DMs from anyone else are dropped.
+ *   SLACK_BOT_MESSAGES - Optional: all, or comma-separated bot/user IDs.
+ *                       Own messages are always dropped; beware bot-to-bot loops.
  *   SLACK_SEND_CHANNELS - Optional additional restriction:
  *                       comma-separated conversation-ID allow-list
  *                       for writes. When set, writes elsewhere are refused.
@@ -38,7 +40,7 @@ import { McplConnection } from '@animalabs/mcpl-core';
 import { connectSlack } from './slack-adapter.js';
 import { SlackMcplServer } from './server.js';
 import { SlackAccessPolicy } from './access-policy.js';
-import { startupSettings } from './config.js';
+import { StartupRefusal, startupSettings } from './config.js';
 import { serveTcp } from './tcp.js';
 
 async function main(): Promise<void> {
@@ -48,13 +50,13 @@ async function main(): Promise<void> {
     process.exit(1);
   }
   const { useStdio, tcpPort, botToken, appToken, dmUsers, sendChannels, disableDms, subscribeMemberChannels, ackReaction,
-    accessPolicy, pagination } =
+    accessPolicy, pagination, botMessages } =
     startup.settings;
 
   // Connect Slack first: auth.test resolves the bot's identity, then Socket
   // Mode comes up so no events are missed once the host attaches.
   const slack = await connectSlack({ botToken, appToken, ackReaction, pagination,
-    accessPolicy, dmUsers, sendChannels, disableDms });
+    accessPolicy, dmUsers, sendChannels, disableDms, botMessages });
   const server = new SlackMcplServer(slack, {
     subscribeMemberChannels,
   });
@@ -62,6 +64,7 @@ async function main(): Promise<void> {
   console.error(
     `[slack-mcpl] Slack connected as bot ${slack.botUserId} in workspace "${slack.teamName}"`,
   );
+  const botStatus = botMessages ? `bot messages: ${botMessages === 'all' ? 'all' : 'only ' + botMessages.join(', ')}` : '';
   if (accessPolicy) {
     const effective = new SlackAccessPolicy(accessPolicy).capabilities(disableDms, dmUsers, sendChannels);
     const targets = [...effective.pins, ...(effective.dmTargets ?? [])];
@@ -70,12 +73,14 @@ async function main(): Promise<void> {
       `write intersection: ${targets.join(', ') || (effective.dmWrites ? 'admitted DMs only' : 'no writable conversation')}` +
       `${effective.dmWrites && !sendChannels?.length ? '; admitted DM writes also allowed' : ''}. ` +
       'These are configuration hints; conversation content reads and writes require fresh admission and scopes; send_dm opens the peer DM to learn its ID before exact destination admission, so a later refusal can leave that DM open. Local subscription edits do not perform Slack admission. ' +
-      'find_user searches the workspace directory with users:read, outside conversation confinement.',
+      'find_user searches the workspace directory with users:read, outside conversation confinement.' +
+      (botStatus ? ` ${botStatus}` : ''),
     );
   }
   else console.error(
     `[slack-mcpl] writes: ${sendChannels?.length ? `only ${sendChannels.join(', ')}` : 'anywhere'}; ` +
-      `DMs: ${disableDms ? 'off' : 'on'}`,
+      `DMs: ${disableDms ? 'off' : 'on'}` +
+      (botStatus ? `; ${botStatus}` : ''),
   );
 
   // Clear pending acknowledgement reactions and thread statuses before exiting,
@@ -115,6 +120,7 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  console.error('[slack-mcpl] Fatal error:', process.env.SLACK_ACCESS_POLICY === undefined ? err : err instanceof Error ? err.message : 'Unexpected startup failure');
+  if (err instanceof StartupRefusal) console.error(err.message);
+  else console.error('[slack-mcpl] Fatal error:', process.env.SLACK_ACCESS_POLICY === undefined ? err : err instanceof Error ? err.message : 'Unexpected startup failure');
   process.exit(1);
 });

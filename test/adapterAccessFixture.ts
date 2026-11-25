@@ -1,3 +1,4 @@
+import type { BotMessagePolicy } from '../src/config.js';
 import type { PaginationLimits } from '../src/pagination.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import test, { type TestContext, type TestOptions } from 'node:test';
@@ -13,7 +14,8 @@ export const accessConfig: SlackAccessPolicyConfig = { readJoinedChannels: true,
 export const fixturePolicy = (config = accessConfig) => new SlackAccessPolicy(parseAccessPolicy(config));
 
 export function accessFixture(options: { legacy?: boolean; scopes?: string[]; config?: SlackAccessPolicyConfig;
-  sendChannels?: string[]; disableDms?: boolean; dmUsers?: string[]; ack?: string; pagination?: Partial<PaginationLimits> } = {}) {
+  sendChannels?: string[]; disableDms?: boolean; dmUsers?: string[]; ack?: string; pagination?: Partial<PaginationLimits>;
+  botMessages?: BotMessagePolicy } = {}) {
   const calls: Array<{ method: string; args: unknown }> = [];
   const state = {
     conversation: joined() as AccessConversation | undefined,
@@ -57,7 +59,7 @@ export function accessFixture(options: { legacy?: boolean; scopes?: string[]; co
   const socket: SlackSocketLike = { on(_event, handler) { message = handler; }, async start() {}, async disconnect() {} };
   const adapter = new SlackAdapter(web, socket, 'UBOT', 'test', options.dmUsers, options.sendChannels,
     options.disableDms, options.ack, options.scopes ?? accessScopes,
-    options.legacy ? undefined : fixturePolicy(options.config), options.pagination);
+    options.legacy ? undefined : fixturePolicy(options.config), options.pagination, options.botMessages, 'BSELF');
   ownAdapter(adapter);
   return { adapter, web, calls, state, methods: () => calls.map((c) => c.method),
     async emit(event: Record<string, unknown>) {
