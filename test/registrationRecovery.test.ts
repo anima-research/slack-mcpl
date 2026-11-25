@@ -10,6 +10,8 @@ import { GaveUp } from '../src/slack-adapter.js';
 import type { SlackAdapter, SlackConversationInfo, SlackWait, SlackWaitOut } from '../src/slack-adapter.js';
 import { FULL_GRANT, until } from './harness.js';
 import { clock } from '../src/clock.js';
+import { accessFixture, joined } from './adapterAccessFixture.js';
+import { virtualClock } from './virtualClock.js';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -732,6 +734,44 @@ test('registration gives up on a request tried ten times in a row, after nine wa
       'row, so registration stopped; refresh_channels can announce the conversations later',
   ], 'each wait is logged, and the give-up ends the series');
   assert.equal(h.requests.length, 0);
+});
+
+test('policy refresh skips host-known IDs before pacing and reaches a late new channel', { timeout: 5000 }, async (t) => {
+  virtualClock(t);
+  const f = accessFixture();
+  const known = Array.from({ length: 20 }, (_, i) => joined(`C${i + 10}`));
+  f.state.listed = known;
+  const checked: string[] = [];
+  f.web.conversations.info = async ({ channel }) => {
+    checked.push(channel);
+    return { channel: { ...joined(channel), name: channel } };
+  };
+  const h = connect(new SlackMcplServer(f.adapter));
+  t.after(() => h.close());
+  await h.initialize();
+  await h.grant();
+  await h.ended();
+  assert.deepEqual(ids(await h.listed()), known.map(c => `slack:${c.id}`));
+
+  f.state.listed = [...known, joined('C99')];
+  checked.length = 0;
+  const result = await h.refresh() as ToolResult;
+  assert.notEqual(result.isError, true, result.content[0].text);
+  const refreshed = JSON.parse(result.content[0].text);
+  assert.deepEqual(refreshed.added.map((c: { id: string }) => c.id), ['slack:C99']);
+  assert.equal(refreshed.visible, 21, 'includes known IDs seen in the current listing');
+  assert.deepEqual(checked, ['C99'], 'only a new candidate needs fresh metadata');
+  assert.ok(ids(await h.listed()).includes('slack:C99'));
+
+  // On the next call C99 is known, but a known ID absent from Slack's list
+  // must not inflate the visible count. A burst of new IDs still hits the cap.
+  f.state.listed = [joined('C99'), ...Array.from({ length: 20 }, (_, i) => joined(`C${i + 100}`))];
+  checked.length = 0;
+  const partial = JSON.parse((await h.refresh() as ToolResult).content[0].text);
+  assert.match(partial.note, /Incomplete:.*deadline/);
+  assert.doesNotMatch(partial.note, /may never be listed or registered/);
+  assert.equal(partial.visible, 1 + partial.added.length);
+  assert.ok(!checked.includes('C99'));
 });
 
 test('with a policy, a registration give-up keeps its reason and refresh_channels remedy', async (t) => {
