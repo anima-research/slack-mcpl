@@ -6,6 +6,29 @@ import { accessTest as test, accessFixture, joined } from './adapterAccessFixtur
 import { connectHost, FULL_GRANT, initialize, until } from './harness.js';
 import { virtualClock } from './virtualClock.js';
 
+test('opt-in bot delivery omits shared attachments only under an access policy', async () => {
+  for (const legacy of [false, true]) {
+    const f = accessFixture({ legacy, botMessages: ['BOTHER'] });
+    const received: SlackMessageData[] = [];
+    f.adapter.onMessage(msg => received.push(msg));
+    assert.equal(await f.emit({
+      type: 'message', subtype: 'bot_message', bot_id: 'BOTHER', username: 'integration',
+      channel: 'C1', channel_type: 'channel', ts: '1.0', text: 'status',
+      attachments: [
+        { is_share: true, channel_id: 'C2', text: 'copied body' },
+        { is_msg_unfurl: true, channel_id: 'C2', fallback: 'copied preview' },
+      ],
+    }), true);
+
+    assert.equal(received.length, 1);
+    assert.equal(received[0].authorBotId, 'BOTHER');
+    const expected = legacy
+      ? 'status\n[shared message from unknown, #C2]\n> copied body\n[shared message from unknown, #C2]\n> copied preview'
+      : 'status\n[shared message omitted]\n[shared message omitted]';
+    assert.equal(received[0].cleanContent, expected);
+  }
+});
+
 for (const open of [false, true]) {
   const lane = open ? method.CHANNELS_INCOMING : method.PUSH_EVENT;
   test(`policy admission and final membership checks apply to bot messages on ${lane}`, async t => {
