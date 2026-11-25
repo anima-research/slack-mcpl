@@ -1680,7 +1680,9 @@ export class SlackMcplServer {
     try {
       return await Promise.race([
         lookup.catch((err: unknown) => {
-          if (!gaveUp) console.error(`[slack-mcpl] Couldn't get ${what} (${(err as Error).message}); delivering without it`);
+          if (!gaveUp && (err as Error).name !== 'AbortError') {
+            console.error(`[slack-mcpl] Couldn't get ${what} (${(err as Error).message}); delivering without it`);
+          }
           throw err;
         }),
         new Promise<never>((_, reject) => {

@@ -570,6 +570,32 @@ const subscriptions = async (peer: ReturnType<typeof connect>) => {
   return JSON.stringify(result);
 };
 
+test('backscroll aborted on disconnect logs the drop, not a fallback delivery', async (t) => {
+  const f = fixture();
+  const errors = t.mock.method(console, 'error', () => {});
+  let started = false;
+  t.mock.method(f.slack, 'fetchHistory', async (_channel: string, opts: { signal?: AbortSignal }) => {
+    const signal = opts.signal;
+    assert.ok(signal, 'backscroll receives an abort signal');
+    return new Promise((_, reject) => {
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      started = true;
+    });
+  });
+  const peer = connect(f.server);
+  try {
+    await peer.ready();
+    f.emit('111.1');
+    await until(() => started, 'backscroll fetch started');
+  } finally {
+    await peer.close();
+  }
+  await until(() => f.cleared.length === 1, 'the dropped message releases its reaction');
+  const lines = logLines(errors).join('\n');
+  assert.match(lines, /Dropped addressed message 111\.1 in C1 before delivery: its peer disconnected/);
+  assert.doesNotMatch(lines, /Couldn't get the backscroll.*delivering without it/);
+});
+
 test('arrival drops name addressed messages with no peer or messaging off, but stay quiet for plain MCP', async (t) => {
   const f = fixture();
   const errors = t.mock.method(console, 'error', () => {});
