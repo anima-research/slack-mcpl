@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  SlackAccessPolicy,
+  SlackAccessPolicy, SlackAccessDenied,
   parseAccessPolicy,
   type AccessConversation,
   type SlackAccessPolicyConfig,
@@ -162,7 +162,7 @@ test('metadata scopes follow the kind, not the ID prefix, and unknown grants den
   ] as const) {
     for (const granted of [undefined, [], scopes.filter((scope) => scope !== needed),
       [needed.toUpperCase()], [needed + ' '], [needed, 'chat:write', 1] as unknown as string[]]) {
-      assert.throws(() => policy.requireReadable(id, metadata, granted), /requires granted scope/);
+      assert.throws(() => policy.requireReadable(id, metadata, granted), granted === undefined ? /scope metadata is unavailable/ : /requires granted scope/);
       assert.throws(() => policy.requireWritable(id, metadata, granted, 'chat:write'));
     }
     assert.doesNotThrow(() => policy.requireReadable(id, metadata, [needed]));
@@ -291,7 +291,7 @@ test('parser and denials identify the failing field or evidence', () => {
   const policy = new SlackAccessPolicy(config());
   assert.throws(() => policy.requireReadable('C1', undefined, scopes), /missing metadata/);
   assert.throws(() => policy.requireReadable('C1', channel('C2'), scopes), /mismatched/);
-  assert.throws(() => policy.requireReadable('C1', { ...channel(), is_member: false }, scopes), /not a confirmed joined/);
+  assert.throws(() => policy.requireReadable('C1', { ...channel(), is_member: false }, scopes), /not in conversation/);
   assert.throws(() => new SlackAccessPolicy(config({ readJoinedChannels: false })).requireReadable('C1', channel(), scopes), /reads are disabled/);
 });
 
@@ -353,7 +353,7 @@ test('bounded diagnostics preserve non-JSON values and scope context', () => {
     assert.ok(err instanceof Error && err.message.length < 500); assert.doesNotMatch(err.message, /[\n\r\u2028\u2029]/); return true;
   });
   const policy = new SlackAccessPolicy(config());
-  assert.throws(() => policy.requireScope(undefined, 'chat:write'), /chat:write.*string array/);
+  assert.throws(() => policy.requireScope(undefined, 'chat:write'), /chat:write.*whoever runs this host.*restart/);
   for (const scope of ['users:read', 'im:write', 'channels:read']) {
     assert.throws(() => policy.requireWritable('C1', channel(), [...scopes, scope], scope), /Unsupported/);
   }
@@ -370,7 +370,7 @@ test('array elements and DM peer metadata are snapshotted before decisions', () 
   assert.equal(policy.mayWrite('C1'), true);
   policy.requireDmUser('U1');
   assert.equal(policy.mayWrite('G1'), false);
-  assert.throws(() => policy.requireReadable('D1', { ...dm(), get user() { return ++peers === 1 ? 'U2' : 'U1'; } }, scopes), /Direct messages.*U2.*not allowed/);
+  assert.throws(() => policy.requireReadable('D1', { ...dm(), get user() { return ++peers === 1 ? 'U2' : 'U1'; } }, scopes), /not an admitted direct message|Direct messages.*U2.*not allowed/);
   assert.deepEqual([channels, users, peers], [1, 1, 1]);
 });
 
@@ -425,5 +425,19 @@ test('missing DM peer is an unverified metadata refusal, not a peer exclusion', 
   for (const run of [() => policy.requireReadable('D1', { ...dm(), user: undefined }, scopes),
     () => policy.requireWritable('D1', { ...dm(), user: undefined }, scopes, 'chat:write')]) {
     assert.throws(run, /invalid DM metadata/);
+  }
+});
+
+test('admission errors distinguish authoritative denials from unverified evidence', () => {
+  const policy = new SlackAccessPolicy(config());
+  for (const [metadata, granted, authoritative] of [
+    [undefined, scopes, false],
+    [{ ...channel(), id: 'C2' }, scopes, false],
+    [{ ...channel(), is_member: undefined }, scopes, false],
+    [{ ...channel(), is_member: false }, scopes, true],
+    [channel(), [], true],
+  ] as const) {
+    assert.throws(() => policy.requireReadable('C1', metadata, granted), (err: unknown) =>
+      err instanceof SlackAccessDenied && err.authoritative === authoritative);
   }
 });

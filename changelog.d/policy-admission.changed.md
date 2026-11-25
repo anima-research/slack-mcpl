@@ -1,0 +1,1 @@
+- Preparation for opt-in access checks on Slack reads, writes and inbound messages. There is no access-policy setting to enable these checks yet.

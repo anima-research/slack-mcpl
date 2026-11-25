@@ -734,6 +734,23 @@ test('registration gives up on a request tried ten times in a row, after nine wa
   assert.equal(h.requests.length, 0);
 });
 
+test('with a policy, a registration give-up keeps its reason and refresh_channels remedy', async (t) => {
+  const log = serverLog(t);
+  const { slack } = fakeSlack(async (_all?: boolean, waitOut?: SlackWaitOut) => {
+    for (let inARow = 1; ; inARow++) await waitOut!(limited(0), inARow);
+  });
+  Object.assign(slack, { hasAccessPolicy: true, isStopping: false });
+  const h = connect(new SlackMcplServer(slack));
+  t.after(() => h.close());
+  await h.initialize();
+  await h.grant();
+  await until(() => log.some((l) => l.includes('Failed to enumerate conversations')), 'the give-up');
+  assert.deepEqual(log.filter((l) => l.includes('Failed to enumerate conversations')), [
+    '[slack-mcpl] Failed to enumerate conversations: Slack rate-limited or failed the same request 10 times in a ' +
+      'row, so registration stopped; refresh_channels can announce the conversations later',
+  ]);
+});
+
 test('refresh_channels answers at once while registration runs, whether it lists or waits', { timeout: 5000 }, async (t) => {
   const listing = deferred<void>();
   const resumed = deferred<void>();
@@ -1039,4 +1056,22 @@ test("refresh_channels leaves out a new DM whose user's name Slack didn't give, 
   assert.equal(second.note, 'Registered 1 newly-visible conversation(s).');
   const labels = (await h.listed()).channels.map((d) => [d.id, d.label]);
   assert.deepEqual(labels, [['slack:C1', '#general (acme)'], ['slack:D1', 'DM: @ann (acme)'], ['slack:D2', 'DM: @bob (acme)']]);
+});
+
+test('policy incomplete registration gives operators distinct retry and access remedies', async t => {
+  const { slack } = fakeSlack();
+  Object.defineProperty(slack, 'hasAccessPolicy', { value: true });
+  t.mock.method(slack, 'listConversations', async () => ({
+    conversations: [conversation()], leftOut: [], admissionFailures: 2,
+  }));
+  const log = serverLog(t);
+  const h = connect(new SlackMcplServer(slack));
+  t.after(() => h.close());
+  await h.initialize();
+  await h.grant();
+  await h.ended();
+  const line = log.find(l => l.includes('registration incomplete')) ?? '';
+  assert.match(line, /2 candidate\(s\).*enumerated 1 eligible/);
+  assert.match(line, /Transient failures.*retry.*Lasting access refusals.*restore/i);
+  assert.doesNotMatch(line, /refresh_channels/);
 });
