@@ -20,7 +20,12 @@
   a current writable share but deletes across all shares; restart or eviction
   from the 1000-entry provenance store requires manual cleanup. Concurrent
   unsharing cannot be made atomic. Legacy DM-name give-up behavior
-  is preserved. In policy conversation listings and directory lookups, a repeated pagination cursor fails instead of looping forever. Legacy cursor behavior is unchanged at this layer.
+  is preserved. With an explicit policy, a repeated pagination cursor in conversation
+  listings, directory lookups and backscroll now fails instead of looping, even on
+  the page where the message or match limit would end the scan; without a policy a
+  repeating cursor runs until the page limit, or a message or match limit that is
+  reached first, ends it with an incomplete result (embedded `findUsers` without a
+  policy has no page limit and repeats it as main did).
 - **Hosts and agents:** policy mode replaces the `fetch_attachment` URL argument
   with `channelId`/`fileId`, carries protected attachment ID hints, offers
   `send_dm` only when effective policy permits DM writes, and lists only freshly admitted conversations. `includeNonMember`
@@ -28,4 +33,4 @@
   unset to retain the legacy interfaces; see the migration guide before enabling it.
 
 - Cheap activation-specific local vetoes run before policy delivery turns are allocated, retaining denial accounting without queued preparation.
-- Policy activation changes list_channels/refresh_channels descriptions and the includeNonMember schema guidance, the subscribe_channel/unsubscribe_channel descriptions and results, and the slack.subscriptions feature-set description; hosts should refresh cached tool definitions and account for the changed prompt bytes. Startup refusals omit raw policy values and invalid legacy switch values to avoid accidental credential disclosure. The startup summary states whether joined-channel reads are on.
+- Policy activation changes list_channels/refresh_channels descriptions, the includeNonMember schema guidance, the subscribe_channel/unsubscribe_channel descriptions and results, and the slack.subscriptions feature-set description (mentions and DMs bypass subscriptions but remain subject to access admission and delivery); hosts should refresh cached tool definitions and account for the changed prompt bytes. Startup refusals omit raw policy values and invalid legacy switch values to avoid accidental credential disclosure. The startup summary states whether joined-channel reads are on.

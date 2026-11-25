@@ -5,7 +5,7 @@ import { SlackMcplServer } from '../src/server.js';
 import { accessContextMessage, withAccessContext } from '../src/access-policy.js';
 import { failedAccessAdmission, postLeftBy } from '../src/slack-adapter.js';
 import { FULL_GRANT, connectHost, initialize } from './harness.js';
-import { accessTest as test, accessFixture, joined } from './adapterAccessFixture.js';
+import { accessTest as test, accessFixture, joined, ownedTest } from './adapterAccessFixture.js';
 
 for (const kind of ['fresh', 'reused', 'frozen', 'rethrown'] as const) {
   test(`public DM ${kind} client error isolates admission/context and uncertain-post provenance`, async t => {
@@ -132,4 +132,18 @@ test('public tools discard old operation context when a client rethrows a contex
   assert.equal(result.content[0].text.match(/Nothing was posted/g)?.length, 1, 'the outcome is stated once');
   assert.doesNotMatch(result.content[0].text, /Nothing was fetched/);
   assert.equal(source.message, previous, 'a later call must not mutate the earlier occurrence');
+});
+
+ownedTest('failedRequest walks causes only through a policy occurrence; legacy lookup stays direct as on main', async t => {
+  const { fakeSlackApi } = await import('./slackApi.js');
+  const { SlackWebClient, SLACK_CLIENT_OPTIONS, failedRequest } = await import('../src/slack-adapter.js');
+  const api = await fakeSlackApi(); t.after(() => api.close());
+  api.answerFor('conversations.info', { status: 500, body: { ok: false } });
+  const legacy = await new SlackWebClient('xoxb', { ...SLACK_CLIENT_OPTIONS, slackApiUrl: api.url }).conversations.info({ channel: 'C1' }).catch(e => e);
+  assert.equal(failedRequest(legacy), 'conversations.info');
+  assert.equal(failedRequest(new Error('later post', { cause: legacy })), undefined, 'main did not attribute a wrapper to its cause');
+  const f = accessFixture(); t.after(() => f.adapter.stop());
+  f.state.infoError = Object.assign(new Error('down'), { code: 'slack_webapi_http_error', statusCode: 503 });
+  const occurrence = await f.adapter.getConversationMeta('C1').catch(e => e);
+  assert.equal(failedRequest(new Error('embedder wrapper', { cause: occurrence })), 'conversations.info');
 });

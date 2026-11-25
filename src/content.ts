@@ -7,6 +7,7 @@
  * Salvaged from zulip-mcp PR #8 (multi-platform branch), Slack halves only.
  */
 
+import { DEFAULT_PAGINATION, isHistoryRow, pageLimit, pageProblem } from './pagination.js';
 import type { PolicyFileRef } from './file-access.js';
 import { channelShown, mimeShown, nameShown } from './framing.js';
 
@@ -438,6 +439,14 @@ export interface SlackHistoryClient {
   };
 }
 
+/** Why fetchSlackHistory refused a policy page (pageProblem). */
+const HISTORY_PAGE_REFUSALS = {
+  container: 'Slack returned a malformed history page. Retry once; if it repeats, ask whoever runs this host to investigate Slack pagination.',
+  row: 'Slack returned a malformed history row (not a message with a placeable timestamp). Retry once; if it repeats, ask whoever runs this host to investigate the Slack response.',
+  cursor: 'Slack returned a malformed history pagination cursor. Retry once; if it repeats, ask whoever runs this host to investigate Slack pagination.',
+  cycle: 'Slack history cursor cycle (repeated pagination cursor). Retry once; if it repeats, ask whoever runs this host to investigate Slack pagination.',
+} as const;
+
 /**
  * Fetch conversations.history with cursor pagination. The API returns
  * newest-first pages and next_cursor walks toward older messages, so draining
@@ -455,11 +464,18 @@ export async function fetchSlackHistory(
     latest?: string;
     inclusive?: boolean;
     maxMessages: number;
+    maxPages?: number;
+    /** Policy callers refuse cycles and malformed pages; legacy callers stop via their page cap. */
+    rejectCursorCycles?: boolean;
   },
-): Promise<{ messages: SlackHistoryMessage[]; truncated: boolean }> {
+): Promise<{ messages: SlackHistoryMessage[]; truncated: boolean; stopReason?: 'message_limit' | 'page_limit' }> {
+  const maxPages = pageLimit(params.maxPages === undefined ? DEFAULT_PAGINATION.backscroll : params.maxPages, 'maxPages');
+  let pages = 0;
   const collected: SlackHistoryMessage[] = [];
   let cursor: string | undefined;
   let truncated = false;
+  let stopReason: 'message_limit' | 'page_limit' | undefined;
+  const cursors = new Set<string>();
   do {
     const result = await client.conversations.history({
       channel: params.channel,
@@ -469,12 +485,23 @@ export async function fetchSlackHistory(
       limit: Math.min(200, params.maxMessages - collected.length),
       cursor,
     });
+    pages++;
+    // Policy callers validate the whole page (pageProblem) before using any
+    // of it or stopping at the message limit: a missing container, a row that
+    // isn't a message with a placeable timestamp, a non-string or repeated
+    // cursor is refused, never shaped or treated as the end.
+    if (params.rejectCursorCycles) {
+      const problem = pageProblem(result.messages, result.response_metadata?.next_cursor as unknown, cursors, isHistoryRow);
+      if (problem) throw new Error(`No backscroll context was returned: ${HISTORY_PAGE_REFUSALS[problem]}`);
+    }
     collected.push(...((result.messages ?? []) as SlackHistoryMessage[]));
     cursor = result.response_metadata?.next_cursor || undefined;
     if (cursor && collected.length >= params.maxMessages) {
       truncated = true;
+      stopReason = 'message_limit';
       cursor = undefined;
     }
+    if (cursor && pages >= maxPages) { truncated = true; stopReason = 'page_limit'; break; }
   } while (cursor);
-  return { messages: collected.reverse(), truncated };
+  return { messages: collected.reverse(), truncated, ...(stopReason ? { stopReason } : {}) };
 }
