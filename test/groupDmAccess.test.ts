@@ -153,10 +153,10 @@ test('group listing asks for mpim only when named and filters fresh membership a
   const missing = fixture({ scopes: scopes.filter((s) => s !== 'mpim:read') });
   missing.state.listed = [group()];
   assert.deepEqual((await missing.adapter.listConversations()).conversations, []);
-  assert.doesNotMatch(JSON.stringify(missing.calls[0].args), /mpim/);
+  assert.ok(!missing.calls.some(c => c.method === 'list' && /mpim/.test(JSON.stringify(c.args))));
   const none = fixture({ config: config({ groupDms: [] }) });
   await none.adapter.listConversations();
-  assert.doesNotMatch(JSON.stringify(none.calls[0].args), /mpim/);
+  assert.ok(!none.calls.some(c => c.method === 'list' && /mpim/.test(JSON.stringify(c.args))));
 });
 
 test('group inbound uses fresh admission and mpim history, not event labels or joined-channel setting', async () => {
@@ -238,7 +238,18 @@ for (const legacy of [false, true]) {
     test(`real upload tool and rollback file delete: legacy=${legacy}, revoke group=${revoke}`, async (t) => {
       const f = fixture({ legacy });
       const endpoint = await uploadEndpoint();
-      f.state.uploadUrl = `${endpoint.url}/F1`;
+      f.state.uploadUrl = legacy ? `${endpoint.url}/F1` : 'https://files.slack.com/upload/F1';
+      if (!legacy) {
+        const realFetch = globalThis.fetch;
+        t.mock.method(globalThis, 'fetch', async (url: string | URL | Request, init?: RequestInit) => {
+          assert.equal(url, f.state.uploadUrl);
+          return realFetch(`${endpoint.url}/F1`, init);
+        });
+        f.web.files.info = async () => {
+          f.calls.push({ method: 'fileInfo', args: { file: 'F1' } });
+          return { file: { mode: 'hosted', id: 'F1', groups: ['G1'] } };
+        };
+      }
       const h = connectHost(new SlackMcplServer(f.adapter));
       t.after(() => h.close());
       await initialize(h, true);
@@ -259,11 +270,13 @@ for (const legacy of [false, true]) {
         featureSet: MESSAGING_FEATURE_SET, checkpoint: uploaded.state.parent,
       }) as { success: boolean; reason?: string };
       assert.equal(rollback.success, true);
+      if (legacy) assert.equal(rollback.reason, undefined);
+      else if (!revoke) assert.match(rollback.reason ?? '', /deletion removes the file from every conversation it is shared in/);
       if (!legacy && revoke) {
         assert.deepEqual(f.methods(), []);
         assert.match(rollback.reason ?? '', /0\/1 files deleted/);
       } else {
-        assert.deepEqual(f.methods(), legacy ? ['deleteFile'] : ['info', 'deleteFile']);
+        assert.deepEqual(f.methods(), legacy ? ['deleteFile'] : ['info', 'fileInfo', 'deleteFile']);
         assert.equal(JSON.stringify(f.calls.at(-1)), '{"method":"deleteFile","args":{"file":"F1"}}');
       }
     });
@@ -360,23 +373,23 @@ test('list_channels labels named groups and reports write pins; registration gui
 });
 
 for (const disableDms of [false, true]) {
-  test(`group DM legacy-switch intersection: disableDms=${disableDms}`, async () => {
+  test(`group DM legacy-switch intersection: disableDms=${disableDms}`, async (t) => {
     // A disjoint legacy peer list must not filter a multi-peer conversation.
     const options = { disableDms, dmUsers: ['UOTHER'] };
-    const endpoint = await uploadEndpoint();
+    t.mock.method(globalThis, 'fetch', async () => new Response('OK'));
     const listing = fixture(options);
     listing.state.listed = [group()];
     const result = await listing.adapter.listConversations();
     assert.deepEqual(result.conversations.map((c) => c.id), disableDms ? [] : ['G1']);
-    assert.equal(JSON.stringify(listing.calls[0].args).includes('mpim'), !disableDms);
+    assert.equal(JSON.stringify(listing.calls[0]?.args ?? {}).includes('mpim'), !disableDms);
     for (const run of [
       ...operations.map(([, , run]) => run),
       (a: SlackAdapter) => a.getConversationMeta('G1'),
-      (a: SlackAdapter) => a.deleteFile('G1', 'F1'),
+      async (a: SlackAdapter) => { if (!disableDms) await a.uploadFile('G1', { filename: 'x', data: Buffer.from('x') }); await a.deleteFile('G1', 'F1'); },
       (a: SlackAdapter) => a.uploadFile('G1', { filename: 'note.txt', data: Buffer.from('hello') }),
     ]) {
       const f = fixture(options);
-      f.state.uploadUrl = `${endpoint.url}/F1`;
+      f.state.uploadUrl = 'https://files.slack.com/upload';
       if (disableDms) {
         await assert.rejects(run(f.adapter), /turned off on this host/);
         assert.deepEqual(f.methods(), ['info']);
@@ -421,7 +434,8 @@ test('missing mpim scope is a listing omission, not a disabled-DM switch', async
 
 test('R3-1 named group with incomplete listing flags gets fresh admission', async () => {
   const f = fixture();
-  f.state.listed = [{ id: 'G1', is_member: false }];
+  // Without joined-channel reads only the mpim type is requested, so the row is an mpim one.
+  f.state.listed = [{ id: 'G1', is_mpim: true, is_member: false }];
   assert.deepEqual((await f.adapter.listConversations()).conversations.map(c => c.id), ['G1']);
   assert.deepEqual(f.methods(), ['list', 'info']);
 });
@@ -500,3 +514,12 @@ for (const granted of ['mpim:history', 'groups:history'] as const) {
     else assert.match(text, /lacks the history grant fetch_history needs/);
   });
 }
+
+test('without joined-channel reads, a listing neither requests nor paces ordinary channels', async () => {
+  const f = fixture();
+  f.state.listed = [joined('C1'), joined('C2'), group()];
+  assert.deepEqual((await f.adapter.listConversations()).conversations.map(c => c.id), ['G1']);
+  const list = f.calls.find(c => c.method === 'list')!;
+  assert.doesNotMatch((list.args as { types: string }).types, /public_channel|private_channel/);
+  assert.deepEqual(f.calls.filter(c => c.method === 'info').map(c => c.args), [{ channel: 'G1' }], 'no paced check of an excluded channel');
+});
