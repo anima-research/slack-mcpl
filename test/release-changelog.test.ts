@@ -5,6 +5,7 @@ import {
   cpSync,
   mkdirSync,
   mkdtempSync,
+  lstatSync,
   readdirSync,
   readFileSync,
   rmSync,
@@ -257,4 +258,19 @@ test("importing the script runs nothing, whatever argv[1] names", () => {
   assert.equal(stdout, "");
   assert.equal(changelog(dir), before.changelog);
   assert.deepEqual(pending(dir), before.pending);
+});
+
+// Exercise the release collector, not a parallel approximation of its grammar.
+test("pending changelog bodies pass the real release collector", () => {
+  const pending = fileURLToPath(new URL("../changelog.d/", import.meta.url));
+  const fragments = Object.fromEntries(readdirSync(pending)
+    .filter(name => name !== "README.md")
+    .map(name => {
+      assert.ok(lstatSync(join(pending, name)).isFile(), `${name} must be a regular fragment file`);
+      return [name, readFileSync(join(pending, name), "utf8")];
+    }));
+  if (!Object.keys(fragments).length) return;
+  const dir = setup({ fragments });
+  assert.doesNotThrow(() => release(dir));
+  assert.deepEqual(readdirSync(join(dir, "changelog.d")), ["README.md"]);
 });

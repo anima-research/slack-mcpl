@@ -263,3 +263,27 @@ export const toolDefinitions: ToolDefinition[] = [
     },
   },
 ];
+
+/** Keep the legacy tools/list surface unchanged when policy is absent. */
+export function policyListingTool(tool: ToolDefinition, policy: boolean): ToolDefinition {
+  if (policy && tool.name === 'refresh_channels') return { ...tool, description: 'Re-scan conversations this bot can currently access and register newly discovered eligible ones. Access restrictions can leave conversations out. Already registered IDs are skipped without rechecking access. Each new candidate needs a serial fresh metadata request, released through the inbound admission pacer (at least 1.2 seconds apart, shared with inbound events). If a rate limit or the 25-second call deadline stops a conversations.list page or candidate check, the scan returns the rows admitted so far with an explicit incomplete notice. With fast responses and no other traffic about 13 candidates fit one call, and a new call starts over. Background registration also shares inbound pacing, has no call deadline, and announces only after its scan finishes.' };
+  if (!policy || tool.name !== 'list_channels') return tool;
+  return {
+    ...tool,
+    description: 'List only freshly admitted policy conversations. includeNonMember has no effect in policy mode: unjoined public channels are never listed. Each eligible candidate needs a serial fresh metadata request, released through the inbound admission pacer (at least 1.2 seconds apart, shared with inbound events). If a rate limit or the 25-second call deadline stops a conversations.list page or candidate check, the scan returns the rows admitted so far with an explicit incomplete notice. With fast responses and no other traffic about 13 candidates fit one call, and a new call starts over.',
+    inputSchema: { ...tool.inputSchema, properties: { ...tool.inputSchema.properties,
+      includeNonMember: { type: 'boolean', description: 'Has no effect in policy mode; unjoined public channels are never listed.' },
+    } },
+  };
+}
+
+/** Subscription qualifiers apply only to the explicit policy surface. */
+export function policySubscriptionTool(tool: ToolDefinition, policy: boolean): ToolDefinition {
+  if (!policy) return tool;
+  if (tool.name === 'subscribe_channel') return { ...tool, description: tool.description!.replace(
+    'Direct mentions and DMs always come through regardless of subscriptions;',
+    'Direct mentions and DMs bypass subscriptions but remain subject to access admission and successful delivery;') };
+  if (tool.name === 'unsubscribe_channel') return { ...tool, description: tool.description!.replace(
+    'from there will still arrive.', 'from there remain eligible, subject to access admission and successful delivery.') };
+  return tool;
+}

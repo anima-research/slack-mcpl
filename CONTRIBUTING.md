@@ -154,7 +154,8 @@ release and 24, and on macos at 22.12.0 and the newest release. Every leg
 installs with `npm ci`, builds (the build typechecks the sources and the
 tests), and starts the built bin without credentials, which must exit 1
 with the missing-token line as all of its stderr and nothing on stdout.
-Ubuntu at 22.12.0 also runs the whole suite. Since every leg installs with
+Every ubuntu leg and macos at the newest release also run the whole suite;
+macos at 22.12.0 does not. Since every leg installs with
 `npm ci`, a `package-lock.json` that is out of sync with `package.json`,
 or that only carries one platform's native packages, fails the build.
 Regenerate the lock from a clean tree (`rm -rf node_modules

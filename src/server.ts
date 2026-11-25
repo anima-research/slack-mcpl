@@ -1,3 +1,4 @@
+import { SlackAccessDenied, SlackScopeEvidenceError } from './access-policy.js';
 /**
  * SlackMcplServer — main MCPL server orchestrator.
  *
@@ -9,6 +10,8 @@
  * salvaged from zulip-mcp PR #8.
  */
 
+import { listingTruncationNote, type PageTruncation } from './pagination.js';
+import { isPolicyFileRef, policyFileNote, type PolicyFileRef } from './file-access.js';
 import {
   McplConnection,
   textContent,
@@ -47,24 +50,27 @@ import {
   STATUS_REFRESH_MS,
   assertRequestFits,
   fileLeftByUpload,
+  failedAccessAdmission,
   leftOutNote,
   outsideCallTime,
   postLeftBy,
   refusedForGood,
+  policyFailureSummary,
   slackRefusal,
   withCallTime,
   type SlackAdapter,
   type SlackMessageData,
+  type SlackListing,
   type SlackWait,
 } from './slack-adapter.js';
-import { toolDefinitions } from './tools.js';
+import { policySubscriptionTool, policyListingTool, toolDefinitions } from './tools.js';
 import { withToolClasses } from './tool-classes.js';
 import { buildFeatureSets, buildServerCapabilities, featureSetForTool, MESSAGING_FEATURE_SET, HISTORY_FEATURE_SET, TYPING_FEATURE_SET } from './feature-sets.js';
 import { ChannelManager, mcplChannelId, parseMcplChannelId, toDescriptor } from './channels.js';
 import { StateTracker, type UploadedFile } from './state.js';
 import { CapabilityGrant } from './grant.js';
 import { McplRpcError, capabilityDenied } from './errors.js';
-import { explainSlackError } from './slack-errors.js';
+import { explainSlackError, isTransientSlackFailure } from './slack-errors.js';
 import { channelShown, mimeShown, nameShown, quotedLabel, senderText, toolResultJson, urlShown } from './framing.js';
 import { CHANNEL_IDS, NOTHING_RETURNED, PARENT_IDS, refuseUnknownArguments } from './history-read.js';
 import {
@@ -132,6 +138,7 @@ const ARGUMENT_SOURCES = {
   userId: "find_user returns each person's userId.",
   emoji: 'Pass an emoji name, such as thumbsup.',
   url: ATTACHMENT_URL_SOURCE,
+  fileId: 'Take the Slack file ID from an attachment reference.',
   query: "Pass part of a person's name.",
   content: "Pass the message's text.",
   filename: 'Pass the name the file is shown with in Slack, with its extension, such as positions.csv.',
@@ -167,9 +174,11 @@ export function backscrollLine(m: {
   timestamp: Date;
   authorName: string;
   content: string;
-  attachments: Array<{ name: string }>;
+  attachments: Array<PolicyFileRef | { name: string; channelId?: never }>;
+  /** Explicit policy rendering; unrelated legacy metadata never selects it. */
+  policyAttachments?: boolean;
 }): string {
-  const att = m.attachments.length > 0 ? ` [attachments: ${m.attachments.map((a) => nameShown(a.name)).join(', ')}]` : '';
+  const att = m.attachments.length > 0 ? ` [attachments: ${m.attachments.map((a) => m.policyAttachments && isPolicyFileRef(a) ? policyFileNote(a) : nameShown(a.name)).join(', ')}]` : '';
   const thread = m.threadTs ? ` thread=${m.threadTs}` : '';
   return `[${m.timestamp.toISOString()}${thread} id=${m.id}] ${nameShown(m.authorName)}${att}: ${senderText(m.content)}`;
 }
@@ -177,12 +186,16 @@ export function backscrollLine(m: {
 /** Context fetched for addressed delivery before any accepted delivery in this conversation. */
 export function backscrollBlock(
   messages: Parameters<typeof backscrollLine>[0][],
-  where: { channelName?: string; isDM: boolean },
+  where: { channelName?: string; isDM: boolean; isGroupDM?: boolean; truncated?: boolean; policyAttachments?: boolean },
   historyGranted: boolean = false,
 ): string {
   const attrs: string[] = [];
-  if (where.channelName && !where.isDM) attrs.push(`channel=${quotedLabel(`#${Array.from(where.channelName).slice(0, 100).join('')}`)}`);
+  if (where.channelName && !where.isDM) {
+    const label = Array.from(where.channelName).slice(0, 100).join('');
+    attrs.push(`channel=${quotedLabel(where.isGroupDM ? label : `#${label}`)}`);
+  }
   if (where.isDM) attrs.push('dm="true"');
+  if (where.isGroupDM) attrs.push('group_dm="true"');
   // Keep a contiguous newest window. An oversized body gets an in-position
   // placeholder rather than a silent gap; if even that cannot fit, summarize
   // the older prefix. Both forms count against the same hard byte budget.
@@ -192,10 +205,14 @@ export function backscrollBlock(
   const lines: string[] = [];
   const summary = (count: number, before?: string) =>
     `[${count} older backscroll ${count === 1 ? 'message' : 'messages'} not shown${historyAvailable ? '; try fetch_history' + (before ? ' latest=' + before : '; follow nextCursor until the omitted window is reached') : unavailable}]`;
-  const frame = (count: number) => `<backscroll ${[...attrs, `count="${count}"`].join(' ')}>\n\n</backscroll>`;
-  const rendered = messages.map(backscrollLine);
-  const complete = [`<backscroll ${[...attrs, `count="${messages.length}"`].join(' ')}>`,
-    ...rendered, '</backscroll>'].join('\n');
+  const opening = (count: number) => `<backscroll ${[...attrs, `count="${count}"`, ...(where.truncated ? ['truncated="true"'] : [])].join(' ')}>`;
+  const ending = [
+    ...(where.truncated ? ['Backscroll is incomplete; older messages may be missing.' +
+      (historyAvailable ? ' Use fetch_history to inspect earlier history.' : '')] : []),
+    '</backscroll>',
+  ];
+  const rendered = messages.map(m => where.policyAttachments ? backscrollLine({ ...m, policyAttachments: true }) : backscrollLine(m));
+  const complete = [opening(messages.length), ...rendered, ...ending].join('\n');
   if (Buffer.byteLength(complete) <= maxBytes) return complete;
   let bytes = 0;
   let oldest = messages.length;
@@ -203,7 +220,7 @@ export function backscrollBlock(
     const message = messages[i];
     const line = rendered[i];
     const size = Buffer.byteLength(line);
-    const reserved = Buffer.byteLength(frame(lines.length + 1)) - 1 +
+    const reserved = Buffer.byteLength([opening(lines.length + 1), ...ending].join('\n')) +
       (i ? Buffer.byteLength(summary(i, message.id)) + 1 : 0);
     let shown = line;
     if (bytes + size + 1 + reserved > maxBytes) {
@@ -215,10 +232,9 @@ export function backscrollBlock(
     bytes += shownBytes;
     oldest = i;
   }
-  attrs.push(`count="${lines.length}"`);
-  return [`<backscroll ${attrs.join(' ')}>`,
+  return [opening(lines.length),
     ...(oldest ? [summary(oldest, messages[oldest]?.id)] : []),
-    ...lines.reverse(), '</backscroll>'].join('\n');
+    ...lines.reverse(), ...ending].join('\n');
 }
 
 let backscrollLimit: number | undefined;
@@ -234,6 +250,37 @@ function readBackscrollLimit(): number {
   return 50;
 }
 
+/** Policy diagnostics include the root needed to recover a thread reply. */
+function deliveryLocation(msg: SlackMessageData, includeThread: boolean): string {
+  const root = includeThread && msg.threadTs !== msg.id ? msg.threadTs : undefined;
+  return `${msg.id} in ${msg.channelId}${root ? ` (thread ${root})` : ''}`;
+}
+
+/** Content-free policy summary of a host request's failure: the host, not
+ *  Slack, refused or failed it. */
+export function hostFailureSummary(err: unknown): string {
+  const code = (err as { code?: unknown } | null)?.code;
+  // The host's own message may echo delivered content, so only its code is kept.
+  return `host request failed${typeof code === 'number' ? ` (code ${code})` : ''}; the host's reason is withheld from policy logs, ` +
+    'and Slack will not replay the message: check the host\'s logs, then recover it with fetch_history or fetch_thread';
+}
+
+/** The note a foreground policy listing carries when it stopped before
+ *  checking every candidate: the conversations it found are admitted and usable. */
+export function admissionIncompleteNote(stop: SlackListing['admissionStop'], refresh = false): string {
+  if (stop?.reason === 'call_deadline') {
+    const deadline = "Incomplete: this call's 25-second deadline left no room to continue listing (candidate checks share " +
+      'inbound admission pacing, at least 1.2 seconds apart); ';
+    if (refresh) return deadline + 'more conversations may exist. A new refresh skips already registered IDs but does not resume this scan.';
+    // No continuation: a scan larger than one call never reaches its tail.
+    return deadline + 'conversations found so far are usable but more may exist. ' +
+      'A new call starts over and stops near the same place, so conversations past it may never be listed or registered ' +
+      'by calling again; if one you need is missing, ask whoever runs this host for its ID.';
+  }
+  const after = stop?.retryAfterSeconds !== undefined ? ` after ${Math.ceil(stop.retryAfterSeconds)} seconds` : ' later';
+  return `Incomplete: the conversation scan was rate-limited; conversations found so far are usable but more may exist. Retry${after}; a new call starts over.`;
+}
+
 export class SlackMcplServer {
   private conn: McplConnection | null = null;
   private mcplEnabled = false;
@@ -245,6 +292,7 @@ export class SlackMcplServer {
    *  ends; a registration it superseded may still be finishing after that. A
    *  refresh_channels answers at once while it's set. */
   private registering: number | undefined;
+  private registrationIncomplete?: PageTruncation;
   private stateTracker = new StateTracker();
   /** Serial delivery within a conversation; different conversations stay independent. */
   private forwarding = new Map<string, Promise<void>>();
@@ -252,8 +300,8 @@ export class SlackMcplServer {
   private backscrollAborts = new Set<AbortController>();
 
   /** Conversations the agent has opted into for ambient (non-mention,
-   *  non-DM) message delivery. Mentions and DMs always come through
-   *  regardless — this only gates passive awareness of channel chatter.
+   *  non-DM) message delivery. Mentions and DMs bypass this filter (an access
+   *  policy can still drop them) — this only gates passive awareness of channel chatter.
    *  Persisted to `SLACK_SUBSCRIPTIONS_FILE` (a JSON array of conversation
    *  IDs) so the list survives restarts. */
   private subscribedChannels = new Set<string>();
@@ -332,6 +380,7 @@ export class SlackMcplServer {
     // context belong to the peer that established them.
     this.mcplEnabled = false;
     this.grant.reset();
+    this.registrationIncomplete = undefined;
     this.channelManager = new ChannelManager();
     this.readOnlyNoted.clear();
     this.forwardedWatermark.clear();
@@ -379,6 +428,7 @@ export class SlackMcplServer {
       this.backscrollAborts.clear();
       // A failed handshake ends here too: close the connection, so a TCP
       // client isn't left on a socket nobody serves.
+      this.registrationIncomplete = undefined;
       conn.close();
       this.lastIncomingRoot.clear();
       void this.slack.resetThreadStatuses();
@@ -412,7 +462,7 @@ export class SlackMcplServer {
     // the host publishes text-only turns to the conversational locus via
     // channels/publish, so no contextHooks are declared here (same rationale
     // as discord-mcpl; see LOCUS-ROUTING-DESIGN.md).
-    const serverCaps: McplCapabilities = buildServerCapabilities();
+    const serverCaps: McplCapabilities = buildServerCapabilities(this.slack.hasAccessPolicy);
 
     const capabilities: InitializeCapabilities = {
       tools: {},
@@ -446,8 +496,16 @@ export class SlackMcplServer {
    *  connection has no host to register conversations with. Neither changes
    *  during a connection, as a grant can. */
   private offeredTools() {
-    return toolDefinitions.filter((t) =>
-      (t.name !== 'send_dm' || this.slack.dmsWritable) && (t.name !== 'refresh_channels' || this.mcplEnabled));
+    return toolDefinitions.map(t => policySubscriptionTool(policyListingTool(t, this.slack.hasAccessPolicy), this.slack.hasAccessPolicy)).filter((t) =>
+      (t.name !== 'send_dm' || this.slack.dmsWritable) && (t.name !== 'refresh_channels' || this.mcplEnabled)).map((t) =>
+        t.name === 'fetch_attachment' && this.slack.hasAccessPolicy ? {
+          ...t,
+          description: 'Fetch a Slack-hosted file through a freshly verified admitted conversation. Pass channelId and fileId from an attachment reference, not a URL. Returns bytes inline: images as image blocks, text-ish files decoded, other binary as base64. Max 5 MiB.',
+          inputSchema: { type: 'object' as const, properties: {
+            channelId: { type: 'string', description: 'Conversation ID from the attachment reference' },
+            fileId: { type: 'string', description: 'Slack file ID from the attachment reference' },
+          }, required: ['channelId', 'fileId'] },
+        } : t);
   }
 
   private requireMcpl(): void {
@@ -505,6 +563,7 @@ export class SlackMcplServer {
           const couldRegister = this.grant.has('channels.register');
           const receipt = this.applyFeatureSetsUpdate(params as unknown as FeatureSetsUpdateParams, 'request');
           conn.sendResponse(req.id, receipt);
+          if (!this.grant.has('channels.register')) this.registrationIncomplete = undefined;
           // channels/register needs the channels.register capability. Register
           // when the grant first allows it, and again if a later policy turns
           // it from denied to granted. The receipt above is sent first.
@@ -512,7 +571,7 @@ export class SlackMcplServer {
             // A registration that throws past its own catches is logged here,
             // so it doesn't end the process.
             void outsideCallTime(() => this.registerSlackChannels())
-              .catch((err) => console.error('[slack-mcpl] Channel registration failed:', err));
+              .catch((err) => console.error('[slack-mcpl] Channel registration failed:', this.slack.hasAccessPolicy ? policyFailureSummary(err) : err));
           }
           break;
         }
@@ -873,7 +932,7 @@ export class SlackMcplServer {
           await this.slack.addReaction(channelId, messageId, emoji);
         } catch (err) {
           // The reaction the call asks for is there, which is its intent.
-          if (slackRefusal(err) === 'already_reacted') {
+          if (!failedAccessAdmission(err) && slackRefusal(err) === 'already_reacted') {
             return `Nothing changed: message ${messageId} already has this bot's ${emoji} reaction.`;
           }
           throw err;
@@ -898,7 +957,7 @@ export class SlackMcplServer {
         try {
           await this.slack.deleteMessage(channelId, messageId);
         } catch (err) {
-          if (slackRefusal(err) === 'message_not_found') this.stateTracker.forgetSent(channelId, messageId);
+          if (!failedAccessAdmission(err) && !(err instanceof SlackAccessDenied) && slackRefusal(err) === 'message_not_found') this.stateTracker.forgetSent(channelId, messageId);
           throw err;
         }
         this.stateTracker.forgetSent(channelId, messageId);
@@ -906,11 +965,11 @@ export class SlackMcplServer {
       }
 
       case 'list_channels': {
-        const { conversations, leftOut } = await this.slack.listConversations(args.includeNonMember === true);
+        const { conversations, leftOut, admissionFailures, admissionStop, truncation } = await this.slack.listConversations(args.includeNonMember === true);
         const listed = conversations.map((c) => ({
           id: c.id,
           kind: c.kind,
-          name: c.kind === 'dm' ? `DM: @${c.name}` : c.name,
+          name: c.kind === 'dm' ? `DM: @${c.name}` : this.slack.hasAccessPolicy && c.policyGroupDm ? `Group DM: ${nameShown(c.name)}` : c.name,
           ...(c.topic ? { topic: c.topic } : {}),
           ...(c.kind === 'channel' || c.kind === 'private_channel' ? { isMember: c.isMember } : {}),
           writable: this.slack.canWrite(c.id),
@@ -920,8 +979,11 @@ export class SlackMcplServer {
         // from "the token can't read them"; one that left none out answers
         // with the list alone. Types the host has turned off aren't listed
         // or noted, as the tool's description says.
-        if (leftOut.length === 0) return listed;
-        return { _content: [textContent(toolResultJson(listed)), textContent(leftOutNote(leftOut))] };
+        if (leftOut.length === 0 && !admissionFailures && !truncation) return listed;
+        return { _content: [textContent(toolResultJson(listed)),
+          ...(leftOut.length ? [textContent(leftOutNote(leftOut))] : []),
+          ...(truncation ? [textContent(listingTruncationNote(truncation))] : []),
+          ...(admissionFailures ? [textContent(admissionIncompleteNote(admissionStop))] : [])] };
       }
 
       case 'refresh_channels':
@@ -944,13 +1006,23 @@ export class SlackMcplServer {
 
       case 'find_user': {
         const query = this.requireString(args, 'query');
-        const matches = await this.slack.findUsers(query);
+        const result = await this.slack.findUsersBounded(query);
+        const matches = Array.isArray(result) ? result : result.matches;
+        const incomplete = Array.isArray(result) ? {} : {
+          truncated: true, stopReason: result.reason,
+          note: (matches.length === 0 ? 'No matching users were found in the portion scanned; the directory search is incomplete. ' : 'The directory search is incomplete. ') +
+            (result.reason === 'match_limit' ? `Stopped at ${result.limit} matches. Try a narrower query.`
+              : `Stopped after ${result.pages} Slack pages. Ask the operator to review the pagination limit; a narrower query still starts at the same directory prefix and may miss unseen users.`),
+        };
         if (matches.length === 0) {
           return {
             found: false,
+            ...incomplete,
             note:
-              `No users matched "${query}". find_user matches part of a username, real name or display name, ` +
-              'ignoring case, and leaves out bots and deactivated accounts. Try a shorter part or another spelling.',
+              (Array.isArray(result) ? `No users matched "${query}". ` : `${incomplete.note} For "${query}", `) +
+              'find_user matches part of a username, real name or display name, ' +
+              'ignoring case, and leaves out bots and deactivated accounts.' +
+              (Array.isArray(result) ? ' Try a shorter part or another spelling.' : ''),
           };
         }
         return {
@@ -962,14 +1034,27 @@ export class SlackMcplServer {
             displayName: u.displayName,
             mentionSyntax: `<@${u.userId}>`,
           })),
+          ...incomplete,
         };
       }
 
       case 'fetch_attachment': {
         // The bot token goes only to files.slack.com, never to workspace hosts:
-        // parseSlackAttachmentUrl checks the url given, and fetch() drops
-        // Authorization on a redirect to another origin (fetchAttachment.test.ts).
-        const url = parseSlackAttachmentUrl(this.requireString(args, 'url'));
+        // legacy parsing checks the supplied URL; policy resolves it from fresh
+        // file evidence and refuses redirects. Legacy fetch strips cross-origin auth.
+        const policy = this.slack.hasAccessPolicy;
+        let url: URL;
+        if (policy) {
+          if ('url' in args) throw new Error('Nothing was fetched: use channelId and fileId from the attachment reference, not a URL');
+          for (const key of ['channelId', 'fileId']) {
+            if (typeof args[key] !== 'string' || !args[key]) throw new Error(`Nothing was fetched: ${key} must be a nonempty string from the attachment reference (received ${args[key] === null ? 'null' : args[key] === '' ? 'an empty string' : typeof args[key]})`);
+          }
+          const channelId = args.channelId as string;
+          const fileId = args.fileId as string;
+          url = await this.slack.resolveFileDownload(channelId, fileId);
+        } else {
+          url = parseSlackAttachmentUrl(this.requireString(args, 'url'));
+        }
         const botToken = process.env.SLACK_BOT_TOKEN || '';
         const headers: Record<string, string> = botToken
           ? { Authorization: `Bearer ${botToken}` }
@@ -992,6 +1077,7 @@ export class SlackMcplServer {
         // call.
         assertRequestFits('The download from files.slack.com', SLACK_CLIENT_OPTIONS.timeout);
         return toFetchResult(await fetchAttachmentBytes(url.toString(), fileName, {
+          ...(policy ? { redirect: 'error' as const } : {}),
           headers,
           signal: AbortSignal.timeout(SLACK_CLIENT_OPTIONS.timeout),
         }));
@@ -1002,7 +1088,7 @@ export class SlackMcplServer {
         const channelId = this.requireString(args, 'channelId');
         return this.subscribe(channelId)
           ? this.opts.subscribeMemberChannels
-            ? `Unmuted conversation ${channelId}: its ambient messages arrive again.`
+            ? (this.slack.hasAccessPolicy ? `Unmuted conversation ${channelId}: its ambient messages are eligible again, subject to access admission and successful delivery.` : `Unmuted conversation ${channelId}: its ambient messages arrive again.`)
             : `Subscribed to ambient messages from conversation ${channelId}.`
           : this.opts.subscribeMemberChannels
             ? `Conversation ${channelId} is not muted.`
@@ -1015,8 +1101,8 @@ export class SlackMcplServer {
         this.unsubscribedByAgent.add(channelId);
         return this.unsubscribe(channelId)
           ? this.opts.subscribeMemberChannels
-            ? `Muted ambient messages in conversation ${channelId} until you subscribe_channel it again. Mentions and DMs from there will still arrive.`
-            : `Unsubscribed from ambient messages in conversation ${channelId}. Mentions and DMs from there will still arrive.`
+            ? `Muted ambient messages in conversation ${channelId} until you subscribe_channel it again. ${this.slack.hasAccessPolicy ? 'Admitted mentions and DMs remain eligible; delivery can still fail.' : 'Mentions and DMs from there will still arrive.'}`
+            : `Unsubscribed from ambient messages in conversation ${channelId}. ${this.slack.hasAccessPolicy ? 'Admitted mentions and DMs remain eligible; delivery can still fail.' : 'Mentions and DMs from there will still arrive.'}`
           : this.opts.subscribeMemberChannels
             ? `Conversation ${channelId} is already muted.`
             : `Conversation ${channelId} was not subscribed.`;
@@ -1029,8 +1115,8 @@ export class SlackMcplServer {
             mode: 'member-channels',
             muted: [...this.mutedChannels].sort(),
             note:
-              'Ambient messages arrive from every conversation the bot is a member of, except the muted ones. ' +
-              'Mentions and DMs always come through.',
+              (this.slack.hasAccessPolicy ? 'Ambient messages from unmuted member conversations are eligible, subject to access admission and successful delivery. ' : 'Ambient messages arrive from every conversation the bot is a member of, except the muted ones. ') +
+              (this.slack.hasAccessPolicy ? 'Mentions and DMs bypass subscription filtering after access admission; delivery can still fail.' : 'Mentions and DMs always come through.'),
           };
         }
         return {
@@ -1038,8 +1124,8 @@ export class SlackMcplServer {
           count: this.subscribedChannels.size,
           note:
             this.subscribedChannels.size === 0
-              ? 'No ambient subscriptions. Mentions and DMs are always delivered.'
-              : 'Ambient messages from these conversations are delivered. Mentions and DMs always come through regardless.',
+              ? (this.slack.hasAccessPolicy ? 'No ambient subscriptions. Admitted mentions and DMs remain eligible; delivery can still fail.' : 'No ambient subscriptions. Mentions and DMs are always delivered.')
+              : (this.slack.hasAccessPolicy ? 'These ambient subscriptions and all mentions/DMs remain subject to access admission and successful delivery.' : 'Ambient messages from these conversations are delivered. Mentions and DMs always come through regardless.'),
         };
       }
 
@@ -1170,12 +1256,13 @@ export class SlackMcplServer {
     }
 
     const generation = ++this.registrationGeneration;
-    const isCurrent = () => this.conn === conn && !conn.isClosed &&
+    const isCurrent = () => (!this.slack.hasAccessPolicy || !this.slack.isStopping) && this.conn === conn && !conn.isClosed &&
       this.registrationGeneration === generation && this.grant.has('channels.register');
     // Until it ends, however it ends, a refresh_channels answers at once.
     // A registration that ends clears only its own record, not a later
     // one's.
     this.registering = generation;
+    this.registrationIncomplete = undefined;
     try {
       await this.listAndRegister(conn, isCurrent);
     } finally {
@@ -1190,15 +1277,25 @@ export class SlackMcplServer {
       // answers at once), so a request Slack rate-limits is waited out, as
       // Slack asks, and one that fails in a way that can pass is asked again
       // after a wait, and the listing goes on from there.
-      const { conversations: convs } = await this.slack.listConversations(false, (wait, inARow) =>
-        this.waitToAskAgain(wait, inARow, isCurrent));
+      const waitOut = (wait: SlackWait, inARow: number) => this.waitToAskAgain(wait, inARow, isCurrent);
+      const listing = this.slack.hasAccessPolicy
+        ? await this.slack.listConversations(false, waitOut, isCurrent)
+        : await this.slack.listConversations(false, waitOut);
+      const { conversations: convs, admissionFailures, truncation } = listing;
+      if (!isCurrent()) return;
+      if (admissionFailures) console.error(`[slack-mcpl] Conversation registration incomplete: ${admissionFailures} candidate(s) skipped after failed admission; enumerated ${convs.length} eligible conversations. ` +
+        `Transient failures may clear on retry: ask the connected agent to refresh channels or reconnect the host to rerun registration. ` +
+        `Lasting access refusals require you to restore the Slack grant or membership, or check the configured policy, before trying again.`);
+      this.registrationIncomplete = truncation;
+      if (truncation) console.error(`[slack-mcpl] Conversation registration incomplete: enumeration reached ${truncation.pages} pages; ` +
+        `additional conversations may be missing. Review the adapter pagination.conversations option (or SLACK_CONVERSATION_PAGE_LIMIT for the executable), restart after changing it, then refresh_channels where available; repeating the same limit may omit the same conversations. Enumerated ${convs.length} eligible conversations; host acceptance is separate.`);
       descriptors = convs.map((c) => toDescriptor(c, this.slack.teamName, this.slack.canWrite(c.id)));
     } catch (err) {
       // One superseded meanwhile stops without a word; the newer one reports.
       if (isCurrent()) {
         const why = err instanceof GaveUp
           ? `${err.message}, so registration stopped; refresh_channels can announce the conversations later`
-          : (err as Error).message;
+          : this.slack.hasAccessPolicy ? `${policyFailureSummary(err).replace(/\.$/, '')}; registration stopped, and refresh_channels can retry it` : (err as Error).message;
         console.error('[slack-mcpl] Failed to enumerate conversations:', why);
       }
       return;
@@ -1232,11 +1329,11 @@ export class SlackMcplServer {
     // Checked before the give-up, which a DM's name survives: a superseded
     // listing that gave up on a name would go on listing.
     if (!isCurrent()) throw superseded();
-    if (inARow >= REGISTRATION_TRIES) {
+    if (inARow >= (wait.attempts ?? REGISTRATION_TRIES)) {
       throw new GaveUp(`Slack rate-limited or failed the same request ${inARow} times in a row`);
     }
     const what = wait.why === 'limited' ? `Slack rate-limited ${wait.method}` : `${wait.method} failed`;
-    console.error(`[slack-mcpl] ${what} (try ${inARow} of ${REGISTRATION_TRIES}); registration asks again in ${wait.seconds} s`);
+    console.error(`[slack-mcpl] ${what} (try ${inARow} of ${wait.attempts ?? REGISTRATION_TRIES}); registration asks again in ${wait.seconds} s`);
     await clock.sleep(wait.seconds * 1000, { unref: true });
     if (!isCurrent()) throw superseded();
   }
@@ -1299,7 +1396,7 @@ export class SlackMcplServer {
     return added;
   }
 
-  /** Re-enumerate every conversation currently visible, of the kinds the
+  /** Re-scan eligible conversations within the configured page budget, of the kinds the
    *  token can read, and register any the host doesn't yet know about — the
    *  agent-facing catch-all for "I was invited to a channel but don't see it". */
   private async refreshChannels(): Promise<{
@@ -1342,11 +1439,19 @@ export class SlackMcplServer {
         "Nothing was announced to the host: this server is still registering the workspace's conversations. " +
           'Registration announces what it finds, unless it stops early. Once it has ended, refresh_channels lists ' +
           "again and announces anything registration didn't, such as a conversation created since it began; until " +
-          'then it answers like this.',
+          'then it answers like this.' + (this.slack.hasAccessPolicy
+            ? ' A refresh scans within the same page limit and candidate checks, so a conversation registration could not reach may also be missed by it.' : ''),
       );
     }
     const gone = () => this.conn !== conn || !!conn?.isClosed;
-    const { conversations: convs, leftOut: typesLeftOut } = await this.slack.listConversations();
+    const { conversations: convs, leftOut: typesLeftOut, truncation, admissionFailures, admissionStop, skippedKnown = 0 } = await (this.slack.hasAccessPolicy
+      ? this.slack.listConversations(false, undefined, () => !gone(), id => !!this.channelManager.get(mcplChannelId(id)))
+      : this.slack.listConversations());
+    const visible = convs.length + skippedKnown;
+    const knownNote = skippedKnown ? ` The visible count includes ${skippedKnown} already registered ID(s) seen in this scan; their access was not rechecked.` : '';
+    const incomplete = truncation ? { truncated: true, stopReason: truncation.reason } : admissionFailures ? { truncated: true, stopReason: admissionStop?.reason ?? 'admission_failed' } : {};
+    const incompleteNote = (truncation ? ` ${listingTruncationNote(truncation)} The visible count covers only this scan, not the whole workspace.` : '')
+      + (admissionFailures ? ` ${admissionIncompleteNote(admissionStop, true)}` : '');
     // The host keeps the label a conversation is first announced with, and a
     // refresh never announces a known one again, so a new DM whose user's name
     // this server couldn't get from Slack just now waits for a later refresh
@@ -1360,12 +1465,15 @@ export class SlackMcplServer {
     // has since gone neither writes the registry nor announces.
     if (gone()) {
       return {
-        visible: convs.length,
+        visible,
         added: [],
-        note: "The host's connection closed while Slack was listing conversations; nothing was announced.",
+        ...incomplete,
+        note: "The host's connection closed while Slack was listing conversations; nothing was announced." + incompleteNote + knownNote,
       };
     }
     const added = this.registerAndNotifyNew(descriptors);
+    // Only a scan that completed clears an earlier page-limit record; an admission-stopped one did not.
+    if (!truncation && !admissionFailures) this.registrationIncomplete = undefined;
     const wait = Math.max(1, ...unnamed.map((c) => c.nameWait?.seconds ?? 0));
     const unnamedIds = unnamed.map((c) => `${mcplChannelId(c.id)} (user ${c.userId})`).join(', ');
     const leftOut = unnamed.length === 0 ? '' :
@@ -1374,15 +1482,18 @@ export class SlackMcplServer {
         `again in about ${wait} second${wait === 1 ? '' : 's'} to announce them by name. This server still sends ` +
         'their messages to the host meanwhile.';
     return {
-      visible: convs.length,
+      visible,
       added: added.map((d) => ({ id: d.id, label: d.label })),
+      ...incomplete,
+      ...(this.registrationIncomplete ? { registration: { enumerationIncomplete: true, ...this.registrationIncomplete } } : {}),
       note:
         (added.length > 0
           ? `Registered ${added.length} newly-visible conversation(s).`
-          : unnamed.length > 0
+          : unnamed.length > 0 || admissionFailures
             ? 'No conversation was registered.'
+            : truncation ? 'No additional conversations were registered from this incomplete scan.'
             : 'No new conversations: the host already has every one this listing found.') + leftOut +
-        (typesLeftOut.length > 0 ? ` ${leftOutNote(typesLeftOut)}` : ''),
+        (typesLeftOut.length > 0 ? ` ${leftOutNote(typesLeftOut)}` : '') + incompleteNote + knownNote,
     };
   }
 
@@ -1434,8 +1545,9 @@ export class SlackMcplServer {
   /** For a channels/open that found nothing registered: how this server's
    *  conversations come to be registered with the host, or that they can't. */
   private howChannelsRegister(): string {
+    if (this.slack.hasAccessPolicy && this.grant.has('channels.register')) return 'refresh_channels registers only conversations admitted by this host’s access policy and Slack scopes, within its listing bounds; a deny-all policy registers none. Open one by the id it announces.';
     return this.grant.has('channels.register')
-      ? `refresh_channels registers the conversations this bot is in${this.slack.dmsDisabled ? ', channels only while direct messages are turned off' : ''}; open one by the id it announces.`
+      ? `refresh_channels registers the conversations this bot is in${(this.slack.hasAccessPolicy ? this.slack.listsChannelsOnly : this.slack.dmsDisabled) ? ', channels only while direct messages are turned off' : ''}; open one by the id it announces.`
       : "This host hasn't granted this server channels.register, so this server can't register conversations with it.";
   }
 
@@ -1521,6 +1633,8 @@ export class SlackMcplServer {
     // this server can't name counts as a message no delete can reach.
     const sent = { message: 0, file: 0 };
     const deleted = { message: 0, file: 0 };
+    let confirmedFileDeletes = 0;
+    const admissionCauses: string[] = [];
     /** Each item a delete didn't confirm gone, or that no delete could name,
      *  by kind, id (where known) and conversation, and whether Slack refused
      *  its delete for good. */
@@ -1531,10 +1645,17 @@ export class SlackMcplServer {
       sent[kind]++;
       try {
         await remove();
+        if (kind === 'file') confirmedFileDeletes++;
         deleted[kind]++;
       } catch (err) {
+        if (err instanceof SlackAccessDenied || err instanceof SlackScopeEvidenceError || failedAccessAdmission(err)) {
+          // "Cleanup was not attempted" is the outcome; the explanation keeps only cause and remedy.
+          const why = (explainSlackError(err, { tool: kind === 'file' ? 'delete_file' : 'delete_message', args: { channelId, messageId: id, fileId: id } }) ?? (err instanceof Error ? err.message : String(err)))
+            .replace(/^Nothing was deleted:\s*/, '');
+          admissionCauses.push(`Cleanup was not attempted for ${kind} ${id} in ${channelId}: ${why.charAt(0).toUpperCase()}${why.slice(1)}`);
+        }
         const refusal = slackRefusal(err);
-        if (refusal !== undefined && gone.includes(refusal)) {
+        if (!failedAccessAdmission(err) && !(err instanceof SlackAccessDenied) && refusal !== undefined && gone.includes(refusal)) {
           deleted[kind]++;
           return;
         }
@@ -1545,16 +1666,17 @@ export class SlackMcplServer {
         // branch, so no later rollback tries it again: the reason names it,
         // for the agent, and stderr says why, for an operator.
         const shared = sharedFile ? `, which shared file ${sharedFile}` : '';
-        left.push({ kind, named: `${kind} ${id} in ${channelId}${shared}`, forGood: refusedForGood(err) });
+        left.push({ kind, named: `${kind} ${id} in ${channelId}${shared}`, forGood: !(err instanceof SlackAccessDenied) && !failedAccessAdmission(err) && refusedForGood(err) });
         console.error(
           `[slack-mcpl] Rollback couldn't delete ${kind} ${id}${shared && `${shared},`} in ${channelId}: ` +
-            `${(err as Error)?.message ?? String(err)}`,
+            `${this.slack.hasAccessPolicy ? policyFailureSummary(err) : (err as Error)?.message ?? String(err)}`,
         );
       }
     };
     for (const item of toDelete) {
       if (item.kind === 'file') {
         await attempt('file', item.fileId, item.channelId, FILE_GONE, () => this.slack.deleteFile(item.channelId, item.fileId));
+        this.slack.forgetUpload?.(item.fileId);
         const { shareTs } = item;
         if (shareTs) {
           await attempt('message', shareTs, item.channelId, ['message_not_found'],
@@ -1601,7 +1723,7 @@ export class SlackMcplServer {
     const namedMessageLeft = mayRemain.some((item) => item.kind === 'message' && !item.unnamed);
     const unnamedLeft = mayRemain.some((item) => item.unnamed);
     const remedy = [
-      ...(namedMessageLeft ? ['delete_message can try a message among them again, by its id'] : []),
+      ...(namedMessageLeft ? [(admissionCauses.length ? 'Once the reported cause is resolved (wait before retrying rate limits or temporary failures), ' : '') + 'delete_message can try a message among them again, by its id'] : []),
       ...(unnamedLeft
         ? [namedMessageLeft
           ? "fetch_history shows the id of one this server doesn't know (fetch_thread, for one in a thread)"
@@ -1612,6 +1734,10 @@ export class SlackMcplServer {
         : []),
     ].join(', and ');
     const notes = [
+      ...admissionCauses,
+      ...(this.slack.hasAccessPolicy && confirmedFileDeletes > 0
+        ? ['A file deletion removes the file from every conversation it is shared in']
+        : []),
       ...(left.length > 0
         ? [[
             `Rolled back (${counts} deleted)`,
@@ -1632,31 +1758,37 @@ export class SlackMcplServer {
     return {
       checkpoint: params.checkpoint,
       success: true,
-      reason: notes.length > 0 ? notes.join('. ') : undefined,
+      reason: notes.length > 0 ? notes.map(note => this.slack.hasAccessPolicy ? note.replace(/\.+$/, '') : note).join('. ') : undefined,
     };
   }
 
   // ── Slack Event Forwarding ──
 
   private setupSlackForwarding(): void {
+    // Optional for embedded legacy adapters; the real adapter applies this only
+    // with explicit policy. Delivery still rechecks subscriptions at its turn.
+    if (this.slack.hasAccessPolicy) this.slack.setAmbientMessageFilter?.(id => this.isChannelSubscribed(id));
     this.slack.onMessage((msg) => {
       const conn = this.conn;
       if (!conn || !this.mcplEnabled || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) {
         if ((msg.mentionsBot || msg.isDM) && (!conn || this.mcplEnabled)) {
           const why = conn ? 'slack.messaging is not active' : 'no peer is connected';
-          console.error(`[slack-mcpl] Dropped addressed message ${msg.id} in ${msg.channelId} before delivery: ${why}`);
+          console.error(`[slack-mcpl] Dropped addressed message ${deliveryLocation(msg, this.slack.hasAccessPolicy)} before delivery: ${why}`);
         }
         return;
       }
       if (msg.mentionsBot || msg.isDM) void this.slack.acknowledge(msg.channelId, msg.id);
       const previous = this.forwarding.get(msg.channelId) ?? Promise.resolve();
       const pending = previous.then(() => this.handleSlackMessage(msg, conn)).catch((err) => {
-        console.error('[slack-mcpl] Error forwarding Slack message:', err);
+        if (this.slack.hasAccessPolicy && (msg.mentionsBot || msg.isDM)) void this.slack.clearAck(msg.channelId, msg.id);
+        if (this.slack.hasAccessPolicy) console.error(`[slack-mcpl] Error forwarding Slack message ${deliveryLocation(msg, true)}:`, policyFailureSummary(err));
+        else console.error('[slack-mcpl] Error forwarding Slack message:', err);
       });
       this.forwarding.set(msg.channelId, pending);
       void pending.then(() => {
         if (this.forwarding.get(msg.channelId) === pending) this.forwarding.delete(msg.channelId);
       });
+      if (this.slack.hasAccessPolicy) return pending;
     });
   }
 
@@ -1665,23 +1797,23 @@ export class SlackMcplServer {
    *  fetch_attachment rather than inlined here. */
   private attachmentNote(attachments: AttachmentRef[]): string {
     const lines = attachments.map((a) =>
-      `- ${nameShown(a.name)} (${mimeShown(a.mimeType)})${a.isImage ? ' — image' : ''}, fetchable via fetch_attachment: ${urlShown(a.path)}`,
+      this.slack.hasAccessPolicy && isPolicyFileRef(a) ? `- ${policyFileNote(a)}` : `- ${nameShown(a.name)} (${mimeShown(a.mimeType ?? '')})${a.isImage ? ' — image' : ''}, fetchable via fetch_attachment: ${urlShown(a.path ?? '')}`,
     );
     return `[attachments: ${attachments.length}]\n${lines.join('\n')}`;
   }
 
-  /** Optional delivery context must not hold a conversation behind a stalled
-   *  Slack call. A late result is ignored; the client may still finish its call.
-   *  A give-up or a failure is logged, since the message goes without what it
-   *  looked up. */
-  private async deliveryLookup<T>(lookup: Promise<T>, what: string, onGiveUp?: () => void): Promise<T> {
+  /** Bound the wait for optional context or mandatory final admission. Late
+   * results are ignored; an in-flight Slack request may finish. Expired final
+   * admission drops delivery. */
+  private async deliveryLookup<T>(lookup: Promise<T>, what: string, fallback = 'delivering without it', onGiveUp?: () => void): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     let gaveUp = false;
     try {
       return await Promise.race([
         lookup.catch((err: unknown) => {
-          if (!gaveUp && (err as Error).name !== 'AbortError') {
-            console.error(`[slack-mcpl] Couldn't get ${what} (${(err as Error).message}); delivering without it`);
+          const aborted = (err as Error | undefined)?.name === 'AbortError';
+          if (!gaveUp && !(aborted && (onGiveUp || !this.slack.hasAccessPolicy))) {
+            console.error(`[slack-mcpl] Couldn't get ${what} (${this.slack.hasAccessPolicy ? policyFailureSummary(err) : (err as Error).message}); ${fallback}`);
           }
           throw err;
         }),
@@ -1689,7 +1821,7 @@ export class SlackMcplServer {
           timer = setTimeout(() => {
             gaveUp = true;
             onGiveUp?.();
-            console.error(`[slack-mcpl] Gave up on ${what} after 5 s; delivering without it`);
+            console.error(`[slack-mcpl] Gave up on ${what} after 5 s; ${fallback}`);
             reject(new Error(`Gave up on ${what} after 5 s`));
           }, 5000);
         }),
@@ -1707,7 +1839,7 @@ export class SlackMcplServer {
   }
 
   private async handleSlackMessage(msg: SlackMessageData, conn: McplConnection): Promise<void> {
-    const isCurrent = () => this.conn === conn && !conn.isClosed && this.mcplEnabled &&
+    const isCurrent = () => (!this.slack.hasAccessPolicy || !this.slack.isStopping) && this.conn === conn && !conn.isClosed && this.mcplEnabled &&
       this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET);
     dbg('handleSlackMessage:enter', {
       msgId: msg.id,
@@ -1718,7 +1850,7 @@ export class SlackMcplServer {
       current: isCurrent(),
       mcplEnabled: this.mcplEnabled,
     });
-    // Direct address (mention or DM) always reaches the agent. Ambient
+    // Direct address (mention or DM) bypasses subscription filtering. Ambient
     // messages only flow from subscribed conversations — otherwise every
     // visible channel would pour unbounded noise into context. The wake
     // decision is the host's, via the chat:* tags below.
@@ -1730,9 +1862,11 @@ export class SlackMcplServer {
     // left, or slack.messaging isn't active, before the message reaches it,
     // the message is dropped; an addressed one says so once on stderr.
     const abandon = () => {
-      if (!isAddressed) return;
-      const why = this.conn === conn && !conn.isClosed ? 'slack.messaging is not active' : 'its peer disconnected';
-      console.error(`[slack-mcpl] Dropped addressed message ${msg.id} in ${msg.channelId} before delivery: ${why}`);
+      const stopping = this.slack.hasAccessPolicy && this.slack.isStopping;
+      if (!isAddressed && !stopping) return;
+      const why = stopping ? 'adapter stopping' : this.conn === conn && !conn.isClosed ? 'slack.messaging is not active' : 'its peer disconnected';
+      const recovery = stopping ? '. Slack will not replay it; after restart, recover it in Slack or ask the connected agent to read it back.' : '';
+      console.error(`[slack-mcpl] Dropped ${isAddressed ? 'addressed' : 'ambient'} message ${deliveryLocation(msg, this.slack.hasAccessPolicy)} before delivery: ${why}${recovery}`);
       releaseAck();
     };
     // §6.7: a disabled slack.messaging stops its traffic at once — incoming
@@ -1749,13 +1883,13 @@ export class SlackMcplServer {
     // this conversation for this peer. A rejected delivery can fetch again;
     // an accepted ambient delivery suppresses later initial backscroll.
     // Auto-subscription and the watermark commit only in taken() below.
-    this.ensureSubscriptionsLoaded();
-    const isFirstInteraction = !this.forwardedWatermark.has(msg.channelId);
-    // The conversation's metadata is looked up at most once per message: the
-    // first interaction's note and backscroll and the location header share it.
-    // A DM's header says DM and a DM gets no note, so a DM looks up none.
+    if (!this.slack.hasAccessPolicy) this.ensureSubscriptionsLoaded();
+    let isFirstInteraction = !this.forwardedWatermark.has(msg.channelId);
+    // Legacy optional context shares one metadata lookup. Policy mode uses
+    // the final admission result below instead of another name request.
     let meta: Awaited<ReturnType<typeof this.slack.getConversationMeta>> | undefined;
     let backscroll: Awaited<ReturnType<typeof this.slack.fetchHistory>>['messages'] = [];
+    let backscrollTruncated = false;
     if (isFirstInteraction && isAddressed) {
       const backscrollAbort = new AbortController();
       this.backscrollAborts.add(backscrollAbort);
@@ -1764,32 +1898,66 @@ export class SlackMcplServer {
           limit: this.backscrollLimit,
           signal: backscrollAbort.signal,
           latest: msg.id, // never include the triggering message itself
-        }), `the backscroll for message ${msg.id} in ${msg.channelId}`, () => backscrollAbort.abort());
+        }), `the backscroll for message ${msg.id} in ${msg.channelId}`,
+          this.slack.hasAccessPolicy ? 'omitting optional backscroll; final delivery admission still applies' : undefined,
+          () => backscrollAbort.abort());
         // Drop the bot's own past messages — already in the agent's
         // chronicle as assistant turns, no need to re-echo.
+        backscrollTruncated = res.stopReason === 'page_limit';
         backscroll = res.messages.filter((m) => m.authorId !== this.slack.botUserId);
       } catch (err) {
-        dbg('backscroll:fetch-failed', { channelId: msg.channelId, error: (err as Error).message });
+        // Optional content failure is not itself a delivery failure. Its
+        // lasting refusal is ordered evidence at the client boundary, so a
+        // transient final check still meets it unless newer evidence won.
+        dbg('backscroll:fetch-failed', { channelId: msg.channelId, error: this.slack.hasAccessPolicy ? policyFailureSummary(err) : (err as Error).message });
       } finally {
         this.backscrollAborts.delete(backscrollAbort);
       }
       if (!isCurrent()) return abandon();
-      if (!msg.isDM) {
+      if (!this.slack.hasAccessPolicy && !msg.isDM) {
         meta = await this.lookUpMeta(msg);
         if (!isCurrent()) return abandon();
       }
     }
 
-    // The conversation is named only when it differs from the last context
-    // this peer was sent, which is read here, after the lookups above, since
-    // another conversation's message can go out while they run. The
-    // conversation's ID, the thread and the message ID are given every time:
-    // two threads in one channel are otherwise indistinguishable, and replying
-    // or reacting to a message needs its conversation's ID and its own.
-    const contextChanged = this.lastChannelId !== msg.channelId;
-    if (contextChanged && meta === undefined && !msg.isDM) {
-      meta = await this.lookUpMeta(msg);
+    let contextChanged: boolean;
+    // Policy delivery uses one bounded fresh admission, also supplying the
+    // channel label. Transient failure keeps the original event admission;
+    // all other failures drop the message.
+    if (this.slack.hasAccessPolicy) {
+      try {
+        meta = await this.deliveryLookup(this.slack.getConversationMeta(msg.channelId, true),
+          `delivery admission for message ${msg.id} in ${msg.channelId}`,
+          'retaining original admission only for classified transient Slack failures');
+        if (meta === undefined || (meta === null && !msg.isDM)) throw new TypeError('Final admission returned no result');
+      } catch (err) {
+        try {
+          this.slack.assertKnownDeliveryAdmission(msg.channelId);
+        } catch (veto) { err = veto; }
+        if (!isTransientSlackFailure(err)) {
+          const root = msg.threadTs && msg.threadTs !== msg.id ? msg.threadTs : undefined;
+          console.error(`[slack-mcpl] Dropped message ${deliveryLocation(msg, true)}: delivery admission failed: ` +
+            `${policyFailureSummary(err)}. Slack will not replay it; once access allows, recover it with ${root ? `fetch_thread for thread ${root}` : 'fetch_history'}.`);
+          releaseAck();
+          return;
+        }
+        console.error(`[slack-mcpl] Delivery admission unavailable for message ${msg.id} in ${msg.channelId}; using original admission`);
+      }
       if (!isCurrent()) return abandon();
+      contextChanged = this.lastChannelId !== msg.channelId;
+    } else {
+      // Preserve legacy header snapshot timing across its optional lookup.
+      contextChanged = this.lastChannelId !== msg.channelId;
+      if (contextChanged && meta === undefined && !msg.isDM) {
+        meta = await this.lookUpMeta(msg);
+        if (!isCurrent()) return abandon();
+      }
+    }
+    // Read policy delivery-visible state only after final admission settles.
+    if (this.slack.hasAccessPolicy) {
+      this.ensureSubscriptionsLoaded();
+      if (!isAddressed && !this.isChannelSubscribed(msg.channelId)) return;
+      isFirstInteraction = !this.forwardedWatermark.has(msg.channelId);
     }
 
     // Nothing is awaited from here to the send, so what is decided here is
@@ -1802,17 +1970,21 @@ export class SlackMcplServer {
       !this.unsubscribedByAgent.has(msg.channelId) && !this.isChannelSubscribed(msg.channelId);
     const blocks: string[] = [];
     if (autoSubscribe) {
-      const where = meta?.name ? channelShown(meta.name) : `conversation ${msg.channelId}`;
+      const where = meta?.name
+        ? (this.slack.hasAccessPolicy && meta.policyGroupDm ? `Group DM: ${nameShown(meta.name)}` : channelShown(meta.name))
+        : `conversation ${msg.channelId}`;
       blocks.push(
-        `<system>Auto-subscribed to ${where} because you were mentioned. ` +
-          `Ambient (non-mention) messages from this conversation will now arrive in your context. ` +
-          `Mentions and DMs always come through regardless of subscriptions. ` +
+        (this.slack.hasAccessPolicy ? `<system>Accepting this message will subscribe you to ${where} because you were mentioned (unless muted before acceptance). ` : `<system>Auto-subscribed to ${where} because you were mentioned. `) +
+          (this.slack.hasAccessPolicy ? 'Ambient (non-mention) messages from this conversation are eligible for your context, subject to access admission and successful delivery. ' : 'Ambient (non-mention) messages from this conversation will now arrive in your context. ') +
+          (this.slack.hasAccessPolicy ? 'Mentions and DMs bypass subscriptions after access admission; delivery can still fail. ' : 'Mentions and DMs always come through regardless of subscriptions. ') +
           `To stop ambient delivery from here: unsubscribe_channel("${msg.channelId}").</system>`,
       );
     }
-    if (backscroll.length > 0) {
-      blocks.push(backscrollBlock(backscroll, { channelName: meta?.name, isDM: msg.isDM },
-        this.grant.isFeatureSetActive(HISTORY_FEATURE_SET)));
+    if (backscroll.length > 0 || backscrollTruncated) {
+      blocks.push(backscrollBlock(backscroll, {
+        channelName: meta?.name, isDM: msg.isDM, isGroupDM: this.slack.hasAccessPolicy && meta?.policyGroupDm,
+        truncated: backscrollTruncated, policyAttachments: this.slack.hasAccessPolicy,
+      }, this.grant.isFeatureSetActive(HISTORY_FEATURE_SET)));
     }
     // Told with the first message the agent gets from here, addressed or not.
     // Counted as told only once the host has taken that message.
@@ -1828,7 +2000,9 @@ export class SlackMcplServer {
     const channelMcplId = mcplChannelId(msg.channelId);
     const channelIsOpen = this.channelManager.isOpen(channelMcplId);
     // A conversation whose name Slack didn't give is named by its ID.
-    const conversation = !contextChanged ? undefined : msg.isDM ? 'DM' : meta?.name ? channelShown(meta.name) : msg.channelId;
+    const conversation = !contextChanged ? undefined : msg.isDM ? 'DM'
+      : this.slack.hasAccessPolicy && meta?.policyGroupDm ? `Group DM: ${nameShown(meta.name || msg.channelId)}`
+      : meta?.name ? channelShown(meta.name) : msg.channelId;
     const location = locationHeader({
       conversation,
       teamName: contextChanged ? this.slack.teamName : undefined,
@@ -1919,7 +2093,7 @@ export class SlackMcplServer {
         res = await conn.sendRequest(method.CHANNELS_INCOMING, incomingParams) as typeof res;
         dbg('handleSlackMessage:sent', { method: 'channels/incoming', channelMcplId });
       } catch (err) {
-        console.error(`[slack-mcpl] channels/incoming failed for message ${msg.id} in ${msg.channelId}:`, (err as Error).message);
+        console.error(`[slack-mcpl] channels/incoming failed for message ${deliveryLocation(msg, this.slack.hasAccessPolicy)}:`, this.slack.hasAccessPolicy ? hostFailureSummary(err) : (err as Error).message);
         notTaken();
         return;
       }
@@ -1945,7 +2119,9 @@ export class SlackMcplServer {
           team: msg.teamId,
         } as Record<string, unknown>,
         tags: eventTags, // MCPL RFC-001 — the host routes/gates on these
-        payload: { content: contentBlocks },
+        payload: {
+          content: contentBlocks,
+        },
       };
 
       let res: { accepted?: boolean } | undefined;
@@ -1953,7 +2129,7 @@ export class SlackMcplServer {
         res = await conn.sendRequest(method.PUSH_EVENT, pushParams) as typeof res;
         dbg('handleSlackMessage:sent', { method: 'push/event', channelMcplId });
       } catch (err) {
-        console.error(`[slack-mcpl] push/event failed for message ${msg.id} in ${msg.channelId}:`, (err as Error).message);
+        console.error(`[slack-mcpl] push/event failed for message ${deliveryLocation(msg, this.slack.hasAccessPolicy)}:`, this.slack.hasAccessPolicy ? hostFailureSummary(err) : (err as Error).message);
         notTaken();
         return;
       }
